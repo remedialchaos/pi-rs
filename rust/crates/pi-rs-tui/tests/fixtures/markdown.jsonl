@@ -1,0 +1,229 @@
+{"source":"# Title","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Title"]}
+{"source":"# Title\nfoo","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Title","","foo"]}
+{"source":"[a][x]\n\n[x]: https://one.example","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["a (https://one.example)",""]}
+{"source":"[a][x]\n\n[x]: https://two.example","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["a (https://two.example)",""]}
+{"source":"- Item 1\n  - Nested 1.1\n  - Nested 1.2\n- Item 2","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["- Item 1","    - Nested 1.1","    - Nested 1.2","- Item 2"]}
+{"source":"- Level 1\n  - Level 2\n    - Level 3\n      - Level 4","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["- Level 1","    - Level 2","        - Level 3","            - Level 4"]}
+{"source":"1. First\n   1. Nested first\n   2. Nested second\n2. Second","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["1. First","    1. Nested first","    2. Nested second","2. Second"]}
+{"source":"1. alpha\n1. beta\n1. gamma","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["1. alpha","2. beta","3. gamma"]}
+{"source":"  4. forth\n  3. third\n\n10) ten\n7) seven\n\n+ plus\n* star\n- minus\n+","width":80,"geometry":[0,0],"hyperlinks":false,"preserveOrderedListMarkers":true,"lines":["4. forth","3. third","","10) ten","7) seven","","+ plus","* star","- minus","+"]}
+{"source":"1. Ordered item\n   - Unordered nested\n   - Another nested\n2. Second ordered\n   - More nested","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["1. Ordered item","    - Unordered nested","    - Another nested","2. Second ordered","    - More nested"]}
+{"source":"1. Lorem ipsum dolor sit amet.\n\n   Ut enim ad minim veniam.\n\n2. Duis aute irure dolor.\n\n   Excepteur sint occaecat cupidatat.\n\n3. Beep boop","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["1. Lorem ipsum dolor sit amet.","","   Ut enim ad minim veniam.","","2. Duis aute irure dolor.","","   Excepteur sint occaecat cupidatat.","","3. Beep boop"]}
+{"source":"- [ ] beep\n- [x] boop","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["- [ ] beep","- [x] boop"]}
+{"source":"1. First item\n\n```typescript\n// code block\n```\n\n2. Second item\n\n```typescript\n// another code block\n```\n\n3. Third item","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["1. First item","","```typescript","  // code block","```","","2. Second item","","```typescript","  // another code block","```","","3. Third item"]}
+{"source":"- alpha beta gamma delta epsilon","width":20,"geometry":[0,0],"hyperlinks":false,"lines":["- alpha beta gamma","  delta epsilon"]}
+{"source":"1. alpha beta gamma delta epsilon","width":20,"geometry":[0,0],"hyperlinks":false,"lines":["1. alpha beta gamma","   delta epsilon"]}
+{"source":"10. alpha beta gamma delta epsilon","width":21,"geometry":[0,0],"hyperlinks":false,"lines":["10. alpha beta gamma","    delta epsilon"]}
+{"source":"- parent\n  - alpha beta gamma delta epsilon","width":24,"geometry":[0,0],"hyperlinks":false,"lines":["- parent","    - alpha beta gamma","      delta epsilon"]}
+{"source":"1. parent\n   - alpha beta gamma delta epsilon","width":24,"geometry":[0,0],"hyperlinks":false,"lines":["1. parent","    - alpha beta gamma","      delta epsilon"]}
+{"source":"- > alpha beta gamma delta epsilon zeta","width":24,"geometry":[0,0],"hyperlinks":false,"lines":["- │ alpha beta gamma","  │ delta epsilon zeta"]}
+{"source":"- ```ts\n  alpha beta gamma delta epsilon zeta\n  ```","width":24,"geometry":[0,0],"hyperlinks":false,"lines":["- ```ts","    alpha beta gamma","  delta epsilon zeta","  ```"]}
+{"source":"| Name | Age |\n| --- | --- |\n| Alice | 30 |\n| Bob | 25 |","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["┌───────┬─────┐","│ Name  │ Age │","├───────┼─────┤","│ Alice │ 30  │","├───────┼─────┤","│ Bob   │ 25  │","└───────┴─────┘"]}
+{"source":"| Column One | Column Two |\n| --- | --- |\n| superlongword short | otherword |\n| small | tiny |","width":32,"geometry":[0,0],"hyperlinks":false,"lines":["┌──────────────────┬───────────┐","│ Column One       │ Column    │","│                  │ Two       │","├──────────────────┼───────────┤","│ superlongword    │ otherword │","│ short            │           │","├──────────────────┼───────────┤","│ small            │ tiny      │","└──────────────────┴───────────┘"]}
+{"source":"| Left | Center | Right |\n| :--- | :---: | ---: |\n| A | B | C |\n| Long text | Middle | End |","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["┌───────────┬────────┬───────┐","│ Left      │ Center │ Right │","├───────────┼────────┼───────┤","│ A         │ B      │ C     │","├───────────┼────────┼───────┤","│ Long text │ Middle │ End   │","└───────────┴────────┴───────┘"]}
+{"source":"| Short | Very long column header |\n| --- | --- |\n| A | This is a much longer cell content |\n| B | Short |","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["┌───────┬────────────────────────────────────┐","│ Short │ Very long column header            │","├───────┼────────────────────────────────────┤","│ A     │ This is a much longer cell content │","├───────┼────────────────────────────────────┤","│ B     │ Short                              │","└───────┴────────────────────────────────────┘"]}
+{"source":"| Command | Description | Example |\n| --- | --- | --- |\n| npm install | Install all dependencies | npm install |\n| npm run build | Build the project | npm run build |","width":50,"geometry":[0,0],"hyperlinks":false,"lines":["┌─────────────┬─────────────────────┬────────────┐","│ Command     │ Description         │ Example    │","├─────────────┼─────────────────────┼────────────┤","│ npm install │ Install all         │ npm        │","│             │ dependencies        │ install    │","├─────────────┼─────────────────────┼────────────┤","│ npm run     │ Build the project   │ npm run    │","│ build       │                     │ build      │","└─────────────┴─────────────────────┴────────────┘"]}
+{"source":"| Link | Plain |\n| --- | --- |\n| [**one two three four five six**](https://example.com) | normal text |","width":24,"geometry":[0,0],"hyperlinks":true,"lines":["┌────────────┬─────────┐","│ Link       │ Plain   │","├────────────┼─────────┤","│ one two    │ normal  │","│ three four │ text    │","│ five six   │         │","└────────────┴─────────┘"]}
+{"source":"| Link | Plain |\n| --- | --- |\n| [**one two three four five six**](https://example.com) | normal text |","width":24,"geometry":[0,0],"hyperlinks":false,"lines":["┌───────────────┬──────┐","│ Link          │ Plai │","│               │ n    │","├───────────────┼──────┤","│ one two three │ norm │","│ four five six │ al   │","│               │ text │","│ (https://exam │      │","│ ple.com)      │      │","└───────────────┴──────┘"]}
+{"source":"| Header |\n| --- |\n| This is a very long cell content that should wrap |","width":25,"geometry":[0,0],"hyperlinks":true,"lines":["┌───────────────────────┐","│ Header                │","├───────────────────────┤","│ This is a very long   │","│ cell content that     │","│ should wrap           │","└───────────────────────┘"]}
+{"source":"| Value |\n| --- |\n| prefix https://example.com/this/is/a/very/long/url/that/should/wrap |","width":30,"geometry":[0,0],"hyperlinks":false,"lines":["┌────────────────────────────┐","│ Value                      │","├────────────────────────────┤","│ prefix                     │","│ https://example.com/this/i │","│ s/a/very/long/url/that/sho │","│ uld/wrap                   │","└────────────────────────────┘"]}
+{"source":"| Code |\n| --- |\n| `averyveryveryverylongidentifier` |","width":20,"geometry":[0,0],"hyperlinks":true,"lines":["┌──────────────────┐","│ Code             │","├──────────────────┤","│ averyveryveryver │","│ ylongidentifier  │","└──────────────────┘"]}
+{"source":"| A | B | C |\n| --- | --- | --- |\n| 1 | 2 | 3 |","width":15,"geometry":[0,0],"hyperlinks":true,"lines":["┌───┬───┬───┐","│ A │ B │ C │","├───┼───┼───┤","│ 1 │ 2 │ 3 │","└───┴───┴───┘"]}
+{"source":"| A | B |\n| --- | --- |\n| 1 | 2 |","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["┌───┬───┐","│ A │ B │","├───┼───┤","│ 1 │ 2 │","└───┴───┘"]}
+{"source":"| Column One | Column Two |\n| --- | --- |\n| Data 1 | Data 2 |","width":40,"geometry":[2,0],"hyperlinks":true,"lines":["  ┌────────────┬────────────┐","  │ Column One │ Column Two │","  ├────────────┼────────────┤","  │ Data 1     │ Data 2     │","  └────────────┴────────────┘"]}
+{"source":"| Name |\n| --- |\n| Alice |","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["┌───────┐","│ Name  │","├───────┤","│ Alice │","└───────┘"]}
+{"source":"# Test Document\n\n- Item 1\n  - Nested item\n- Item 2\n\n| Col1 | Col2 |\n| --- | --- |\n| A | B |","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Test Document","","- Item 1","    - Nested item","- Item 2","","┌──────┬──────┐","│ Col1 │ Col2 │","├──────┼──────┤","│ A    │ B    │","└──────┴──────┘"]}
+{"source":"A map $\\mathbb{C}^3 \\to \\mathbb{C}^3$, $xy$, $x-y$, $-x$, $\\frac{1}{2}$, $\\rightarrow$, and \\(s \\to \\infty\\).","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["A map ℂ³ → ℂ³, xy, x-y, -x, 1/2, →, and s → ∞."]}
+{"source":"Before\n\n$$\\{3x+2y,\\; x \\in \\{0, \\pm 1\\}\\}$$\n\nafter","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Before","","{3x+2y, x ∈ {0, ± 1}}","","after"]}
+{"source":"Before\n\n\\[\nE \\approx \\frac{0.1\\ \\text{lux}}{100\\ \\text{lm/W}}\n\\]\n\nafter","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Before","","    0.1 lux","E ≈ ────────","    100 lm/W","","after"]}
+{"source":"Consider the matrix\n\n\\[\nA=\n\\begin{pmatrix}\n\\pi & 0\\\\\n0 & \\frac{1}{\\pi}\n\\end{pmatrix}.\n\\]","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Consider the matrix","","A = ⎛ π │ 0   ⎞","    ⎝ 0 │ 1/π ⎠."]}
+{"source":"\\[\n\\lim_{x\\to 0}\\frac{\\frac{\\sin x}{x}-1}{\\frac{e^x-1}{x}-1}=0\n\\]","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["     (sin x)/x-1","lim  ─────────── = 0","x→0  (eˣ-1)/x-1"]}
+{"source":"- Formula: $F_1 = u^2$\n\n| Value |\n| --- |\n| $\\mathbb{C}^3$ |","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["- Formula: F₁ = u²","","┌───────┐","│ Value │","├───────┤","│ ℂ³    │","└───────┘"]}
+{"source":"Costs $5 and $10 or $8k–$12k; use `$x$`, $HOME, and ${PATH}.","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Costs $5 and $10 or $8k–$12k; use $x$, $HOME, and ${PATH}."]}
+{"source":"Paths: $HOME/$USER and $XDG_CONFIG_HOME/$APP_CONFIG","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Paths: $HOME/$USER and $XDG_CONFIG_HOME/$APP_CONFIG"]}
+{"source":"Unknown $x + \\unknown{y}$ after","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Unknown $x + \\unknown{y}$ after"]}
+{"source":"Streaming $\\mathbb{C}^3","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Streaming $\\mathbb{C}^3"]}
+{"source":"Map \\(\\mathbb{C}^3","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Map \\(\\mathbb{C}^3"]}
+{"source":"\\[\nx^2","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["\\[","x^2"]}
+{"source":"Escaped \\$x-y\\$.\n\n```text\n$\\mathbb{C}^3$\n```","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Escaped $x-y$.","","```text","  $\\mathbb{C}^3$","```"]}
+{"source":"$$\n\\widetilde Y_{sf}\n=\n(1-w_{sf})\\mu_{sf}^{\\mathrm{MAR}}\n$$\n\nInline \\(A_{sf}\\)","width":80,"geometry":[0,0],"hyperlinks":true,"renderLatex":false,"lines":["$$","\\widetilde Y_{sf}","=","(1-w_{sf})\\mu_{sf}^{\\mathrm{MAR}}","$$","","Inline \\(A_{sf}\\)"]}
+{"source":"\\[\n\\frac{\\partial^2 u}{\\partial x^2} + \\frac{\\partial^2 u}{\\partial y^2} = \\sum_{i=1}^{n} \\frac{1}{i^2} + \\int_0^1 f(x)\\,dx\n\\]","width":40,"geometry":[0,0],"hyperlinks":true,"lines":["∂² u   ∂² u   n   1   1","──── + ──── = ∑   ── +∫ f(x) dx","∂ x²   ∂ y²  i=1  i²  0"]}
+{"source":"\\[\n\\frac{\\partial^2 u}{\\partial x^2} + \\frac{\\partial^2 u}{\\partial y^2} = \\sum_{i=1}^{n} \\frac{1}{i^2} + \\int_0^1 f(x)\\,dx\n\\]","width":30,"geometry":[0,0],"hyperlinks":true,"lines":["\\[","\\frac{\\partial^2 u}{\\partial","x^2} + \\frac{\\partial^2","u}{\\partial y^2} =","\\sum_{i=1}^{n} \\frac{1}{i^2} +","\\int_0^1 f(x)\\,dx","\\]"]}
+{"source":"Intro\n\n$$\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nAfter","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Intro","","$$","","┌───┬───┐","│ A │ B │","├───┼───┤","│ 1 │ 2 │","└───┴───┘","","After"]}
+{"source":"$$\nx = 1\n\n| A | B |\n|---|---|\n| 1 | 2 |","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["$$","x = 1","","┌───┬───┐","│ A │ B │","├───┼───┤","│ 1 │ 2 │","└───┴───┘"]}
+{"source":"Intro\n\n$$\nx = 1\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n$$\ny^2\n$$","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Intro","","$$","x = 1","","┌───┬───┐","│ A │ B │","├───┼───┤","│ 1 │ 2 │","└───┴───┘","","y²"]}
+{"source":"$$\n\n| A |\n:---:\n| 1 |","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["$$","","┌───┐","│ A │","├───┤","│ 1 │","└───┘"]}
+{"source":"\\\\[\nx^2\n\n| A | B |\n|---|---|\n| 1 | 2 |","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["","\\[","x^2","","┌───┬───┐","│ A │ B │","├───┼───┤","│ 1 │ 2 │","└───┴───┘"]}
+{"source":"\\\\[\nx = 1\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n\\\\[\ny^2\n\\\\]","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["","\\[","x = 1","","┌───┬───┐","│ A │ B │","├───┼───┤","│ 1 │ 2 │","└───┴───┘","","\\","","\\[","y^2","\\\\]"]}
+{"source":"$$\nx^2\n\nValue\n| --- |\n1","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["$$","x^2","","┌───────┐","│ Value │","├───────┤","│ 1     │","└───────┘"]}
+{"source":"$$\na\n+ b\n$$\n\n| A | B |\n|---|---|\n| 1 | 2 |","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["a + b","","┌───┬───┐","│ A │ B │","├───┼───┤","│ 1 │ 2 │","└───┴───┘"]}
+{"source":"Map $\\mathbb{C}^3","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Map $\\mathbb{C}^3"]}
+{"source":"Map $\\mathbb{C}^3$","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Map ℂ³"]}
+{"source":"\"\\\"","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["\"\""]}
+{"source":"\"\\\"","width":80,"geometry":[0,0],"hyperlinks":true,"preserveBackslashEscapes":true,"lines":["\"\\\""]}
+{"source":"hello world\n\n```js\nconst hello = \"world\";\n```\n\nagain, hello world","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["hello world","","```js","  const hello = \"world\";","```","","again, hello world"]}
+{"source":"hello this is text\n```\ncode block\n```\nmore text","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["hello this is text","","```","  code block","```","","more text"]}
+{"source":"hello this is text\n\n```\ncode block\n```\n\nmore text","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["hello this is text","","```","  code block","```","","more text"]}
+{"source":"```js\nconst hello = 'world';\n```","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["```js","  const hello = 'world';","```"]}
+{"source":"hello world\n\n```js\nconst hello = 'world';\n```","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["hello world","","```js","  const hello = 'world';","```"]}
+{"source":"hello world\n\n---\n\nagain, hello world","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["hello world","","────────────────────────────────────────────────────────────────────────────────","","again, hello world"]}
+{"source":"---","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["────────────────────────────────────────────────────────────────────────────────"]}
+{"source":"# Hello\n\nThis is a paragraph","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Hello","","This is a paragraph"]}
+{"source":"# Hello","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Hello"]}
+{"source":"hello world\n\n> This is a quote\n\nagain, hello world","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["hello world","","│ This is a quote","","again, hello world"]}
+{"source":"> This is a quote","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["│ This is a quote"]}
+{"source":">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>x","width":80,"geometry":[1,0],"hyperlinks":true,"lines":[" │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ x"]}
+{"source":"> 1. bla bla\n> - nested bullet","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["│ 1. bla bla","│ - nested bullet"]}
+{"source":"> This is a very long blockquote line that should wrap to multiple lines when rendered","width":30,"geometry":[0,0],"hyperlinks":true,"lines":["│ This is a very long","│ blockquote line that should","│ wrap to multiple lines when","│ rendered"]}
+{"source":"> Quote with **bold** and `code`","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["│ Quote with bold and code"]}
+{"source":"### Why `sourceInfo` should not be optional","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["### Why sourceInfo should not be optional"]}
+{"source":"# Title with `code` inside","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Title with code inside"]}
+{"source":"# Important distinction from `open()`","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Important distinction from open()"]}
+{"source":"## Heading with **bold** and more","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Heading with bold and more"]}
+{"source":"Use ~~strikethrough~~ here","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Use strikethrough here"]}
+{"source":"Use ~strikethrough~ literally","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Use ~strikethrough~ literally"]}
+{"source":"https://example.com。后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com。后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段。后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段。后面的中文"]}
+{"source":"www.example.com。后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com。后面的中文"]}
+{"source":"https://example.com，后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com，后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段，后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段，后面的中文"]}
+{"source":"www.example.com，后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com，后面的中文"]}
+{"source":"https://example.com；后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com；后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段；后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段；后面的中文"]}
+{"source":"www.example.com；后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com；后面的中文"]}
+{"source":"https://example.com：后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com：后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段：后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段：后面的中文"]}
+{"source":"www.example.com：后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com：后面的中文"]}
+{"source":"https://example.com！后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com！后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段！后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段！后面的中文"]}
+{"source":"www.example.com！后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com！后面的中文"]}
+{"source":"https://example.com？后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com？后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段？后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段？后面的中文"]}
+{"source":"www.example.com？后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com？后面的中文"]}
+{"source":"https://example.com、后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com、后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段、后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段、后面的中文"]}
+{"source":"www.example.com、后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com、后面的中文"]}
+{"source":"https://example.com“后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com“后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段“后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段“后面的中文"]}
+{"source":"www.example.com“后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com“后面的中文"]}
+{"source":"https://example.com”后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com”后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段”后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段”后面的中文"]}
+{"source":"www.example.com”后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com”后面的中文"]}
+{"source":"https://example.com‘后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com‘后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段‘后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段‘后面的中文"]}
+{"source":"www.example.com‘后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com‘后面的中文"]}
+{"source":"https://example.com’后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com’后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段’后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段’后面的中文"]}
+{"source":"www.example.com’后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com’后面的中文"]}
+{"source":"https://example.com（后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com（后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段（后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段（后面的中文"]}
+{"source":"www.example.com（后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com（后面的中文"]}
+{"source":"https://example.com）后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com）后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段）后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段）后面的中文"]}
+{"source":"www.example.com）后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com）后面的中文"]}
+{"source":"https://example.com【后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com【后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段【后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段【后面的中文"]}
+{"source":"www.example.com【后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com【后面的中文"]}
+{"source":"https://example.com】后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com】后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段】后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段】后面的中文"]}
+{"source":"www.example.com】后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com】后面的中文"]}
+{"source":"https://example.com《后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com《后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段《后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段《后面的中文"]}
+{"source":"www.example.com《后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com《后面的中文"]}
+{"source":"https://example.com》后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com》后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段》后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段》后面的中文"]}
+{"source":"www.example.com》后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com》后面的中文"]}
+{"source":"https://example.com「后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com「后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段「后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段「后面的中文"]}
+{"source":"www.example.com「后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com「后面的中文"]}
+{"source":"https://example.com」后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com」后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段」后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段」后面的中文"]}
+{"source":"www.example.com」后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com」后面的中文"]}
+{"source":"https://example.com『后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com『后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段『后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段『后面的中文"]}
+{"source":"www.example.com『后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com『后面的中文"]}
+{"source":"https://example.com』后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com』后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段』后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段』后面的中文"]}
+{"source":"www.example.com』后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com』后面的中文"]}
+{"source":"https://example.com…后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com…后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段…后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段…后面的中文"]}
+{"source":"www.example.com…后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com…后面的中文"]}
+{"source":"https://example.com—后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com—后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段—后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段—后面的中文"]}
+{"source":"www.example.com—后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com—后面的中文"]}
+{"source":"https://example.com·后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com·后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段·后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段·后面的中文"]}
+{"source":"www.example.com·后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com·后面的中文"]}
+{"source":"https://example.com・后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com・后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段・后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段・后面的中文"]}
+{"source":"www.example.com・后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com・后面的中文"]}
+{"source":"https://example.com〈后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com〈后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段〈后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段〈后面的中文"]}
+{"source":"www.example.com〈后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com〈后面的中文"]}
+{"source":"https://example.com〉后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com〉后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段〉后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段〉后面的中文"]}
+{"source":"www.example.com〉后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com〉后面的中文"]}
+{"source":"https://example.com［后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com［后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段［后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段［后面的中文"]}
+{"source":"www.example.com［后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com［后面的中文"]}
+{"source":"https://example.com］后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com］后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段］后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段］后面的中文"]}
+{"source":"www.example.com］后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com］后面的中文"]}
+{"source":"https://example.com｛后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com｛后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段｛后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段｛后面的中文"]}
+{"source":"www.example.com｛后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com｛后面的中文"]}
+{"source":"https://example.com｝后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com｝后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段｝后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段｝后面的中文"]}
+{"source":"www.example.com｝后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com｝后面的中文"]}
+{"source":"https://example.com．后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com．后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段．后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段．后面的中文"]}
+{"source":"www.example.com．后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com．后面的中文"]}
+{"source":"https://example.com｡后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com｡后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段｡后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段｡后面的中文"]}
+{"source":"www.example.com｡后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com｡后面的中文"]}
+{"source":"https://example.com｢后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com｢后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段｢后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段｢后面的中文"]}
+{"source":"www.example.com｢后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com｢后面的中文"]}
+{"source":"https://example.com｣后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com｣后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段｣后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段｣后面的中文"]}
+{"source":"www.example.com｣后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com｣后面的中文"]}
+{"source":"https://example.com､后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com､后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段､后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段､后面的中文"]}
+{"source":"www.example.com､后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com､后面的中文"]}
+{"source":"https://example.com･后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com･后面的中文"]}
+{"source":"https://example.com/中文?q=搜索#片段･后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段･后面的中文"]}
+{"source":"www.example.com･后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["www.example.com･后面的中文"]}
+{"source":"https://example.com紧接着中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com紧接着中文"]}
+{"source":"https://example.com/中文?q=搜索#片段","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文?q=搜索#片段"]}
+{"source":"https://example.com/テストー한글","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/テストー한글"]}
+{"source":"[文档](https://example.com/中文，路径·テスト・한글…—。)","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["文档"]}
+{"source":"<https://example.com/中文，路径·テスト・한글…—。>","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com/中文，路径·テスト・한글…—。"]}
+{"source":"https://example.com.，后面的中文","width":160,"geometry":[0,0],"hyperlinks":true,"lines":["https://example.com.，后面的中文"]}
+{"source":"Contact user@example.com for help","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["Contact user@example.com for help"]}
+{"source":"Visit https://example.com for more","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["Visit https://example.com for more"]}
+{"source":"[click here](https://example.com)","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["click here (https://example.com)"]}
+{"source":"[Email me](mailto:test@example.com)","width":80,"geometry":[0,0],"hyperlinks":false,"lines":["Email me (mailto:test@example.com)"]}
+{"source":"[click here](https://example.com)","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["click here"]}
+{"source":"[Email me](mailto:test@example.com)","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Email me"]}
+{"source":"Visit https://example.com for more","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["Visit https://example.com for more"]}
+{"source":"This is text with <thinking>hidden content</thinking> that should be visible","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["This is text with <thinking>hidden content</thinking> that should be visible"]}
+{"source":"```html\n<div>Some HTML</div>\n```","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["```html","  <div>Some HTML</div>","```"]}
+{"source":"## [1.0.0]\n\n<!-- release-notes:start -->\nFixed a bug.\n\nSee <!-- todo: link --> the docs.","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["[1.0.0]","","Fixed a bug.","","See the docs."]}
+{"source":"## [1.0.0]\n\nFixed a bug.\n\nSee the docs.","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["[1.0.0]","","Fixed a bug.","","See the docs."]}
+{"source":"<!-- start -->\n\n## [1.0.0]\n\n<!-- a -->\n\n- item\n\n<!-- b -->\n\n## [0.9.0]\n\n<!-- end -->","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["[1.0.0]","","- item","","[0.9.0]"]}
+{"source":"## [1.0.0]\n\n- item\n\n## [0.9.0]","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["[1.0.0]","","- item","","[0.9.0]"]}
+{"source":"<!--\nmulti\nline\n-->\ntext","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["text"]}
+{"source":"text","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["text"]}
+{"source":"text\n\n<!-- streaming","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["text"]}
+{"source":"> q\n>\n> <!-- c -->\n>\n> r\n\n- a\n\n  <!-- c -->\n\n  b\n- <!-- c --> item","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["│ q","│","│ r","","- a","","  b","","- item"]}
+{"source":"> q\n>\n> r\n\n- a\n\n  b\n- item","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["│ q","│","│ r","","- a","","  b","","- item"]}
+{"source":"with <tag> markers","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["with <tag> markers"]}
+{"source":"<!-- c --> trailing text","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["trailing text"]}
+{"source":"<div>\n<!-- c -->a</div>","width":60,"geometry":[0,0],"hyperlinks":true,"lines":["<div>","a</div>"]}
+{"source":"```ts\nconst x = 1;\n``","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["```ts","  const x = 1;","```"]}
+{"source":"```md\nnot a closing fence:\n``\n```","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["```md","  not a closing fence:","  ``","```"]}
+{"source":"```ts\n``","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["```ts","","```"]}
+{"source":"````\n```","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["```","","```"]}
+{"source":"~~~~~\n~~~~","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["```","","```"]}
+{"source":"```md\nnot a closing fence:\n``\n```\n\nafter","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["```md","  not a closing fence:","  ``","```","","after"]}
+{"source":"```ts\nconst x = 1;\n```","width":80,"geometry":[0,0],"hyperlinks":true,"lines":["```ts","  const x = 1;","```"]}

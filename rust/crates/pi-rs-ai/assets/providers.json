@@ -1,0 +1,439 @@
+[
+  {
+    "id": "amazon-bedrock",
+    "name": "Amazon Bedrock",
+    "key": "AWS credentials or bearer token",
+    "env": [
+      "AWS_BEARER_TOKEN_BEDROCK",
+      "AWS_PROFILE",
+      "AWS_ACCESS_KEY_ID",
+      "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+      "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+      "AWS_WEB_IDENTITY_TOKEN_FILE"
+    ],
+    "dynamic": false
+  },
+  {
+    "id": "ant-ling",
+    "name": "Ant Ling",
+    "key": "Ant Ling API key",
+    "env": [
+      "ANT_LING_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.ant-ling.com/v1"
+  },
+  {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "key": "Anthropic API key",
+    "env": [
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_OAUTH_TOKEN",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_FEDERATION_RULE_ID"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.anthropic.com"
+  },
+  {
+    "id": "azure",
+    "name": "Azure",
+    "key": "Azure OpenAI API key",
+    "env": [
+      "AZURE_OPENAI_API_KEY"
+    ],
+    "dynamic": false
+  },
+  {
+    "id": "baseten",
+    "name": "Baseten",
+    "key": "Baseten API key",
+    "env": [
+      "BASETEN_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://inference.baseten.co/v1"
+  },
+  {
+    "id": "cerebras",
+    "name": "Cerebras",
+    "key": "Cerebras API key",
+    "env": [
+      "CEREBRAS_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.cerebras.ai/v1"
+  },
+  {
+    "id": "cloudflare-ai-gateway",
+    "name": "Cloudflare AI Gateway",
+    "key": "Cloudflare API key",
+    "env": [
+      "CLOUDFLARE_API_KEY",
+      "CLOUDFLARE_ACCOUNT_ID",
+      "CLOUDFLARE_GATEWAY_ID"
+    ],
+    "dynamic": false
+  },
+  {
+    "id": "cloudflare-workers-ai",
+    "name": "Cloudflare Workers AI",
+    "key": "Cloudflare API key",
+    "env": [
+      "CLOUDFLARE_API_KEY",
+      "CLOUDFLARE_ACCOUNT_ID"
+    ],
+    "dynamic": false
+  },
+  {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "key": "DeepSeek API key",
+    "env": [
+      "DEEPSEEK_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.deepseek.com"
+  },
+  {
+    "id": "fireworks",
+    "name": "Fireworks",
+    "key": "Fireworks API key",
+    "env": [
+      "FIREWORKS_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.fireworks.ai/inference"
+  },
+  {
+    "id": "github-copilot",
+    "name": "GitHub Copilot",
+    "key": "GitHub Copilot token",
+    "env": [
+      "COPILOT_GITHUB_TOKEN"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.individual.githubcopilot.com"
+  },
+  {
+    "id": "google",
+    "name": "Google",
+    "key": "Gemini API key",
+    "env": [
+      "GEMINI_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://generativelanguage.googleapis.com/v1beta"
+  },
+  {
+    "id": "google-vertex",
+    "name": "Google Vertex AI",
+    "key": "Google Cloud credentials",
+    "env": [
+      "GOOGLE_CLOUD_API_KEY",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "GOOGLE_CLOUD_PROJECT",
+      "GCLOUD_PROJECT",
+      "GOOGLE_CLOUD_LOCATION"
+    ],
+    "dynamic": false
+  },
+  {
+    "id": "groq",
+    "name": "Groq",
+    "key": "Groq API key",
+    "env": [
+      "GROQ_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.groq.com/openai/v1"
+  },
+  {
+    "id": "huggingface",
+    "name": "Hugging Face",
+    "key": "Hugging Face token",
+    "env": [
+      "HF_TOKEN"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://router.huggingface.co/v1"
+  },
+  {
+    "id": "kimi-coding",
+    "name": "Kimi For Coding",
+    "key": "Kimi API key",
+    "env": [
+      "KIMI_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.kimi.com/coding/v1"
+  },
+  {
+    "id": "meta",
+    "name": "Meta",
+    "key": "Meta Model API key",
+    "env": [
+      "META_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.meta.ai/v1"
+  },
+  {
+    "id": "minimax",
+    "name": "MiniMax",
+    "key": "MiniMax API key",
+    "env": [
+      "MINIMAX_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.minimax.io/anthropic"
+  },
+  {
+    "id": "minimax-cn",
+    "name": "MiniMax CN",
+    "key": "MiniMax CN API key",
+    "env": [
+      "MINIMAX_CN_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.minimaxi.com/anthropic"
+  },
+  {
+    "id": "mistral",
+    "name": "Mistral",
+    "key": "Mistral API key",
+    "env": [
+      "MISTRAL_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.mistral.ai"
+  },
+  {
+    "id": "moonshotai",
+    "name": "Moonshot AI",
+    "key": "Moonshot AI API key",
+    "env": [
+      "MOONSHOT_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.moonshot.ai/v1"
+  },
+  {
+    "id": "moonshotai-cn",
+    "name": "Moonshot AI CN",
+    "key": "Moonshot AI API key",
+    "env": [
+      "MOONSHOT_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.moonshot.cn/v1"
+  },
+  {
+    "id": "nvidia",
+    "name": "NVIDIA",
+    "key": "NVIDIA API key",
+    "env": [
+      "NVIDIA_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://integrate.api.nvidia.com/v1"
+  },
+  {
+    "id": "openai",
+    "name": "OpenAI",
+    "key": "OpenAI API key",
+    "env": [
+      "OPENAI_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.openai.com/v1"
+  },
+  {
+    "id": "openai-codex",
+    "name": "OpenAI Codex",
+    "env": [],
+    "dynamic": false,
+    "baseUrl": "https://chatgpt.com/backend-api"
+  },
+  {
+    "id": "opencode",
+    "name": "OpenCode Zen",
+    "key": "OpenCode API key",
+    "env": [
+      "OPENCODE_API_KEY"
+    ],
+    "dynamic": false
+  },
+  {
+    "id": "opencode-go",
+    "name": "OpenCode Go",
+    "key": "OpenCode API key",
+    "env": [
+      "OPENCODE_API_KEY"
+    ],
+    "dynamic": false
+  },
+  {
+    "id": "openrouter",
+    "name": "OpenRouter",
+    "key": "OpenRouter API key",
+    "env": [
+      "OPENROUTER_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://openrouter.ai/api/v1"
+  },
+  {
+    "id": "qwen-token-plan",
+    "name": "Qwen Token Plan Team",
+    "key": "Qwen Token Plan Team API key",
+    "env": [
+      "QWEN_TOKEN_PLAN_TEAM_API_KEY",
+      "QWEN_TOKEN_PLAN_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"
+  },
+  {
+    "id": "qwen-token-plan-cn",
+    "name": "Qwen Token Plan Team CN",
+    "key": "Qwen Token Plan Team CN API key",
+    "env": [
+      "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+      "QWEN_TOKEN_PLAN_CN_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1"
+  },
+  {
+    "id": "qwen-token-plan-individual",
+    "name": "Qwen Token Plan Individual",
+    "key": "Qwen Token Plan Individual API key",
+    "env": [
+      "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+      "QWEN_TOKEN_PLAN_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"
+  },
+  {
+    "id": "qwen-token-plan-individual-cn",
+    "name": "Qwen Token Plan Individual CN",
+    "key": "Qwen Token Plan Individual CN API key",
+    "env": [
+      "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+      "QWEN_TOKEN_PLAN_CN_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1"
+  },
+  {
+    "id": "radius",
+    "name": "Radius",
+    "key": "Radius API key",
+    "env": [
+      "RADIUS_API_KEY"
+    ],
+    "dynamic": true
+  },
+  {
+    "id": "together",
+    "name": "Together",
+    "key": "Together API key",
+    "env": [
+      "TOGETHER_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.together.ai/v1"
+  },
+  {
+    "id": "typesafe",
+    "name": "TypeSafe",
+    "key": "TypeSafe API key",
+    "env": [
+      "TYPESAFE_API_KEY"
+    ],
+    "dynamic": false
+  },
+  {
+    "id": "vercel-ai-gateway",
+    "name": "Vercel AI Gateway",
+    "key": "Vercel AI Gateway API key",
+    "env": [
+      "AI_GATEWAY_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://ai-gateway.vercel.sh"
+  },
+  {
+    "id": "xai",
+    "name": "xAI",
+    "key": "xAI API key",
+    "env": [
+      "XAI_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.x.ai/v1"
+  },
+  {
+    "id": "xiaomi",
+    "name": "Xiaomi",
+    "key": "Xiaomi API key",
+    "env": [
+      "XIAOMI_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.xiaomimimo.com/v1"
+  },
+  {
+    "id": "xiaomi-token-plan-ams",
+    "name": "Xiaomi Token Plan AMS",
+    "key": "Xiaomi Token Plan AMS API key",
+    "env": [
+      "XIAOMI_TOKEN_PLAN_AMS_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://token-plan-ams.xiaomimimo.com/v1"
+  },
+  {
+    "id": "xiaomi-token-plan-cn",
+    "name": "Xiaomi Token Plan CN",
+    "key": "Xiaomi Token Plan CN API key",
+    "env": [
+      "XIAOMI_TOKEN_PLAN_CN_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1"
+  },
+  {
+    "id": "xiaomi-token-plan-sgp",
+    "name": "Xiaomi Token Plan SGP",
+    "key": "Xiaomi Token Plan SGP API key",
+    "env": [
+      "XIAOMI_TOKEN_PLAN_SGP_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://token-plan-sgp.xiaomimimo.com/v1"
+  },
+  {
+    "id": "zai",
+    "name": "Z.AI",
+    "key": "Z.AI API key",
+    "env": [
+      "ZAI_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://api.z.ai/api/coding/paas/v4"
+  },
+  {
+    "id": "zai-coding-cn",
+    "name": "Z.AI Coding CN",
+    "key": "Z.AI Coding CN API key",
+    "env": [
+      "ZAI_CODING_CN_API_KEY"
+    ],
+    "dynamic": false,
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4"
+  }
+]

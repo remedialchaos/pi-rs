@@ -1,0 +1,16 @@
+[package]
+name = "pi-rs-codemode"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wasmtime = { version = "=50.0.2", default-features = false, features = ["std", "runtime", "cranelift"] }
+getrandom = "0.3"
+jiff = "=1.0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+futures = "0.3"
+futures-timer = "3"
+thiserror = "2"
+indexmap = { version = "2", features = ["serde"] }

@@ -1,0 +1,18 @@
+[package]
+name = "pi-rs-telemetry"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+indexmap = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+futures = "0.3"
+
+[[bin]]
+name = "telemetry-propagation-worker"
+path = "tests/support/propagation_worker.rs"

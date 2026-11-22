@@ -1,0 +1,18 @@
+[package]
+name = "pi-rs-schema"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "JSON Schema validation (drafts 2020-12 and 7) without eval, ported from @earendil-works/pi-schema"
+license = "MIT"
+
+[dependencies]
+indexmap = "2"
+num-bigint = "0.4"
+regress = "0.12"
+serde_json = { version = "1", features = ["preserve_order"] }
+unicode-normalization = "0.1"
+url = "2"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }

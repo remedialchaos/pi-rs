@@ -1,0 +1,181 @@
+{"method":"extractSegments","args":["abcdG EFGH",5,9,11,true],"result":{"before":"abcdG","beforeWidth":5,"after":"H","afterWidth":1}}
+{"method":"extractSegments","args":["abcd让EFGH",5,9,11,true],"result":{"before":"abcd","beforeWidth":4,"after":"H","afterWidth":1}}
+{"method":"extractSegments","args":["out 192M\t.pi/skill-tests/results-ha",10,13,10,true],"result":{"before":"out 192M","beforeWidth":8,"after":"i/skill-te","afterWidth":10}}
+{"method":"extractSegments","args":["out 192M\t.pi/skill-tests/results-ha",11,13,10,true],"result":{"before":"out 192M\t","beforeWidth":11,"after":"i/skill-te","afterWidth":10}}
+{"method":"getGraphemeCellRange","args":["→é→",2],"result":{"start":2,"end":3}}
+{"method":"getGraphemeCellRange","args":["│ a → 中文 ✓ │",7],"result":{"start":6,"end":8}}
+{"method":"normalizeTerminalOutput","args":["\u001b]0;window\ttitle\u001b\\label\ttext"],"result":"\u001b]0;window\ttitle\u001b\\label   text"}
+{"method":"normalizeTerminalOutput","args":["\u001b]8;;https://example.test/a\tb\u0007label\ttext"],"result":"\u001b]8;;https://example.test/a\tb\u0007label   text"}
+{"method":"normalizeTerminalOutput","args":["\u001b_payload\tdata\u001b\\label\ttext"],"result":"\u001b_payload\tdata\u001b\\label   text"}
+{"method":"normalizeTerminalOutput","args":["ำ"],"result":"ํา"}
+{"method":"normalizeTerminalOutput","args":["ำabc"],"result":"ําabc"}
+{"method":"normalizeTerminalOutput","args":["ຳ"],"result":"ໍາ"}
+{"method":"normalizeTerminalOutput","args":["ຳabc"],"result":"ໍາabc"}
+{"method":"sliceByColumn","args":["Another \u001b[35malpha\u001b[39m line with \u001b[35mbeta\u001b[39m later.",13,100,true],"result":"\u001b[35m\u001b[39m line with \u001b[35mbeta\u001b[39m later."}
+{"method":"sliceByColumn","args":["\u001b[32mfoo\u001b[39m bar",3,4,true],"result":"\u001b[32m\u001b[39m bar"}
+{"method":"sliceByColumn","args":["abcd \u001b[0m\u001b]8;;\u0007│XX│\u001b[0m\u001b]8;;\u0007H          ",0,5,true],"result":"abcd "}
+{"method":"sliceByColumn","args":["abcd \u001b[0m\u001b]8;;\u0007│XX│\u001b[0m\u001b]8;;\u0007H          ",5,4,true],"result":"\u001b[0m\u001b]8;;\u0007│XX│"}
+{"method":"sliceByColumn","args":["abcd\u001b[0m\u001b]8;;\u0007│XX│\u001b[0m\u001b]8;;\u0007GH          ",4,4,true],"result":"\u001b[0m\u001b]8;;\u0007│XX│"}
+{"method":"sliceWithWidth","args":["\u001b[31mabcdefghij\u001b[0m",4,2,true],"result":{"text":"\u001b[31mef","width":2}}
+{"method":"sliceWithWidth","args":["ab\u001b_pi:c\u0007cdefghij",4,2,true],"result":{"text":"ef","width":2}}
+{"method":"sliceWithWidth","args":["ab\u001b_pi:c\u0007cdefghij",6,4,true],"result":{"text":"ghij","width":4}}
+{"method":"sliceWithWidth","args":["out 192M\t.pi/skill-tests/results-ha",0,10,true],"result":{"text":"out 192M","width":8}}
+{"method":"sliceWithWidth","args":["x👨‍❤y",1,2,true],"result":{"text":"👨‍❤","width":2}}
+{"method":"sliceWithWidth","args":["→é→",1,1,true],"result":{"text":"é","width":1}}
+{"method":"sliceWithWidth","args":["│ a → 中文 ✓ │",0,6,true],"result":{"text":"│ a → ","width":6}}
+{"method":"sliceWithWidth","args":["│ a → 中文 ✓ │",6,4,true],"result":{"text":"中文","width":4}}
+{"method":"sliceWithWidth","args":["│ a → 中文 ✓ │",7,3,true],"result":{"text":"文","width":2}}
+{"method":"truncateToWidth","args":[["\u001b[31m","hello ",1000,"\u001b[0m"],20,"…"],"result":"\u001b[31mhello hello hello h\u001b[0m…\u001b[0m"}
+{"method":"truncateToWidth","args":["\u001b[31mhellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohellohello",10,""],"result":"\u001b[31mhellohello\u001b[0m"}
+{"method":"truncateToWidth","args":["\u001b]8;;https://example.com\u0007some-longer-label-here\u001b]8;;\u0007",15],"result":"\u001b]8;;https://example.com\u0007some-longer-\u001b]8;;\u0007\u001b[0m...\u001b[0m"}
+{"method":"truncateToWidth","args":["a",2,"🙂"],"result":"a"}
+{"method":"truncateToWidth","args":["abc\u001bnot-ansi 🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂",20,"…"],"result":"abc\u001bnot-ansi 🙂🙂🙂\u001b[0m…\u001b[0m"}
+{"method":"truncateToWidth","args":["abcdef",1,"🙂"],"result":""}
+{"method":"truncateToWidth","args":["abcdef",2,"🙂"],"result":"\u001b[0m🙂\u001b[0m"}
+{"method":"truncateToWidth","args":["界",2,"🙂"],"result":"界"}
+{"method":"truncateToWidth","args":["🙂\t界 \u001b_abc\u0007",7,"…",true],"result":"🙂\t\u001b[0m…\u001b[0m "}
+{"method":"truncateToWidth","args":["🙂界🙂界🙂界",8,"…",true],"result":"🙂界🙂\u001b[0m…\u001b[0m "}
+{"method":"truncateToWidth","args":[["","🙂界",100000,""],40,"…"],"result":"🙂界🙂界🙂界🙂界🙂界🙂界🙂界🙂界🙂界🙂\u001b[0m…\u001b[0m"}
+{"method":"visibleWidth","args":["      - 🇨"],"result":10}
+{"method":"visibleWidth","args":["      -"],"result":7}
+{"method":"visibleWidth","args":[""],"result":0}
+{"method":"visibleWidth","args":["This is an example 中文汉字测试段落内容"],"result":39}
+{"method":"visibleWidth","args":["\t\u001b[31m界\u001b[0m"],"result":5}
+{"method":"visibleWidth","args":["\u001b[0m\u001b]8;;\u0007│XX│"],"result":4}
+{"method":"visibleWidth","args":["\u001b[0m🙂\u001b[0m"],"result":2}
+{"method":"visibleWidth","args":["\u001b[1ma\tb\u001b[22m"],"result":5}
+{"method":"visibleWidth","args":["\u001b[31"],"result":3}
+{"method":"visibleWidth","args":["\u001b[31mThis is an example 中文汉字测试段落内容"],"result":39}
+{"method":"visibleWidth","args":["\u001b[31mhello hello hello h\u001b[0m…\u001b[0m"],"result":20}
+{"method":"visibleWidth","args":["\u001b[31mhellohello\u001b[0m"],"result":10}
+{"method":"visibleWidth","args":["\u001b[31m─→\u001b[39m"],"result":2}
+{"method":"visibleWidth","args":["\u001b[31m中文汉字测试段落内容.\u001b[0m"],"result":21}
+{"method":"visibleWidth","args":["\u001b[31m日本\u001b[39m ok"],"result":7}
+{"method":"visibleWidth","args":["\u001b[33mx\u001b[39m"],"result":1}
+{"method":"visibleWidth","args":["\u001b[38;5;4mhello\u001b[39m world"],"result":11}
+{"method":"visibleWidth","args":["\u001b[41m\u001b[0m"],"result":0}
+{"method":"visibleWidth","args":["\u001b[41m\u001b[49mcd"],"result":2}
+{"method":"visibleWidth","args":["\u001b]133;A\u0007hello\u001b]133;B\u0007"],"result":5}
+{"method":"visibleWidth","args":["\u001b]133;A\u001b\\hello\u001b]133;B\u001b\\"],"result":5}
+{"method":"visibleWidth","args":["\u001b]133;A\u001b\\prompt"],"result":6}
+{"method":"visibleWidth","args":["\u001b]8;;https://example.com\u0007link\u001b]8;;\u0007"],"result":4}
+{"method":"visibleWidth","args":["\u001b_pi:c\u0007cursor"],"result":6}
+{"method":"visibleWidth","args":["a\u001b"],"result":1}
+{"method":"visibleWidth","args":["ab\u001b[41m"],"result":2}
+{"method":"visibleWidth","args":["abc\u001bnot-ansi 🙂🙂🙂\u001b[0m…\u001b[0m"],"result":19}
+{"method":"visibleWidth","args":["abcd "],"result":5}
+{"method":"visibleWidth","args":["abcd \u001b[0m\u001b]8;;\u0007│XX│\u001b[0m\u001b]8;;\u0007H          "],"result":20}
+{"method":"visibleWidth","args":["abcd"],"result":4}
+{"method":"visibleWidth","args":["abcdG"],"result":5}
+{"method":"visibleWidth","args":["abcd\u001b[0m\u001b]8;;\u0007│XX│\u001b[0m\u001b]8;;\u0007GH          "],"result":20}
+{"method":"visibleWidth","args":["é"],"result":1}
+{"method":"visibleWidth","args":["hello"],"result":5}
+{"method":"visibleWidth","args":["is a test"],"result":9}
+{"method":"visibleWidth","args":["out 192M"],"result":8}
+{"method":"visibleWidth","args":["out 192M\t"],"result":11}
+{"method":"visibleWidth","args":["world this"],"result":10}
+{"method":"visibleWidth","args":["čřžůú"],"result":5}
+{"method":"visibleWidth","args":["שָׁ"],"result":1}
+{"method":"visibleWidth","args":["بّ"],"result":1}
+{"method":"visibleWidth","args":["नेटवर्क"],"result":5}
+{"method":"visibleWidth","args":["र्क"],"result":2}
+{"method":"visibleWidth","args":["सर्वाधिकार सुरक्षित। ऑर्डर पर क्लिक करें"],"result":33}
+{"method":"visibleWidth","args":["র্ক"],"result":2}
+{"method":"visibleWidth","args":["ર્ક"],"result":2}
+{"method":"visibleWidth","args":["ର୍କ"],"result":2}
+{"method":"visibleWidth","args":["ర్క"],"result":2}
+{"method":"visibleWidth","args":["ര്‍ക"],"result":2}
+{"method":"visibleWidth","args":["กำ"],"result":2}
+{"method":"visibleWidth","args":["ำ"],"result":1}
+{"method":"visibleWidth","args":["ำabc"],"result":4}
+{"method":"visibleWidth","args":["ําabc"],"result":4}
+{"method":"visibleWidth","args":["ກຳ"],"result":2}
+{"method":"visibleWidth","args":["ຳ"],"result":1}
+{"method":"visibleWidth","args":["ຳabc"],"result":4}
+{"method":"visibleWidth","args":["ໍາabc"],"result":4}
+{"method":"visibleWidth","args":["རྐ"],"result":1}
+{"method":"visibleWidth","args":["ကာ"],"result":2}
+{"method":"visibleWidth","args":["ကို"],"result":1}
+{"method":"visibleWidth","args":["ကေ"],"result":2}
+{"method":"visibleWidth","args":["ကဳ"],"result":2}
+{"method":"visibleWidth","args":["ကဴ"],"result":2}
+{"method":"visibleWidth","args":["ကဵ"],"result":2}
+{"method":"visibleWidth","args":["ကး"],"result":2}
+{"method":"visibleWidth","args":["က္"],"result":1}
+{"method":"visibleWidth","args":["က်"],"result":2}
+{"method":"visibleWidth","args":["ကျ"],"result":2}
+{"method":"visibleWidth","args":["ကြ"],"result":2}
+{"method":"visibleWidth","args":["ᜠ᜴"],"result":1}
+{"method":"visibleWidth","args":["⚡"],"result":2}
+{"method":"visibleWidth","args":["⚡️"],"result":2}
+{"method":"visibleWidth","args":["✅"],"result":2}
+{"method":"visibleWidth","args":["が"],"result":2}
+{"method":"visibleWidth","args":["が"],"result":2}
+{"method":"visibleWidth","args":["ネットワーク"],"result":12}
+{"method":"visibleWidth","args":["中文汉字测试段落内容."],"result":21}
+{"method":"visibleWidth","args":["网络"],"result":4}
+{"method":"visibleWidth","args":["가〮"],"result":2}
+{"method":"visibleWidth","args":["가〯"],"result":2}
+{"method":"visibleWidth","args":["🇦"],"result":2}
+{"method":"visibleWidth","args":["🇧"],"result":2}
+{"method":"visibleWidth","args":["🇨"],"result":2}
+{"method":"visibleWidth","args":["🇨🇳"],"result":2}
+{"method":"visibleWidth","args":["🇩"],"result":2}
+{"method":"visibleWidth","args":["🇩🇪"],"result":2}
+{"method":"visibleWidth","args":["🇪"],"result":2}
+{"method":"visibleWidth","args":["🇫"],"result":2}
+{"method":"visibleWidth","args":["🇫🇷"],"result":2}
+{"method":"visibleWidth","args":["🇬"],"result":2}
+{"method":"visibleWidth","args":["🇬🇧"],"result":2}
+{"method":"visibleWidth","args":["🇭"],"result":2}
+{"method":"visibleWidth","args":["🇮"],"result":2}
+{"method":"visibleWidth","args":["🇯"],"result":2}
+{"method":"visibleWidth","args":["🇯🇵"],"result":2}
+{"method":"visibleWidth","args":["🇰"],"result":2}
+{"method":"visibleWidth","args":["🇱"],"result":2}
+{"method":"visibleWidth","args":["🇲"],"result":2}
+{"method":"visibleWidth","args":["🇳"],"result":2}
+{"method":"visibleWidth","args":["🇴"],"result":2}
+{"method":"visibleWidth","args":["🇵"],"result":2}
+{"method":"visibleWidth","args":["🇶"],"result":2}
+{"method":"visibleWidth","args":["🇷"],"result":2}
+{"method":"visibleWidth","args":["🇸"],"result":2}
+{"method":"visibleWidth","args":["🇹"],"result":2}
+{"method":"visibleWidth","args":["🇺"],"result":2}
+{"method":"visibleWidth","args":["🇺🇸"],"result":2}
+{"method":"visibleWidth","args":["🇻"],"result":2}
+{"method":"visibleWidth","args":["🇼"],"result":2}
+{"method":"visibleWidth","args":["🇽"],"result":2}
+{"method":"visibleWidth","args":["🇾"],"result":2}
+{"method":"visibleWidth","args":["🇿"],"result":2}
+{"method":"visibleWidth","args":["🏳️‍🌈"],"result":2}
+{"method":"visibleWidth","args":["👍"],"result":2}
+{"method":"visibleWidth","args":["👍🏻"],"result":2}
+{"method":"visibleWidth","args":["👨"],"result":2}
+{"method":"visibleWidth","args":["👨‍💻"],"result":2}
+{"method":"visibleWidth","args":["🙂界🙂\u001b[0m…\u001b[0m "],"result":8}
+{"method":"visibleWidth","args":["🙂界🙂界🙂界🙂界🙂界🙂界🙂界🙂界🙂界🙂\u001b[0m…\u001b[0m"],"result":39}
+{"method":"wrapTextWithAnsi","args":["      - 🇨",9],"result":["      -","🇨"]}
+{"method":"wrapTextWithAnsi","args":["  ",1],"result":[""]}
+{"method":"wrapTextWithAnsi","args":["This is an example 中文汉字测试段落内容中文汉字测试段落内容.",40],"result":["This is an example 中文汉字测试段落内容","中文汉字测试段落内容."]}
+{"method":"wrapTextWithAnsi","args":["\u001b[31mThis is an example 中文汉字测试段落内容中文汉字测试段落内容.\u001b[0m",40],"result":["\u001b[31mThis is an example 中文汉字测试段落内容","\u001b[31m中文汉字测试段落内容.\u001b[0m"]}
+{"method":"wrapTextWithAnsi","args":["\u001b[31mfirst\r\nsecond\rthird\u001b[0m",80],"result":["\u001b[31mfirst","\u001b[31msecond","\u001b[31mthird\u001b[0m"]}
+{"method":"wrapTextWithAnsi","args":["\u001b[31mhello world this is red\u001b[0m",10],"result":["\u001b[31mhello","\u001b[31mworld this","\u001b[31mis red\u001b[0m"]}
+{"method":"wrapTextWithAnsi","args":["\u001b[33m                    x\u001b[39m",10],"result":["\u001b[33mx\u001b[39m"]}
+{"method":"wrapTextWithAnsi","args":["\u001b[41;9mstrike me\u001b[0m",6],"result":["\u001b[41;9mstrike\u001b[29m","\u001b[9;41mme\u001b[0m"]}
+{"method":"wrapTextWithAnsi","args":["\u001b[41m                    \u001b[0m",10],"result":["\u001b[41m\u001b[0m"]}
+{"method":"wrapTextWithAnsi","args":["\u001b[41mprefix \u001b[4mUNDERLINED_CONTENT_THAT_WRAPS\u001b[24m suffix\u001b[0m",20],"result":["\u001b[41mprefix","\u001b[41m\u001b[4mUNDERLINED_CONTENT_T\u001b[24m","\u001b[4;41mHAT_WRAPS\u001b[24m suffix\u001b[0m"]}
+{"method":"wrapTextWithAnsi","args":["\u001b[44mhello world this is blue background text\u001b[0m",15],"result":["\u001b[44mhello world","\u001b[44mthis is blue","\u001b[44mbackground text\u001b[0m"]}
+{"method":"wrapTextWithAnsi","args":["\u001b[4munderlined text here \u001b[24mmore",18],"result":["\u001b[4munderlined text\u001b[24m","\u001b[4mhere \u001b[24mmore"]}
+{"method":"wrapTextWithAnsi","args":["\u001b]8;;https://example.com/oauth/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u0007https://example.com/oauth/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001b]8;;\u0007",20],"result":["\u001b]8;;https://example.com/oauth/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u0007https://example.com/\u001b]8;;\u0007","\u001b]8;;https://example.com/oauth/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u0007oauth/aaaaaaaaaaaaaa\u001b]8;;\u0007","\u001b]8;;https://example.com/oauth/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u0007aaaaaaaaaaaaaaaaaa\u001b]8;;\u0007"]}
+{"method":"wrapTextWithAnsi","args":["\u001b]8;;https://example.com\u001b\\0123456789\u001b]8;;\u001b\\",6],"result":["\u001b]8;;https://example.com\u001b\\012345\u001b]8;;\u001b\\","\u001b]8;;https://example.com\u001b\\6789\u001b]8;;\u001b\\"]}
+{"method":"wrapTextWithAnsi","args":["aaa\u001b[9m    abcdefghij\u001b[29m",9],"result":["aaa\u001b[9m\u001b[29m","\u001b[9mabcdefghi\u001b[29m","\u001b[9mj\u001b[29m"]}
+{"method":"wrapTextWithAnsi","args":["aaaa \u001b[1mbold\u001b[22m next word",9],"result":["aaaa \u001b[1mbold\u001b[22m","next word"]}
+{"method":"wrapTextWithAnsi","args":["aaaa \u001b[31mred\u001b[39m  next",8],"result":["aaaa \u001b[31mred\u001b[39m","next"]}
+{"method":"wrapTextWithAnsi","args":["aaaa \u001b[9mstrike me\u001b[29m next",12],"result":["aaaa \u001b[9mstrike\u001b[29m","\u001b[9mme\u001b[29m next"]}
+{"method":"wrapTextWithAnsi","args":["ab\u001b[41m                    \u001b[49mcd",10],"result":["ab\u001b[41m","\u001b[41m\u001b[49mcd"]}
+{"method":"wrapTextWithAnsi","args":["before \u001b]8;;https://example.com\u001b\\link\u001b]8;;\u001b\\ after",80],"result":["before \u001b]8;;https://example.com\u001b\\link\u001b]8;;\u001b\\ after"]}
+{"method":"wrapTextWithAnsi","args":["first\nsecond\r\nthird\rfourth",80],"result":["first","second","third","fourth"]}
+{"method":"wrapTextWithAnsi","args":["hello world this is a test",10],"result":["hello","world this","is a test"]}
+{"method":"wrapTextWithAnsi","args":["prefix \u001b[4mhttps://example.com/very/long/path/that/will/definitely/wrap\u001b[24m suffix",30],"result":["prefix","\u001b[4mhttps://example.com/very/long/\u001b[24m","\u001b[4mpath/that/will/definitely/wrap\u001b[24m","suffix"]}
+{"method":"wrapTextWithAnsi","args":["read this thread \u001b[4mhttps://example.com/very/long/path/that/will/wrap\u001b[24m",40],"result":["read this thread","\u001b[4mhttps://example.com/very/long/path/that/\u001b[24m","\u001b[4mwill/wrap\u001b[24m"]}

@@ -1,0 +1,43 @@
+package pi:extension@0.1.0;
+
+interface host {
+    notify: func(level: string, message: string);
+    get-flag: func(name: string) -> option<string>;
+    execute-tool: func(name: string, args-json: string) -> result<string, string>;
+}
+
+interface types {
+    record header-entry {
+        name: string,
+        value: string,
+    }
+
+    record headers-patch {
+        set: list<header-entry>,
+        delete: list<string>,
+    }
+
+    record tool-call-patch {
+        block: option<bool>,
+        reason: option<string>,
+        input-json: option<string>,
+        terminate: option<bool>,
+    }
+
+    record tool-outcome {
+        ok: bool,
+        payload-json: string,
+        error: option<string>,
+    }
+}
+
+world extension {
+    import host;
+    use types.{headers-patch, tool-call-patch, tool-outcome};
+
+    export init: func() -> result<_, string>;
+    export on-tool-call: func(name: string, input-json: string) -> result<option<tool-call-patch>, string>;
+    export on-before-headers: func(headers-json: string) -> result<option<headers-patch>, string>;
+    export execute-tool: func(name: string, args-json: string) -> result<tool-outcome, string>;
+    export run-command: func(name: string, args: string) -> result<_, string>;
+}

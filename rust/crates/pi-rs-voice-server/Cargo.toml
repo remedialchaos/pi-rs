@@ -1,0 +1,35 @@
+[package]
+name = "pi-rs-voice-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Authenticated offline speech service for p2"
+
+[[bin]]
+name = "pi-voice-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+fancy-regex = "0.17"
+futures-util = { version = "0.3", features = ["sink"] }
+libloading = "0.9"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "api-24"] }
+rand = "0.10"
+rand_distr = "0.6"
+rayon = "1.11"
+regex = "1"
+rustfft = "6.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2.6"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+unicode-normalization = "0.1"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.29"

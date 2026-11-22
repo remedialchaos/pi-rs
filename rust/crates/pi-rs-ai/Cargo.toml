@@ -1,0 +1,45 @@
+[package]
+name = "pi-rs-ai"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Model registry and direct AI provider protocols for pi-rs"
+
+[[bin]]
+name = "pi-ai"
+path = "src/bin/pi-ai.rs"
+
+[dependencies]
+pi-rs-schema = { path = "../pi-rs-schema" }
+pi-rs-telemetry = { path = "../pi-rs-telemetry" }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+indexmap = { version = "2", features = ["serde"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "io-std", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+base64 = "0.22"
+bytes = "1"
+sha2 = "0.11"
+url = { version = "2", features = ["serde"] }
+futures-util = "0.3"
+async-trait = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "form", "query", "gzip", "http2"] }
+httpdate = "1"
+rand = "0.10"
+regex = "1"
+google-cloud-auth = "1"
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sso", "credentials-process"] }
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-smithy-eventstream = "0.61"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+zstd = "0.13"
+uuid = { version = "1", features = ["v4", "v7"] }
+
+axum = { version = "0.8", features = ["ws"] }
+
+[dev-dependencies]
+aws-smithy-types = "1"
+tokio = { version = "1", features = ["test-util"] }

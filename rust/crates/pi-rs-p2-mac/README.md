@@ -1,0 +1,48 @@
+# pi-mac
+
+Rust companion for p2. The portable library owns process supervision, login-shell environment capture, server discovery, Unix dev control, backups, owner sign-in, Radius OAuth and grants, brain ordering, diagnostics and signed appcasts. The macOS adapter keeps AppKit and WebKit on the main thread and sends only Rust data to background workers.
+
+## Run
+
+On Linux, exercise the real portable executable with the same p2 checkout it will supervise on macOS:
+
+```sh
+cargo build --locked -j 2
+P2MAC_CHECKOUT=/path/to/pi-rs/apps/p2 P2MAC_DATA_DIR=/path/to/private-test-data \
+  P2MAC_PORT=8798 P2MAC_FAKE=1 target/debug/pi-mac --serve
+P2MAC_ATTACH=8798 P2MAC_DATA_DIR=/path/to/private-test-data target/debug/pi-mac --diag
+```
+
+`--check-config` prints effective settings without starting p2. `--diag` probes the selected server and, when `P2MAC_DIAG_DIR` and `P2MAC_DIAG_BRIDGE` are set, records the portable bridge. `--serve` watches or runs p2, stopping only a server it owns when interrupted. For upstream p2, the checkout needs its Node dependencies. This crate starts that p2; it does not embed or port the p2 server itself.
+
+For a macOS development bundle, build the Rust binary and put it at `Pi.app/Contents/MacOS/pi-mac` with [Info.plist](resources/Info.plist) at `Pi.app/Contents/Info.plist`. Launch the bundle without arguments. It uses the `com.earendil.pi` defaults domain and supports the upstream bundled layout under `Contents/Resources`: `p2/apps/p2` and `node/bin/node`. Set `SUFeedURL` and `SUPublicEDKey` in signed builds to enable update checks. Manual checks verify the Sparkle enclosure's exact length and Ed25519 signature before opening the downloaded DMG; the Rust updater does not replace a running application bundle.
+
+## Settings
+
+| Variable | Default or effect |
+|---|---|
+| `P2MAC_CHECKOUT`, `P2MAC_NODE` | Pick a repository or `apps/p2`; otherwise use the bundled paths or resolve Node on login-shell PATH. |
+| `P2MAC_PORT`, `P2MAC_DATA_DIR` | `8788`, `~/.pi/p2`. |
+| `P2MAC_MODE`, `P2MAC_FAKE` | `start` or `dev`; `1` enables the faux provider. |
+| `P2MAC_ATTACH` | Use an external loopback port; `P2MAC_DATA_DIR` then names that server's data. |
+| `PI_RADIUS_GATEWAY`, `P2MAC_SIGN_IN`, `P2MAC_BRAINS` | New sign-ins use `https://radius.pi.dev`; `headless` or a brain-list fixture is for development. |
+| `P2MAC_DIAG_DIR`, `P2MAC_DIAG_BRIDGE`, `P2MAC_DIAG_OPEN`, `P2MAC_DIAG_PATH` | Write numbered diagnostics; optionally drive a theme probe or open selected brains. |
+
+The macOS UI stores settings in UserDefaults. CLI diagnostics use `$XDG_CONFIG_HOME/pi-mac/settings.json` (or `~/.config/pi-mac/settings.json`). The app and p2 share the selected server's `radius.json`. Managed server output is appended to `~/Library/Logs/Pi/server-<port>.log`.
+
+On macOS, diagnostics record WebKit page and chrome state, theme replies and refusals, menu and button behavior, event timing, and page/window snapshots. They do not sample per-frame screen captures during fades.
+
+## Verify
+
+```sh
+cargo fmt --check
+cargo clippy --offline --locked -j 2 --all-targets -- -D warnings
+cargo test --offline --locked -j 2
+```
+
+The Linux tests require cached Cargo dependencies, Node for the child-process fixture, and `lsof` for Unix listener discovery. They use temporary directories, local sockets, and loopback HTTP servers, not an external service. macOS AppKit/WKWebView linking, bundle signing, and live UI testing require a macOS machine and are not part of the Linux gate.
+
+Linux x86_64: fmt and Clippy passed; all 16 offline tests passed (3 network, 9 portable, 4 supervisor).
+The AppKit/WebKit shell also passed `cargo check --target aarch64-apple-darwin -j 2` from Linux using the Apple target standard library.
+
+The real-checkout Linux smoke started upstream p2 under Rust supervision, checked configuration and attached diagnostics, completed the local owner challenge/claim, rejected an unrelated owner key, and shut down on SIGTERM.

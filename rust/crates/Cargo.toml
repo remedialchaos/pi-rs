@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = [
+    "pi-rs-schema",
+    "pi-rs-telemetry",
+    "pi-rs-mcp",
+    "pi-rs-codemode",
+    "pi-rs-tui",
+    "pi-rs-ai",
+    "pi-rs-agent",
+    "pi-rs-coding-agent",
+    "pi-rs-chord",
+    "pi-rs-p2-mac",
+    "pi-rs-voice-server",
+]

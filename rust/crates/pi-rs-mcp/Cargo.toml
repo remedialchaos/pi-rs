@@ -1,0 +1,33 @@
+[package]
+name = "pi-rs-mcp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Standalone Model Context Protocol client for pi and other applications (Rust port of packages/mcp)"
+
+[dependencies]
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
+http = "1"
+indexmap = "2"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "unbounded_depth"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

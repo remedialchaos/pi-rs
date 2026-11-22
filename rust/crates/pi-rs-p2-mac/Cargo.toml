@@ -1,0 +1,46 @@
+[package]
+name = "pi-rs-p2-mac"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Native Pi companion and portable p2 supervision and sign-in"
+
+[[bin]]
+name = "pi-mac"
+path = "src/bin/pi-mac.rs"
+
+[dependencies]
+axum = "0.8"
+base64 = "0.22"
+cookie = "0.18"
+ed25519-dalek = "2.2"
+getrandom = "0.4"
+hex = "0.4"
+hmac = "0.12"
+plist = "1.10"
+roxmltree = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+unicode-segmentation = "1.13"
+url = "2.5"
+uuid = { version = "1", features = ["serde", "v4"] }
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "user"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+objc2-quartz-core = "0.3"
+objc2-web-kit = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
