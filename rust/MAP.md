@@ -22,6 +22,7 @@
 | ADR-008 | Tangled Clusters and False Blockers | accepted |
 | ADR-009 | Checkpoint Cadence and Session Handoff | accepted |
 | ADR-010 | Host QuickJS-WASM Inside Pure-Rust `wasmtime` for `pi-rs-codemode` | accepted |
+| ADR-011 | Use `leptos` (`0.8.x`, CSR) for Rust-to-WASM Web Frontends | accepted |
 
 ## Pre-Work Prerequisite
 
@@ -112,7 +113,8 @@ Shape: CLI (`pi`). Research complete ([rust/research/wasm-extensions.md](researc
 | ---: | --- | ---: | --- | --- |
 | 1.8a | Leaf proofs (`changelog`, `frontmatter`, `ansi`) + standalone foundation (`config`, `migrations`, `lockfile`, standalone `utils/`, `core/{keybindings,skills,prompt_templates,project_trust}`, pure `core/tools/` executors) | ~15k | **done** (`opencode`, verified 2026-11-22) | 3/3 leaf gates **PASS** (`changelog` 898/898, `frontmatter` 230/230 100% cov 1.64x, `ansi` 711/711 100% cov); `rust/crates/pi-rs-coding-agent`: `fmt`/`clippy -D warnings` PASS, 0 `unsafe`/`#[allow]`, **316/316** tests PASS in 0.37s |
 | 1.8b-1 | Core data & session runtime: `session-manager` (JSONL v3), `settings-manager`, `auth-storage`, `model-registry`, `system-prompt`, `compaction/`, `AgentTool` wrappers, `extensions/` (41-event trait + checked-in `wit/extension.wit` `wasmtime::component::bindgen!` host), built-in extensions (`codemode`, `mcp`, `tool-search`, `llama`), `agent-session`/`sdk`, `export-html/`, `package-manager` | ~40k | **done** (`opencode` + coordinator integration, verified 2026-11-22) | `rust/crates/pi-rs-coding-agent`: `fmt`/`clippy -D warnings` PASS in unified `rust/crates/Cargo.toml` workspace, `pi-rs-tui` wired directly, real on-disk `tests/fixtures/echo_extension.wasm` WIT component test PASS, 0 `unsafe`/`#[allow]`, **759/759** offline tests PASS in 18.88s; details in [MILESTONE.md](crates/pi-rs-coding-agent/MILESTONE.md) |
-| 1.8b-2 | Whole-app record (`app record`) + `rust/app` clap front door + `cli/`, modes (`print`, `json`, `rpc`, `interactive/` 45 components + themes + slash commands), `main.ts`/`rpc-entry.ts`, `app lift` -> standalone `pi` binary (0% fallback, 100% `app replay`) | ~27k | open (follows 1.8b-1) | - |
+| 1.8b-2a | Non-interactive CLI & front door: `cli/` (15 files), `modes/{print,json,rpc}`, `package_manager_cli`, `main.ts`/`rpc-entry.ts`, `[[bin]] name = "pi"` + whole-app `app record/replay` for non-interactive paths | ~5.5k | **done** (`omp`, verified 2026-11-22) | `rust/crates/pi-rs-coding-agent` (`pi` bin): `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **806/806** tests PASS in 22.4s + 8/8 TS oracle replay + loopback print/15-event JSON parity; details in [MILESTONE.md](crates/pi-rs-coding-agent/MILESTONE.md) |
+| 1.8b-2b | Interactive TUI mode: `modes/interactive/` (`theme/`, 45 `components/`, `chat_viewport`, `tui_renderer`, `interactive_mode`, `external_editor`, `model_search`, `session_share`, `bug_report`) wired to `pi-rs-tui` | ~22.8k | **done** (`omp`, verified 2026-11-22) | `rust/crates/pi-rs-coding-agent` (`pi` bin): `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **865/865** tests PASS (+59 new, 5/5 mutation-checked + real Linux PTY main/alt/resume/config checks) -> **Phase 1 100% COMPLETE**; details in [MILESTONE.md](crates/pi-rs-coding-agent/MILESTONE.md) |
 
 ---
 
@@ -121,10 +123,12 @@ Shape: CLI (`pi`). Research complete ([rust/research/wasm-extensions.md](researc
 | Milestone | Crate | Upstream Package | Src LOC | Units / Pieces | State | Dependencies |
 | --- | --- | --- | ---: | --- | --- | --- |
 | 2.1a | `pi-rs-chord` (Foundation: `json`, `output`, `context`, `watch`, `data`, `contracts`, `delta`, `state`, `documents`, `sqlite`, `store`, `sync`, `link`, `telemetry-sqlite`, `telemetry-ingest`) | `packages/chord` | ~29k | 16 subsystems | **done** (`jcode` + coordinator telemetry bridge, verified 2026-11-22) | 2/2 leaf gates **PASS** (`json` 151/151, `output` 4,844/4,844); `rust/crates/pi-rs-chord`: `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `unwrap`/`expect`/`panic!`, **107/107** offline tests PASS incl. all 19 untouched-TS binary & segmented-text goldens + `tests/telemetry_bridge.rs`; fidelity limits recorded in [MILESTONE.md](crates/pi-rs-chord/MILESTONE.md) |
-| 2.1b | `pi-rs-chord` (Runtime & Host: `host`, `jobs`, `registries`, `remote`, `surfaces`, `tui`, `node/{http,workers,plugins,surfaces,tui,app}`, `web` client) | `packages/chord` | ~38k | 16 subsystems | open (follows 2.1a) | Milestone 2.1a, `wasm-extensions` |
+| 2.1b-1 | `pi-rs-chord` (Portable Runtime: `host`, `jobs`, `registries`, `remote`, `surfaces`, `tui`, `web`) | `packages/chord` | ~25k | 7 subsystems | **done** (`jcode`, verified 2026-11-22) | `rust/crates/pi-rs-chord`: `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`/`unwrap`/`expect`/`panic!` in `src/`, **143/143** tests PASS (+36 new, all 36 mutation-checked); details & fidelity limits in [MILESTONE.md](crates/pi-rs-chord/MILESTONE.md) |
+| 2.1b-2 | `pi-rs-chord` (Node/Platform Host: `node/{http,workers,plugins,surfaces,tui,app}`, WASM/WIT plugins) | `packages/chord` | ~14.6k | 6 subsystems | **done (bounded)** (`jcode`, verified 2026-11-22) | `rust/crates/pi-rs-chord`: `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **163/163** tests PASS (+20 new, all 20 mutation-checked: live Axum HTTP/WS RPC, `wit/plugin.wit` bindgen, real child workers, surfaces/TUI/app auth/files/archive); remaining HostData address-ownership/worker-routing/registry-adapter gaps logged in [MILESTONE.md](crates/pi-rs-chord/MILESTONE.md) |
 | 2.2 | `pi-rs-durable` | `packages/durable` | 35.9k | 24 units / 15 pieces (4 waves) | open | `pi-rs-chord`, `pi-rs-ai`, `pi-rs-codemode`, `pi-rs-schema`, `pi-rs-telemetry` |
-| 2.3 | `pi-rs-env` | `packages/env` (+ Rust `daemon/`) | 2.6k TS + 5.8k Rust | 9 units + existing Rust daemon | open | `pi-rs-chord`, `pi-rs-durable` |
-| 2.4 | `pi-rs-evals` | `packages/evals` | 1.4k | 7 units | open | Phase 1 `pi` binary |
+| 2.3a | `pi-rs-env` (Daemon + Transport: integrated `packages/env/daemon/` as `pi-env` bin + `connection`, `ssh`, `process`, `terminal`, `watch`, `errors`) | `packages/env` (+ Rust `daemon/`) | 1.5k TS + 5.8k Rust | 6 client units + daemon | **done** (`opencode`, verified 2026-11-22) | `rust/crates/pi-rs-env` (`pi-env` bin): `fmt`/`clippy -D warnings` PASS, 0 `#[allow]`, `unsafe` isolated to `daemon/sys/`, **41/41** tests PASS in 1.17s (33 unit + 8 live `pi-env` binary integration); details in [MILESTONE.md](crates/pi-rs-env/MILESTONE.md) |
+| 2.3b | `pi-rs-env` (Durable Bridge: `list-files`, `remote-env` implementing `ExecutionEnv`) | `packages/env` | 1.1k TS | 2 units | open (follows 2.2, 2.3a) | `pi-rs-chord`, `pi-rs-durable`, 2.3a |
+| 2.4 | `pi-rs-evals` | `packages/evals` | 1.4k | 7 units | **done** (`opencode`, verified 2026-11-22) | `rust/crates/pi-rs-evals` (`pi-evals` bin): `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **44/44** tests PASS in 0.02s (5/5 mutation-checked, upstream golden report/SHA parity, TTY-deterministic styling); details in [MILESTONE.md](crates/pi-rs-evals/MILESTONE.md) |
 
 ---
 
@@ -141,6 +145,6 @@ Shape: CLI (`pi`). Research complete ([rust/research/wasm-extensions.md](researc
 
 ## Open Questions
 
-1. **Before Phase 3.1**: Confirm whether `apps/p3/old/` (2k LOC archived prototype inside `apps/p3`) should be skipped as dead code or ported.
-2. **Before Phase 3.2**: Finalize Rust WASM web UI framework (`leptos` vs `dioxus`) from `rust/research/web-ui-wasm.md`.
-3. **Before Phase 1.8 (`pi` front door)**: Confirm whether `packages/ai/src/providers/data/` should be hydrated from network (`npm run build`) or offline/pinned catalog (`nix/model-catalog.json`) when recording upstream test fixtures.
+1. **Resolved (2026-11-22)**: Skip `apps/p3/old/` as dead archive code; port only live `apps/p3/src/` and `apps/p3/plugins/`.
+2. **Resolved (2026-11-22, ADR-011)**: Adopted `leptos` (`0.8.x`, CSR) per [web-ui-wasm.md](research/web-ui-wasm.md) for drop-in CSS/WebKit compatibility, 1:1 Chord reactive signal parity, and shared server/WASM wire types.
+3. **Resolved (2026-11-22)**: `packages/ai/src/providers/data/` is already hydrated on disk (matching `pi-rs-ai`'s embedded catalog); use those local provider JSON files offline when recording upstream `pi` fixtures.

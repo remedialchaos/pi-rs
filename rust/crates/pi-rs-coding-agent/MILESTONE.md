@@ -129,3 +129,99 @@ lock contention, self-update command construction.
 4. Built-in MCP extension renders server/tool sections and names via `pi_rs_mcp`; live MCP
    transport wiring happens in 1.8b-2's front door.
 5. `pi-rs-coding-agent` remains a library-only crate at this milestone (no `[[bin]]`).
+
+---
+
+## Milestone 1.8b-2a — native non-interactive `pi` (2026-11-22)
+
+**Status:** Native front door and protocol implemented; full ADR-003 parity is not established.
+
+- `cli/`: hand-written argument parsing and help; stdin and `@file` text/image assembly;
+  model table; auth check, login, logout, and credential printing; project trust and setup.
+- `main.rs`, `package_manager_cli.rs`, `utils/windows_self_update.rs`: mode and session
+  selection, HTML export, package lifecycle and updates, and the deferred TUI entry point.
+- `modes/`: text and JSON output, strict LF-framed RPC server and typed client, all 33 RPC
+  commands, and extension UI requests and responses. The RPC reader keeps accepting
+  commands while prompts, Bash commands, and extension dialogs are active.
+- `core/`: on-disk settings, credentials, v3 sessions, provider and model dispatch,
+  compaction, diagnostics, and the native extension host behind the front door.
+
+### Verification
+
+| Gate | Result |
+| --- | --- |
+| Scoped `cargo fmt -- --check` / offline `cargo clippy --all-targets -- -D warnings` | Passed |
+| Scoped offline `cargo test` | 806 passed, 0 failed, 0 ignored |
+| TypeScript oracle replay | 8/8: help, version, invalid mode, unknown option, RPC rejects `@file`, model list, package list, auth check |
+| Loopback provider, TypeScript vs. Rust | Print bytes and all 15 LF-framed JSON event types matched; both sent the same stdin + `@file` + positional message |
+| Actual interactive TTY | Printed the 1.8b-2b notice and exited 1 |
+| Mutation checks | Selected new regressions failed after deliberate parser, output, auth, package, provider, and RPC breaks; source restored before final gates |
+
+Added 47 tests; removed none. Previous milestone recorded 759 tests in 18.88 s.
+This run reported 23.62 s for the unit suite and 27.99 s summed across test binaries,
+excluding compilation. A fresh before-run did not fit in the `/tmp` tmpfs; timings
+are not a controlled performance comparison.
+
+### Parity limits
+
+- Interactive TTY and the interactive resume/config selectors are reserved for 1.8b-2b.
+  The TTY path prints a milestone notice and exits 1.
+- The standalone upstream `pi mcp` subcommand is not ported. The in-session MCP command
+  can inspect and reconnect servers but does not handle OAuth or expose MCP tools to the
+  model. The in-process RPC UI is verified for native extensions; the existing WIT world
+  does not expose guest dialogs or tool/provider registration.
+- Startup uses cached model catalogs; it does not run the upstream background RPC catalog
+  refresh or install missing configured packages. Explicit catalog updates use the native
+  HTTP dispatcher; `pi-rs-ai` streaming does not use its proxy/idle-timeout settings.
+- Help is unstyled, non-ASCII model sorting does not use ICU collation, and the native HTML
+  renderer does not reproduce upstream markup byte for byte.
+
+---
+
+## Milestone 1.8b-2b — native interactive `pi` (2026-11-22)
+
+The native `pi` front door starts `pi-rs-tui` in regular (scrollback-preserving)
+or fullscreen mode. The interactive loop owns the editor, viewport, transcript,
+footer, session transitions, slash commands, and native extension dialogs and
+shortcuts. The CLI opens terminal selectors for resume, config, and startup trust.
+Config edits persist resource rules used by subsequent runs.
+
+The theme layer embeds dark/light, validates custom palettes against the upstream
+schema, and watches palette files for changes. Transcript rendering handles
+streamed assistant and tool updates, Markdown, images, diffs, native Mermaid, and
+persisted Bash and session-summary rows.
+
+### Verification
+
+- Faux provider: regular/fullscreen rendering, streaming deltas, real read-tool
+  output and expansion, model/thinking/theme changes, compaction, reload, new
+  sessions, extension dialogs and shortcuts, and terminal cleanup.
+- Linux PTY: main and alternate screens started and restored terminal state on
+  exit. `--resume` selected a v3 session; `pi config` saved a prompt exclusion
+  that a subsequent native RPC process respected.
+- Mutation checks failed on the intended assertions for the optional theme
+  token fallback, partial tool output, stale slash completion, footer thinking
+  level, and extension confirmation. All five mutations were reverted.
+
+| Gate | Result |
+| --- | --- |
+| Scoped `cargo fmt -- --check` | Passed |
+| Scoped offline `cargo clippy --all-targets -- -D warnings` | Passed |
+| Scoped offline `cargo test` | 865 passed, 0 failed, 0 ignored |
+
+Added 59 tests, removed none. Recorded suite runtime before and after was
+27.99 s → 26.81 s (sum across test binaries; compilation excluded). The unit
+suite was 23.62 s → 21.75 s. This was not a controlled benchmark.
+
+### Parity limits
+
+- No captured TypeScript interactive replay was available. Pixel/frame parity,
+  complex Mermaid layout, animation details, and the upstream staged login picker
+  are not established. Unsupported or too-wide Mermaid falls back to source.
+- Native commands and shortcuts have `ExtensionContext` UI callbacks. Guest WASM
+  dialogs require a WIT change outside this milestone's scope. Extension
+  provider/virtual-model queues are drained on reload but are not applied to the
+  live AI registry.
+- Live OAuth, session-share uploads, bug-report delivery, and terminal image
+  protocols were not exercised end to end. Missing configured packages are not
+  auto-installed at startup.

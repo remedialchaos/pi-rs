@@ -232,6 +232,7 @@ pub struct ExtensionRegistration {
     pub tools: IndexMap<String, ToolDefinition>,
     pub commands: IndexMap<String, CommandDefinition>,
     pub shortcuts: IndexMap<String, ShortcutDefinition>,
+    pub shortcut_handlers: IndexMap<String, CommandHandler>,
     pub flags: IndexMap<String, FlagDefinition>,
     pub providers: Vec<ProviderRegistration>,
     pub virtual_models: Vec<VirtualModelRegistration>,
@@ -769,6 +770,18 @@ impl ExtensionInitContext<'_> {
         Ok(())
     }
 
+    /// Register a keyboard action and its interactive command context callback.
+    pub fn register_shortcut_handler(
+        &mut self,
+        definition: ShortcutDefinition,
+        handler: CommandHandler,
+    ) -> Result<(), String> {
+        let key = definition.key.to_lowercase();
+        self.register_shortcut(definition)?;
+        self.registration.shortcut_handlers.insert(key, handler);
+        Ok(())
+    }
+
     pub fn register_flag(&mut self, definition: FlagDefinition) -> Result<(), String> {
         self.assert_active()?;
         if let Some(default) = &definition.default
@@ -887,6 +900,7 @@ impl ToolOutcome {
 }
 
 /// Base context passed to event handlers and tool execution.
+#[derive(Clone)]
 pub struct ExtensionContext {
     pub host: Arc<ExtensionHost>,
     pub cwd: String,
@@ -903,6 +917,49 @@ pub struct ExtensionContext {
     pub compact: Arc<dyn Fn(Option<Value>) + Send + Sync>,
 }
 
+/// An optional timeout and cancellation signal for a host dialog.
+#[derive(Clone, Default)]
+pub struct UiDialogOptions {
+    pub timeout_ms: Option<u64>,
+    pub cancel: Option<pi_rs_agent::CancellationToken>,
+}
+
+pub enum UiDialog {
+    Select(String, Vec<String>),
+    Confirm(String, String),
+    Input(String, Option<String>),
+    Editor(String, Option<String>),
+}
+
+pub enum UiAnswer {
+    Text(String),
+    Confirmed(bool),
+}
+
+#[derive(Clone, Copy)]
+pub enum UiWidgetPlacement {
+    AboveEditor,
+    BelowEditor,
+}
+
+pub enum UiUpdate {
+    Notify(String, Option<String>),
+    Status(String, Option<String>),
+    Widget(String, Option<Vec<String>>, Option<UiWidgetPlacement>),
+    Title(String),
+    EditorText(String),
+}
+
+pub trait ExtensionUiHost: Send + Sync {
+    fn dialog(
+        &self,
+        dialog: UiDialog,
+        options: UiDialogOptions,
+    ) -> BoxFuture<'static, Option<UiAnswer>>;
+    fn update(&self, update: UiUpdate);
+}
+
+#[derive(Clone)]
 /// Injectable UI primitives. All functions are host-provided so tests are
 /// fully offline: no terminal, no sockets, no dialogs.
 pub struct ExtensionUi {
@@ -912,6 +969,7 @@ pub struct ExtensionUi {
     pub confirm: ConfirmFn,
     pub input: InputFn,
     pub notify: NotifyFn,
+    pub(crate) host: Option<Arc<dyn ExtensionUiHost>>,
 }
 
 pub type ExecuteToolFn = Arc<
@@ -974,6 +1032,7 @@ pub type ReloadFn = Arc<dyn Fn() -> BoxFuture<'static, Result<(), String>> + Sen
 
 /// Context passed to command handlers. Adds session-control operations that
 /// are only safe for user-initiated commands.
+#[derive(Clone)]
 pub struct ExtensionCommandContext {
     pub base: ExtensionContext,
     pub wait_for_idle: AsyncFn<()>,
@@ -1027,13 +1086,16 @@ pub trait Extension: Send + Sync {
     async fn run_command(
         &self,
         name: &str,
-        _args: &str,
-        _ctx: &ExtensionCommandContext,
+        args: &str,
+        ctx: &ExtensionCommandContext,
     ) -> Result<(), String> {
-        Err(format!(
-            "Extension \"{}\" does not provide command \"{name}\"",
-            self.name()
-        ))
+        let command = self.registration().commands.get(name).ok_or_else(|| {
+            format!(
+                "Extension \"{}\" does not provide command \"{name}\"",
+                self.name()
+            )
+        })?;
+        (command.handler)(args.to_owned(), ctx.clone()).await
     }
 
     /// Tear down the instance. Native extensions are no-ops; the WASM adapter

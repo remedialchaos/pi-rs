@@ -206,7 +206,7 @@ fn parse_data(content: Option<&str>) -> Result<IndexMap<String, Credential>, Str
     serde_json::from_str(strip_bom(content)).map_err(|error| format!("Invalid auth.json: {error}"))
 }
 
-fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+pub(super) fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -229,7 +229,7 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     }
 }
 
-fn ensure_file_exists(path: &Path) -> Result<(), String> {
+pub(super) fn ensure_file_exists(path: &Path) -> Result<(), String> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

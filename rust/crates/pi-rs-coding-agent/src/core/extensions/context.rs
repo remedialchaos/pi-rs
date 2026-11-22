@@ -8,8 +8,9 @@ use serde_json::Value;
 
 use super::types::{
     AsyncFn, ConfirmFn, ContextUsage, ExecuteToolFn, ExtensionCommandContext, ExtensionContext,
-    ExtensionMode, ExtensionToolContext, ExtensionUi, InputFn, NewSessionFn, NotifyFn, ReloadFn,
-    SelectFn, SimpleSessionFn, ToolDefinition,
+    ExtensionMode, ExtensionToolContext, ExtensionUi, ExtensionUiHost, InputFn, NewSessionFn,
+    NotifyFn, ReloadFn, SelectFn, SimpleSessionFn, ToolDefinition, UiAnswer, UiDialog,
+    UiDialogOptions, UiUpdate, UiWidgetPlacement,
 };
 
 /// Host-provided UI callbacks. `select`, `confirm`, and `input` are async;
@@ -64,6 +65,7 @@ impl ExtensionUi {
                 confirm: inject.confirm,
                 input: inject.input,
                 notify: inject.notify,
+                host: None,
             }
         } else {
             Self::no_op(mode)
@@ -78,15 +80,27 @@ impl ExtensionUi {
             confirm: Arc::new(|_, _| Box::pin(async { false })),
             input: Arc::new(|_, _| Box::pin(async { None })),
             notify: Arc::new(|_, _| {}),
+            host: None,
         }
     }
 
+    pub fn with_host(mode: ExtensionMode, host: Arc<dyn ExtensionUiHost>) -> Self {
+        let mut ui = Self::no_op(mode);
+        ui.has_ui = mode.has_ui();
+        if ui.has_ui {
+            ui.host = Some(host);
+        }
+        ui
+    }
+
     pub async fn select(&self, title: impl Into<String>, options: Vec<String>) -> Option<String> {
-        (self.select)(title.into(), options).await
+        self.select_with_options(title, options, UiDialogOptions::default())
+            .await
     }
 
     pub async fn confirm(&self, title: impl Into<String>, message: impl Into<String>) -> bool {
-        (self.confirm)(title.into(), message.into()).await
+        self.confirm_with_options(title, message, UiDialogOptions::default())
+            .await
     }
 
     pub async fn input(
@@ -94,11 +108,121 @@ impl ExtensionUi {
         title: impl Into<String>,
         placeholder: Option<String>,
     ) -> Option<String> {
-        (self.input)(title.into(), placeholder).await
+        self.input_with_options(title, placeholder, UiDialogOptions::default())
+            .await
+    }
+
+    pub async fn select_with_options(
+        &self,
+        title: impl Into<String>,
+        items: Vec<String>,
+        options: UiDialogOptions,
+    ) -> Option<String> {
+        let title = title.into();
+        match &self.host {
+            Some(host) => text_answer(host.dialog(UiDialog::Select(title, items), options).await),
+            None => (self.select)(title, items).await,
+        }
+    }
+
+    pub async fn confirm_with_options(
+        &self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        options: UiDialogOptions,
+    ) -> bool {
+        let (title, message) = (title.into(), message.into());
+        match &self.host {
+            Some(host) => matches!(
+                host.dialog(UiDialog::Confirm(title, message), options)
+                    .await,
+                Some(UiAnswer::Confirmed(true))
+            ),
+            None => (self.confirm)(title, message).await,
+        }
+    }
+
+    pub async fn input_with_options(
+        &self,
+        title: impl Into<String>,
+        placeholder: Option<String>,
+        options: UiDialogOptions,
+    ) -> Option<String> {
+        let title = title.into();
+        match &self.host {
+            Some(host) => text_answer(
+                host.dialog(UiDialog::Input(title, placeholder), options)
+                    .await,
+            ),
+            None => (self.input)(title, placeholder).await,
+        }
+    }
+
+    pub async fn editor(
+        &self,
+        title: impl Into<String>,
+        prefill: Option<String>,
+    ) -> Option<String> {
+        let host = self.host.as_ref()?;
+        text_answer(
+            host.dialog(
+                UiDialog::Editor(title.into(), prefill),
+                UiDialogOptions::default(),
+            )
+            .await,
+        )
     }
 
     pub fn notify(&self, message: impl Into<String>, kind: &str) {
-        (self.notify)(message.into(), kind.to_string());
+        self.notify_with_type(message, Some(kind));
+    }
+
+    pub fn notify_with_type(&self, message: impl Into<String>, kind: Option<&str>) {
+        let message = message.into();
+        match &self.host {
+            Some(host) => host.update(UiUpdate::Notify(message, kind.map(str::to_owned))),
+            None => (self.notify)(message, kind.unwrap_or("info").to_owned()),
+        }
+    }
+
+    pub fn set_status(&self, key: impl Into<String>, text: Option<String>) {
+        if let Some(host) = &self.host {
+            host.update(UiUpdate::Status(key.into(), text));
+        }
+    }
+
+    pub fn set_widget(
+        &self,
+        key: impl Into<String>,
+        lines: Option<Vec<String>>,
+        placement: Option<UiWidgetPlacement>,
+    ) {
+        if let Some(host) = &self.host {
+            host.update(UiUpdate::Widget(key.into(), lines, placement));
+        }
+    }
+
+    pub fn set_title(&self, title: impl Into<String>) {
+        if let Some(host) = &self.host {
+            host.update(UiUpdate::Title(title.into()));
+        }
+    }
+
+    pub fn set_editor_text(&self, text: impl Into<String>) {
+        if let Some(host) = &self.host {
+            host.update(UiUpdate::EditorText(text.into()));
+        }
+    }
+
+    pub fn paste_to_editor(&self, text: impl Into<String>) {
+        self.set_editor_text(text);
+    }
+}
+
+fn text_answer(answer: Option<UiAnswer>) -> Option<String> {
+    match answer {
+        Some(UiAnswer::Text(text)) => Some(text),
+        _ => None,
     }
 }
 
@@ -166,7 +290,7 @@ impl ExtensionContext {
         options: Vec<String>,
     ) -> Option<String> {
         let title = title.into();
-        let call = (self.ui.select)(title.clone(), options);
+        let call = self.ui.select(title.clone(), options);
         self.prompt("select", Some(title), call).await
     }
 
@@ -176,7 +300,7 @@ impl ExtensionContext {
         message: impl Into<String>,
     ) -> bool {
         let title = title.into();
-        let call = (self.ui.confirm)(title.clone(), message.into());
+        let call = self.ui.confirm(title.clone(), message);
         self.prompt("confirm", Some(title), call).await
     }
 
@@ -186,7 +310,7 @@ impl ExtensionContext {
         placeholder: Option<String>,
     ) -> Option<String> {
         let title = title.into();
-        let call = (self.ui.input)(title.clone(), placeholder);
+        let call = self.ui.input(title.clone(), placeholder);
         self.prompt("input", Some(title), call).await
     }
 

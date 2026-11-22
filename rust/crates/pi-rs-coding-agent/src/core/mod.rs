@@ -13,6 +13,7 @@ pub mod footer_data;
 pub mod messages;
 pub mod model_registry;
 pub mod model_resolver;
+pub mod model_runtime;
 pub mod resolve_config_value;
 pub mod session_manager;
 pub mod settings_manager;
@@ -27,7 +28,12 @@ pub mod resource_loader;
 
 pub mod agent_session;
 pub mod agent_session_runtime;
+pub mod agent_session_services;
+pub mod auth_guidance;
+pub mod http_dispatcher;
 pub mod sdk;
+pub mod session_cwd;
+pub mod settings_diagnostics;
 
 pub mod export_html;
 pub mod package_manager;

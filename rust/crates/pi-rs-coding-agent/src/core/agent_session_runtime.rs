@@ -227,6 +227,21 @@ impl AgentSessionRuntime {
         Ok(())
     }
 
+    /// Replace the runtime with an already selected or prepared session manager.
+    pub(crate) async fn replace_session(
+        &mut self,
+        manager: Arc<dyn SessionManager>,
+        reason: SessionReason,
+    ) -> Result<()> {
+        self.replace(RuntimeTarget {
+            cwd: manager.cwd(),
+            agent_dir: self.services.agent_dir.clone(),
+            session_manager: manager,
+            reason,
+        })
+        .await
+    }
+
     /// Resume a different session file (represented by its session manager).
     pub async fn switch_session(&mut self, manager: Arc<dyn SessionManager>) -> Result<()> {
         let target = RuntimeTarget {

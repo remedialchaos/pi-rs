@@ -6,17 +6,25 @@ pub mod contracts;
 pub mod data;
 pub mod delta;
 pub mod documents;
+pub mod host;
+pub mod jobs;
 pub mod json;
 pub mod link;
+pub mod node;
 pub mod output;
+pub mod registries;
+pub mod remote;
 pub mod sqlite;
 pub mod state;
 pub mod store;
+pub mod surfaces;
 pub mod sync;
 pub mod telemetry;
 pub mod telemetry_ingest;
 pub mod telemetry_sqlite;
+pub mod tui;
 pub mod watch;
+pub mod web;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

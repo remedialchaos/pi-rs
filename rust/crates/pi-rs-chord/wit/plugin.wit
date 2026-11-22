@@ -1,0 +1,15 @@
+package chord:plugin@0.1.0;
+
+// No WASI imports. Capabilities are only the explicit host operations below.
+interface host {
+    log: func(message: string);
+    publish: func(object: string, member: string, value-json: string) -> result<_, string>;
+}
+
+world plugin {
+    import host;
+    // JSON array of {name, version, members: {name: {kind, schema, initial?, args?, result?}}}.
+    // Setup records declarations only. The host stages them synchronously before atomic reload.
+    export setup: func() -> result<string, string>;
+    export invoke: func(object: string, member: string, args-json: string, principal-json: string) -> result<string, string>;
+}

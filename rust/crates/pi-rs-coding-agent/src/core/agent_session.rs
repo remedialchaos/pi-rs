@@ -15,14 +15,21 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::future::BoxFuture;
+use indexmap::IndexMap;
 use pi_rs_agent::{
     Agent, AgentError, AgentEvent, AgentListener, AgentMessage, CancellationToken, QueueMode,
     Subscription, ThinkingLevel,
 };
-use pi_rs_ai::{AssistantContent, Model, StopReason};
+use pi_rs_ai::{
+    AssistantContent, ImageContent, InputContent, Model, StopReason, StringOrBlocks, SystemMessage,
+    TextContent, UserMessage, UserRole,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use super::system_prompt::SystemPromptSections;
 
 /// Errors produced by the session layer.
 #[derive(Debug)]
@@ -98,6 +105,15 @@ pub trait SessionManager: Send + Sync {
     fn navigate(&self, entry_id: &str) -> Result<()>;
     fn fork(&self, entry_id: &str, position: ForkPosition) -> Result<()>;
     fn stats(&self) -> SessionStatsSnapshot;
+    fn disk(&self) -> Option<&super::agent_session_services::DiskSession> {
+        None
+    }
+    fn try_append_message(&self, message: &AgentMessage) -> Result<String> {
+        Ok(self.append_message(message))
+    }
+    fn try_append_compaction(&self, result: &CompactionResult) -> Result<String> {
+        Ok(self.append_compaction(&result.summary, result.first_kept_entry_id.clone()))
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -401,6 +417,23 @@ pub trait SettingsStore: Send + Sync {
     fn follow_up_mode(&self) -> QueueMode;
     fn set_retry_enabled(&self, _enabled: bool) {}
     fn set_compaction_enabled(&self, _enabled: bool) {}
+    fn set_steering_mode(&self, _mode: QueueMode) {}
+    fn set_follow_up_mode(&self, _mode: QueueMode) {}
+    fn shell_path(&self) -> Option<String> {
+        None
+    }
+    fn shell_command_prefix(&self) -> Option<String> {
+        None
+    }
+    fn compaction_reserve_tokens(&self) -> Option<u64> {
+        None
+    }
+    fn auto_resize_images(&self) -> bool {
+        true
+    }
+    fn trusted_project(&self) -> Option<bool> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -470,6 +503,12 @@ impl SettingsStore for InMemorySettings {
     }
     fn set_compaction_enabled(&self, enabled: bool) {
         InMemorySettings::set_compaction_enabled(self, enabled);
+    }
+    fn set_steering_mode(&self, mode: QueueMode) {
+        InMemorySettings::set_steering_mode(self, mode);
+    }
+    fn set_follow_up_mode(&self, mode: QueueMode) {
+        InMemorySettings::set_follow_up_mode(self, mode);
     }
     fn retry_enabled(&self) -> bool {
         self.lock().retry_enabled
@@ -543,6 +582,12 @@ pub trait ModelRegistry: Send + Sync {
     fn get_model(&self, provider: &str, model_id: &str) -> Option<Model>;
     fn models(&self) -> Vec<Model>;
     fn has_configured_auth(&self, provider: &str) -> bool;
+    fn scoped_models(&self) -> Vec<(Model, Option<ThinkingLevel>)> {
+        Vec::new()
+    }
+    fn model_catalog(&self) -> Option<pi_rs_ai::Models> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -575,11 +620,14 @@ impl ModelRegistry for InMemoryModelRegistry {
 }
 
 /// Outcome of a compaction request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompactionResult {
     pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub first_kept_entry_id: Option<String>,
     pub tokens_before: u64,
+    #[serde(skip)]
     pub estimated_tokens_after: u64,
 }
 
@@ -588,7 +636,8 @@ pub struct CompactionResult {
 pub trait Compactor: Send + Sync {
     fn compact<'a>(
         &'a self,
-        messages: &'a [AgentMessage],
+        model: Model,
+        manager: &'a dyn SessionManager,
         instructions: &'a str,
         signal: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionResult>>;
@@ -603,11 +652,13 @@ pub struct TailCompactor {
 impl Compactor for TailCompactor {
     fn compact<'a>(
         &'a self,
-        messages: &'a [AgentMessage],
+        _model: Model,
+        manager: &'a dyn SessionManager,
         instructions: &'a str,
         _signal: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionResult>> {
         Box::pin(async move {
+            let messages = manager.messages();
             let tokens_before = messages
                 .iter()
                 .map(|message| {
@@ -640,6 +691,12 @@ pub trait ExtensionRunner: Send + Sync {
     fn emit(&self, event: &Value) -> Value;
     fn has_handlers(&self, _event_type: &str) -> bool {
         false
+    }
+    fn native(&self) -> Option<&Arc<super::extensions::runner::ExtensionRunner>> {
+        None
+    }
+    fn resources(&self) -> Option<&super::resource_loader::Resources> {
+        None
     }
 }
 
@@ -738,6 +795,7 @@ pub struct PromptOptions {
     pub streaming_behavior: Option<StreamingBehavior>,
     pub expand_prompt_templates: bool,
     pub source: String,
+    pub images: Vec<ImageContent>,
 }
 
 impl PromptOptions {
@@ -784,30 +842,8 @@ pub enum AgentSessionEvent {
         aborted: bool,
     },
     TurnStart,
-    TurnEnd {
-        tool_results: usize,
-    },
-    MessageStart {
-        role: String,
-    },
-    MessageUpdate {
-        role: String,
-    },
-    MessageEnd {
-        role: String,
-    },
-    ToolExecutionStart {
-        tool_call_id: String,
-        tool_name: String,
-    },
-    ToolExecutionUpdate {
-        tool_call_id: String,
-        tool_name: String,
-    },
-    ToolExecutionEnd {
-        tool_call_id: String,
-        tool_name: String,
-        is_error: bool,
+    EntryAppended {
+        entry: super::session_manager::SessionEntry,
     },
     QueueUpdate {
         steering: Vec<String>,
@@ -818,7 +854,10 @@ pub enum AgentSessionEvent {
     },
     CompactionEnd {
         reason: CompactionReason,
-        summary: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<CompactionResult>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
         aborted: bool,
         will_retry: bool,
     },
@@ -831,6 +870,7 @@ pub enum AgentSessionEvent {
     AutoRetryEnd {
         success: bool,
         attempt: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
         final_error: Option<String>,
     },
     SessionStart {
@@ -849,6 +889,8 @@ pub enum AgentSessionEvent {
     SessionInfoChanged {
         name: Option<String>,
     },
+    #[serde(untagged)]
+    Core(AgentEvent),
 }
 
 impl AgentSessionEvent {
@@ -858,13 +900,19 @@ impl AgentSessionEvent {
             Self::AgentEnd { .. } => "agent_end",
             Self::AgentSettled { .. } => "agent_settled",
             Self::TurnStart => "turn_start",
-            Self::TurnEnd { .. } => "turn_end",
-            Self::MessageStart { .. } => "message_start",
-            Self::MessageUpdate { .. } => "message_update",
-            Self::MessageEnd { .. } => "message_end",
-            Self::ToolExecutionStart { .. } => "tool_execution_start",
-            Self::ToolExecutionUpdate { .. } => "tool_execution_update",
-            Self::ToolExecutionEnd { .. } => "tool_execution_end",
+            Self::Core(event) => match event {
+                AgentEvent::AgentStart => "agent_start",
+                AgentEvent::AgentEnd { .. } => "agent_end",
+                AgentEvent::TurnStart => "turn_start",
+                AgentEvent::TurnEnd { .. } => "turn_end",
+                AgentEvent::MessageStart { .. } => "message_start",
+                AgentEvent::MessageUpdate { .. } => "message_update",
+                AgentEvent::MessageEnd { .. } => "message_end",
+                AgentEvent::ToolExecutionStart { .. } => "tool_execution_start",
+                AgentEvent::ToolExecutionUpdate { .. } => "tool_execution_update",
+                AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end",
+            },
+            Self::EntryAppended { .. } => "entry_appended",
             Self::QueueUpdate { .. } => "queue_update",
             Self::CompactionStart { .. } => "compaction_start",
             Self::CompactionEnd { .. } => "compaction_end",
@@ -903,6 +951,7 @@ pub struct SessionStats {
 }
 
 pub type SessionEventListener = Arc<dyn Fn(&AgentSessionEvent) + Send + Sync>;
+type OutputBackpressure = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 pub struct AgentSessionConfig {
     pub agent: Agent,
@@ -927,14 +976,20 @@ struct Inner {
     compactor: Arc<dyn Compactor>,
     extensions: Arc<dyn ExtensionRunner>,
     cwd: String,
+    system_prompt_sections: Option<SystemPromptSections>,
     retry_prompt: String,
     listeners: BTreeMap<usize, SessionEventListener>,
     next_listener: usize,
     agent_subscription: Option<Subscription>,
+    output_backpressure: Option<OutputBackpressure>,
     steering: Vec<String>,
     follow_up: Vec<String>,
+    pending_bash: Vec<AgentMessage>,
     retry_attempt: usize,
     retry_cancel: Option<CancellationToken>,
+    run_settled: Option<CancellationToken>,
+    run_aborted: bool,
+    compaction_cancel: Option<CancellationToken>,
     is_streaming: bool,
     is_compacting: bool,
     disposed: bool,
@@ -952,6 +1007,14 @@ pub struct AgentSession {
     inner: Arc<Mutex<Inner>>,
 }
 
+struct RunningSession<'a>(&'a AgentSession);
+
+impl Drop for RunningSession<'_> {
+    fn drop(&mut self) {
+        self.0.finish_run();
+    }
+}
+
 impl AgentSession {
     pub fn new(config: AgentSessionConfig) -> Result<Self> {
         let inner = Arc::new(Mutex::new(Inner {
@@ -963,16 +1026,22 @@ impl AgentSession {
             compactor: config.compactor,
             extensions: config.extensions,
             cwd: config.cwd,
+            system_prompt_sections: None,
             retry_prompt: config
                 .retry_prompt
                 .unwrap_or_else(|| "Continue from the last response.".to_string()),
             listeners: BTreeMap::new(),
             next_listener: 0,
             agent_subscription: None,
+            output_backpressure: None,
             steering: Vec::new(),
             follow_up: Vec::new(),
+            pending_bash: Vec::new(),
             retry_attempt: 0,
             retry_cancel: None,
+            run_settled: None,
+            run_aborted: false,
+            compaction_cancel: None,
             is_streaming: false,
             is_compacting: false,
             disposed: false,
@@ -982,7 +1051,13 @@ impl AgentSession {
             let session = weak.upgrade().map(|inner| Self { inner });
             Box::pin(async move {
                 if let Some(session) = session {
-                    session.handle_agent_event(event);
+                    session
+                        .handle_agent_event(event)
+                        .map_err(|error| AgentError::Callback(error.to_string()))?;
+                    let backpressure = session.lock().output_backpressure.clone();
+                    if let Some(drain) = backpressure {
+                        drain().await;
+                    }
                 }
                 Ok(())
             })
@@ -1034,6 +1109,10 @@ impl AgentSession {
         runner.emit(&event);
     }
 
+    pub(crate) fn set_output_backpressure(&self, drain: OutputBackpressure) {
+        self.lock().output_backpressure = Some(drain);
+    }
+
     fn emit(&self, event: AgentSessionEvent) {
         let listeners: Vec<SessionEventListener> =
             self.lock().listeners.values().cloned().collect();
@@ -1082,7 +1161,7 @@ impl AgentSession {
         }
     }
 
-    fn handle_agent_event(&self, event: &AgentEvent) {
+    fn handle_agent_event(&self, event: &AgentEvent) -> Result<()> {
         match event {
             AgentEvent::AgentStart => self.emit(AgentSessionEvent::AgentStart),
             AgentEvent::AgentEnd { messages } => self.emit(AgentSessionEvent::AgentEnd {
@@ -1090,49 +1169,16 @@ impl AgentSession {
                 will_retry: false,
             }),
             AgentEvent::TurnStart => self.emit(AgentSessionEvent::TurnStart),
-            AgentEvent::TurnEnd { tool_results, .. } => {
-                self.emit(AgentSessionEvent::TurnEnd {
-                    tool_results: tool_results.len(),
-                });
-            }
             AgentEvent::MessageStart { message } => {
-                {
-                    let mut inner = self.lock();
-                    if message.role() == "user" {
-                        let text = pi_rs_ai::transcript::input_text(
-                            &match message {
-                                AgentMessage::User(user) => match &user.content {
-                                    pi_rs_ai::StringOrBlocks::String(text) => {
-                                        vec![pi_rs_ai::InputContent::Text(pi_rs_ai::TextContent {
-                                            text: text.clone(),
-                                            ..Default::default()
-                                        })]
-                                    }
-                                    pi_rs_ai::StringOrBlocks::Blocks(blocks) => blocks.clone(),
-                                },
-                                _ => Vec::new(),
-                            },
-                            " ",
-                        );
-                        inner.steering.retain(|queued| queued != &text);
-                        inner.follow_up.retain(|queued| queued != &text);
-                    }
+                let changed = self.dequeue_started_message(message);
+                if changed {
+                    self.emit_queue_update();
                 }
-                self.emit_queue_update();
-                self.emit(AgentSessionEvent::MessageStart {
-                    role: message.role().to_string(),
-                });
-            }
-            AgentEvent::MessageUpdate { .. } => {
-                self.emit(AgentSessionEvent::MessageUpdate {
-                    role: "assistant".to_string(),
-                });
+                self.emit(AgentSessionEvent::Core(event.clone()));
             }
             AgentEvent::MessageEnd { message } => {
-                self.lock().session_manager.append_message(message);
-                self.emit(AgentSessionEvent::MessageEnd {
-                    role: message.role().to_string(),
-                });
+                self.emit(AgentSessionEvent::Core(event.clone()));
+                self.session_manager().try_append_message(message)?;
                 if let AgentMessage::Assistant(assistant) = message
                     && assistant.stop_reason != StopReason::Error
                 {
@@ -1148,33 +1194,33 @@ impl AgentSession {
                     }
                 }
             }
-            AgentEvent::ToolExecutionStart {
-                tool_call_id,
-                tool_name,
-                ..
-            } => self.emit(AgentSessionEvent::ToolExecutionStart {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-            }),
-            AgentEvent::ToolExecutionUpdate {
-                tool_call_id,
-                tool_name,
-                ..
-            } => self.emit(AgentSessionEvent::ToolExecutionUpdate {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-            }),
-            AgentEvent::ToolExecutionEnd {
-                tool_call_id,
-                tool_name,
-                is_error,
-                ..
-            } => self.emit(AgentSessionEvent::ToolExecutionEnd {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                is_error: *is_error,
-            }),
+            _ => self.emit(AgentSessionEvent::Core(event.clone())),
         }
+        Ok(())
+    }
+
+    fn dequeue_started_message(&self, message: &AgentMessage) -> bool {
+        let AgentMessage::User(user) = message else {
+            return false;
+        };
+        let mut inner = self.lock();
+        if inner.steering.is_empty() && inner.follow_up.is_empty() {
+            return false;
+        }
+        let text = match &user.content {
+            StringOrBlocks::String(text) => std::borrow::Cow::Borrowed(text.as_str()),
+            StringOrBlocks::Blocks(blocks) => {
+                std::borrow::Cow::Owned(pi_rs_ai::transcript::input_text(blocks, " "))
+            }
+        };
+        if let Some(index) = inner.steering.iter().position(|queued| queued == &*text) {
+            inner.steering.remove(index);
+        } else if let Some(index) = inner.follow_up.iter().position(|queued| queued == &*text) {
+            inner.follow_up.remove(index);
+        } else {
+            return false;
+        }
+        true
     }
 
     fn emit_queue_update(&self) {
@@ -1214,6 +1260,16 @@ impl AgentSession {
         text: impl Into<String>,
         options: PromptOptions,
     ) -> Result<PromptDisposition> {
+        self.prompt_with_preflight(text, options, |_| {}).await
+    }
+
+    /// Report acceptance before starting the turn so RPC can correlate the following events.
+    pub async fn prompt_with_preflight(
+        &self,
+        text: impl Into<String>,
+        options: PromptOptions,
+        accepted: impl FnOnce(PromptDisposition),
+    ) -> Result<PromptDisposition> {
         let text = text.into();
         if self.lock().disposed {
             return Err(SessionError::Disposed);
@@ -1224,13 +1280,14 @@ impl AgentSession {
         if self.is_streaming() {
             match options.streaming_behavior {
                 Some(StreamingBehavior::Steer) => {
-                    self.steer(text).await?;
+                    self.steer_with_images(text, options.images).await?
                 }
                 Some(StreamingBehavior::FollowUp) => {
-                    self.follow_up(text).await?;
+                    self.follow_up_with_images(text, options.images).await?
                 }
                 None => return Err(SessionError::StreamingBehaviorRequired),
-            }
+            };
+            accepted(PromptDisposition::Queued);
             return Ok(PromptDisposition::Queued);
         }
         {
@@ -1243,6 +1300,7 @@ impl AgentSession {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
+                    accepted(PromptDisposition::Handled);
                     return Ok(PromptDisposition::Handled);
                 }
             }
@@ -1256,15 +1314,58 @@ impl AgentSession {
                 "source": options.source(),
             }));
         }
-        self.lock().is_streaming = true;
-        let result = self.agent().prompt(text).await;
+        let _run = self.begin_run()?;
+        accepted(PromptDisposition::Started);
+        let (text, images) = self.normalize_images(text, options.images);
+        let agent = self.agent();
+        let user = user_input(text, images);
+        let result = if let Some(system) = self.pending_system_message(&agent) {
+            agent.prompt(vec![system.into(), user]).await
+        } else {
+            agent.prompt(user).await
+        };
         let outcome = match result {
             Ok(()) => self.after_run().await,
             Err(error) => Err(SessionError::Agent(error)),
         };
-        self.finish_run();
         outcome?;
         Ok(PromptDisposition::Started)
+    }
+
+    pub(super) fn with_system_prompt_sections(self, sections: SystemPromptSections) -> Self {
+        self.lock().system_prompt_sections = Some(sections);
+        self
+    }
+
+    fn pending_system_message(&self, agent: &Agent) -> Option<SystemMessage> {
+        let inner = self.lock();
+        let desired = inner.system_prompt_sections.as_ref()?;
+        let messages = agent.messages();
+        let mut previous = IndexMap::new();
+        for message in &messages {
+            if let AgentMessage::System(message) = message {
+                for (name, content) in message.sections.iter().flatten() {
+                    if let Some(content) = content {
+                        previous.insert(name.as_str(), content.as_str());
+                    } else {
+                        previous.shift_remove(name.as_str());
+                    }
+                }
+            }
+        }
+        let mut sections = IndexMap::new();
+        for (name, content) in desired {
+            if previous.shift_remove(name.as_str()) != Some(content.as_str()) {
+                sections.insert(name.clone(), Some(content.clone()));
+            }
+        }
+        sections.extend(previous.into_keys().map(|name| (name.to_owned(), None)));
+        (!sections.is_empty()).then(|| SystemMessage {
+            content: StringOrBlocks::String(String::new()),
+            sections: Some(sections),
+            timestamp: chrono::Utc::now().timestamp_millis().unsigned_abs(),
+            ..SystemMessage::default()
+        })
     }
 
     /// Continue the conversation without adding a new user message.
@@ -1275,54 +1376,153 @@ impl AgentSession {
         if self.is_streaming() {
             return Err(SessionError::Agent(AgentError::ContinueInProgress));
         }
-        self.lock().is_streaming = true;
+        let _run = self.begin_run()?;
         let result = self.agent().continue_run().await;
-        let outcome = match result {
+        match result {
             Ok(()) => self.after_run().await,
             Err(error) => Err(SessionError::Agent(error)),
-        };
-        self.finish_run();
-        outcome
+        }
     }
 
     /// Queue a message to be delivered after the current assistant turn finishes its tools.
     pub async fn steer(&self, text: impl Into<String>) -> Result<PromptDisposition> {
-        let text = text.into();
-        {
-            let mut inner = self.lock();
-            inner.steering.push(text.clone());
-        }
-        self.agent().steer(AgentMessage::user(text));
+        self.steer_with_images(text.into(), Vec::new()).await
+    }
+
+    pub async fn steer_with_images(
+        &self,
+        text: String,
+        images: Vec<ImageContent>,
+    ) -> Result<PromptDisposition> {
+        let (text, images) = self.normalize_images(text, images);
+        let message = user_input(text.clone(), images);
+        self.lock().steering.push(text);
+        self.agent().steer(message);
         self.emit_queue_update();
         Ok(PromptDisposition::Queued)
     }
 
     /// Queue a message to be delivered once the agent would otherwise stop.
     pub async fn follow_up(&self, text: impl Into<String>) -> Result<PromptDisposition> {
-        let text = text.into();
-        {
-            let mut inner = self.lock();
-            inner.follow_up.push(text.clone());
-        }
-        self.agent().follow_up(AgentMessage::user(text));
+        self.follow_up_with_images(text.into(), Vec::new()).await
+    }
+
+    pub async fn follow_up_with_images(
+        &self,
+        text: String,
+        images: Vec<ImageContent>,
+    ) -> Result<PromptDisposition> {
+        let (text, images) = self.normalize_images(text, images);
+        let message = user_input(text.clone(), images);
+        self.lock().follow_up.push(text);
+        self.agent().follow_up(message);
         self.emit_queue_update();
         Ok(PromptDisposition::Queued)
     }
 
+    fn normalize_images(
+        &self,
+        mut text: String,
+        images: Vec<ImageContent>,
+    ) -> (String, Vec<ImageContent>) {
+        use crate::utils::{
+            image_process::{ProcessImageOptions, ProcessImageResult, process_image},
+            tool_result_images::NormalizeToolResultImagesOptions,
+        };
+        if images.is_empty() {
+            return (text, images);
+        }
+        let auto_resize = self.settings().auto_resize_images();
+        let model = self.model();
+        let resize_options = model
+            .input_limits
+            .as_ref()
+            .and_then(|limits| limits.images.as_ref())
+            .and_then(|images| images.resize.as_ref())
+            .and_then(|options| {
+                NormalizeToolResultImagesOptions::from_model_options(options, auto_resize)
+                    .resize_options
+            });
+        let options = ProcessImageOptions {
+            auto_resize_images: Some(auto_resize),
+            resize_options,
+        };
+        let mut normalized = Vec::with_capacity(images.len());
+        let mut hints = Vec::new();
+        for mut image in images {
+            let bytes = STANDARD.decode(&image.data).unwrap_or_default();
+            match process_image(&bytes, &image.mime_type, options.clone()) {
+                ProcessImageResult::Ok {
+                    data,
+                    mime_type,
+                    hints: image_hints,
+                } => {
+                    image.data = data;
+                    image.mime_type = mime_type;
+                    normalized.push(image);
+                    hints.extend(image_hints);
+                }
+                ProcessImageResult::Err { message } => hints.push(message),
+            }
+        }
+        if !hints.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&hints.join("\n"));
+        }
+        (text, normalized)
+    }
+
+    /// A bash result cannot be inserted between an assistant tool call and its result.
+    pub fn record_bash_message(&self, message: AgentMessage) -> Result<()> {
+        let mut inner = self.lock();
+        if inner.is_streaming {
+            inner.pending_bash.push(message);
+        } else {
+            inner.session_manager.try_append_message(&message)?;
+            inner.agent.append_message(message);
+        }
+        Ok(())
+    }
+
+    fn begin_run(&self) -> Result<RunningSession<'_>> {
+        let mut inner = self.lock();
+        if inner.is_streaming {
+            return Err(SessionError::StreamingBehaviorRequired);
+        }
+        inner.is_streaming = true;
+        inner.run_settled = Some(CancellationToken::new());
+        Ok(RunningSession(self))
+    }
+
     fn finish_run(&self) {
-        let aborted = {
+        let (aborted, retry_attempt, settled) = {
             let mut inner = self.lock();
             inner.is_streaming = false;
-            inner.retry_cancel.take().is_some()
+            for message in std::mem::take(&mut inner.pending_bash) {
+                match inner.session_manager.try_append_message(&message) {
+                    Ok(_) => inner.agent.append_message(message),
+                    Err(error) => eprintln!("{error}"),
+                }
+            }
+            let aborted = std::mem::take(&mut inner.run_aborted);
+            let retry_attempt = if aborted {
+                std::mem::take(&mut inner.retry_attempt)
+            } else {
+                0
+            };
+            inner.retry_cancel = None;
+            (aborted, retry_attempt, inner.run_settled.take())
         };
         self.emit(AgentSessionEvent::AgentSettled { aborted });
-        if aborted {
+        if retry_attempt != 0 {
             self.emit(AgentSessionEvent::AutoRetryEnd {
                 success: false,
-                attempt: self.lock().retry_attempt,
+                attempt: retry_attempt,
                 final_error: Some("retry aborted".to_string()),
             });
-            self.lock().retry_attempt = 0;
+        }
+        if let Some(settled) = settled {
+            settled.cancel();
         }
     }
 
@@ -1338,9 +1538,7 @@ impl AgentSession {
             .rev()
             .find_map(|message| match message {
                 AgentMessage::Assistant(assistant) => Some(AssistantSnapshot {
-                    retryable: assistant.stop_reason == StopReason::Error
-                        || assistant.stop_reason == StopReason::Aborted
-                        || assistant.error_message.is_some(),
+                    retryable: assistant.stop_reason == StopReason::Error,
                     error_message: assistant.error_message.clone(),
                 }),
                 _ => None,
@@ -1348,9 +1546,12 @@ impl AgentSession {
     }
 
     async fn after_run(&self) -> Result<()> {
+        if self.lock().run_aborted {
+            return Ok(());
+        }
         let mut retry_rounds = 0usize;
         while let Some(snapshot) = self.last_assistant_snapshot() {
-            if !snapshot.retryable {
+            if !snapshot.retryable || self.lock().run_aborted {
                 break;
             }
             if !self.prepare_retry(snapshot).await? {
@@ -1364,7 +1565,7 @@ impl AgentSession {
             self.agent().prompt(prompt).await?;
         }
         if self.needs_compaction() {
-            self.compact_with_reason(CompactionReason::Threshold)
+            self.compact_with_reason(CompactionReason::Threshold, None)
                 .await?;
         }
         Ok(())
@@ -1410,6 +1611,11 @@ impl AgentSession {
             inner.retry_cancel = None;
         }
         if cancelled {
+            self.emit(AgentSessionEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: None,
+            });
             self.lock().retry_attempt = 0;
             return Ok(false);
         }
@@ -1434,56 +1640,59 @@ impl AgentSession {
             return false;
         }
         let window = self.agent().model().context_window;
-        let threshold = self.lock().settings.compaction_threshold();
-        let limit = (window as f64 * threshold) as u64;
+        let settings = self.settings();
+        let limit = settings.compaction_reserve_tokens().map_or_else(
+            || (window as f64 * settings.compaction_threshold()) as u64,
+            |reserve| window.saturating_sub(reserve),
+        );
         limit > 0 && self.estimated_tokens() >= limit
     }
 
     /// Compact the active context. Upstream supports manual, threshold, and overflow reasons.
     pub async fn compact(&self, custom_instructions: Option<&str>) -> Result<CompactionResult> {
-        self.compact_with_reason(CompactionReason::Manual)
+        self.compact_with_reason(CompactionReason::Manual, custom_instructions)
             .await
-            .map(|result| {
-                if let Some(instructions) = custom_instructions
-                    && !instructions.trim().is_empty()
-                {
-                    let mut with_instructions = result;
-                    with_instructions
-                        .summary
-                        .push_str(&format!("\n\n{instructions}"));
-                    with_instructions
-                } else {
-                    result
-                }
-            })
     }
 
-    async fn compact_with_reason(&self, reason: CompactionReason) -> Result<CompactionResult> {
+    async fn compact_with_reason(
+        &self,
+        reason: CompactionReason,
+        instructions: Option<&str>,
+    ) -> Result<CompactionResult> {
+        let signal = CancellationToken::new();
         {
             let mut inner = self.lock();
             if inner.is_compacting {
                 return Err(SessionError::CompactionInProgress);
             }
             inner.is_compacting = true;
+            inner.compaction_cancel = Some(signal.clone());
         }
         self.emit(AgentSessionEvent::CompactionStart { reason });
-        let (messages, compactor) = {
+        let (manager, compactor) = {
             let inner = self.lock();
-            (inner.session_manager.messages(), inner.compactor.clone())
+            (inner.session_manager.clone(), inner.compactor.clone())
         };
-        let signal = CancellationToken::new();
-        let result = compactor.compact(&messages, "", &signal).await;
+        let result = compactor
+            .compact(
+                self.model(),
+                manager.as_ref(),
+                instructions.unwrap_or_default(),
+                &signal,
+            )
+            .await
+            .and_then(|compaction| {
+                manager.try_append_compaction(&compaction)?;
+                Ok(compaction)
+            });
         let outcome = match result {
             Ok(compaction) => {
-                let first_kept = compaction.first_kept_entry_id.clone();
-                self.lock()
-                    .session_manager
-                    .append_compaction(&compaction.summary, first_kept);
-                let messages = self.lock().session_manager.messages();
+                let messages = manager.messages();
                 self.agent().set_messages(messages);
                 self.emit(AgentSessionEvent::CompactionEnd {
                     reason,
-                    summary: Some(compaction.summary.clone()),
+                    result: Some(compaction.clone()),
+                    error_message: None,
                     aborted: false,
                     will_retry: false,
                 });
@@ -1492,14 +1701,17 @@ impl AgentSession {
             Err(error) => {
                 self.emit(AgentSessionEvent::CompactionEnd {
                     reason,
-                    summary: None,
-                    aborted: false,
+                    result: None,
+                    error_message: (!signal.is_cancelled()).then(|| error.to_string()),
+                    aborted: signal.is_cancelled(),
                     will_retry: false,
                 });
                 Err(SessionError::CompactionFailed(error.to_string()))
             }
         };
-        self.lock().is_compacting = false;
+        let mut inner = self.lock();
+        inner.is_compacting = false;
+        inner.compaction_cancel = None;
         outcome
     }
 
@@ -1636,7 +1848,11 @@ impl AgentSession {
     pub async fn abort(&self) {
         {
             let mut inner = self.lock();
-            if let Some(cancel) = inner.retry_cancel.take() {
+            inner.run_aborted = inner.is_streaming;
+            if let Some(cancel) = &inner.retry_cancel {
+                cancel.cancel();
+            }
+            if let Some(cancel) = &inner.compaction_cancel {
                 cancel.cancel();
             }
             inner.agent.abort();
@@ -1644,7 +1860,30 @@ impl AgentSession {
         self.wait_for_idle().await;
     }
 
+    pub fn abort_retry(&self) {
+        if let Some(cancel) = &self.lock().retry_cancel {
+            cancel.cancel();
+        }
+    }
+
+    pub fn set_steering_mode(&self, mode: QueueMode) {
+        let inner = self.lock();
+        inner.settings.set_steering_mode(mode);
+        inner.agent.set_steering_mode(mode);
+    }
+
+    pub fn set_follow_up_mode(&self, mode: QueueMode) {
+        let inner = self.lock();
+        inner.settings.set_follow_up_mode(mode);
+        inner.agent.set_follow_up_mode(mode);
+    }
+
     pub async fn wait_for_idle(&self) {
+        let settled = self.lock().run_settled.clone();
+        if let Some(settled) = settled {
+            settled.cancelled().await;
+            return;
+        }
         let agent = self.agent();
         agent.wait_for_idle().await;
     }
@@ -1664,7 +1903,8 @@ impl AgentSession {
     }
 
     pub fn is_idle(&self) -> bool {
-        !self.is_streaming() && !self.lock().is_compacting && self.lock().retry_cancel.is_none()
+        let inner = self.lock();
+        !inner.is_streaming && !inner.is_compacting && inner.retry_cancel.is_none()
     }
 
     pub fn is_compacting(&self) -> bool {
@@ -1685,6 +1925,10 @@ impl AgentSession {
 
     pub fn available_models(&self) -> Vec<Model> {
         self.lock().models.models()
+    }
+
+    pub fn scoped_models(&self) -> Vec<(Model, Option<ThinkingLevel>)> {
+        self.lock().models.scoped_models()
     }
 
     pub fn thinking_level(&self) -> ThinkingLevel {
@@ -1708,7 +1952,19 @@ impl AgentSession {
     }
 
     pub fn system_prompt(&self) -> String {
-        self.agent().system_prompt()
+        let inner = self.lock();
+        if let Some(sections) = &inner.system_prompt_sections {
+            return pi_rs_ai::transcript::system_message_text(&SystemMessage {
+                sections: Some(
+                    sections
+                        .iter()
+                        .map(|(name, content)| (name.clone(), Some(content.clone())))
+                        .collect(),
+                ),
+                ..SystemMessage::default()
+            });
+        }
+        inner.agent.system_prompt()
     }
 
     pub fn session_manager(&self) -> Arc<dyn SessionManager> {
@@ -1717,6 +1973,18 @@ impl AgentSession {
 
     pub fn settings(&self) -> Arc<dyn SettingsStore> {
         self.lock().settings.clone()
+    }
+
+    pub(crate) fn interactive_tools(&self) -> Vec<pi_rs_ai::Tool> {
+        self.agent()
+            .tools()
+            .iter()
+            .map(|tool| tool.declaration().clone())
+            .collect()
+    }
+
+    pub(crate) fn interactive_resources(&self) -> Option<super::resource_loader::Resources> {
+        self.lock().extensions.resources().cloned()
     }
 
     /// Session statistics including context usage and all-history token totals.
@@ -1769,6 +2037,25 @@ impl AgentSession {
         inner.listeners.clear();
         inner.agent.abort();
     }
+}
+
+fn user_input(text: String, images: Vec<ImageContent>) -> AgentMessage {
+    let mut blocks = Vec::with_capacity(1 + images.len());
+    blocks.push(InputContent::Text(TextContent {
+        text,
+        ..TextContent::default()
+    }));
+    blocks.extend(images.into_iter().map(InputContent::Image));
+    UserMessage {
+        role: UserRole::User,
+        content: StringOrBlocks::Blocks(blocks),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            }),
+    }
+    .into()
 }
 
 #[cfg(test)]

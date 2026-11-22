@@ -12,6 +12,7 @@
 //! changing the registration and collision logic below.
 
 pub mod codemode;
+pub(crate) mod headless;
 pub mod llama;
 pub mod mcp;
 pub mod tool_search;

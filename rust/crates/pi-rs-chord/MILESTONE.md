@@ -1,5 +1,10 @@
 # Milestone 2.1a foundation checkpoint
 
+Milestone 2.1b-2 claimed by Jcode on 2026-11-22. Partial checkpoint verified below.
+The complete milestone remains open. Do not unblock dependent packages.
+The task's explicit scope forbids editing shared MAP/HANDOFF or running map --write.
+No commits or pushes. Existing uncommitted work is retained.
+
 Base commit: `780bf31fc`. Updated 2026-11-22 UTC. No commits created.
 **Slice 3 implementation and bounded functional gates: COMPLETE.**
 The foundation is ready for coordinator review and the additive telemetry bridge.
@@ -123,3 +128,223 @@ Earlier Slice 2 sensitivity and fidelity evidence remains under `target/slice2-*
 Next: separately claimed Milestone 2.1b (`host`, `jobs`, `registries`, `remote`, `surfaces`, `tui`,
 `node/{http,workers,plugins,surfaces,tui,app}`, `web`).
 Do not interpret this bounded checkpoint as proof that the known parity limits vanished.
+
+## Milestone 2.1b-1: portable runtime core
+
+Updated 2026-11-22 UTC. Implementation and bounded functional checkpoint, not a
+claim of complete upstream API or resource parity. No commits or pushes created.
+Only this crate's `src/`, `tests/`, and this record were authored for this task.
+Concurrent workspace manifest, lockfile, sibling-crate and map changes were left alone.
+
+### Gates
+
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| Formatting | PASS | Exact package-scoped brief command, `chord-b1-final3-fmt.txt` |
+| Warning-free lint | PASS | Exact offline brief command, all targets, zero warnings, 1m44s |
+| Complete offline suite | PASS | Final exact isolated-target command: 143 passed, 0 failed, 0 ignored |
+| Foundation preserved | PASS | All 107 existing tests retained and passing, including 19 wire goldens and telemetry bridge |
+| Registries | PASS, bounded | 6 tests: owner order/removal, adapters, follow, atomic replacement, failure retention, conflicts |
+| Jobs | PASS, bounded | 7 tests: validation/dedupe/concurrency, cancellation, finish retries, durable recovery/claims, restart limits, state schemas |
+| Host | PASS, bounded | 10 tests: lifecycle, admission/follow/revoke, cached sources, document persistence, fixed-point holdback, dry-run declarations, real drain cycle, atomic registry handover |
+| Remote | PASS, bounded | 3 real memory-link tests: calls/deltas/rebind, principal stamping/cancellation, atomic paired updates beyond acknowledgement window |
+| Surfaces/TUI/web | PASS, bounded | 10 tests: persisted choices, digest identity, theme/language, terminal bridge/scopes/optimism, pure page and connection effects |
+| Mutation sensitivity | PASS | All 36 new tests fail on behavioral mutations, with clean source restoration |
+| Source safety and scope | PASS | Crate forbids unsafe; no source unwrap/expect/panic/allow, clean whitespace, only permitted authored paths |
+| Complete upstream runtime parity | NOT COMPLETE | Specific remaining boundaries below |
+
+### Implementation
+
+- Typed registry definitions, owner tables, contribution/value adapters, failure
+  episodes, followed contributions, stable sources and batched host replacement.
+- Durable and memory job queues with UUIDv7 run IDs, validation-before-dedupe,
+  concurrency limits, FIFO state settlement, generation fences, independent wait
+  cancellation, committed intent/outcomes, crash recovery, abort and finish backoff.
+  Persisted run/state documents share one store step and owner claims.
+- Facets, scoped references/calls, admissions, routines, follow/open resources,
+  revocation, presence/activity, hosted documents/tables/jobs and retained link peers.
+  Reload rehearses declaration-only factories, iterates holdback to a fixed point,
+  commits declarations in one batch, drains old calls, and cuts real old-work cycles
+  immediately with `unavailable/reload_cycle`. Cached readable proxies survive restarts.
+  Non-native contributions remain through drain or a failed successor and swap in
+  the successor's publication batch. Native-open contributions withdraw before
+  resource cleanup. Ending an object also removes its retained contributions.
+- Direct remote peers use the existing channel protocol, indexed methods/members,
+  per-member delta dictionaries, cancellation, child-principal stamping, reconnect
+  re-holds and a two-message replica acknowledgement window. Related member deltas
+  from a host batch publish atomically. Local contracts cannot cross links.
+- Portable scripts/choice contracts, persisted principal-keyed preferences capped at
+  10,000 entries, digest adoption/holdback, page state, theme/locale followers,
+  translation catalogs, terminal colors, deterministic connection effects, bridge
+  requests/sockets, UTF-16-safe terminal frames, `pi-rs-tui::Terminal`, scoped watches
+  and optimistic actions. Web page/script/style operations are pure effect data.
+
+### Verification evidence
+
+Tests added: 36. Tests removed: 0. Baseline: 107 passing, 8.61s summed execution.
+Final: 143 passing, zero failed or ignored, 11.98s summed execution after 3m46s
+compilation. All 36 added tests have observed behavioral failures. Execution totals
+exclude builds and are not comparative benchmarks on this concurrently used machine.
+Exact final command outputs: `chord-b1-final3-{fmt,clippy,tests}.txt`.
+Evidence files are under `$HOME/.jcode/scratch/chord-b1-*`.
+The required `/tmp/pi-rs-target-jcode` target is a symlink to session-owned build
+storage after the 4 GiB tmpfs filled. No manifest or dependency changes were made.
+
+`chord-b1-mutants1.txt` records 23 failures across registry admission/order/adapters,
+follow/retention/conflicts, job cancellation/dedupe/crash/finish bounds, holdback/cycle
+cutting, principal stamping, replica atomicity, digests, themes, catalogs, connection
+backoff, UTF-16 framing, optimistic settlement and CSS adoption. The second bounded
+round (`chord-b1-mutants2b.txt`) checks presence, cached handles, rejected rehearsals,
+persisted document binding, state-schema identity, committed job outcomes, abort
+classification, choice persistence, script contracts and bridge reply data.
+The shared-source teardown mutation initially survived a fast reconnect, so that
+test now waits for actual object cleanup before re-holding. It then fails in
+`chord-b1-mutant-rebind.txt`. Every new test is listed in the 35-line
+`chord-b1-mutation-coverage.txt`. The original unbounded mutated document wait was
+stopped and readiness/recovery assertions gained explicit deadlines. Both source
+restorations passed `sha256sum --check` against `chord-b1-before-mutations.sha256`.
+An intermediate full-suite attempt exposed a cached-reference revocation bug: the
+fix fails/ends owned proxies without detaching borrowed factory sources. The
+expanded admission test covers deny, reallow and revoke on a cached source.
+A 36th test initially failed on a non-native contribution gap, then passed after
+atomic successor handover. A native-seal mutation failed its other branch;
+`chord-b1-handover-{red2,edges,mutant}.txt` records these results, and restoration
+matches `chord-b1-handover-clean.sha256`. Failed successors and final release are
+covered by the same real host test.
+
+### Honest fidelity limits and next work
+
+- This is representative Rust integration coverage, not replay of the entire TS
+  application or upstream runtime test suite. A Wasm target was not built. Node,
+  browser DOM, process, HTTP and OS connection adapters are not part of this slice.
+- Host/remote expose JSON state and methods. Event, keyed/query member integration,
+  route/destination/relay resolution, origin forwarding, bytes-valued calls and
+  remote historical contract views are not implemented. Accepted host contracts
+  bind by compatibility, but do not reproduce the full upstream adaptation layer.
+- Job finish callbacks and domain-document writes are not one atomic transaction
+  with run retirement. In-memory job records/waiters are not handed across object
+  restarts. Stored state schema migrations, missing-declaration recovery, blocked-run
+  operator retry and durable trace-carrier restoration remain incomplete.
+- The declaration commit and object contribution handover have separate upstream
+  boundaries: facet declarations commit together, retained object contributions
+  swap when a successor goes live. The closure check is conservative for unrelated
+  unbound requests after a failure. Cancellation after commit does not expose an
+  adoption-ready committed report to LoadedFacets.
+- Registry composition is eager rather than upstream lazy. Last-good ownership,
+  failure/end propagation and report deduplication have narrower coverage. Host
+  follow failure/end does not reproduce every attempt-restart rule; job activity
+  changes do not independently republish the host activity snapshot.
+- Replica messages waiting for acknowledgement are queued rather than coalesced
+  under a hard memory bound. Separate initial binds are not aggregated across
+  objects. Large-peer and hostile-peer scheduling/resource parity is unproven.
+- Locale canonicalization/direction uses a bounded Rust implementation, not full
+  Intl/CLDR data. Number/date/time formatting is not ported. Theme/translation registry
+  facet helpers and complete fallback-report deduplication remain to be wired.
+- Connection and web modules emit adapter effects rather than running an actual
+  browser/launcher. Stylesheet timeout driving, complete bootstrap/environment
+  wiring and native GUI behavior are not established by these tests.
+
+## Milestone 2.1b-2: native platform checkpoint
+
+Updated 2026-11-22 UTC. This is a partial implementation, NOT completion of
+Milestone 2.1 and NOT permission to treat its dependent packages as unblocked.
+Only this crate's `src/`, `tests/`, `wit/`, and this record were authored.
+Shared manifests, lockfile, tracking files, upstream sources and sibling crates
+were not edited. Existing dirty work was retained. No commit or push was run.
+
+### Acceptance gates
+
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| Formatting | PASS | Exact brief command, `chord-b2-final-fmt.txt` |
+| Warning-free lint | PASS | Exact offline all-target command, zero warnings, 50.37s wall time |
+| Complete offline suite | PASS | 163 passed, zero failed/ignored, 9.32s summed execution, 325.52s including build |
+| Compression, HTTP and live WebSocket RPC | PASS, bounded | Raw deflate bounds/corruption, live admission/wraps/headers, signed cookies, file containment/ranges, remote call and readable updates |
+| Plugin component engine and reload | PASS, bounded | Real Component instantiation, checked-in WIT bindgen, native SHA identity/reuse, holdback, discovery and filesystem notifications |
+| Native worker lifecycle | PASS, bounded | Actual Rust child demand/start/plugin delivery/echo/idle stop/crash retention, IPC bounds and kernel lock exclusion |
+| App boot, metadata and native file persistence | PASS, bounded | Server/worker boot, AppInfo/WorkerInfo, owner/pair/invite/ephemeral HTTP flows, restart, versions/uploads/folders and archive staging roundtrip |
+| Surface HTTP, host scripts and terminal protocol | PASS, bounded | Real HTTP artifact and Host scripts readable, holdback, fragmented framing, filtering and private credentials |
+| New-test mutation sensitivity | PASS | All 20 failed under deliberate behavior faults, all 17 source/WIT hashes restored, final 163 passed |
+| Complete required platform orchestration | FAIL | Address data management, registry adapters, build/bootstrap and launcher integration remain below |
+
+### Implemented boundaries
+
+- `node::compression`: raw DEFLATE level 1 and bounded complete-stream inflate.
+- `node::http`: native Axum HTTP/WebSocket listener, ordered routes/wrap phases,
+  authenticators, origin/Host/relay admission, CSP and security headers, HMAC cookies,
+  canonical static-file containment, ETag/ranges/HEAD, binary links into Host RPC.
+  Output queues and frame sizes are bounded. Ephemeral socket leases release on drop.
+- `node::plugins`: compiled-in facets and Component Model guests with checked-in
+  `wit/plugin.wit`, JSON state/method declarations, fuel and store limits, no WASI,
+  SHA-256 identities, failed-successor holdback through the existing Host staging,
+  directory/package discovery and debounced bounded native filesystem notifications.
+- `node::workers`: framed native child IPC, digest-checked plugin shipments,
+  demand-start handles, readiness/idle/shutdown deadlines, sticky crash failure,
+  explicit retry and private kernel-owned advisory lockfiles. Worker sessions own
+  their pump tasks and release process locks on drop.
+- `node::surfaces` and `node::tui`: content-addressed prebuilt artifacts, retained
+  old publications, script manifests/HTTP serving, native pipe framing, output
+  filtering, create-only private credentials and `pi-rs-tui` launcher actions.
+- `node::app`: private layout/store setup, server/worker lifetime, metadata facets,
+  persisted redacted sign-in listing and token hashes, one-use owner/pair/invite
+  flows, short-lived logins, native versioned Files/FilesFolder/blob/upload APIs,
+  checksummed bounded tar parsing and validated archive-to-staging import.
+
+### Verification evidence
+
+Tests added: 20. Tests removed: 0. Baseline: 143 passed, 8.66s summed test execution
+and 531.17s including the initial dependency build. Final: 163 passed, zero failed
+or ignored, 9.32s summed execution and 325.52s including rebuilding the crate's test
+binaries. Execution times on this shared machine are not performance comparisons.
+All three exact brief commands passed in `chord-b2-final-gates`, with the required
+`/var/tmp/pi-rs-target-jcode` target directory and offline flags.
+Logs are in `$HOME/.jcode/scratch/chord-b2-*.txt`.
+
+Mutation campaign: all 20 new tests failed with deliberately broken bounds/corruption
+classification, cookie MAC verification, cache headers, range status, WebSocket auth,
+plugin discovery/digests/component admission/watcher delivery, worker bytes/locks,
+surface holdback, terminal bounds/credential replacement, file reads and tar checksum.
+Faults were applied together, not independently scored. App boot tests detected the
+lock fault before the additional metadata mutation. All 20 test names reported
+failure. SHA-256 checks restored every one of the 17 recorded source/WIT files
+byte-for-byte before the successful final run. The fault run took 37.56s including
+rebuild. The checked-in standalone worker fixture is Rust and was exercised as an
+actual child process, not a process mock.
+
+Acceptance runs found and corrected root document writes with empty paths,
+non-idempotent Files index declarations on reopening, incorrect local contract
+variants, delayed terminal frame-length validation, and a worker test that assumed
+control readiness preceded the binary link hello. Readiness tests now have deadlines.
+
+### Honest fidelity limits and next action
+
+- Full upstream reference/test replay and complete external-contract equivalence
+  have not been established. The prior Host/remote JSON-only, keyed/event/bytes,
+  destination routing, job activity and historical-contract limits still apply.
+- Native HTTP contributions are callback APIs, not an implementation of every
+  upstream Http registry facet. Contributions close all retained links on changes.
+  WSS client support is not enabled by the supplied dependency features.
+- Guest declarations currently support local singleton JSON state and methods.
+  The offline component test instantiates a real empty Component Model binary and
+  rejects missing plugin-world exports. It does not execute a full guest plugin.
+  Per-host reload uses Host staging, but rollout over multiple runtimes is sequential,
+  not one atomic distributed publication. Discovery does not implement all globs,
+  install/build conventions or the complete upstream package metadata model.
+- Surfaces accept already-built Rust/WASM/native artifacts. A Rust-to-WASM build,
+  actual browser bootstrap and full native terminal subprocess/TTY event loop are
+  not implemented. Clipboard/open/attach/fetch actions remain caller-driven effects.
+- AppServer does not compose worker-kind routing/demand or HostData owner retirement.
+  Users, host-bound Files/FilesFolder keyed/bytes facets and per-address running-worker
+  export, active import/swap and delete are not implemented. Native Files methods do
+  not substitute for those external contracts. Folder views lack upstream paging
+  and persisted summary documents. Upload expiry is explicitly driven by the caller.
+- Archive APIs buffer whole entries instead of streaming. The staging roundtrip
+  restores the full supplied store and finished blobs, but optional `server.archive`
+  is only carried as bytes. It is not a complete format-2 host ownership transfer and
+  must not be represented as compatible app export/import/delete per address.
+- Linux was exercised. macOS/Windows compilation, ownership checks beyond Linux,
+  filesystem race hardening and upstream resource-cost parity remain unverified.
+
+Next: finish the FAIL gate, starting with HostData address ownership operations and
+worker routing, then registry-facing Files/HTTP and real launcher/build/bootstrap
+wiring. Do not mark Milestone 2.1 complete from this bounded checkpoint.

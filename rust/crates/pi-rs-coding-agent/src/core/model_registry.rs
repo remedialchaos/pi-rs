@@ -548,6 +548,11 @@ fn apply_provider_config(
         }
     }
 
+    // Models validates the provider's wire APIs before invoking the shared
+    // adapter. A configured model may use a different API than the catalog.
+    provider
+        .chat_apis
+        .extend(chat.iter().map(|model| model.api.clone()));
     let mut models = other;
     models.extend(chat.into_iter().map(pi_rs_ai::AnyModel::Chat));
     provider.models = models.into();
@@ -566,7 +571,14 @@ pub fn apply_config(
     for (id, config) in &config.providers {
         let mut provider = models.get_provider(id).unwrap_or_else(|| {
             let name = config.name.clone().unwrap_or_else(|| id.clone());
-            Provider::new(id.clone(), name)
+            let mut provider = Provider::new(id.clone(), name);
+            // The runtime supplies the resolved API key from models.json or
+            // the CLI; the same adapter also accepts saved API credentials.
+            provider.auth.api_key = Some(pi_rs_ai::providers::env_api_key_auth(
+                provider.name.clone(),
+                std::iter::empty::<&str>(),
+            ));
+            provider
         });
         if provider.models.is_empty() && config.models.is_empty() && config.api.is_none() {
             return Err(format!(

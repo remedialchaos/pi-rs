@@ -8,9 +8,21 @@ license = "MIT"
 [dependencies]
 pi-rs-schema = { path = "../pi-rs-schema" }
 pi-rs-telemetry = { path = "../pi-rs-telemetry" }
+pi-rs-tui = { path = "../pi-rs-tui" }
+axum = { version = "0.8", features = ["ws"] }
+http = "1"
+notify = "9"
 rusqlite = { version = "0.40", features = ["bundled"] }
 flate2 = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = "0.29"
+tower = "0.5"
+wasmtime = { version = "=50.0.2", default-features = false, features = ["std", "runtime", "cranelift", "component-model", "async"] }
+futures-util = "0.3"
+bytes = "1"
+base64 = "0.22"
+hmac = "0.12"
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "raw_value"] }
 indexmap = { version = "2", features = ["serde"] }

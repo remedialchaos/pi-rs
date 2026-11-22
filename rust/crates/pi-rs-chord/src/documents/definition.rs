@@ -67,6 +67,15 @@ impl Definition {
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
+    pub fn is_persisted(&self) -> bool {
+        self.persist
+    }
+    pub fn is_singleton(&self) -> bool {
+        matches!(self.keyed, KeyedBy::Singleton)
+    }
+    pub(crate) fn validate(&self, value: &JsonValue) -> Result<()> {
+        self.check(value, "state")
+    }
     pub fn keyed(mut self, keyed: KeyedBy) -> Self {
         self.keyed = keyed;
         self
@@ -122,7 +131,7 @@ impl Definition {
     pub(super) fn checkpoint(&self, value: &JsonValue, ops: &[Op], deltas: usize) -> bool {
         (self.checkpoint)(value, ops, deltas)
     }
-    pub(super) fn compatible(&self, next: &Definition) -> Result<()> {
+    pub(crate) fn compatible(&self, next: &Definition) -> Result<()> {
         let same_keyed = matches!(
             (&self.keyed, &next.keyed),
             (KeyedBy::Singleton, KeyedBy::Singleton) | (KeyedBy::String, KeyedBy::String)

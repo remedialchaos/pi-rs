@@ -1,0 +1,364 @@
+use super::*;
+use crate::node::{
+    http::{Http, HttpOptions, HttpServer},
+    plugins::{PluginRuntime, PluginScript},
+    surfaces::Surface,
+    workers::{Control, ProcessLock, WorkerSession},
+};
+use crate::{
+    context::Context,
+    contracts::{Contract, Member, schema as s},
+    host::{
+        Facet, Host, HostOptions, Members, PluginFacet, ServeOptions, create_host, define_facet,
+    },
+    json::JsonValue,
+    remote::{RemoteOptions, RemotePeer},
+    sqlite::{Options, SqliteDatabase},
+    store::StoreEngine,
+};
+use indexmap::IndexMap;
+use serde_json::{Value, json};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+pub fn app_info_contract() -> Result<Contract> {
+    Contract::local(
+        "chord.app.info",
+        2,
+        vec![],
+        IndexMap::from([
+            ("dataDir".into(), Member::State(s::str())),
+            ("name".into(), Member::State(s::str())),
+            ("version".into(), Member::State(s::str())),
+            ("owner".into(), Member::State(s::unknown())),
+        ]),
+    )
+}
+pub fn worker_info_contract() -> Result<Contract> {
+    Contract::local(
+        "chord.app.worker-info",
+        1,
+        vec![],
+        IndexMap::from([
+            (
+                "address".into(),
+                Member::State(s::obj([
+                    ("kind", s::required(s::str())),
+                    ("key", s::required(s::str())),
+                    ("params", s::required(s::unknown())),
+                ])),
+            ),
+            ("start".into(), Member::State(s::unknown())),
+        ]),
+    )
+}
+fn info_facet(contract: Contract, values: IndexMap<String, Value>) -> Facet {
+    let contract = Arc::new(contract);
+    define_facet(move |host| {
+        let values = values.clone();
+        host.serve(
+            contract.clone(),
+            move |_, _, self_| {
+                let mut members = Members::new();
+                for (name, value) in &values {
+                    members.state(name, self_.writable(JsonValue::from_serde(value.clone()))?)?;
+                }
+                Ok(members)
+            },
+            ServeOptions::default(),
+        )
+    })
+}
+pub struct AppOptions {
+    pub name: String,
+    pub version: String,
+    pub data_dir: PathBuf,
+    pub listen: SocketAddr,
+    pub owner: Value,
+    pub principal: Value,
+    pub core: Vec<PluginFacet>,
+    pub plugins: Vec<PluginScript>,
+    pub surfaces: Vec<Surface>,
+    pub files: FilesCaps,
+}
+impl AppOptions {
+    pub fn new(name: &str, data_dir: PathBuf, owner: Value, principal: Value) -> Self {
+        Self {
+            name: name.into(),
+            version: "1".into(),
+            data_dir,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            owner,
+            principal,
+            core: vec![],
+            plugins: vec![],
+            surfaces: vec![],
+            files: FilesCaps::default(),
+        }
+    }
+}
+pub struct AppServer {
+    pub host: Host,
+    pub http: Http,
+    pub layout: AppLayout,
+    pub store: StoreEngine,
+    pub files: Files,
+    pub sign_ins: SignIns,
+    pub plugins: PluginRuntime,
+    pub address: SocketAddr,
+    pub owner_link: String,
+    listener: Option<HttpServer>,
+    _lock: ProcessLock,
+    name: String,
+    version: String,
+}
+pub async fn start_server(options: AppOptions) -> Result<AppServer> {
+    crate::contracts::check_name(&options.name, "app name")?;
+    if options.owner == options.principal || options.owner.is_null() {
+        return Err(Error::Invalid(
+            "owner must differ from server principal".into(),
+        ));
+    }
+    let layout = AppLayout::create(&options.data_dir)?;
+    let lock = ProcessLock::try_acquire(&layout.data_dir.join("server.lock"))?
+        .ok_or_else(|| Error::Invalid("server data directory is already in use".into()))?;
+    let db = SqliteDatabase::open(&layout.server_store, Options::default()).await?;
+    let store = StoreEngine::open(db.clone()).await?;
+    let host = create_host(HostOptions {
+        principal: Some(options.principal),
+        address: Some(JsonValue::from_serde(
+            json!({"kind":"server","key":"server","params":{}}),
+        )),
+        store: Some(store.clone()),
+        ..Default::default()
+    })?;
+    let result = async {
+        let sign_ins = SignIns::open(
+            store.clone(),
+            options.owner.clone(),
+            secret_file(&layout.cookie_secret)?,
+        )
+        .await?;
+        sign_ins.owner_token_file(&layout.owner_token).await?;
+        let owner_link = sign_ins.owner_link();
+        let files = Files::open(store.clone(), layout.server.join("files"), options.files).await?;
+        let mut core = options.core;
+        core.push(PluginFacet::new("chord.app.sign-ins", sign_ins.facet()?));
+        core.push(PluginFacet::new(
+            "chord.app.info",
+            info_facet(
+                app_info_contract()?,
+                IndexMap::from([
+                    ("dataDir".into(), json!(layout.data_dir)),
+                    ("name".into(), json!(options.name)),
+                    ("version".into(), json!(options.version)),
+                    ("owner".into(), options.owner),
+                ]),
+            ),
+        ));
+        for surface in &options.surfaces {
+            core.push(PluginFacet::new(
+                format!("chord.surface.{}", surface.manifest().base),
+                surface.facet()?,
+            ));
+        }
+        let (plugins, report) =
+            PluginRuntime::load(host.clone(), core, options.plugins, &Context::background())
+                .await?;
+        if !report.failed.is_empty() {
+            return Err(Error::Invalid(format!(
+                "server facets failed: {:?}",
+                report.failed
+            )));
+        }
+        let opened = sign_ins.clone();
+        let http = Http::new(
+            host.clone(),
+            HttpOptions {
+                opened: Arc::new(move |request| opened.opened(request)),
+                ..Default::default()
+            },
+        );
+        http.contribute(
+            sign_ins
+                .contribution()
+                .map_err(|e| Error::Invalid(e.to_string()))?,
+        )
+        .map_err(|e| Error::Invalid(e.to_string()))?;
+        for surface in options.surfaces {
+            http.contribute(
+                surface
+                    .contribution(false)
+                    .map_err(|e| Error::Invalid(e.to_string()))?,
+            )
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        }
+        let listener = http
+            .listen(options.listen)
+            .await
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        Ok((sign_ins, owner_link, files, plugins, http, listener))
+    }
+    .await;
+    match result {
+        Ok((sign_ins, owner_link, files, plugins, http, listener)) => Ok(AppServer {
+            host,
+            http,
+            layout,
+            store,
+            files,
+            sign_ins,
+            plugins,
+            address: listener.address,
+            owner_link,
+            listener: Some(listener),
+            _lock: lock,
+            name: options.name,
+            version: options.version,
+        }),
+        Err(error) => {
+            let _ = host.close(&Context::background()).await;
+            let _ = db.close().await;
+            Err(error)
+        }
+    }
+}
+impl AppServer {
+    pub async fn export_server(&self) -> Result<Vec<u8>> {
+        pack_data(
+            ArchiveManifest {
+                format: 2,
+                app: self.name.clone(),
+                api: self.version.clone(),
+                address: ArchiveAddress {
+                    kind: "server".into(),
+                    key: "server".into(),
+                },
+            },
+            &self.store,
+            self.files.directory(),
+            None,
+        )
+        .await
+    }
+    pub async fn close(mut self) -> Result<()> {
+        self.host.close(&Context::background()).await?;
+        if let Some(listener) = self.listener.take() {
+            listener
+                .close()
+                .await
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+        }
+        self.sign_ins.close();
+        self.store.database().close().await
+    }
+}
+pub struct WorkerAppOptions {
+    pub directory: PathBuf,
+    pub principal: Value,
+    pub server_principal: Value,
+    pub core: Vec<PluginFacet>,
+    pub files: FilesCaps,
+}
+pub struct WorkerApp {
+    pub host: Host,
+    pub store: StoreEngine,
+    pub files: Files,
+    pub plugins: PluginRuntime,
+    pub session: WorkerSession,
+    _parent: RemotePeer,
+}
+pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> Result<WorkerApp> {
+    private_directory(&options.directory)?;
+    let path = options.directory.join("store.sqlite");
+    private_store(&path)?;
+    let db = SqliteDatabase::open(path, Options::default()).await?;
+    let store = StoreEngine::open(db.clone()).await?;
+    let host = create_host(HostOptions {
+        principal: Some(options.principal),
+        address: Some(JsonValue::from_serde(session.address.clone())),
+        store: Some(store.clone()),
+        ..Default::default()
+    })?;
+    let result = async {
+        let parent = host.accept(
+            session.parent.clone(),
+            RemoteOptions::new(options.server_principal),
+        )?;
+        let files = Files::open(
+            store.clone(),
+            options.directory.join("files"),
+            options.files,
+        )
+        .await?;
+        let mut core = options.core;
+        core.push(PluginFacet::new(
+            "chord.app.worker-info",
+            info_facet(
+                worker_info_contract()?,
+                IndexMap::from([
+                    ("address".into(), session.address.clone()),
+                    ("start".into(), session.start.clone()),
+                ]),
+            ),
+        ));
+        let scripts = session
+            .scripts
+            .iter()
+            .map(|s| PluginScript::wasm(&s.name, s.bytes.clone(), false))
+            .collect();
+        let (plugins, _) =
+            PluginRuntime::load(host.clone(), core, scripts, &Context::background()).await?;
+        let activity = host.activity().value();
+        session
+            .report(Control::Ready {
+                idle: activity.references + activity.jobs + activity.lingering == 0,
+            })
+            .await?;
+        Ok((parent, files, plugins))
+    }
+    .await;
+    match result {
+        Ok((parent, files, plugins)) => Ok(WorkerApp {
+            host,
+            store,
+            files,
+            plugins,
+            session,
+            _parent: parent,
+        }),
+        Err(error) => {
+            let _ = host.close(&Context::background()).await;
+            let _ = db.close().await;
+            Err(error)
+        }
+    }
+}
+impl WorkerApp {
+    pub async fn run(mut self) -> Result<()> {
+        let mut interval = tokio::time::interval(Duration::from_millis(50));
+        let mut idle = None;
+        loop {
+            tokio::select! {
+                control=self.session.controls.recv()=>match control {
+                    None|Some(Control::Shutdown)=>break,
+                    Some(Control::Reload { scripts }) => {
+                        let valid = scripts.iter().all(|script| script.validate().is_ok());
+                        let control = if valid {
+                            let scripts = scripts.into_iter().map(|script| PluginScript::wasm(script.name, script.bytes, false)).collect();
+                            match self.plugins.reload(scripts, &Context::background()).await {
+                                Ok(report) if report.failed.is_empty() => Control::Reloaded,
+                                _ => Control::ReloadFailed { message: "worker plugin reload failed".into() },
+                            }
+                        } else {
+                            Control::ReloadFailed { message: "worker plugin digest mismatch".into() }
+                        };
+                        self.session.report(control).await?;
+                    },
+                    _ => {}
+                },
+                _=interval.tick()=>{if self.session.parent.closed(){break;}let activity=self.host.activity().value();let next=activity.references+activity.jobs+activity.lingering==0;if idle!=Some(next){idle=Some(next);self.session.report(Control::Idle {idle:next}).await?;}}
+            }
+        }
+        self.host.close(&Context::background()).await?;
+        self.store.database().close().await
+    }
+}

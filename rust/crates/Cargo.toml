@@ -10,6 +10,8 @@ members = [
     "pi-rs-agent",
     "pi-rs-coding-agent",
     "pi-rs-chord",
+    "pi-rs-env",
+    "pi-rs-evals",
     "pi-rs-p2-mac",
     "pi-rs-voice-server",
 ]

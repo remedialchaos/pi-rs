@@ -46,6 +46,7 @@ pub struct ResolvedCommand {
     pub name: String,
     pub invocation_name: String,
     pub definition: CommandDefinition,
+    pub extension_path: String,
 }
 
 /// Owns loaded extensions and applies the upstream registration rules.
@@ -113,6 +114,13 @@ impl ExtensionRunner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub(crate) fn replace_loaded_extensions(&self, extensions: Vec<Arc<dyn Extension>>) {
+        *self
+            .extensions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = extensions;
     }
 
     pub fn extension_paths(&self) -> Vec<String> {
@@ -364,7 +372,7 @@ impl ExtensionRunner {
         let mut counts = IndexMap::new();
         for extension in self.extensions() {
             for command in extension.registration().commands.values() {
-                commands.push(command.clone());
+                commands.push((command.clone(), extension.path().to_owned()));
                 *counts.entry(command.name.clone()).or_insert(0usize) += 1;
             }
         }
@@ -372,7 +380,7 @@ impl ExtensionRunner {
         let mut seen = IndexMap::new();
         let mut taken = BTreeSet::new();
         let mut resolved = Vec::new();
-        for command in commands {
+        for (command, extension_path) in commands {
             let occurrence = seen.entry(command.name.clone()).or_insert(0usize);
             *occurrence += 1;
             let mut invocation = if counts.get(&command.name).copied().unwrap_or(0) > 1 {
@@ -390,6 +398,7 @@ impl ExtensionRunner {
                 name: command.name.clone(),
                 invocation_name: invocation,
                 definition: command,
+                extension_path,
             });
         }
         *self
@@ -424,14 +433,38 @@ impl ExtensionRunner {
         let owner = self
             .extensions()
             .into_iter()
-            .find(|extension| {
-                extension
-                    .registration()
-                    .commands
-                    .contains_key(&command.name)
-            })
+            .find(|extension| extension.path() == command.extension_path)
             .ok_or_else(|| format!("command owner missing: {invocation_name}"))?;
         owner.run_command(&command.name, args, context).await
+    }
+
+    pub(crate) async fn execute_shortcut(
+        &self,
+        shortcut: &ShortcutDefinition,
+        context: &super::types::ExtensionCommandContext,
+    ) -> Result<(), String> {
+        self.host.assert_active()?;
+        let handler = self
+            .extensions()
+            .into_iter()
+            .find_map(|extension| {
+                (extension.path() == shortcut.extension_path)
+                    .then(|| {
+                        extension
+                            .registration()
+                            .shortcut_handlers
+                            .get(&shortcut.key)
+                            .cloned()
+                    })
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                format!(
+                    "No handler registered for extension shortcut '{}'",
+                    shortcut.key
+                )
+            })?;
+        handler(String::new(), context.clone()).await
     }
 
     pub fn get_message_renderer(&self, custom_type: &str) -> Option<String> {

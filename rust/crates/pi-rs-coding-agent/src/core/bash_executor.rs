@@ -6,13 +6,16 @@
 //! `core::tools::truncate::truncate_tail`. When output exceeds the buffer the
 //! complete sanitized text is persisted to a temp file.
 
-use std::io::Write as _;
-use std::path::Path;
-use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
-
 use pi_rs_agent::CancellationToken;
-use tokio::io::AsyncReadExt;
+use std::{
+    collections::VecDeque,
+    fs::File,
+    io::Write as _,
+    path::{Path, PathBuf},
+    process::{ExitStatus, Stdio},
+    sync::Arc,
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{Duration, sleep, timeout};
 
@@ -20,7 +23,7 @@ use super::tools::bash::EXIT_STDIO_GRACE_MS;
 use super::tools::truncate::{DEFAULT_MAX_BYTES, TruncationOptions, truncate_tail};
 use crate::utils::ansi::{split_incomplete_ansi_suffix, strip_ansi};
 use crate::utils::output_files::create_output_file_stream;
-use crate::utils::shell::sanitize_binary_output;
+use crate::utils::shell::{CommandTransport, get_shell_config, sanitize_binary_output};
 
 /// Maximum number of sanitized bytes retained in the rolling buffer.
 pub const MAX_OUTPUT_BYTES: usize = DEFAULT_MAX_BYTES * 2;
@@ -34,6 +37,7 @@ pub struct BashExecutorOptions {
     pub timeout_ms: Option<u64>,
     pub cancel: Option<CancellationToken>,
     pub on_chunk: Option<ChunkCallback>,
+    pub shell_path: Option<String>,
 }
 
 /// Result of a bash execution.
@@ -77,31 +81,149 @@ pub fn flush_pending(pending: &mut String, on_chunk: &Option<ChunkCallback>) -> 
     text
 }
 
-fn push_rolling(chunks: &mut Vec<String>, bytes: &mut usize, discarded: &mut bool, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    chunks.push(text.to_string());
+fn push_rolling(
+    chunks: &mut VecDeque<String>,
+    bytes: &mut usize,
+    discarded: &mut bool,
+    text: String,
+) {
     *bytes += text.len();
+    chunks.push_back(text);
     while *bytes > MAX_OUTPUT_BYTES && chunks.len() > 1 {
-        let removed = chunks.remove(0);
-        *bytes = bytes.saturating_sub(removed.len());
-        *discarded = true;
+        if let Some(removed) = chunks.pop_front() {
+            *bytes -= removed.len();
+            *discarded = true;
+        }
     }
 }
 
-fn shell_command() -> (String, Vec<&'static str>) {
-    #[cfg(windows)]
-    {
-        ("bash".to_string(), vec!["-c"])
-    }
-    #[cfg(not(windows))]
-    {
-        if Path::new("/bin/bash").exists() {
-            ("/bin/bash".to_string(), vec!["-c"])
-        } else {
-            ("sh".to_string(), vec!["-c"])
+#[derive(Default)]
+struct Capture {
+    chunks: VecDeque<String>,
+    raw_bytes: usize,
+    bytes: usize,
+    discarded: bool,
+    ansi: String,
+    file: Option<(PathBuf, File)>,
+}
+
+impl Capture {
+    fn ensure_file(&mut self) -> Result<(), String> {
+        if self.file.is_none() {
+            let (path, mut file) =
+                create_output_file_stream("pi-bash", ".log").map_err(|error| error.to_string())?;
+            for chunk in &self.chunks {
+                file.write_all(chunk.as_bytes())
+                    .map_err(|error| error.to_string())?;
+            }
+            self.file = Some((path, file));
         }
+        Ok(())
+    }
+
+    fn push(&mut self, text: String, callback: &Option<ChunkCallback>) -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if self.raw_bytes > DEFAULT_MAX_BYTES {
+            self.ensure_file()?;
+        }
+        if let Some((_, file)) = &mut self.file {
+            file.write_all(text.as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(callback) = callback {
+            callback(&text);
+        }
+        push_rolling(&mut self.chunks, &mut self.bytes, &mut self.discarded, text);
+        Ok(())
+    }
+
+    fn ingest(&mut self, bytes: &[u8], callback: &Option<ChunkCallback>) -> Result<(), String> {
+        self.raw_bytes += bytes.len();
+        let valid = String::from_utf8_lossy(bytes);
+        let text = sanitize_chunk(&valid, &mut self.ansi);
+        self.push(text, callback)
+    }
+}
+
+struct Pipe<R> {
+    reader: Option<R>,
+    buf: [u8; 8192],
+    pending: usize,
+}
+
+impl<R: AsyncRead + Unpin> Pipe<R> {
+    fn new(reader: Option<R>) -> Self {
+        Self {
+            reader,
+            buf: [0; 8192],
+            pending: 0,
+        }
+    }
+
+    fn ingest(
+        &mut self,
+        read: usize,
+        capture: &mut Capture,
+        callback: &Option<ChunkCallback>,
+    ) -> Result<(), String> {
+        let end = self.pending + read;
+        if read == 0 {
+            self.reader = None;
+            self.pending = 0;
+            return capture.ingest(&self.buf[..end], callback);
+        }
+        let mut complete = end;
+        // A UTF-8 scalar may straddle pipe reads. Carry its prefix, not the preceding data.
+        if let Some(start) = self.buf[..end]
+            .iter()
+            .rposition(|&byte| byte & 0xc0 != 0x80)
+            && end - start < 4
+            && std::str::from_utf8(&self.buf[start..end])
+                .is_err_and(|error| error.error_len().is_none())
+        {
+            complete = start;
+        }
+        capture.ingest(&self.buf[..complete], callback)?;
+        self.buf.copy_within(complete..end, 0);
+        self.pending = end - complete;
+        Ok(())
+    }
+
+    async fn read_chunk(&mut self) -> Result<usize, String> {
+        let Some(reader) = &mut self.reader else {
+            return Ok(0);
+        };
+        reader
+            .read(&mut self.buf[self.pending..])
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct ChildTree(Option<u32>);
+
+impl ChildTree {
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.take().and_then(|pid| i32::try_from(pid).ok()) {
+            use nix::{
+                sys::signal::{Signal, killpg},
+                unistd::Pid,
+            };
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(pid) = self.0.take() {
+            let _ = crate::utils::child_process::kill_process_tree(pid);
+        }
+    }
+}
+
+impl Drop for ChildTree {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -129,34 +251,51 @@ impl BashExecutor {
                 cwd.display()
             ));
         }
-        let (shell, args) = shell_command();
-        let mut child = Command::new(shell)
-            .args(args)
-            .arg(command)
+        if options
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Ok(BashOutput {
+                cancelled: true,
+                ..BashOutput::default()
+            });
+        }
+        let shell = get_shell_config(options.shell_path.as_deref())?;
+        let mut process = Command::new(shell.shell);
+        process
+            .args(shell.args)
             .current_dir(cwd)
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        match shell.command_transport {
+            CommandTransport::Argv => {
+                process.arg(command).stdin(Stdio::null());
+            }
+            CommandTransport::Stdin => {
+                process.stdin(Stdio::piped());
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            process.as_std_mut().process_group(0);
+        }
+        let mut child = process
             .spawn()
             .map_err(|error| format!("Failed to spawn bash: {error}"))?;
-
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-        let mut stdout_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = stdout_pipe {
-                let _ = pipe.read_to_end(&mut bytes).await;
+        let mut children = ChildTree(child.id());
+        let mut stdout = Pipe::new(child.stdout.take());
+        let mut stderr = Pipe::new(child.stderr.take());
+        let mut stdin = child.stdin.take();
+        let input = async {
+            if let Some(stdin) = &mut stdin {
+                let _ = stdin.write_all(command.as_bytes()).await;
+                let _ = stdin.shutdown().await;
             }
-            bytes
-        });
-        let mut stderr_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = stderr_pipe {
-                let _ = pipe.read_to_end(&mut bytes).await;
-            }
-            bytes
-        });
+            std::future::pending::<()>().await;
+        };
 
         let timeout_future = async {
             match options.timeout_ms {
@@ -176,82 +315,82 @@ impl BashExecutor {
                 None => std::future::pending::<bool>().await,
             }
         };
-        let outcome = tokio::select! {
-            result = child.wait() => WaitOutcome::Status(result),
-            _ = timeout_future => WaitOutcome::TimedOut,
-            _ = cancel_future => WaitOutcome::Cancelled,
-        };
-        let mut timed_out = matches!(outcome, WaitOutcome::TimedOut);
-        let mut cancelled = matches!(outcome, WaitOutcome::Cancelled);
-        if !matches!(outcome, WaitOutcome::Status(_)) {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-        let status = match outcome {
-            WaitOutcome::Status(result) => {
-                Some(result.map_err(|error| format!("Failed to wait for bash: {error}"))?)
+        let mut capture = Capture::default();
+        let outcome = {
+            let pump = async {
+                while stdout.reader.is_some() || stderr.reader.is_some() {
+                    tokio::select! {
+                        read = stdout.read_chunk(), if stdout.reader.is_some() => stdout.ingest(read?, &mut capture, &options.on_chunk)?,
+                        read = stderr.read_chunk(), if stderr.reader.is_some() => stderr.ingest(read?, &mut capture, &options.on_chunk)?,
+                    }
+                }
+                Ok::<_, String>(())
+            };
+            let wait = async {
+                tokio::select! {
+                    result = child.wait() => WaitOutcome::Status(result),
+                    _ = timeout_future => {
+                        children.kill();
+                        let _ = child.kill().await;
+                        WaitOutcome::TimedOut
+                    }
+                    _ = cancel_future => {
+                        children.kill();
+                        let _ = child.kill().await;
+                        WaitOutcome::Cancelled
+                    }
+                    () = input => WaitOutcome::Cancelled,
+                }
+            };
+            tokio::pin!(pump, wait);
+            tokio::select! {
+                outcome = &mut wait => {
+                    if let Ok(result) = timeout(Duration::from_millis(EXIT_STDIO_GRACE_MS), &mut pump).await {
+                        result?;
+                    }
+                    outcome
+                }
+                result = &mut pump => { result?; wait.await }
             }
+        };
+        if matches!(&outcome, WaitOutcome::Status(_)) {
+            // A successful shell may have intentionally detached a child; cancellation alone
+            // should terminate the process tree.
+            children.0 = None;
+        }
+        let pending = flush_pending(&mut capture.ansi, &None);
+        capture.push(pending, &options.on_chunk)?;
+        let mut output = String::with_capacity(capture.bytes);
+        for chunk in &capture.chunks {
+            output.push_str(chunk);
+        }
+        let snapshot = truncate_tail(&output, &TruncationOptions::default());
+        if snapshot.truncated {
+            capture.ensure_file()?;
+        }
+        let cancelled = matches!(&outcome, WaitOutcome::Cancelled)
+            || options
+                .cancel
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled);
+        let exit_code = match outcome {
+            WaitOutcome::Status(status) => status
+                .map_err(|error| format!("Failed to wait for bash: {error}"))?
+                .code(),
             WaitOutcome::TimedOut | WaitOutcome::Cancelled => None,
         };
-
-        let drain = Duration::from_millis(EXIT_STDIO_GRACE_MS);
-        let stdout_bytes = timeout(drain, &mut stdout_task)
-            .await
-            .ok()
-            .and_then(|result| result.ok())
-            .unwrap_or_default();
-        let stderr_bytes = timeout(drain, &mut stderr_task)
-            .await
-            .ok()
-            .and_then(|result| result.ok())
-            .unwrap_or_default();
-
-        let mut combined = stdout_bytes;
-        combined.extend_from_slice(&stderr_bytes);
-        let full_output = String::from_utf8_lossy(&combined).into_owned();
-
-        let mut pending = String::new();
-        let mut chunks = Vec::new();
-        let mut chunk_bytes = 0;
-        let mut discarded = false;
-        let text = sanitize_chunk(&full_output, &mut pending);
-        push_rolling(&mut chunks, &mut chunk_bytes, &mut discarded, &text);
-        flush_pending(&mut pending, &options.on_chunk);
-        if let Some(callback) = &options.on_chunk {
-            callback(&text);
-        }
-
-        let sanitized = chunks.join("");
-        let snapshot = truncate_tail(&sanitized, &TruncationOptions::default());
-        let mut full_output_path = None;
-        if (discarded || snapshot.truncated)
-            && let Ok((path, mut file)) = create_output_file_stream("pi-bash", ".log")
-            && file.write_all(sanitized.as_bytes()).is_ok()
-        {
-            full_output_path = Some(path.to_string_lossy().into_owned());
-        }
-        if options
-            .cancel
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            cancelled = true;
-            timed_out = false;
-        }
         Ok(BashOutput {
             output: if snapshot.truncated {
                 snapshot.content
             } else {
-                sanitized
+                output
             },
-            exit_code: if cancelled || timed_out {
-                None
-            } else {
-                status.and_then(|status| status.code())
-            },
+            exit_code: exit_code.filter(|_| !cancelled),
             cancelled,
-            truncated: discarded || snapshot.truncated,
-            full_output_path,
+            truncated: capture.discarded || snapshot.truncated,
+            full_output_path: capture
+                .file
+                .map(|(path, _)| path.to_string_lossy().into_owned()),
         })
     }
 }
@@ -280,13 +419,13 @@ mod tests {
 
     #[test]
     fn rolling_buffer_discards_oldest_chunks() {
-        let mut chunks = Vec::new();
+        let mut chunks = VecDeque::new();
         let mut bytes = 0;
         let mut discarded = false;
         let payload = "x".repeat(MAX_OUTPUT_BYTES + 1);
-        push_rolling(&mut chunks, &mut bytes, &mut discarded, &payload);
+        push_rolling(&mut chunks, &mut bytes, &mut discarded, payload);
         assert!(!discarded);
-        push_rolling(&mut chunks, &mut bytes, &mut discarded, "tail");
+        push_rolling(&mut chunks, &mut bytes, &mut discarded, "tail".into());
         assert!(discarded);
     }
 

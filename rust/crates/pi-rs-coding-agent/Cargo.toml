@@ -3,7 +3,11 @@ name = "pi-rs-coding-agent"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Standalone foundation of the pi coding agent (Rust port of packages/coding-agent)"
+description = "Coding agent runtime, modes, and pi CLI (Rust port of packages/coding-agent)"
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
 
 [dependencies]
 pi-rs-schema = { path = "../pi-rs-schema" }
@@ -17,6 +21,7 @@ wasmtime = { version = "=50.0.2", default-features = false, features = ["std", "
 
 async-trait = "0.1"
 base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
 futures-util = "0.3"
 fancy-regex = "0.14"
 globset = "0.4"
@@ -33,9 +38,10 @@ serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "
 sha2 = "0.10"
 similar = { version = "3", features = ["inline"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 unicode-normalization = "0.1"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

@@ -253,6 +253,7 @@ pub enum SourceScope {
 #[serde(rename_all = "lowercase")]
 pub enum SourceOrigin {
     Package,
+    #[serde(rename = "top-level")]
     TopLevel,
 }
 

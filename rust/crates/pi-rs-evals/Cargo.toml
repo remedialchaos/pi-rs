@@ -1,0 +1,28 @@
+[package]
+name = "pi-rs-evals"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Evaluation planner, harness, docker runner, and comparison reporter (Rust port of packages/evals)"
+
+[[bin]]
+name = "pi-evals"
+path = "src/main.rs"
+
+[dependencies]
+pi-rs-ai = { path = "../pi-rs-ai" }
+pi-rs-coding-agent = { path = "../pi-rs-coding-agent" }
+chrono = { version = "0.4", features = ["clock", "serde"] }
+globset = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -74,7 +74,7 @@ pub struct LoadedExtensionSet {
 }
 
 fn is_extension_file(name: &str) -> bool {
-    name.ends_with(".ts") || name.ends_with(".js")
+    name.ends_with(".wasm") || name.ends_with(".ts") || name.ends_with(".js")
 }
 
 /// Resolve the entry points of one extension directory: `package.json` with a
@@ -101,7 +101,7 @@ pub fn resolve_extension_entries(dir: &Path) -> Vec<PathBuf> {
             return resolved;
         }
     }
-    for candidate in ["index.ts", "index.js"] {
+    for candidate in ["index.wasm", "index.ts", "index.js"] {
         let path = dir.join(candidate);
         if path.exists() {
             return vec![path];
