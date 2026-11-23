@@ -44,8 +44,7 @@ impl Invocation {
                         .ok_or_else(|| Error::invalid(format!("Task {id} does not exist")))?
                         .as_ref()
                         .clone();
-                    if current.state != self.record.state
-                        || current.abort_requested != self.record.abort_requested
+                    if current.state != self.record.state || current.abort_requested != self.record.abort_requested
                     {
                         return Err(Error::invalid(format!("Task {id} invocation ended")));
                     }
@@ -61,13 +60,27 @@ impl Invocation {
                     }
                     if let TaskState::Waiting { on, policy, .. } = &state {
                         for child in on {
-                            let target=tx.current_task(*child).await?.ok_or_else(||Error::invalid(format!("Task {child} does not exist")))?;
-                            if *policy==crate::JoinPolicy::FailFast && target.owner!=Some(id) {
-                                return Err(Error::invalid(format!("Task {id} can wait failFast only on tasks it owns; {child} is not one")));
+                            let target = tx
+                                .current_task(*child)
+                                .await?
+                                .ok_or_else(|| Error::invalid(format!("Task {child} does not exist")))?;
+                            if *policy == crate::JoinPolicy::FailFast && target.owner != Some(id) {
+                                return Err(Error::invalid(format!(
+                                    "Task {id} can wait failFast only on tasks it owns; {child} is not one"
+                                )));
                             }
-                            if target.owner!=Some(id) && !matches!(target.state,TaskState::Terminal{..}) && let Some(path)=ownership.wait_cycle(id,*child){
-                                let cycle=std::iter::once(id).chain(path).map(|n|n.to_string()).collect::<Vec<_>>().join(" -> ");
-                                return Err(Error::invalid(format!("Task {id} cannot wait on {child}: {cycle} is a wait cycle")));
+                            if target.owner != Some(id)
+                                && !matches!(target.state, TaskState::Terminal { .. })
+                                && let Some(path) = ownership.wait_cycle(id, *child)
+                            {
+                                let cycle = std::iter::once(id)
+                                    .chain(path)
+                                    .map(|n| n.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(" -> ");
+                                return Err(Error::invalid(format!(
+                                    "Task {id} cannot wait on {child}: {cycle} is a wait cycle"
+                                )));
                             }
                         }
                     }
@@ -214,7 +227,12 @@ impl Harness {
             let (phase_context, cancel) = ctx.with_cancel();
             let mark = record.abort_requested;
             let _observe=self.session.follow_commits(move |publication,_|{
-                if !mark && let crate::session::ObservedCommit::Stored(commit)=publication && commit.changes.iter().any(|change|matches!(change,crate::CommitChange::Task{value} if value.id==id && value.abort_requested)){
+                if !mark
+                    && let crate::session::ObservedCommit::Stored(commit) = publication
+                    && commit.changes.iter().any(|change| matches!(
+                        change, crate::CommitChange::Task { value } if value.id == id && value.abort_requested
+                    ))
+                {
                     cancel.cancel("Task aborted");
                 }
                 Ok(())
@@ -521,52 +539,120 @@ impl Harness {
     async fn reconcile(&self, ctx: &Context) -> Result<()> {
         let registry = self.registry.snapshot();
         self.session.commit(async |tx|{
-            let graph=Ownership::read(tx).await?;
-            let mut changes=std::collections::BTreeMap::new();
-            for record in graph.tasks.values(){
-                let cancelling=record.abort_requested || matches!(&record.state,TaskState::Completing{outcome} if !matches!(outcome,TaskOutcome::Completed{..}));
-                if cancelling{
-                    for child in graph.tasks.values().filter(|child|child.id!=record.id && !child.abort_requested && graph.reaches(Some(Scope::Task(record.id)),Scope::Task(child.id),false)){
-                        let update=changes.entry(child.id).or_insert_with(||child.clone());
-                        update.abort_requested=true;
-                        update.abort_reason=record.abort_reason;
+            let graph = Ownership::read(tx).await?;
+            let mut changes = std::collections::BTreeMap::new();
+            for record in graph.tasks.values() {
+                let cancelling = record.abort_requested
+                    || matches!(&record.state,TaskState::Completing{outcome} if !matches!(outcome,TaskOutcome::Completed{..}));
+                if cancelling {
+                    for child in graph.tasks.values().filter(|child| {
+                        child.id != record.id
+                            && !child.abort_requested
+                            && graph.reaches(Some(Scope::Task(record.id)), Scope::Task(child.id), false)
+                    }) {
+                        let update = changes.entry(child.id).or_insert_with(|| child.clone());
+                        update.abort_requested = true;
+                        update.abort_reason = record.abort_reason;
                     }
                 }
-                if let TaskState::Waiting{on,policy:crate::JoinPolicy::FailFast,..}=&record.state{
-                    let mut failed=false;
-                    for id in on{
-                        if let Some(member)=tx.task(*id).await? && matches!(&member.state,TaskState::Terminal{outcome}|TaskState::Completing{outcome} if !matches!(outcome,TaskOutcome::Completed{..})){failed=true;break;}
+                if let TaskState::Waiting {
+                    on,
+                    policy: crate::JoinPolicy::FailFast,
+                    ..
+                } = &record.state
+                {
+                    let mut failed = false;
+                    for id in on {
+                        if let Some(member) = tx.task(*id).await?
+                            && matches!(
+                                &member.state,
+                                TaskState::Terminal { outcome } | TaskState::Completing { outcome }
+                                    if !matches!(outcome, TaskOutcome::Completed { .. })
+                            )
+                        {
+                            failed = true;
+                            break;
+                        }
                     }
-                    if failed{
-                        for child in on.iter().filter_map(|id|graph.tasks.get(id)).filter(|c|!c.abort_requested){
-                            let update=changes.entry(child.id).or_insert_with(||child.clone());
-                            update.abort_requested=true;
-                            update.abort_reason=None;
+                    if failed {
+                        for child in on
+                            .iter()
+                            .filter_map(|id| graph.tasks.get(id))
+                            .filter(|c| !c.abort_requested)
+                        {
+                            let update = changes.entry(child.id).or_insert_with(|| child.clone());
+                            update.abort_requested = true;
+                            update.abort_reason = None;
                         }
                     }
                 }
-                if let TaskState::Completing{outcome}=&record.state && !graph.has_children(record.id){
-                    changes.entry(record.id).or_insert_with(||record.clone()).state=TaskState::Terminal{outcome:outcome.clone()};
-                } else if !matches!(record.state,TaskState::Completing{..}|TaskState::Running{..}) {
-                    let limit=(self.settings)()["restartLimit"].as_u64().unwrap_or(super::DEFAULT_RESTART_LIMIT);
-                    let blocked=match registry.task(&record.kind) {
-                        None=>Some("missing_task"),
-                        Some(t) if t.version()<record.version=>Some("task_too_old"),
-                        Some(t) if t.version()>record.version && t.definition.migrate.is_none()=>Some("migration_failed"),
-                        _=>None,
+                if let TaskState::Completing { outcome } = &record.state
+                    && !graph.has_children(record.id)
+                {
+                    changes
+                        .entry(record.id)
+                        .or_insert_with(|| record.clone())
+                        .state = TaskState::Terminal {
+                        outcome: outcome.clone(),
                     };
-                    let outcome=if let Some(n)=record.restarts.filter(|n|*n>=limit) && (record.abort_requested || !matches!(record.kind.as_str(),"pi.tool"|"pi.generation"|"pi.compaction")) {
-                        let message=if record.abort_requested {format!("Abort handler of task {} ({}) was cut off {n} times",record.id,record.kind)} else {format!("Task {} ({}) was cut off {n} times without progress",record.id,record.kind)};
-                        Some(TaskOutcome::Faulted{error:TaskOutcomeError{message,detail:Some(serde_json::json!({"reason":"restart_limit"}))}})
+                } else if !matches!(
+                    record.state,
+                    TaskState::Completing { .. } | TaskState::Running { .. }
+                ) {
+                    let limit = (self.settings)()["restartLimit"]
+                        .as_u64()
+                        .unwrap_or(super::DEFAULT_RESTART_LIMIT);
+                    let blocked = match registry.task(&record.kind) {
+                        None => Some("missing_task"),
+                        Some(t) if t.version() < record.version => Some("task_too_old"),
+                        Some(t) if t.version() > record.version && t.definition.migrate.is_none() => {
+                            Some("migration_failed")
+                        }
+                        _ => None,
+                    };
+                    let outcome = if let Some(n) = record.restarts.filter(|n| *n >= limit)
+                        && (record.abort_requested
+                            || !matches!(
+                                record.kind.as_str(),
+                                "pi.tool" | "pi.generation" | "pi.compaction"
+                            )) {
+                        let message = if record.abort_requested {
+                            format!(
+                                "Abort handler of task {} ({}) was cut off {n} times",
+                                record.id, record.kind
+                            )
+                        } else {
+                            format!(
+                                "Task {} ({}) was cut off {n} times without progress",
+                                record.id, record.kind
+                            )
+                        };
+                        Some(TaskOutcome::Faulted {
+                            error: TaskOutcomeError {
+                                message,
+                                detail: Some(serde_json::json!({"reason":"restart_limit"})),
+                            },
+                        })
                     } else if record.abort_requested && record.abort_reason.is_none() {
-                        blocked.map(|reason|TaskOutcome::Orphaned{reason:reason.into()})
-                    } else {None};
-                    if let Some(outcome)=outcome {
-                        changes.entry(record.id).or_insert_with(||record.clone()).state=if graph.has_children(record.id){TaskState::Completing{outcome}}else{TaskState::Terminal{outcome}};
+                        blocked.map(|reason| TaskOutcome::Orphaned {
+                            reason: reason.into(),
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(outcome) = outcome {
+                        changes
+                            .entry(record.id)
+                            .or_insert_with(|| record.clone())
+                            .state = if graph.has_children(record.id) {
+                            TaskState::Completing { outcome }
+                        } else {
+                            TaskState::Terminal { outcome }
+                        };
                     }
                 }
             }
-            for update in changes.into_values(){
+            for update in changes.into_values() {
                 if let TaskState::Terminal { outcome } = &update.state {
                     super::live::settle_scheduler_outcome(tx, &update, outcome).await?;
                 }
@@ -700,42 +786,122 @@ pub struct HarnessInspection {
 
 impl Harness {
     pub async fn inspect(&self, ctx: &Context) -> Result<HarnessInspection> {
-        self.session.commit(async |tx|{
-            let scheduling={let driver=self.driver.state.lock().unwrap_or_else(|e|e.into_inner());if driver.closing{"closing"}else if driver.active.is_some(){"running"}else{"paused"}};
-            let graph=Ownership::read(tx).await?;
-            let registry=self.registry.snapshot();
-            let mut tasks=Vec::new();let now=(self.now)();
-            for record in graph.tasks.values(){
-                let definition=registry.task(&record.kind);
-                let blocked=match definition{
-                    None=>Some("missing_task"),
-                    Some(t) if t.version()<record.version=>Some("task_too_old"),
-                    Some(t) if t.version()>record.version && t.definition.migrate.is_none()=>Some("migration_failed"),
-                    _=>None
-                };
-                let pending=||serde_json::json!({"kind":"pending","migrates":definition.is_some_and(|t|t.version()>record.version)});
-                let state=if let Some(reason)=blocked{serde_json::json!({"kind":"blocked","reason":reason})}else{match &record.state{
-                    TaskState::Running{..}=>serde_json::json!({"kind":"running"}),
-                    TaskState::Completing{..}=>serde_json::json!({"kind":"completing"}),
-                    TaskState::Waiting{on,policy,..} if !record.abort_requested=>{
-                        let live:Vec<_>=on.iter().filter(|id|graph.tasks.contains_key(id)).collect();
-                        if live.is_empty() || (*policy==crate::JoinPolicy::Any && live.len()<on.len()){pending()}else{serde_json::json!({"kind":"waiting","on":live})}
+        self.session
+            .commit(
+                async |tx| {
+                    let scheduling = {
+                        let driver = self.driver.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if driver.closing {
+                            "closing"
+                        } else if driver.active.is_some() {
+                            "running"
+                        } else {
+                            "paused"
+                        }
+                    };
+                    let graph = Ownership::read(tx).await?;
+                    let registry = self.registry.snapshot();
+                    let mut tasks = Vec::new();
+                    let now = (self.now)();
+                    for record in graph.tasks.values() {
+                        let definition = registry.task(&record.kind);
+                        let blocked = match definition {
+                            None => Some("missing_task"),
+                            Some(t) if t.version() < record.version => Some("task_too_old"),
+                            Some(t)
+                                if t.version() > record.version
+                                    && t.definition.migrate.is_none() =>
+                            {
+                                Some("migration_failed")
+                            }
+                            _ => None,
+                        };
+                        let pending = || {
+                            serde_json::json!({
+                                "kind": "pending",
+                                "migrates": definition.is_some_and(|t|t.version()>record.version)
+                            })
+                        };
+                        let state = if let Some(reason) = blocked {
+                            serde_json::json!({"kind":"blocked","reason":reason})
+                        } else {
+                            match &record.state {
+                                TaskState::Running { .. } => serde_json::json!({"kind":"running"}),
+                                TaskState::Completing { .. } => {
+                                    serde_json::json!({"kind":"completing"})
+                                }
+                                TaskState::Waiting { on, policy, .. }
+                                    if !record.abort_requested =>
+                                {
+                                    let live: Vec<_> = on
+                                        .iter()
+                                        .filter(|id| graph.tasks.contains_key(id))
+                                        .collect();
+                                    if live.is_empty()
+                                        || (*policy == crate::JoinPolicy::Any
+                                            && live.len() < on.len())
+                                    {
+                                        pending()
+                                    } else {
+                                        serde_json::json!({"kind":"waiting","on":live})
+                                    }
+                                }
+                                TaskState::Sleeping { until, .. }
+                                    if !record.abort_requested
+                                        && !crate::signals::sleep_due(
+                                            &record.state,
+                                            record.memos.as_ref(),
+                                            now,
+                                        ) =>
+                                {
+                                    let mut s = serde_json::json!({"kind":"sleeping"});
+                                    if let Some(at) = until {
+                                        s["until"] = serde_json::json!(at);
+                                    }
+                                    s
+                                }
+                                _ => pending(),
+                            }
+                        };
+                        tasks.push(TaskInspection {
+                            record: record.clone(),
+                            state,
+                        });
                     }
-                    TaskState::Sleeping{until,..} if !record.abort_requested && !crate::signals::sleep_due(&record.state,record.memos.as_ref(),now)=>{
-                        let mut s=serde_json::json!({"kind":"sleeping"});if let Some(at)=until{s["until"]=serde_json::json!(at);}s
+                    let mut submissions = Vec::new();
+                    for status in [
+                        crate::SubmissionStatus::Queued,
+                        crate::SubmissionStatus::Placed,
+                    ] {
+                        let mut cursor = None;
+                        loop {
+                            let page = tx
+                                .scan_submissions(
+                                    &crate::SubmissionQuery {
+                                        status: Some(status),
+                                        ..Default::default()
+                                    },
+                                    256,
+                                    cursor.as_ref(),
+                                )
+                                .await?;
+                            submissions.extend(page.items);
+                            cursor = page.next;
+                            if cursor.is_none() {
+                                break;
+                            }
+                        }
                     }
-                    _=>pending()
-                }};
-                tasks.push(TaskInspection{record:record.clone(),state});
-            }
-            let mut submissions=Vec::new();
-            for status in [crate::SubmissionStatus::Queued,crate::SubmissionStatus::Placed]{
-                let mut cursor=None;
-                loop{let page=tx.scan_submissions(&crate::SubmissionQuery{status:Some(status),..Default::default()},256,cursor.as_ref()).await?;submissions.extend(page.items);cursor=page.next;if cursor.is_none(){break;}}
-            }
-            submissions.sort_by_key(|s|s.id);
-            Ok(HarnessInspection{scheduling,tasks,submissions})
-        },ctx).await
+                    submissions.sort_by_key(|s| s.id);
+                    Ok(HarnessInspection {
+                        scheduling,
+                        tasks,
+                        submissions,
+                    })
+                },
+                ctx,
+            )
+            .await
     }
     pub async fn wake(&self, ctx: &Context) -> Result<Wake> {
         let mut wake = Wake::default();

@@ -61,9 +61,19 @@ pub async fn append_tool_result(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        content.push(json!({"type":"text","text":format!("<harness>\n{lines}\n</harness>")}));
+        content.push(json!({
+            "type": "text",
+            "text": format!("<harness>\n{lines}\n</harness>")
+        }));
     }
-    let mut msg = json!({"role":"toolResult","toolCallId":call_id,"toolName":name,"content":content,"isError":result.is_error.unwrap_or(false),"timestamp":timestamp});
+    let mut msg = json!({
+        "role": "toolResult",
+        "toolCallId": call_id,
+        "toolName": name,
+        "content": content,
+        "isError": result.is_error.unwrap_or(false),
+        "timestamp": timestamp
+    });
     if let Some(details) = result.details {
         msg["details"] = details;
     }
@@ -245,9 +255,23 @@ impl Invocation {
                 if let Some(reason) = denied {
                     harness_error("blocked", &format!("Tool call blocked: {reason}"))
                 } else {
-                    match pi_rs_ai::utils::validate_tool_arguments(&tool.declaration,&checked_call){
-                        Ok(args)=>return self.commit(ctx,async |_,_|Ok(TaskState::Running{checkpoint:json!({"phase":"execute","arguments":args,"replay":if tool.replay_safe{"safe"}else{"unsafe"}}),wake:None})).await,
-                        Err(e)=>harness_error("invalid_arguments",&e.to_string())
+                    match pi_rs_ai::utils::validate_tool_arguments(&tool.declaration, &checked_call)
+                    {
+                        Ok(args) => {
+                            return self
+                                .commit(ctx, async |_, _| {
+                                    Ok(TaskState::Running {
+                                        checkpoint: json!({
+                                            "phase": "execute",
+                                            "arguments": args,
+                                            "replay": if tool.replay_safe{"safe"}else{"unsafe"}
+                                        }),
+                                        wake: None,
+                                    })
+                                })
+                                .await;
+                        }
+                        Err(e) => harness_error("invalid_arguments", &e.to_string()),
                     }
                 }
             } else if checkpoint["phase"] == "parked" {
@@ -399,7 +423,8 @@ impl Invocation {
                         .map_err(|e| Error::invalid(e.to_string()))?;
                     validator.validate(&pi_rs_schema::Value::from(value)).err().and_then(|errors|errors.into_iter().next()).map(|e|{
                         let path=e.path.trim_start_matches('/').split('/').map(|p|p.replace("~1","/").replace("~0","~")).collect::<Vec<_>>().join(".");
-                        format!("Tool {name} returned structuredOutput that does not match its schema: {}: {}",if path.is_empty(){"root"}else{&path},e.message)
+                        let path = if path.is_empty() { "root" } else { &path };
+                        format!("Tool {name} returned structuredOutput that does not match its schema: {path}: {}", e.message)
                     })
                 }
                 _ => None,
@@ -549,33 +574,92 @@ impl Invocation {
             .as_str()
             .or_else(|| self.record.input["call"]["id"].as_str())
             .ok_or_else(|| Error::invalid("Nested tool execution requires a tool caller"))?;
-        let call = json!({"type":"toolCall","name":name,"id":format!("{parent_call}/{key}"),"arguments":args});
+        let call = json!({
+            "type": "toolCall",
+            "name": name,
+            "id": format!("{parent_call}/{key}"),
+            "arguments": args
+        });
         let parent = self.record.id;
         let address =
             crate::documents::resolve_address(&NESTED_CALL_DOC, Some(parent), Some(key.into()))?;
         let id=self.harness.session.commit(async |tx|{
-            let current=tx.task(parent).await?.ok_or_else(||Error::invalid("Missing nested caller"))?;
-            if current.state!=self.record.state || current.abort_requested{return Err(Error::invalid("Nested caller invocation ended"));}
-            let member=tx.doc(&NESTED_CALL_DOC,&address,Some(&Value::Null)).await?;
-            let prior=serde_json::to_value(member.value()?.to_json())?;
-            if let Some(id)=prior["taskId"].as_u64(){
-                let existing=tx.task(id).await?.ok_or_else(||Error::invalid("Missing keyed task"))?;
-                if existing.input["kind"]!="nested" || existing.input["call"]["name"]!=name || existing.input["call"]["arguments"]!=call["arguments"]{return Err(Error::invalid(format!("Nested call {} was already made with another tool or other arguments",call["id"])));}
+            let current = tx
+                .task(parent)
+                .await?
+                .ok_or_else(|| Error::invalid("Missing nested caller"))?;
+            if current.state != self.record.state || current.abort_requested {
+                return Err(Error::invalid("Nested caller invocation ended"));
+            }
+            let member = tx
+                .doc(&NESTED_CALL_DOC, &address, Some(&Value::Null))
+                .await?;
+            let prior = serde_json::to_value(member.value()?.to_json())?;
+            if let Some(id) = prior["taskId"].as_u64() {
+                let existing = tx
+                    .task(id)
+                    .await?
+                    .ok_or_else(|| Error::invalid("Missing keyed task"))?;
+                if existing.input["kind"] != "nested"
+                    || existing.input["call"]["name"] != name
+                    || existing.input["call"]["arguments"] != call["arguments"]
+                {
+                    return Err(Error::invalid(format!(
+                        "Nested call {} was already made with another tool or other arguments",
+                        call["id"]
+                    )));
+                }
                 return Ok(id);
             }
-            let mut input=json!({"kind":"nested","parent":parent,"parentCallId":parent_call,"key":key,"call":call});
-            if !progress{input["progress"]=json!(false);}
-            let mut options=crate::session::TaskOptions::new(crate::TaskOwnership::Task{task_id:parent});
-            options.abandon_on_restart=abandon_on_restart;
-            let id=tx.create_task(tool_task().as_ref(),input,options).await?;
-            let member=tx.doc(&NESTED_CALL_DOC,&address,Some(&Value::Null)).await?;
-            member.set(&[pi_rs_chord::delta::Segment::Key("kind".into())],json!("nested").into())?;
-            member.set(&[pi_rs_chord::delta::Segment::Key("taskId".into())],json!(id).into())?;
-            let live_addr=crate::documents::resolve_address(&super::LIVE_DOC,Some(self.record.conversation_id),None)?;
-            let live=tx.doc(&super::LIVE_DOC,&live_addr,None).await?;
-            let mut slots=serde_json::to_value(live.value()?.to_json())?["nestedTools"].as_array().cloned().unwrap_or_default();
-            slots.push(json!({"callId":call["id"],"parentCallId":parent_call,"parentTaskId":parent,"name":name,"taskId":id,"arguments":args,"status":"pending"}));
-            live.set(&[pi_rs_chord::delta::Segment::Key("nestedTools".into())],json!(slots).into())?;
+            let mut input =
+                json!({
+                    "kind": "nested",
+                    "parent": parent,
+                    "parentCallId": parent_call,
+                    "key": key,
+                    "call": call
+                });
+            if !progress {
+                input["progress"] = json!(false);
+            }
+            let mut options =
+                crate::session::TaskOptions::new(crate::TaskOwnership::Task { task_id: parent });
+            options.abandon_on_restart = abandon_on_restart;
+            let id = tx.create_task(tool_task().as_ref(), input, options).await?;
+            let member = tx
+                .doc(&NESTED_CALL_DOC, &address, Some(&Value::Null))
+                .await?;
+            member.set(
+                &[pi_rs_chord::delta::Segment::Key("kind".into())],
+                json!("nested").into(),
+            )?;
+            member.set(
+                &[pi_rs_chord::delta::Segment::Key("taskId".into())],
+                json!(id).into(),
+            )?;
+            let live_addr = crate::documents::resolve_address(
+                &super::LIVE_DOC,
+                Some(self.record.conversation_id),
+                None,
+            )?;
+            let live = tx.doc(&super::LIVE_DOC, &live_addr, None).await?;
+            let mut slots = serde_json::to_value(live.value()?.to_json())?["nestedTools"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            slots.push(json!({
+                "callId": call["id"],
+                "parentCallId": parent_call,
+                "parentTaskId": parent,
+                "name": name,
+                "taskId": id,
+                "arguments": args,
+                "status": "pending"
+            }));
+            live.set(
+                &[pi_rs_chord::delta::Segment::Key("nestedTools".into())],
+                json!(slots).into(),
+            )?;
             Ok(id)
         },ctx).await?;
         let task = self.harness.wait_for_task(id, ctx).await?;
@@ -676,27 +760,65 @@ impl Invocation {
                 crate::documents::resolve_address(&NESTED_CALL_DOC, Some(parent), Some(key.into()))
             })
             .transpose()?;
-        self.harness.session.commit(async |tx|{
-            let current=tx.task(parent).await?.ok_or_else(||Error::invalid("Missing caller"))?;
-            if current.state!=self.record.state || current.abort_requested{return Err(Error::invalid("Caller invocation ended"));}
-            if let Some(address)=&addr{
-                let doc=tx.doc(&NESTED_CALL_DOC,address,Some(&Value::Null)).await?;
-                let prior=serde_json::to_value(doc.value()?.to_json())?;
-                if let Some(id)=prior["taskId"].as_u64(){
-                    let existing=tx.task(id).await?.ok_or_else(||Error::invalid("Missing keyed task"))?;
-                    if prior["kind"]!="task" || existing.kind!=task.name() || existing.input!=input{return Err(Error::invalid(format!("Key {key:?} already identifies another call or task")));}
-                    return Ok(id);
-                }
-            }
-            let mut options=crate::session::TaskOptions::new(crate::TaskOwnership::Task{task_id:parent});
-            options.abandon_on_restart=abandon_on_restart.unwrap_or(matches!(&current.state,TaskState::Running{checkpoint,..} if current.kind=="pi.tool" && checkpoint["replay"]!="safe"));
-            let id=tx.create_task(task,input,options).await?;
-            if let Some(address)=addr{
-                let doc=tx.doc(&NESTED_CALL_DOC,&address,Some(&Value::Null)).await?;
-                doc.set(&[pi_rs_chord::delta::Segment::Key("taskId".into())],json!(id).into())?;
-                doc.set(&[pi_rs_chord::delta::Segment::Key("kind".into())],json!("task").into())?;
-            }
-            Ok(id)
-        },ctx).await
+        self.harness
+            .session
+            .commit(
+                async |tx| {
+                    let current = tx
+                        .task(parent)
+                        .await?
+                        .ok_or_else(|| Error::invalid("Missing caller"))?;
+                    if current.state != self.record.state || current.abort_requested {
+                        return Err(Error::invalid("Caller invocation ended"));
+                    }
+                    if let Some(address) = &addr {
+                        let doc = tx
+                            .doc(&NESTED_CALL_DOC, address, Some(&Value::Null))
+                            .await?;
+                        let prior = serde_json::to_value(doc.value()?.to_json())?;
+                        if let Some(id) = prior["taskId"].as_u64() {
+                            let existing = tx
+                                .task(id)
+                                .await?
+                                .ok_or_else(|| Error::invalid("Missing keyed task"))?;
+                            if prior["kind"] != "task"
+                                || existing.kind != task.name()
+                                || existing.input != input
+                            {
+                                return Err(Error::invalid(format!(
+                                    "Key {key:?} already identifies another call or task"
+                                )));
+                            }
+                            return Ok(id);
+                        }
+                    }
+                    let mut options =
+                        crate::session::TaskOptions::new(crate::TaskOwnership::Task {
+                            task_id: parent,
+                        });
+                    options.abandon_on_restart = abandon_on_restart.unwrap_or(matches!(
+                        &current.state,
+                        TaskState::Running { checkpoint, .. }
+                            if current.kind == "pi.tool" && checkpoint["replay"] != "safe"
+                    ));
+                    let id = tx.create_task(task, input, options).await?;
+                    if let Some(address) = addr {
+                        let doc = tx
+                            .doc(&NESTED_CALL_DOC, &address, Some(&Value::Null))
+                            .await?;
+                        doc.set(
+                            &[pi_rs_chord::delta::Segment::Key("taskId".into())],
+                            json!(id).into(),
+                        )?;
+                        doc.set(
+                            &[pi_rs_chord::delta::Segment::Key("kind".into())],
+                            json!("task").into(),
+                        )?;
+                    }
+                    Ok(id)
+                },
+                ctx,
+            )
+            .await
     }
 }

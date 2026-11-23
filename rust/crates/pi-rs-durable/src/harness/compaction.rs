@@ -240,7 +240,12 @@ pub async fn create_compaction(
         .as_array()
         .cloned()
         .unwrap_or_default();
-    items.push(json!({"taskId":id,"trigger":reason,"blocking":owner.is_some(),"attempt":1}));
+    items.push(json!({
+        "taskId": id,
+        "trigger": reason,
+        "blocking": owner.is_some(),
+        "attempt": 1
+    }));
     doc.set(&[Segment::Key("compactions".into())], json!(items).into())?;
     Ok(id)
 }
@@ -273,9 +278,11 @@ fn summary_entry(first: crate::EntryId, summary: &str, reason: &Value, now: u64)
     EntryDraft {
         kind: "pi.compaction".into(),
         head: Some(EntryHead::Id(first)),
-        model: Some(vec![
-            json!({"role":"user","content":[{"type":"text","text":text}],"timestamp":now}),
-        ]),
+        model: Some(vec![json!({
+            "role": "user",
+            "content": [{"type":"text","text":text}],
+            "timestamp": now
+        })]),
         data: Some(json!({"reason":reason})),
         edits: None,
     }
@@ -362,7 +369,12 @@ impl Invocation {
                     policy["keepRecentTokens"].as_u64().unwrap_or_default(),
                 )? {
                     let first = view.entries[cut].id;
-                    let mut input = json!({"reason":self.record.input["reason"],"entries":&view.entries[..cut],"messages":summarized_messages(&view,cut),"firstKept":first});
+                    let mut input = json!({
+                        "reason": self.record.input["reason"],
+                        "entries": &view.entries[..cut],
+                        "messages": summarized_messages(&view,cut),
+                        "firstKept": first
+                    });
                     if let Some(instructions) = self.record.input.get("instructions") {
                         input["instructions"] = instructions.clone();
                     }
@@ -398,7 +410,23 @@ impl Invocation {
                                 model.max_tokens
                             });
                             let tail = view.entries.iter().map(|e| e.id).max();
-                            return self.commit(ctx,async |_,_|Ok(TaskState::Running{checkpoint:json!({"phase":"summarize","attempt":1,"model":reference,"thinkingLevel":agent.state["thinkingLevel"],"maxTokens":limit,"tail":tail,"firstKept":view.entries[cut].id,"streamOptions":settings["stream"]}),wake:None})).await;
+                            return self
+                                .commit(ctx, async |_, _| {
+                                    Ok(TaskState::Running {
+                                        checkpoint: json!({
+                                            "phase": "summarize",
+                                            "attempt": 1,
+                                            "model": reference,
+                                            "thinkingLevel": agent.state["thinkingLevel"],
+                                            "maxTokens": limit,
+                                            "tail": tail,
+                                            "firstKept": view.entries[cut].id,
+                                            "streamOptions": settings["stream"]
+                                        }),
+                                        wake: None,
+                                    })
+                                })
+                                .await;
                         }
                     }
                 }
@@ -420,9 +448,10 @@ impl Invocation {
                     serialize_conversation(&summarized_messages(&view, cut))
                 );
                 let now = (self.harness.now)();
-                let messages = serde_json::from_value(
-                    json!([{"role":"system","content":SUMMARIZATION_SYSTEM_PROMPT,"timestamp":now},{"role":"user","content":[{"type":"text","text":prompt}],"timestamp":now}]),
-                )?;
+                let messages = serde_json::from_value(json!([
+                    {"role": "system", "content": SUMMARIZATION_SYSTEM_PROMPT, "timestamp": now},
+                    {"role": "user", "content": [{"type": "text", "text": prompt}], "timestamp": now}
+                ]))?;
                 let session_id =
                     super::ensure_provider_session_id(&self.harness.session, conv.id, ctx).await?;
                 let mut opts = super::generation::stream_options(checkpoint, session_id, ctx)?;
@@ -544,24 +573,57 @@ impl Invocation {
                 result: None,
             };
         }
-        self.commit(ctx,async |tx,_|{
-            if let Some((key,usage))=usage{super::record_usage(tx,conv.id,super::UsageBucket::Models,&key,&usage).await?;}
-            if let Some(entry)=entry{
-                let result=if self.record.owner.is_some(){json!({"entryId":tx.append_entry(conv.id,entry).await?.id})}else{json!({"submissionId":conv.admit(tx,SubmissionDraft{request_id:Some(format!("compaction:{}",self.record.id)),notify:None,body:SubmissionBody::Write{entry}}).await?})};
-                outcome=TaskOutcome::Completed{result};
+        self.commit(ctx, async |tx, _| {
+            if let Some((key, usage)) = usage {
+                super::record_usage(tx, conv.id, super::UsageBucket::Models, &key, &usage).await?;
             }
-            let address=resolve_address(&LIVE_DOC,Some(conv.id),None)?;
-            let doc=tx.doc(&LIVE_DOC,&address,None).await?;
-            let mut items=serde_json::to_value(doc.value()?.to_json())?["compactions"].as_array().cloned().unwrap_or_default();
-            items.retain(|s|s["taskId"]!=self.record.id);
-            if items.is_empty() { doc.delete(&[Segment::Key("compactions".into())])?; } else { doc.set(&[Segment::Key("compactions".into())],json!(items).into())?; }
+            if let Some(entry) = entry {
+                let result = if self.record.owner.is_some() {
+                    let appended = tx.append_entry(conv.id, entry).await?;
+                    json!({"entryId": appended.id})
+                } else {
+                    let draft = SubmissionDraft {
+                        request_id: Some(format!("compaction:{}", self.record.id)),
+                        notify: None,
+                        body: SubmissionBody::Write { entry },
+                    };
+                    let submission = conv.admit(tx, draft).await?;
+                    json!({"submissionId": submission})
+                };
+                outcome = TaskOutcome::Completed { result };
+            }
+            let address = resolve_address(&LIVE_DOC, Some(conv.id), None)?;
+            let doc = tx.doc(&LIVE_DOC, &address, None).await?;
+            let mut items = serde_json::to_value(doc.value()?.to_json())?["compactions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            items.retain(|s| s["taskId"] != self.record.id);
+            if items.is_empty() {
+                doc.delete(&[Segment::Key("compactions".into())])?;
+            } else {
+                doc.set(&[Segment::Key("compactions".into())], json!(items).into())?;
+            }
             match &outcome {
-                TaskOutcome::Failed {error,..} => doc.set(&[Segment::Key("compactionFailure".into())],json!({"taskId":self.record.id,"trigger":self.record.input["reason"],"error":error.message}).into())?,
-                TaskOutcome::Completed {result} if result.get("entryId").is_some() || result.get("submissionId").is_some() => {doc.delete(&[Segment::Key("compactionFailure".into())])?;}
-                _=>{}
+                TaskOutcome::Failed { error, .. } => doc.set(
+                    &[Segment::Key("compactionFailure".into())],
+                    json!({
+                        "taskId": self.record.id,
+                        "trigger": self.record.input["reason"],
+                        "error": error.message
+                    })
+                    .into(),
+                )?,
+                TaskOutcome::Completed { result }
+                    if result.get("entryId").is_some() || result.get("submissionId").is_some() =>
+                {
+                    doc.delete(&[Segment::Key("compactionFailure".into())])?;
+                }
+                _ => {}
             }
-            Ok(TaskState::Terminal{outcome})
-        }).await
+            Ok(TaskState::Terminal { outcome })
+        })
+        .await
     }
 }
 

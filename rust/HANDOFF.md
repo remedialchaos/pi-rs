@@ -1,6 +1,6 @@
 # `pi-rs` Handoff
 
-- **Previous checkpoint**: `dd638f99e` (standalone browser asset delivery) on local `main`.
+- **Previous checkpoint**: `cc8661c04` (verified durable harness core) on local `main`.
 - **Stage**: Wave 1 in progress. The previous checkpoint recorded 17 workspace crates, 21 leaf gates and 2,236 native tests.
 - **Fallback rate**: `pi`, `pi-ai`, `pi-env`, `pi-evals`, `p3`, `pi-mac`, and `pi-voice-server` binaries run 100% natively; `packages/` and `apps/` untouched.
 - **Next action**: Verify and integrate the Wave 1 claims in [MAP.md](MAP.md) before assigning the 49 built-in plugins. Isolated worktrees under `.worktrees/` contain unmerged work.
@@ -22,7 +22,7 @@
 | **1.8** `pi-rs-coding-agent` (`1.8a`–`1.8c`, `pi` bin) | **PASS (Phase 1 100% + Parity)** | 3/3 leaf gates (1,839/1,839); **879/879** offline + PTY + `pi mcp` CLI + live MCP/OAuth loopback + expanded WIT UI/registrations + provider/virtual-model reload, `#![forbid(unsafe_code)]`, 0 `#[allow]` |
 | **2.1** `pi-rs-chord` (`2.1a` + `2.1b-1`..`2.1b-3`) | **PASS** | 2/2 leaf gates (4,995/4,995); **178/178** tests (19 wire goldens, Axum HTTP/WS RPC, real checked-in WASM guest components, `HostData` owner transfer, worker routing, registry-bound `Http`/`Files`/`Users`, TUI launcher), `#![forbid(unsafe_code)]` |
 | **2.2a** `pi-rs-durable` foundation, env, images, tools, codemode, storage & session | **PASS** | **77/77** contract tests (memory/SQLite/Chord-store/JSONL + local `ExecutionEnv` conformance, 16 mutation checks), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
-| **2.2b** `pi-rs-durable` harness | PARTIAL | The frozen core passed 81 native tests. The model scheduler, two automatic compaction paths, persisted fork and transcript windows have mutation evidence. Observation, telemetry and additional lifecycle verification are in progress. |
+| **2.2b** `pi-rs-durable` harness | PARTIAL | The native suite passed 82 tests. Model scheduling, both automatic compaction paths, persisted fork, transcript windows and the queue after a failed run have mutation evidence. Observation, telemetry and remaining lifecycle verification are in progress. |
 | **2.3a** `pi-rs-env` daemon (`pi-env` bin) + client transport | **PASS** | **41/41** tests (33 unit + 8 live `pi-env` binary integration; `RemoteError.fields` boxed for workspace `preserve_order`), `unsafe` isolated to `daemon/sys/`, 0 `#[allow]` |
 | **2.3b** `pi-rs-env` durable `ExecutionEnv` bridge | Native gates passed | 46 tests, 5 new mutation checks. Rust and upstream agreed on the exercised daemon, shell and error cases. Formal listing replay pending. |
 | **2.4** `pi-rs-evals` (`pi-evals` bin) | **PASS** | **44/44** tests (5/5 mutation checks, golden report/SHA parity, TTY-deterministic styling), `#![forbid(unsafe_code)]`, 0 `#[allow]` |

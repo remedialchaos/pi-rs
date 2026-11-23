@@ -110,29 +110,51 @@ impl Invocation {
         let address = resolve_address(&LIVE_DOC, Some(self.record.conversation_id), None)?;
         loop {
             tokio::select! {
-                event=events.next()=>{
-                    let Some(event)=event else{break};
-                    let partial=match &event{
-                        Event::Start{partial}|Event::TextStart{partial,..}|Event::TextDelta{partial,..}|Event::TextEnd{partial,..}|Event::ThinkingStart{partial,..}|Event::ThinkingDelta{partial,..}|Event::ThinkingEnd{partial,..}|Event::ToolCallStart{partial,..}|Event::ToolCallDelta{partial,..}|Event::ToolCallEnd{partial,..}=>partial,
-                        Event::Done{..}|Event::Error{..}=>break
+                event = events.next() => {
+                    let Some(event) = event else { break };
+                    let partial = match &event {
+                        Event::Start { partial }
+                        | Event::TextStart { partial, .. }
+                        | Event::TextDelta { partial, .. }
+                        | Event::TextEnd { partial, .. }
+                        | Event::ThinkingStart { partial, .. }
+                        | Event::ThinkingDelta { partial, .. }
+                        | Event::ThinkingEnd { partial, .. }
+                        | Event::ToolCallStart { partial, .. }
+                        | Event::ToolCallDelta { partial, .. }
+                        | Event::ToolCallEnd { partial, .. } => partial,
+                        Event::Done { .. } | Event::Error { .. } => break,
                     };
-                    if partial.read().unwrap_or_else(|e|e.into_inner()).content.is_empty(){continue;}
+                    if partial.read().unwrap_or_else(|e| e.into_inner()).content.is_empty() {
+                        continue;
+                    }
                     changes.observe(&event);
-                    if pending.is_none(){deadline=Instant::now()+request.partial_interval;}
-                    pending=Some(partial.clone());
+                    if pending.is_none() {
+                        deadline = Instant::now() + request.partial_interval;
+                    }
+                    pending = Some(partial.clone());
                 }
-                ()=tokio::time::sleep_until(deadline),if pending.is_some()=>{
-                    let Some(partial)=pending.take() else{continue};
-                    let mut message=serde_json::to_value(&*partial.read().unwrap_or_else(|e|e.into_inner()))?;
-                    let taken=changes.take(&mut message);
+                () = tokio::time::sleep_until(deadline), if pending.is_some() => {
+                    let Some(partial) = pending.take() else { continue };
+                    let mut message = serde_json::to_value(&*partial.read().unwrap_or_else(|e| e.into_inner()))?;
+                    let taken = changes.take(&mut message);
                     self.harness.session.commit_with(async |tx|{
-                        let current=tx.task(self.record.id).await?;
-                        if current.is_none_or(|r|r.state!=self.record.state || r.abort_requested){return Err(Error::invalid("Generation invocation ended"))}
-                        let live=tx.doc(&LIVE_DOC,&address,None).await?;
-                        if live.value()?.at(&[Segment::Key("generation".into())]).is_err(){
-                            live.set(&[Segment::Key("generation".into())],serde_json::json!({"attempt":request.attempt}).into())?;
+                        let current = tx.task(self.record.id).await?;
+                        if current.is_none_or(|r| r.state != self.record.state || r.abort_requested) {
+                            return Err(Error::invalid("Generation invocation ended"));
                         }
-                        changes.commit(live,&mut message,&taken)
+                        let live = tx.doc(&LIVE_DOC, &address, None).await?;
+                        if live
+                            .value()?
+                            .at(&[Segment::Key("generation".into())])
+                            .is_err()
+                        {
+                            live.set(
+                                &[Segment::Key("generation".into())],
+                                serde_json::json!({"attempt":request.attempt}).into(),
+                            )?;
+                        }
+                        changes.commit(live, &mut message, &taken)
                     },ctx,Default::default(),CommitOptions{persistence:CommitPersistence::Deferred{within:None}}).await?;
                 }
             }
@@ -285,6 +307,16 @@ pub(super) async fn start_run(
     inputs: Vec<SubmissionId>,
     first: Option<EntryId>,
 ) -> Result<()> {
+    start_run_with_failure(tx, conversation, inputs, first, false).await
+}
+
+async fn start_run_with_failure(
+    tx: &mut Transaction<'_>,
+    conversation: ConversationId,
+    inputs: Vec<SubmissionId>,
+    first: Option<EntryId>,
+    keep_failure: bool,
+) -> Result<()> {
     let mut options = TaskOptions::new(TaskOwnership::Conversation);
     options.conversation_id = Some(conversation);
     options.submission_ids = Some(inputs.clone());
@@ -298,54 +330,81 @@ pub(super) async fn start_run(
     let address = resolve_address(&LIVE_DOC, Some(conversation), None)?;
     let live = tx.doc(&LIVE_DOC, &address, None).await?;
     live.set(&[Segment::Key("run".into())], run.into())?;
-    if live
-        .value()?
-        .at(&[Segment::Key("runFailure".into())])
-        .is_ok()
+    if !keep_failure
+        && live
+            .value()?
+            .at(&[Segment::Key("runFailure".into())])
+            .is_ok()
     {
         live.delete(&[Segment::Key("runFailure".into())])?;
     }
     Ok(())
 }
 
-async fn generation_failure(
-    tx: &mut Transaction<'_>,
-    conversation: ConversationId,
-    id: crate::TaskId,
-    reason: &str,
-    text: &str,
-) -> Result<TaskState> {
-    let settlement = if reason == "no_model" {
-        Some(crate::SubmissionSettlement::Unanswered {
-            reason: reason.into(),
-            detail: None,
-        })
-    } else {
-        None
-    };
-    end_run(
-        tx,
-        conversation,
-        id,
-        RunEnd::Unanswered {
-            reason: reason.into(),
-            detail: (reason != "nothing_to_answer").then(|| text.to_owned()),
-            settlement,
-        },
-    )
-    .await?;
-    Ok(TaskState::Terminal {
-        outcome: TaskOutcome::Failed {
-            error: TaskOutcomeError {
-                message: text.into(),
-                detail: Some(json!({"reason":reason})),
-            },
-            result: None,
-        },
-    })
-}
-
 impl Invocation {
+    async fn generation_failure(
+        &self,
+        tx: &mut Transaction<'_>,
+        conversation: ConversationId,
+        boundary: Option<super::Boundary>,
+        settings: &Value,
+        reason: &str,
+        text: &str,
+    ) -> Result<TaskState> {
+        let id = self.record.id;
+        let policy = settings["afterFailedRun"].as_str().unwrap_or("keep");
+        let boundary = match (policy, boundary) {
+            ("continue", Some(b)) => Some(b),
+            ("continue", None) => Some(
+                prepare_boundary(
+                    tx,
+                    conversation,
+                    settings["steeringMode"] == "all",
+                    settings["followUpMode"] == "all",
+                )
+                .await?,
+            ),
+            _ => None,
+        };
+        let settlement = if reason == "no_model" {
+            Some(crate::SubmissionSettlement::Unanswered {
+                reason: reason.into(),
+                detail: None,
+            })
+        } else {
+            None
+        };
+        end_run(
+            tx,
+            conversation,
+            id,
+            RunEnd::Unanswered {
+                reason: reason.into(),
+                detail: (reason != "nothing_to_answer").then(|| text.to_owned()),
+                settlement,
+            },
+        )
+        .await?;
+        if policy == "withdraw" {
+            super::withdraw_inputs(tx, conversation, "run_failed", false).await?;
+        }
+        if let Some(boundary) = boundary {
+            let placed = apply_boundary(tx, boundary, true, (self.harness.now)()).await?;
+            if !placed.users.is_empty() {
+                start_run_with_failure(tx, conversation, placed.users, placed.first, true).await?;
+            }
+        }
+        Ok(TaskState::Terminal {
+            outcome: TaskOutcome::Failed {
+                error: TaskOutcomeError {
+                    message: text.into(),
+                    detail: Some(json!({"reason":reason})),
+                },
+                result: None,
+            },
+        })
+    }
+
     async fn generate(&self, ctx: &Context) -> Result<()> {
         use pi_rs_ai::types::StopReason;
         let TaskState::Running { checkpoint, .. } = &self.record.state else {
@@ -383,20 +442,51 @@ impl Invocation {
                     .unwrap_or_else(|| json!([])),
             )?;
             if let Some((next, rest)) = pending.split_first() {
-                return self.commit(ctx,async |tx,_|{
-                    let address=resolve_address(&LIVE_DOC,Some(conversation.id),None)?;
-                    let value=serde_json::to_value(tx.doc(&LIVE_DOC,&address,None).await?.value()?.to_json())?;
-                    let slot=value["tools"].as_array().and_then(|slots| slots.iter().enumerate().find(|(_,s)|s["callId"]==*next && s.get("taskId").is_none()));
-                    let mut input=json!({"kind":"model","assistant":assistant,"callId":next});
-                    if slot.is_some_and(|(_,s)|s["unoffered"]==true){input["unoffered"]=json!(true);}
-                    let mut options=TaskOptions::new(TaskOwnership::Task{task_id:id});
-                    options.conversation_id=Some(conversation.id);
-                    let child=tx.create_task(super::tool_task().as_ref(),input,options).await?;
-                    if let Some((i,_))=slot {tx.doc(&LIVE_DOC,&address,None).await?.set(&[Segment::Key("tools".into()),Segment::Index(i),Segment::Key("taskId".into())],json!(child).into())?;}
-                    let mut tools=children;
-                    tools.push(child);
-                    Ok(TaskState::Waiting{checkpoint:json!({"phase":"tools","assistant":assistant,"tools":tools,"pending":rest}),on:vec![child],policy:crate::JoinPolicy::AllSettled})
-                }).await;
+                return self
+                    .commit(ctx, async |tx, _| {
+                        let address = resolve_address(&LIVE_DOC, Some(conversation.id), None)?;
+                        let value = serde_json::to_value(
+                            tx.doc(&LIVE_DOC, &address, None).await?.value()?.to_json(),
+                        )?;
+                        let slot = value["tools"].as_array().and_then(|slots| {
+                            slots
+                                .iter()
+                                .enumerate()
+                                .find(|(_, s)| s["callId"] == *next && s.get("taskId").is_none())
+                        });
+                        let mut input = json!({"kind":"model","assistant":assistant,"callId":next});
+                        if slot.is_some_and(|(_, s)| s["unoffered"] == true) {
+                            input["unoffered"] = json!(true);
+                        }
+                        let mut options = TaskOptions::new(TaskOwnership::Task { task_id: id });
+                        options.conversation_id = Some(conversation.id);
+                        let child = tx
+                            .create_task(super::tool_task().as_ref(), input, options)
+                            .await?;
+                        if let Some((i, _)) = slot {
+                            tx.doc(&LIVE_DOC, &address, None).await?.set(
+                                &[
+                                    Segment::Key("tools".into()),
+                                    Segment::Index(i),
+                                    Segment::Key("taskId".into()),
+                                ],
+                                json!(child).into(),
+                            )?;
+                        }
+                        let mut tools = children;
+                        tools.push(child);
+                        Ok(TaskState::Waiting {
+                            checkpoint: json!({
+                                "phase": "tools",
+                                "assistant": assistant,
+                                "tools": tools,
+                                "pending": rest
+                            }),
+                            on: vec![child],
+                            policy: crate::JoinPolicy::AllSettled,
+                        })
+                    })
+                    .await;
             }
             let mut hook_terminate = false;
             if phase == "afterTools" {
@@ -433,11 +523,32 @@ impl Invocation {
                     .iter()
                     .any(|d| d["tasks"].as_array().is_some_and(|v| !v.is_empty()))
                 {
-                    return self.commit(ctx,async |tx,_|{
-                        let tasks=self.hook_children(tx,&decisions).await?;
-                        if tasks.is_empty(){return Ok(TaskState::Running{checkpoint:json!({"phase":"afterTools","assistant":assistant,"tools":children,"tasks":[]}),wake:None});}
-                        Ok(TaskState::Waiting{checkpoint:json!({"phase":"afterTools","assistant":assistant,"tools":children,"tasks":tasks}),on:tasks,policy:crate::JoinPolicy::AllSettled})
-                    }).await;
+                    return self
+                        .commit(ctx, async |tx, _| {
+                            let tasks = self.hook_children(tx, &decisions).await?;
+                            if tasks.is_empty() {
+                                return Ok(TaskState::Running {
+                                    checkpoint: json!({
+                                        "phase": "afterTools",
+                                        "assistant": assistant,
+                                        "tools": children,
+                                        "tasks": []
+                                    }),
+                                    wake: None,
+                                });
+                            }
+                            Ok(TaskState::Waiting {
+                                checkpoint: json!({
+                                    "phase": "afterTools",
+                                    "assistant": assistant,
+                                    "tools": children,
+                                    "tasks": tasks
+                                }),
+                                on: tasks,
+                                policy: crate::JoinPolicy::AllSettled,
+                            })
+                        })
+                        .await;
                 }
             }
             return self
@@ -505,14 +616,16 @@ impl Invocation {
                             .as_u64()
                             .is_some_and(|limit| turns >= limit)
                     {
-                        return generation_failure(
-                            tx,
-                            conversation.id,
-                            id,
-                            "turn_limit",
-                            &format!("{turns} turn{}", if turns == 1 { "" } else { "s" }),
-                        )
-                        .await;
+                        return self
+                            .generation_failure(
+                                tx,
+                                conversation.id,
+                                Some(boundary),
+                                &settings,
+                                "turn_limit",
+                                &format!("{turns} turn{}", if turns == 1 { "" } else { "s" }),
+                            )
+                            .await;
                     }
                     let placed = apply_boundary(tx, boundary, terminate, now()).await?;
                     if terminate || placed.reset {
@@ -579,7 +692,8 @@ impl Invocation {
             };
             return self
                 .commit(ctx, async |tx, _| {
-                    generation_failure(tx, conversation.id, id, "no_model", &text).await
+                    self.generation_failure(tx, conversation.id, None, &settings, "no_model", &text)
+                        .await
                 })
                 .await;
         };
@@ -617,7 +731,15 @@ impl Invocation {
             if let Some(text) = failure {
                 return self
                     .commit(ctx, async |tx, _| {
-                        generation_failure(tx, conversation.id, id, "model_error", &text).await
+                        self.generation_failure(
+                            tx,
+                            conversation.id,
+                            None,
+                            &settings,
+                            "model_error",
+                            &text,
+                        )
+                        .await
                     })
                     .await;
             }
@@ -635,10 +757,11 @@ impl Invocation {
             {
                 return self
                     .commit(ctx, async |tx, _| {
-                        generation_failure(
+                        self.generation_failure(
                             tx,
                             conversation.id,
-                            id,
+                            None,
+                            &settings,
                             "nothing_to_answer",
                             "The conversation has nothing to answer",
                         )
@@ -648,7 +771,11 @@ impl Invocation {
             }
             let shown = super::replay_sections(&view.messages);
             let mut desired = indexmap::IndexMap::new();
-            let input = json!({"conversationId":conversation.id,"agent":agent.state,"shown":shown});
+            let input = json!({
+                "conversationId": conversation.id,
+                "agent": agent.state,
+                "shown": shown
+            });
             for section in &agent.sections {
                 match (section.render)(&input, ctx).await {
                     Ok(Some(text)) => {
@@ -688,27 +815,62 @@ impl Invocation {
                     && super::select_cut(&view, keep)?.is_some()
                 {
                     if tokens > limit {
-                        return self.commit(ctx,async |tx,_|{
-                            let child=super::create_compaction(tx,conversation.id,json!({"reason":"threshold"}),Some(id)).await?;
-                            Ok(TaskState::Waiting{checkpoint:json!({"phase":"prepare","attempt":attempt,"compacted":child,"threshold":true}),on:vec![child],policy:crate::JoinPolicy::AllSettled})
-                        }).await;
+                        return self
+                            .commit(ctx, async |tx, _| {
+                                let child = super::create_compaction(
+                                    tx,
+                                    conversation.id,
+                                    json!({"reason":"threshold"}),
+                                    Some(id),
+                                )
+                                .await?;
+                                Ok(TaskState::Waiting {
+                                    checkpoint: json!({
+                                        "phase": "prepare",
+                                        "attempt": attempt,
+                                        "compacted": child,
+                                        "threshold": true
+                                    }),
+                                    on: vec![child],
+                                    policy: crate::JoinPolicy::AllSettled,
+                                })
+                            })
+                            .await;
                     }
                     background = true;
                 }
             }
             return self.commit(ctx,async |tx,_|{
-                let mut cutoff=tx.latest_entry_id(conversation.id).await?.ok_or_else(||Error::invalid("Empty request history"))?;
-                for entry in entries{cutoff=tx.append_entry(conversation.id,entry).await?.id;}
+                let mut cutoff = tx
+                    .latest_entry_id(conversation.id)
+                    .await?
+                    .ok_or_else(|| Error::invalid("Empty request history"))?;
+                for entry in entries {
+                    cutoff = tx.append_entry(conversation.id, entry).await?.id;
+                }
                 if background {
-                    let address=resolve_address(&LIVE_DOC,Some(conversation.id),None)?;
-                    let live=tx.doc(&LIVE_DOC,&address,None).await?.value()?.to_json();
-                    if serde_json::to_value(live)?.get("compactions").is_none(){
-                        super::create_compaction(tx,conversation.id,json!({"reason":"threshold"}),None).await?;
+                    let address = resolve_address(&LIVE_DOC, Some(conversation.id), None)?;
+                    let live = tx.doc(&LIVE_DOC, &address, None).await?.value()?.to_json();
+                    if serde_json::to_value(live)?.get("compactions").is_none() {
+                        super::create_compaction(tx, conversation.id, json!({"reason":"threshold"}), None)
+                            .await?;
                     }
                 }
-                let mut request=json!({"phase":"request","attempt":attempt,"model":reference,"thinkingLevel":agent.state["thinkingLevel"].as_str().unwrap_or("off"),"streamOptions":settings.get("stream").cloned().unwrap_or_else(||json!({})),"cutoff":cutoff});
-                if let Some(child)=compacted { request["compacted"]=json!(child); }
-                Ok(TaskState::Running{checkpoint:request,wake:None})
+                let mut request = json!({
+                    "phase": "request",
+                    "attempt": attempt,
+                    "model": reference,
+                    "thinkingLevel": agent.state["thinkingLevel"].as_str().unwrap_or("off"),
+                    "streamOptions": settings.get("stream").cloned().unwrap_or_else(||json!({})),
+                    "cutoff": cutoff
+                });
+                if let Some(child) = compacted {
+                    request["compacted"] = json!(child);
+                }
+                Ok(TaskState::Running {
+                    checkpoint: request,
+                    wake: None,
+                })
             }).await;
         }
         if phase == "request" && self.record.restarts.is_some() {
@@ -803,11 +965,28 @@ impl Invocation {
             let until = now()
                 .saturating_add(handle.poll_after_ms.unwrap_or(5000))
                 .max(checkpoint["pollAt"].as_u64().unwrap_or(0).saturating_add(1));
-            return self.commit(ctx,async |tx,_|{
-                let address=resolve_address(&LIVE_DOC,Some(conversation.id),None)?;
-                tx.doc(&LIVE_DOC,&address,None).await?.set(&[Segment::Key("generation".into())],json!({"attempt":attempt,"deferred":{"pollAt":until}}).into())?;
-                Ok(TaskState::Sleeping{until:Some(until),signals:None,checkpoint:json!({"phase":"poll","attempt":attempt,"model":reference,"thinkingLevel":checkpoint["thinkingLevel"],"cutoff":checkpoint["cutoff"],"handle":handle,"pollAt":until})})
-            }).await;
+            return self
+                .commit(ctx, async |tx, _| {
+                    let address = resolve_address(&LIVE_DOC, Some(conversation.id), None)?;
+                    tx.doc(&LIVE_DOC, &address, None).await?.set(
+                        &[Segment::Key("generation".into())],
+                        json!({"attempt":attempt,"deferred":{"pollAt":until}}).into(),
+                    )?;
+                    Ok(TaskState::Sleeping {
+                        until: Some(until),
+                        signals: None,
+                        checkpoint: json!({
+                            "phase": "poll",
+                            "attempt": attempt,
+                            "model": reference,
+                            "thinkingLevel": checkpoint["thinkingLevel"],
+                            "cutoff": checkpoint["cutoff"],
+                            "handle": handle,
+                            "pollAt": until
+                        }),
+                    })
+                })
+                .await;
         }
         for hook in agent.hooks("pi.generation", "afterResponse") {
             hook(serde_json::to_value(&*message)?, self, ctx).await?;
@@ -819,11 +998,24 @@ impl Invocation {
             && super::select_cut(&view, keep)?.is_some()
         {
             return self.commit(ctx,async |tx,_|{
-                let address=resolve_address(&LIVE_DOC,Some(conversation.id),None)?;
-                append_assistant(tx,conversation.id,(*message).clone()).await?;
-                tx.doc(&LIVE_DOC,&address,None).await?.delete(&[Segment::Key("generation".into())])?;
-                let child=super::create_compaction(tx,conversation.id,json!({"reason":"overflow"}),Some(id)).await?;
-                Ok(TaskState::Waiting{checkpoint:json!({"phase":"prepare","attempt":attempt,"compacted":child,"overflow":message.error_message.as_deref().unwrap_or("Context overflow")}),on:vec![child],policy:crate::JoinPolicy::AllSettled})
+                let address = resolve_address(&LIVE_DOC, Some(conversation.id), None)?;
+                append_assistant(tx, conversation.id, (*message).clone()).await?;
+                tx.doc(&LIVE_DOC, &address, None)
+                    .await?
+                    .delete(&[Segment::Key("generation".into())])?;
+                let child =
+                    super::create_compaction(tx, conversation.id, json!({"reason":"overflow"}), Some(id))
+                        .await?;
+                Ok(TaskState::Waiting {
+                    checkpoint: json!({
+                        "phase": "prepare",
+                        "attempt": attempt,
+                        "compacted": child,
+                        "overflow": message.error_message.as_deref().unwrap_or("Context overflow")
+                    }),
+                    on: vec![child],
+                    policy: crate::JoinPolicy::AllSettled,
+                })
             }).await;
         }
         let is_answer = matches!(message.stop_reason, StopReason::Stop | StopReason::Length)
@@ -839,7 +1031,13 @@ impl Invocation {
             vec![]
         };
         self.commit(ctx, async |tx, _| {
-            let boundary = prepare_boundary(tx, conversation.id, settings["steeringMode"]=="all", settings["followUpMode"]=="all").await?;
+            let boundary = prepare_boundary(
+                tx,
+                conversation.id,
+                settings["steeringMode"] == "all",
+                settings["followUpMode"] == "all",
+            )
+            .await?;
             let entry = append_assistant(tx, conversation.id, (*message).clone()).await?;
             if !matches!(
                 message.stop_reason,
@@ -851,56 +1049,122 @@ impl Invocation {
                         message.stop_reason.as_str()
                     )
                 });
-                if message.stop_reason==StopReason::Error && !pi_rs_ai::utils::is_context_overflow(&message,None) && let Some(delay)=super::retry::delay(&settings,&text,attempt){
-                    let until=now().saturating_add(delay);
-                    let address=resolve_address(&LIVE_DOC,Some(conversation.id),None)?;
-                    tx.doc(&LIVE_DOC,&address,None).await?.set(&[Segment::Key("generation".into())],json!({"attempt":attempt,"retry":{"at":until,"error":text}}).into())?;
-                    return Ok(TaskState::Sleeping{checkpoint:json!({"phase":"retry","attempt":attempt,"until":until}),until:Some(until),signals:None});
+                if message.stop_reason == StopReason::Error
+                    && !pi_rs_ai::utils::is_context_overflow(&message, None)
+                    && let Some(delay) = super::retry::delay(&settings, &text, attempt)
+                {
+                    let until = now().saturating_add(delay);
+                    let address = resolve_address(&LIVE_DOC, Some(conversation.id), None)?;
+                    tx.doc(&LIVE_DOC, &address, None).await?.set(
+                        &[Segment::Key("generation".into())],
+                        json!({"attempt":attempt,"retry":{"at":until,"error":text}}).into(),
+                    )?;
+                    return Ok(TaskState::Sleeping {
+                        checkpoint: json!({"phase":"retry","attempt":attempt,"until":until}),
+                        until: Some(until),
+                        signals: None,
+                    });
                 }
-                return generation_failure(tx, conversation.id, id, "model_error", &text).await;
+                return self
+                    .generation_failure(
+                        tx,
+                        conversation.id,
+                        Some(boundary),
+                        &settings,
+                        "model_error",
+                        &text,
+                    )
+                    .await;
             }
             let mut children = Vec::new();
-            let sequential=settings["toolExecution"]=="sequential" || message.content.iter().any(|block|matches!(block,pi_rs_ai::types::AssistantContent::ToolCall(call) if agent.tools.iter().any(|tool|tool.declaration.name==call.name && tool.sequential)));
+            let sequential = settings["toolExecution"] == "sequential" || message.content.iter().any(|block| {
+                matches!(block, pi_rs_ai::types::AssistantContent::ToolCall(call)
+                    if agent.tools.iter().any(|tool| tool.declaration.name == call.name && tool.sequential))
+            });
             let mut slots = Vec::new();
-            let mut pending=Vec::new();
-            for block in message.content.iter().filter(|_|message.stop_reason==StopReason::ToolUse) {
-                let pi_rs_ai::types::AssistantContent::ToolCall(call) = block else { continue; };
-                let mut input=json!({"kind":"model","assistant":entry.id,"callId":call.id});
-                let mut slot=json!({"callId":call.id,"name":call.name,"status":"pending"});
-                if !agent.tools.iter().any(|t|t.declaration.name==call.name){input["unoffered"]=json!(true);slot["unoffered"]=json!(true);}
-                if sequential && !children.is_empty(){pending.push(call.id.clone());slots.push(slot);continue;}
-                let mut options=TaskOptions::new(TaskOwnership::Task{task_id:id});
-                options.conversation_id=Some(conversation.id);
-                let child=tx.create_task(super::tool_task().as_ref(),input,options).await?;
+            let mut pending = Vec::new();
+            for block in message
+                .content
+                .iter()
+                .filter(|_| message.stop_reason == StopReason::ToolUse)
+            {
+                let pi_rs_ai::types::AssistantContent::ToolCall(call) = block else {
+                    continue;
+                };
+                let mut input = json!({"kind":"model","assistant":entry.id,"callId":call.id});
+                let mut slot = json!({"callId":call.id,"name":call.name,"status":"pending"});
+                if !agent.tools.iter().any(|t| t.declaration.name == call.name) {
+                    input["unoffered"] = json!(true);
+                    slot["unoffered"] = json!(true);
+                }
+                if sequential && !children.is_empty() {
+                    pending.push(call.id.clone());
+                    slots.push(slot);
+                    continue;
+                }
+                let mut options = TaskOptions::new(TaskOwnership::Task { task_id: id });
+                options.conversation_id = Some(conversation.id);
+                let child = tx
+                    .create_task(super::tool_task().as_ref(), input, options)
+                    .await?;
                 children.push(child);
-                slot["taskId"]=json!(child);
+                slot["taskId"] = json!(child);
                 slots.push(slot);
             }
             if !children.is_empty() {
-                let address=resolve_address(&LIVE_DOC,Some(conversation.id),None)?;
-                let doc=tx.doc(&LIVE_DOC,&address,None).await?;
-                doc.set(&[Segment::Key("tools".into())],json!(slots).into())?;
-                let state=serde_json::to_value(doc.value()?.to_json())?;
-                if state.get("generation").is_some(){doc.delete(&[Segment::Key("generation".into())])?;}
-                if state["run"]["taskId"]==id{
-                    let mut run=state["run"].clone();
-                    run["turns"]=json!(run["turns"].as_u64().unwrap_or(0)+1);
-                    if run.get("first").is_none(){run["first"]=json!(entry.id);}
-                    doc.set(&[Segment::Key("run".into())],run.into())?;
+                let address = resolve_address(&LIVE_DOC, Some(conversation.id), None)?;
+                let doc = tx.doc(&LIVE_DOC, &address, None).await?;
+                doc.set(&[Segment::Key("tools".into())], json!(slots).into())?;
+                let state = serde_json::to_value(doc.value()?.to_json())?;
+                if state.get("generation").is_some() {
+                    doc.delete(&[Segment::Key("generation".into())])?;
                 }
-                return Ok(TaskState::Waiting{checkpoint:json!({"phase":"tools","assistant":entry.id,"tools":children,"pending":pending}),on:children,policy:crate::JoinPolicy::AllSettled});
+                if state["run"]["taskId"] == id {
+                    let mut run = state["run"].clone();
+                    run["turns"] = json!(run["turns"].as_u64().unwrap_or(0) + 1);
+                    if run.get("first").is_none() {
+                        run["first"] = json!(entry.id);
+                    }
+                    doc.set(&[Segment::Key("run".into())], run.into())?;
+                }
+                return Ok(TaskState::Waiting {
+                    checkpoint: json!({
+                        "phase": "tools",
+                        "assistant": entry.id,
+                        "tools": children,
+                        "pending": pending
+                    }),
+                    on: children,
+                    policy: crate::JoinPolicy::AllSettled,
+                });
             }
-            let tasks=self.hook_children(tx,&decisions).await?;
+            let tasks = self.hook_children(tx, &decisions).await?;
             if !tasks.is_empty() {
-                let address=resolve_address(&LIVE_DOC,Some(conversation.id),None)?;
-                let doc=tx.doc(&LIVE_DOC,&address,None).await?;
-                let state=serde_json::to_value(doc.value()?.to_json())?;
-                if state.get("generation").is_some(){doc.delete(&[Segment::Key("generation".into())])?;}
-                doc.set(&[Segment::Key("run".into()),Segment::Key("yield".into())],json!({"answer":entry.id,"tasks":tasks}).into())?;
-                return Ok(TaskState::Waiting{checkpoint:json!({"phase":"yield","answer":entry.id,"tasks":tasks}),on:tasks,policy:crate::JoinPolicy::AllSettled});
+                let address = resolve_address(&LIVE_DOC, Some(conversation.id), None)?;
+                let doc = tx.doc(&LIVE_DOC, &address, None).await?;
+                let state = serde_json::to_value(doc.value()?.to_json())?;
+                if state.get("generation").is_some() {
+                    doc.delete(&[Segment::Key("generation".into())])?;
+                }
+                doc.set(
+                    &[Segment::Key("run".into()), Segment::Key("yield".into())],
+                    json!({"answer":entry.id,"tasks":tasks}).into(),
+                )?;
+                return Ok(TaskState::Waiting {
+                    checkpoint: json!({"phase":"yield","answer":entry.id,"tasks":tasks}),
+                    on: tasks,
+                    policy: crate::JoinPolicy::AllSettled,
+                });
             }
-            let continuation=decisions.first().and_then(|d|d.get("continue")).cloned();
-            self.conclude_answer(tx,boundary,entry.id,continuation,!agent.hooks("pi.generation","afterRun").is_empty()).await
+            let continuation = decisions.first().and_then(|d| d.get("continue")).cloned();
+            self.conclude_answer(
+                tx,
+                boundary,
+                entry.id,
+                continuation,
+                !agent.hooks("pi.generation", "afterRun").is_empty(),
+            )
+            .await
         })
         .await
     }

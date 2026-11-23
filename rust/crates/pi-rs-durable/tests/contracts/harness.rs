@@ -84,19 +84,37 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
         let registry = create_registry();
         if available {
             registry.install(Extension {
-            name: "tool:echo".into(),
-            tools: vec![ToolRegistration {
-                sequential:false,prepare_arguments:None,cancel:None,structured_output_schema:None,output_limits:None, declaration: pi_rs_ai::types::Tool {
-                    name: "echo".into(), description: "Returns the input text".into(),
-                    parameters: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}), constrained_sampling: None,
-                },
-                execute: Arc::new(|args,_,_| Box::pin(async move {
-                    let result: ToolResult = serde_json::from_value(json!({"output":[{"type":"text","text":args["text"]}]}))?;
-                    Ok(result.into())
-                })),
-                deferred: false, callers: None, replay_safe: false,
-            }], ..Default::default()
-        })?;
+                name: "tool:echo".into(),
+                tools: vec![ToolRegistration {
+                    sequential: false,
+                    prepare_arguments: None,
+                    cancel: None,
+                    structured_output_schema: None,
+                    output_limits: None,
+                    declaration: pi_rs_ai::types::Tool {
+                        name: "echo".into(),
+                        description: "Returns the input text".into(),
+                        parameters: json!({
+                            "type": "object",
+                            "properties": {"text":{"type":"string"}},
+                            "required": ["text"]
+                        }),
+                        constrained_sampling: None,
+                    },
+                    execute: Arc::new(|args, _, _| {
+                        Box::pin(async move {
+                            let result: ToolResult = serde_json::from_value(
+                                json!({"output":[{"type":"text","text":args["text"]}]}),
+                            )?;
+                            Ok(result.into())
+                        })
+                    }),
+                    deferred: false,
+                    callers: None,
+                    replay_safe: false,
+                }],
+                ..Default::default()
+            })?;
         }
         let ctx = Context::background();
         let harness = Harness::open_with(
@@ -294,7 +312,26 @@ async fn automatic_compaction_places_one_summary_before_answering_second_input()
         fake.set_responses(responses);
         harness.models.set_provider(fake.provider.clone());
         let root = harness.root(&ctx).await?;
-        root.configure(&[("model".into(),json!({"provider":model.provider,"modelId":model.id})),("compaction".into(),json!({"keepRecentTokens":1,"backgroundTokens":0,"reserveTokens":if trigger=="threshold"{model.context_window}else{0}}))].into_iter().collect(),&ctx).await?;
+        root.configure(
+            &[
+                (
+                    "model".into(),
+                    json!({"provider":model.provider,"modelId":model.id}),
+                ),
+                (
+                    "compaction".into(),
+                    json!({
+                        "keepRecentTokens": 1,
+                        "backgroundTokens": 0,
+                        "reserveTokens": if trigger=="threshold"{model.context_window}else{0}
+                    }),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            &ctx,
+        )
+        .await?;
         for input in ["first", "second"] {
             let submission = root
                 .submit(
@@ -350,6 +387,83 @@ async fn automatic_compaction_places_one_summary_before_answering_second_input()
             fake.state.call_count(),
             if trigger == "overflow" { 3 } else { 2 }
         );
+        harness.close(&ctx).await?;
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn failed_run_policy_settles_or_preserves_the_queued_follow_up()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_ai::faux::{FauxStep, faux_assistant_message, faux_provider, faux_text};
+    use pi_rs_durable::{HarnessOptions, MemoryStorage, SubmissionStatus};
+    use tokio::sync::Notify;
+    for policy in ["keep", "withdraw", "continue"] {
+        let ctx = Context::background();
+        let harness = Harness::open_with(
+            Arc::new(MemoryStorage::new()),
+            HarnessOptions {
+                settings: Arc::new(move || json!({"afterFailedRun": policy})),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await?;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let gate = (started.clone(), release.clone());
+        let fake = faux_provider(Default::default());
+        let model = &fake.models[0];
+        fake.set_responses([
+            FauxStep::Factory(Arc::new(move |_, _, _, _| {
+                let (started, release) = gate.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    let mut response = faux_assistant_message(vec![]);
+                    response.stop_reason = pi_rs_ai::StopReason::Error;
+                    response.error_message = Some("permanent failure".into());
+                    Ok(response)
+                })
+            })),
+            faux_assistant_message(vec![faux_text("next answer")]).into(),
+        ]);
+        harness.models.set_provider(fake.provider.clone());
+        let root = harness.root(&ctx).await?;
+        root.configure(
+            &[(
+                "model".into(),
+                json!({"provider":model.provider,"modelId":model.id}),
+            )]
+            .into_iter()
+            .collect(),
+            &ctx,
+        )
+        .await?;
+        let draft = |text| {
+            serde_json::from_value(json!({"type":"input","content":text,"whenBusy":"followUp"}))
+        };
+        let first = root.submit(draft("first")?, &ctx).await?;
+        let timeout = std::time::Duration::from_secs(10);
+        tokio::time::timeout(timeout, started.notified()).await?;
+        let second = root.submit(draft("second")?, &ctx).await?;
+        release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(timeout, first.wait(&ctx))
+                .await??
+                .status,
+            SubmissionStatus::Unanswered
+        );
+        if policy == "keep" {
+            assert_eq!(second.status(&ctx).await?.status, SubmissionStatus::Queued);
+        } else {
+            let outcome = tokio::time::timeout(timeout, second.wait(&ctx)).await??;
+            if policy == "withdraw" {
+                assert_eq!(outcome.reason.as_deref(), Some("run_failed"));
+                assert_eq!(outcome.status, SubmissionStatus::Unanswered);
+            } else {
+                assert_eq!(outcome.status, SubmissionStatus::Done);
+            }
+        }
         harness.close(&ctx).await?;
     }
     Ok(())
