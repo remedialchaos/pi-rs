@@ -1,23 +1,37 @@
+//! A display filename, never a path or a raw HTTP header value.
+use regex::Regex;
 use serde::Serialize;
+use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
 
+static UNSAFE: LazyLock<Regex> = LazyLock::new(|| {
+    // INFALLIBLE: This literal uses only the supported `\p{L}`/`\p{N}` categories and a plain class.
+    Regex::new(r"[^\p{L}\p{N}._-]+").expect("static filename sanitizer pattern")
+});
+static LEADING_DOTS: LazyLock<Regex> = LazyLock::new(|| {
+    // INFALLIBLE: A literal anchored class with no metasyntactic ambiguity.
+    Regex::new(r"^\.+").expect("static leading-dot pattern")
+});
+
+/// A display filename, never a path or a raw HTTP header value.
+///
+/// Mirrors the upstream `safeFileName`: take the last `/`- or `\`-separated segment, NFKC-normalize
+/// it, replace every run of characters outside letters/numbers/`._-` with one `_`, drop leading
+/// dots, keep the last 120 **UTF-16 code units** (a cut low surrogate stays as the JS string did:
+/// lone in JS, U+FFFD in Rust), and fall back to `file` when nothing remains.
 pub fn safe_file_name(name: &str) -> String {
-    let mut safe = String::new();
-    let mut replacing = false;
-    for c in name.rsplit(['/', '\\']).next().unwrap_or_default().nfkc() {
-        let valid = c.is_numeric() || c.is_alphabetic() || matches!(c, '.' | '_' | '-');
-        if valid {
-            safe.push(c);
-        } else if !replacing {
-            safe.push('_');
-        }
-        replacing = !valid;
-    }
-    let units: Vec<_> = safe.trim_start_matches('.').encode_utf16().collect();
+    let normalized: String = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .nfkc()
+        .collect();
+    let sanitized = UNSAFE.replace_all(&normalized, "_");
+    let trimmed = LEADING_DOTS.replace(&sanitized, "");
+    let units: Vec<u16> = trimmed.encode_utf16().collect();
     if units.is_empty() {
         return "file".into();
     }
-    // JavaScript slice can retain a lone low surrogate. Rust strings encode it as U+FFFD.
     String::from_utf16_lossy(&units[units.len().saturating_sub(120)..])
 }
 
@@ -35,6 +49,7 @@ pub struct FilePreview {
     pub mime_type: &'static str,
 }
 
+/// A conservative extension allowlist; active formats such as SVG never execute.
 pub fn file_preview(name: &str) -> Option<FilePreview> {
     let (kind, mime_type) = match name.rsplit('.').next()?.to_ascii_lowercase().as_str() {
         "txt" | "md" | "markdown" | "js" | "jsx" | "ts" | "tsx" | "json" | "css" | "html"
