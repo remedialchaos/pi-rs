@@ -122,4 +122,14 @@ passed offline. One test added, zero removed. Test execution totaled 2.39 s
 The existing disconnect test now waits for request start before killing the
 daemon. Its former ordering sometimes killed the daemon before the request
 started, allowing the request to succeed on a replacement session.
-The earlier parity results and formal bridge gate limits still apply.
+### Daemon-backed listing proof
+
+A clean export rebuilt the production daemon and reproduced the recorded local
+and remote listing cases. Both scenarios matched across five operations each.
+Changing the fixture root made both comparisons fail. The formal gate passed
+with a Cargo audit advisory warning. Upstream line coverage was 765/1,808
+(42%). On the unoptimized verification build the five-operation scenarios
+averaged 30.62 ms upstream and 23.91 ms in Rust, including connection setup.
+The retained fixture, corpus and [reproduction recipe](../../verification/env-listing/README.md)
+cover ordered entries, truncation, invalid limits, filesystem and cancellation
+errors. This proof adds two recorded scenarios and zero native tests.
