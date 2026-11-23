@@ -58,6 +58,11 @@ impl ServerNatives {
         }
     }
 
+    /// The server's Chord host, for HTTP callbacks that hold objects or open transactions.
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
     /// The root holds objects as the server principal and releases them on drop.
     pub fn root(&self) -> Root {
         self.host.root()
@@ -102,6 +107,45 @@ pub fn server_of(host: &Host) -> Result<Arc<ServerNatives>> {
         .0
         .upgrade()
         .ok_or_else(|| Error::Invalid("No server natives (the core facet contributes them)".into()))
+}
+
+struct ServiceSlot<T>(Weak<T>);
+
+impl<T> Clone for ServiceSlot<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> Default for ServiceSlot<T> {
+    fn default() -> Self {
+        Self(Weak::new())
+    }
+}
+
+impl<T> PartialEq for ServiceSlot<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Publish a host-lifetime native service by key so peer plugins can retrieve it via `service_of`.
+pub fn install_service<T: Send + Sync + 'static>(
+    host: &Host,
+    name: &str,
+    value: &Arc<T>,
+) -> Result<()> {
+    host.page_state(name, ServiceSlot::<T>::default())?
+        .set(ServiceSlot(Arc::downgrade(value)), &Context::background())
+}
+
+/// Retrieve a host-lifetime native service previously published via `install_service`.
+pub fn service_of<T: Send + Sync + 'static>(host: &Host, name: &str) -> Result<Arc<T>> {
+    host.page_state(name, ServiceSlot::<T>::default())?
+        .value()
+        .0
+        .upgrade()
+        .ok_or_else(|| Error::Invalid(format!("Native service {name} is not active")))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

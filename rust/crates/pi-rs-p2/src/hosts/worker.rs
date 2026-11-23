@@ -12,7 +12,7 @@ use pi_rs_ai::{
 use pi_rs_chord::{
     Error, Result,
     context::Context,
-    host::{HostOptions, PluginFacet},
+    host::{Host, HostOptions, PluginFacet, define_facet},
     node::{
         app::{FilesCaps, WorkerApp, WorkerAppOptions, start_worker_with},
         workers::WorkerSession,
@@ -76,7 +76,7 @@ pub async fn start_session_worker(
 
 /// Existing embedders can supply a lifecycle boundary of their own.
 pub async fn start_session_worker_with(
-    mut worker: WorkerSession,
+    worker: WorkerSession,
     registry: &PluginRegistry,
     requested: Option<&[String]>,
     boundary: impl FnOnce(&WorkerInit, &SessionInit) -> Result<Option<Arc<WorkerBoundary>>>,
@@ -106,8 +106,15 @@ pub async fn start_session_worker_configured(
     .await
 }
 
+const WORKER_PROCESS_SERVICE: &str = "p2.worker-process";
+
+/// Retrieve the active `WorkerProcess` from a worker Chord `Host`.
+pub fn worker_of(host: &Host) -> Result<Arc<WorkerProcess>> {
+    crate::runtime::server::service_of::<WorkerProcess>(host, WORKER_PROCESS_SERVICE)
+}
+
 async fn start(
-    worker: WorkerSession,
+    mut worker: WorkerSession,
     registry: &PluginRegistry,
     requested: Option<&[String]>,
     models: Option<Models>,
@@ -147,7 +154,19 @@ async fn start(
             Arc::new(BoundaryBackend(Arc::downgrade(&process))),
         ))
     });
-    let mut core = registry.facets(FacetKind::Worker, &selected);
+    let mut core = Vec::new();
+    let installed = process.clone();
+    core.push(PluginFacet::new(
+        "@p2/worker-process",
+        define_facet(move |host| {
+            crate::runtime::server::install_service(
+                &host.host(),
+                WORKER_PROCESS_SERVICE,
+                &installed,
+            )
+        }),
+    ));
+    core.extend(registry.facets(FacetKind::Worker, &selected));
     core.extend(facets(&process)?);
     core.push(PluginFacet::new("@p2/core", boundary.facet(id.clone())?));
     let delivered: Vec<_> = worker

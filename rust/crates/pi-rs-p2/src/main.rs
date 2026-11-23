@@ -89,7 +89,9 @@ fn start(worker: bool) -> HostResult {
     process_logs().add_directory(data_dir);
     let result = published_at(&format!("session:{id}"), &path, "worker.logs.json", |_| {
         rt.block_on(async {
-            Ok(start_session_worker(worker, &PluginRegistry::new(), None)
+            let mut registry = PluginRegistry::new();
+            pi_rs_p2::plugins::register_builtins(&mut registry)?;
+            Ok(start_session_worker(worker, &registry, None)
                 .await?
                 .run()
                 .await?)
@@ -122,6 +124,7 @@ async fn run_server(data_dir: PathBuf, capture: &ProcessCapture) -> HostResult {
         return Err("Set both P2_PROVIDER and P2_MODEL".into());
     }
     let mut options = ServerOptions::new(data_dir);
+    pi_rs_p2::plugins::register_builtins(&mut options.registry)?;
     options.dev |= env::args_os().skip(1).any(|arg| arg == "--dev");
     options.app_dir = upstream::find_app(&env::current_dir()?)?;
     if let Some(port) = env::var_os("PORT").filter(|value| !value.is_empty()) {

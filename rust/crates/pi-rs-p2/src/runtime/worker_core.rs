@@ -125,6 +125,13 @@ impl WorkerRegistries {
     }
 }
 
+fn current_models(models: &pi_rs_durable::ModelsInput) -> Models {
+    match models {
+        pi_rs_durable::ModelsInput::Static(models) => models.clone(),
+        pi_rs_durable::ModelsInput::Dynamic(select) => select(),
+    }
+}
+
 fn entries<T: Clone>(registry: &Mutex<IndexMap<String, T>>) -> Vec<T> {
     registry
         .lock()
@@ -329,7 +336,7 @@ impl WorkerProcess {
                         .map_err(|error| DurableError::Callback(Box::new(error)))
                 })
             })),
-            models: self.registries.models.clone(),
+            models: self.registries.models.clone().into(),
             settings: Arc::new(move || settings.borrow().clone()),
             registry: Arc::new(self.registries.extensions.reader(&Context::background())?),
             ..Default::default()
@@ -391,9 +398,7 @@ impl WorkerProcess {
             .commit(
                 async |tx| {
                     if tx.conversation(ROOT_CONVERSATION_ID).await?.is_none() {
-                        if parts
-                            .durable
-                            .models
+                        if current_models(&parts.durable.models)
                             .get_model(&session.model.provider, &session.model.model_id)
                             .is_none()
                         {
@@ -419,7 +424,9 @@ impl WorkerProcess {
         let model = agent.state["model"]["provider"]
             .as_str()
             .zip(agent.state["model"]["modelId"].as_str())
-            .and_then(|(provider, id)| parts.durable.models.get_model(provider, id));
+            .and_then(|(provider, id)| {
+                current_models(&parts.durable.models).get_model(provider, id)
+            });
         if model.is_none() {
             return Err(Error::Invalid("Unknown model".into()));
         }

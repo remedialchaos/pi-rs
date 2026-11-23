@@ -94,6 +94,13 @@ impl StoreEngine {
             None,
         )
     }
+    /// Run an atomic read/write step against the store's declared tables and documents.
+    pub fn transact<T: Send + 'static>(
+        &self,
+        apply: impl FnOnce(&mut super::Step<'_>) -> Result<T> + Send + 'static,
+    ) -> SqliteFuture<T> {
+        self.commit_step(apply, |value, _| value, None)
+    }
     pub(super) fn change_host_data(
         &self,
         address: crate::contracts::Address,
