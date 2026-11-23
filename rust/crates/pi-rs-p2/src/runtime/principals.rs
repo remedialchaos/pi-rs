@@ -41,6 +41,36 @@ pub enum GrantMode {
 }
 
 impl Principal {
+    pub const POLICY: pi_rs_chord::host::PrincipalPolicy = pi_rs_chord::host::PrincipalPolicy {
+        key: |value| Ok(Self::deserialize(value)?.key()),
+        revoked_by: |value, selector| {
+            let Some(selector) = selector.as_object().filter(|fields| fields.len() == 1) else {
+                return false;
+            };
+            match Self::deserialize(value) {
+                Ok(Self::Owner {
+                    access: OwnerAccess::Device { device },
+                }) => {
+                    selector.get("device").and_then(serde_json::Value::as_str) == Some(&device)
+                        || selector.get("owners").and_then(serde_json::Value::as_str)
+                            == Some("remote")
+                }
+                Ok(Self::Owner { access }) => {
+                    let group = if access == OwnerAccess::Local {
+                        "local"
+                    } else {
+                        "remote"
+                    };
+                    selector.get("owners").and_then(serde_json::Value::as_str) == Some(group)
+                }
+                Ok(Self::Guest { id, .. }) => {
+                    selector.get("guest").and_then(serde_json::Value::as_str) == Some(&id)
+                }
+                _ => false,
+            }
+        },
+    };
+
     pub fn is_owner(&self) -> bool {
         matches!(self, Self::Owner { .. })
     }

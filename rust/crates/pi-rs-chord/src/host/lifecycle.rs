@@ -466,25 +466,42 @@ impl Host {
         }
     }
     pub(super) fn end_object(&self, object: Arc<Object>, reason: &str) -> SyncFuture<()> {
+        self.end_object_with(object, ChordError::new("released", reason))
+    }
+
+    fn end_object_with(&self, object: Arc<Object>, error: ChordError) -> SyncFuture<()> {
         let host = self.clone();
-        let reason = reason.to_string();
+        let reason = error.message.clone();
+        let instances = {
+            let mut state = lock(&object.state);
+            if matches!(state.phase, RefState::Ended { .. }) {
+                return Box::pin(async { Ok(()) });
+            }
+            state.generation += 1;
+            state.activating = false;
+            state.phase = RefState::Ended { error };
+            state
+                .attempt
+                .take()
+                .into_iter()
+                .chain(state.old.take())
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut state = lock(&host.0.state);
+            if state
+                .objects
+                .get(&object.key)
+                .is_some_and(|o| Arc::ptr_eq(o, &object))
+            {
+                host.0.cycles.remove_edges(&object.key);
+                state.objects.shift_remove(&object.key);
+            }
+        }
+        let moved = object.moved();
+        lock(&object.admission).take();
         Box::pin(async move {
-            let instances = {
-                let mut state = lock(&object.state);
-                state.generation += 1;
-                state.activating = false;
-                state.phase = RefState::Ended {
-                    error: ChordError::new("released", &reason),
-                };
-                state
-                    .attempt
-                    .take()
-                    .into_iter()
-                    .chain(state.old.take())
-                    .collect::<Vec<_>>()
-            };
-            object.moved()?;
-            lock(&object.admission).take();
+            moved?;
             for instance in instances {
                 host.drain(
                     object.clone(),
@@ -506,17 +523,6 @@ impl Host {
             }
             object.documents.end();
             lock(&object.job_store).take();
-            host.0.cycles.remove_edges(&object.key);
-            {
-                let mut state = lock(&host.0.state);
-                if state
-                    .objects
-                    .get(&object.key)
-                    .is_some_and(|o| Arc::ptr_eq(o, &object))
-                {
-                    state.objects.shift_remove(&object.key);
-                }
-            }
             host.publish_presence(object.contract.name())?;
             host.publish_activity()?;
             Ok(())
@@ -526,6 +532,43 @@ impl Host {
         context
             .check()
             .map_err(|e| ChordError::new("aborted", e.to_string()))?;
+        if let Some(policy) = self.0.options.principal_policy {
+            let own = self
+                .0
+                .options
+                .principal
+                .as_ref()
+                .map(policy.key)
+                .transpose()?;
+            let matches = |who: &serde_json::Value| {
+                (policy.revoked_by)(who, principal)
+                    && (policy.key)(who).is_ok_and(|key| own.as_ref() != Some(&key))
+            };
+            let (objects, links) = {
+                let state = lock(&self.0.state);
+                let objects = state
+                    .objects
+                    .values()
+                    .filter(|object| object.principal.as_ref().is_some_and(matches))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (objects, state.links.clone())
+            };
+            let drains: Vec<_> = objects
+                .into_iter()
+                .map(|object| self.end_object_with(object, revoked()))
+                .collect();
+            for link in &links {
+                link.revoke_forwarded(principal, matches)?;
+            }
+            for link in links {
+                link.close_revoked_child(matches);
+            }
+            for drain in drains {
+                drain.await?;
+            }
+            return Ok(());
+        }
         let key = crate::data::principal_key(principal)?;
         let objects = {
             let mut state = lock(&self.0.state);

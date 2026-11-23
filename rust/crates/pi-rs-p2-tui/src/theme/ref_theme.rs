@@ -45,7 +45,7 @@ impl ThemeRef {
                 .retain(|item| !Rc::ptr_eq(item, &listener))
         }
     }
-    fn fg(&self, token: &'static str) -> TextStyleFn {
+    pub fn fg(&self, token: &'static str) -> TextStyleFn {
         let theme = self.theme.clone();
         Rc::new(move |text| theme.borrow().fg(token, text))
     }

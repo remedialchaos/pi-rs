@@ -294,6 +294,7 @@ impl HttpContribution {
     }
 }
 pub type OpenedLink = Arc<dyn Fn(&HttpRequest) -> Option<Box<dyn FnOnce() + Send>> + Send + Sync>;
+pub type AdmitLink = Arc<dyn Fn(&HttpRequest) -> LinkAdmission + Send + Sync>;
 struct OpenLease(Option<Box<dyn FnOnce() + Send>>);
 impl Drop for OpenLease {
     fn drop(&mut self) {
@@ -313,7 +314,7 @@ pub enum LinkAdmission {
 pub struct HttpOptions {
     pub links_path: Option<String>,
     /// Inspect the authenticated request before attaching a WebSocket to Chord.
-    pub admit_link: fn(&HttpRequest) -> LinkAdmission,
+    pub admit_link: AdmitLink,
     /// Stop at this principal; otherwise keep the first match while checking later authenticators.
     pub prefer_principal: fn(&serde_json::Value) -> bool,
     pub opened: OpenedLink,
@@ -328,7 +329,7 @@ impl Default for HttpOptions {
     fn default() -> Self {
         Self {
             links_path: Some("/_chord/link".into()),
-            admit_link: |_| LinkAdmission::Attach,
+            admit_link: Arc::new(|_| LinkAdmission::Attach),
             prefer_principal: |_| true,
             opened: Arc::new(|_| None),
             remote: Arc::new(RemoteOptions::new),

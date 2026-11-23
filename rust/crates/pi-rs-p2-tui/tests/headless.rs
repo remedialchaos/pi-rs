@@ -397,3 +397,34 @@ fn prepending_history_retains_plugin_entry_until_its_record_changes()
     );
     Ok(())
 }
+
+#[test]
+fn terminal_wheel_scrolls_panel_body_and_keeps_heading_and_editor() -> io::Result<()> {
+    use pi_rs_tui::{Text, Tui};
+    let text = |value: &str| ComponentRef::new(Text::new(value, 0, 0, None));
+    let rows = (0..32)
+        .map(|i| format!("row-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut client = TuiClient::mount_panel(
+        VirtualTerminal {
+            input: b"\x1b[<64;10;4M".to_vec(),
+            output: Default::default(),
+        },
+        text("heading"),
+        text(&rows),
+        text("editor"),
+        true,
+    );
+    client.screen.start()?;
+    client.screen.render_now(true)?;
+    let before = client.screen.viewport_top();
+    assert!(client.screen.screen_lines().join("\n").contains("row-31"));
+    client.step(Duration::ZERO)?;
+    client.screen.render_now(false)?;
+    assert!(client.screen.viewport_top() < before);
+    let frame = client.screen.screen_lines();
+    assert!(frame.first().is_some_and(|line| line.contains("heading")));
+    assert!(frame.last().is_some_and(|line| line.contains("editor")));
+    Ok(())
+}

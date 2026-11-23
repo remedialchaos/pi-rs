@@ -37,19 +37,41 @@ impl Invocation {
         })
     }
 
+    pub(super) fn report_hook_error(&self, extension: &str, errors: Vec<String>) {
+        let legacy = errors.join("\n");
+        self.harness
+            .session
+            .harness_report(crate::session::ReportKind::Extension, &legacy);
+        if let Some(report) = &self.harness.report_hook {
+            let error = if errors.len() == 1 {
+                super::HookError::Single(legacy)
+            } else {
+                super::HookError::Aggregate {
+                    message: format!("{} hook task requests were rejected", errors.len()),
+                    errors,
+                }
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(extension, &error)))
+                .is_err()
+            {
+                self.harness
+                    .session
+                    .harness_report(crate::session::ReportKind::Host, "Hook reporter panicked");
+            }
+        }
+    }
+
     pub(super) async fn invoke_hook(
         &self,
-        hook: &super::HookHandler,
+        hook: &(String, super::HookHandler),
         input: Value,
         ctx: &Context,
     ) -> Result<Option<Value>> {
-        match hook(input, self, ctx).await {
+        match (hook.1)(input, self, ctx).await {
             Ok(decision) => Ok(decision),
             Err(error) => {
                 ctx.check()?;
-                self.harness
-                    .session
-                    .harness_report(crate::session::ReportKind::Extension, &error.to_string());
+                self.report_hook_error(&hook.0, vec![error.to_string()]);
                 Ok(None)
             }
         }
@@ -104,9 +126,7 @@ impl Invocation {
                     errors.push("Hook tasks must be an array".into());
                 }
                 if !errors.is_empty() {
-                    self.harness
-                        .session
-                        .harness_report(crate::session::ReportKind::Extension, &errors.join("\n"));
+                    self.report_hook_error(&hook.0, errors);
                 }
             }
             if event == "onYield" {

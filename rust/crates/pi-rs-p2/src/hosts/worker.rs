@@ -2,9 +2,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use pi_rs_chord::{
     Error, Result,
-    host::PluginFacet,
+    host::{HostOptions, PluginFacet},
     node::{
-        app::{FilesCaps, WorkerApp, WorkerAppOptions, start_worker},
+        app::{FilesCaps, WorkerApp, WorkerAppOptions, start_worker_with_host},
         workers::WorkerSession,
     },
 };
@@ -71,7 +71,7 @@ pub async fn start_session_worker_with(
     if let Some(boundary) = boundary(&init, &session)? {
         core.push(PluginFacet::new("@p2/core", boundary.facet(id.clone())?));
     }
-    start_worker(
+    start_worker_with_host(
         worker,
         WorkerAppOptions {
             directory,
@@ -79,6 +79,10 @@ pub async fn start_session_worker_with(
             server_principal: json!({"kind":"server"}),
             core,
             files: FilesCaps::default(),
+        },
+        HostOptions {
+            principal_policy: Some(crate::runtime::principals::Principal::POLICY),
+            ..Default::default()
         },
     )
     .await

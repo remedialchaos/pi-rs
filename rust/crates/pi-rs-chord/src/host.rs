@@ -54,6 +54,8 @@ pub struct Presence {
 }
 #[derive(Clone)]
 pub struct HostOptions {
+    /// Application-defined object identity and revocation selectors for principals.
+    pub principal_policy: Option<PrincipalPolicy>,
     pub principal: Option<serde_json::Value>,
     pub address: Option<JsonValue>,
     pub store: Option<StoreEngine>,
@@ -65,6 +67,7 @@ pub struct HostOptions {
 impl Default for HostOptions {
     fn default() -> Self {
         Self {
+            principal_policy: None,
             principal: None,
             address: None,
             store: None,
@@ -74,6 +77,12 @@ impl Default for HostOptions {
             on_error: Arc::new(|_| {}),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct PrincipalPolicy {
+    pub key: fn(&serde_json::Value) -> Result<String>,
+    pub revoked_by: fn(&serde_json::Value, &serde_json::Value) -> bool,
 }
 #[derive(Clone, Debug)]
 pub struct HostError {
@@ -216,15 +225,17 @@ struct HostInner {
 #[derive(Clone)]
 pub struct Host(Arc<HostInner>);
 #[derive(Clone)]
-pub(crate) struct WeakHost(Weak<HostInner>);
+pub struct WeakHost(Weak<HostInner>);
 impl WeakHost {
-    pub(crate) fn upgrade(&self) -> Option<Host> {
+    pub fn upgrade(&self) -> Option<Host> {
         self.0.upgrade().map(Host)
     }
 }
 pub fn create_host(options: HostOptions) -> Result<Host> {
     if let Some(principal) = &options.principal {
-        crate::data::principal_key(principal)?;
+        options
+            .principal_policy
+            .map_or(crate::data::principal_key, |policy| policy.key)(principal)?;
     }
     let report = options.on_error.clone();
     let batch = options
@@ -399,10 +410,27 @@ impl Drop for CallScope {
 }
 impl Host {
     pub(crate) fn keep_peer(&self, peer: crate::remote::RemotePeer) {
-        lock(&self.0.state).links.push(peer);
+        let mut state = lock(&self.0.state);
+        if state.closed {
+            drop(state);
+            peer.close();
+        } else {
+            state.links.push(peer);
+        }
     }
-    pub(crate) fn downgrade(&self) -> WeakHost {
+    pub(crate) fn forget_peer(&self, peer: &crate::remote::RemotePeer) {
+        lock(&self.0.state)
+            .links
+            .retain(|registered| !registered.same_peer(peer));
+    }
+    pub fn downgrade(&self) -> WeakHost {
         WeakHost(Arc::downgrade(&self.0))
+    }
+    pub(crate) fn principal_key(&self, principal: &serde_json::Value) -> Result<String> {
+        match self.0.options.principal_policy {
+            Some(policy) => (policy.key)(principal),
+            None => crate::data::principal_key(principal),
+        }
     }
     pub fn batch(&self) -> Batch {
         self.0.batch.clone()
@@ -482,7 +510,7 @@ impl Host {
         };
         let principal_key = principal
             .as_ref()
-            .map(crate::data::principal_key)
+            .map(|principal| self.principal_key(principal))
             .transpose()?
             .unwrap_or_default();
         let key =
@@ -954,7 +982,7 @@ fn released(reason: &str, message: &str) -> Error {
     e.reason = Some(reason.into());
     e.into()
 }
-fn revoked() -> ChordError {
+pub(crate) fn revoked() -> ChordError {
     let mut e = ChordError::new("forbidden", "principal revoked");
     e.reason = Some("revoked".into());
     e

@@ -242,7 +242,7 @@ impl Invocation {
                     }
                 }
                 for hook in agent.hooks("pi.tool", "beforeTool") {
-                    match hook(serde_json::to_value(&checked_call)?, self, ctx).await {
+                    match (hook.1)(serde_json::to_value(&checked_call)?, self, ctx).await {
                         Ok(Some(decision)) => {
                             if let Some(block) = decision["block"].as_str() {
                                 denied = Some(block.to_owned());
@@ -364,12 +364,17 @@ impl Invocation {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .finish(&mut result);
-        if cutoff
-            .as_ref()
-            .is_none_or(|(_, salvage)| *salvage && !self.record.abort_requested)
-        {
+        let run_after_tool = if self.record.abort_requested {
+            let limit = (self.harness.settings)()["restartLimit"]
+                .as_u64()
+                .unwrap_or(super::DEFAULT_RESTART_LIMIT);
+            self.record.restarts.unwrap_or(0) < limit.saturating_sub(1)
+        } else {
+            cutoff.as_ref().is_none_or(|(_, salvage)| *salvage)
+        };
+        if run_after_tool {
             for hook in agent.hooks("pi.tool", "afterTool") {
-                let change = hook(json!({"call":call,"result":result}), self, ctx)
+                let change = (hook.1)(json!({"call":call,"result":result}), self, ctx)
                     .await
                     .and_then(|value| {
                         value
@@ -382,10 +387,7 @@ impl Invocation {
                     Ok(None) => {}
                     Err(error) => {
                         ctx.check()?;
-                        self.harness.session.harness_report(
-                            crate::session::ReportKind::Extension,
-                            &error.to_string(),
-                        );
+                        self.report_hook_error(&hook.0, vec![error.to_string()]);
                     }
                 }
             }

@@ -2,7 +2,12 @@
 
 pub mod p2_contracts;
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::Arc,
+};
+
+use pi_rs_chord::sync::SyncFuture;
 
 pub use pi_rs_chord::{
     Error, Result, context, contracts, data, documents,
@@ -15,6 +20,9 @@ pub use pi_rs_chord::{
 
 pub const API_NAME: &str = "@p2/app";
 pub const API_VERSION: &str = "v1";
+
+pub(crate) type SessionAuthorizer =
+    Arc<dyn Fn(Host, Principal, String, context::Context) -> SyncFuture<bool> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FacetKind {
@@ -41,6 +49,7 @@ impl FacetKind {
 #[derive(Clone, Default)]
 pub struct PluginRegistry {
     plugins: BTreeMap<String, BTreeMap<FacetKind, Facet>>,
+    session_authorizers: BTreeMap<String, SessionAuthorizer>,
 }
 
 impl PluginRegistry {
@@ -82,6 +91,41 @@ impl PluginRegistry {
             .filter(|name| requested.is_none_or(|names| names.contains(name)))
             .cloned()
             .collect())
+    }
+
+    /// Register a server-side check for a guest's current access to a session.
+    /// The callback receives the live server host and the cancellation context for this hold.
+    pub fn register_session_authorizer(
+        &mut self,
+        plugin: impl Into<String>,
+        authorize: impl Fn(Host, Principal, String, context::Context) -> SyncFuture<bool>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<()> {
+        let plugin = plugin.into();
+        contracts::check_name(&plugin, "A plugin name")?;
+        match self.session_authorizers.entry(plugin.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::new(authorize));
+                self.plugins.entry(plugin).or_default();
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(Error::Invalid(format!(
+                "duplicate p2 session authorizer for {plugin}"
+            ))),
+        }
+    }
+
+    pub(crate) fn session_authorizers(
+        &self,
+        selected: &[String],
+    ) -> BTreeMap<String, SessionAuthorizer> {
+        self.session_authorizers
+            .iter()
+            .filter(|(name, _)| selected.contains(name))
+            .map(|(name, authorize)| (name.clone(), authorize.clone()))
+            .collect()
     }
 
     pub fn facets(&self, kind: FacetKind, selected: &[String]) -> Vec<PluginFacet> {

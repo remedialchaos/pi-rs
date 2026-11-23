@@ -740,6 +740,7 @@ mod grouped {
     struct PausedStorage {
         backing: SqliteStorage,
         pause: AtomicBool,
+        hold_abort_of: AtomicU64,
         started: Semaphore,
         resume: Mutex<mpsc::Receiver<()>>,
         calls: Mutex<Vec<usize>>,
@@ -763,7 +764,11 @@ mod grouped {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(batches.len());
-            if self.pause.swap(false, Ordering::AcqRel) {
+            let target = self.hold_abort_of.load(Ordering::Acquire);
+            let cascade = target != 0 && batches.iter().flatten().any(|write| matches!(write, StorageWrite::Task {value} if value.id == target && value.abort_requested));
+            if self.pause.swap(false, Ordering::AcqRel)
+                || (cascade && self.hold_abort_of.swap(0, Ordering::AcqRel) == target)
+            {
                 self.started.add_permits(1);
                 self.resume
                     .lock()
@@ -794,6 +799,154 @@ mod grouped {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn held_cascade_commit_prevents_child_from_starting_its_next_phase()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use pi_rs_durable::{
+            Extension, Harness, HarnessOptions, HarnessRegistry, Invocation, TaskOutcome,
+            create_registry, define_task,
+            session::TaskOptions,
+            tasks::{PhaseHandler, TaskDefinition},
+        };
+        let dir = tempfile::tempdir()?;
+        let (release, resume) = mpsc::channel();
+        let storage = Arc::new(PausedStorage {
+            backing: SqliteStorage::open(dir.path().join("barrier.sqlite"))?,
+            pause: AtomicBool::new(false),
+            hold_abort_of: AtomicU64::new(0),
+            started: Semaphore::new(0),
+            resume: Mutex::new(resume),
+            calls: Mutex::default(),
+        });
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let advance = Arc::new(tokio::sync::Notify::new());
+        let attempted = Arc::new(tokio::sync::Notify::new());
+        let ran_next = Arc::new(AtomicBool::new(false));
+        let gate = (entered.clone(), advance.clone(), attempted.clone());
+        let first: PhaseHandler<Invocation> = Arc::new(move |record, inv, ctx| {
+            let (entered, advance, attempted) = gate.clone();
+            Box::pin(async move {
+                if record.owner.is_none() {
+                    return std::future::pending().await;
+                }
+                entered.notify_one();
+                advance.notified().await;
+                attempted.notify_one();
+                inv.commit(ctx, async |_, _| {
+                    Ok(TaskState::Running {
+                        checkpoint: json!({"phase":"next"}),
+                        wake: None,
+                    })
+                })
+                .await?;
+                Ok(())
+            })
+        });
+        let marker = ran_next.clone();
+        let next: PhaseHandler<Invocation> = Arc::new(move |_, _, _| {
+            marker.store(true, Ordering::Release);
+            Box::pin(async { Err("cancelled child advanced to next phase".into()) })
+        });
+        let task = Arc::new(define_task(TaskDefinition {
+            name: "test.barrier".into(),
+            version: 1,
+            initial: Arc::new(|_| Ok(json!({"phase":"first"}))),
+            phases: [("first".into(), first), ("next".into(), next)]
+                .into_iter()
+                .collect(),
+            migrate: None,
+            hooks: (),
+            abort: Arc::new(|_, inv, ctx| {
+                Box::pin(async move {
+                    inv.commit(ctx, async |_, _| {
+                        Ok(TaskState::Terminal {
+                            outcome: TaskOutcome::Aborted {
+                                reason: None,
+                                result: None,
+                            },
+                        })
+                    })
+                    .await?;
+                    Ok(())
+                })
+            }),
+        }));
+        let registry = create_registry();
+        registry.install(Extension {
+            name: "barrier".into(),
+            tasks: vec![task.clone()],
+            ..Default::default()
+        })?;
+        let ctx = Context::background();
+        let harness = Harness::open_with(
+            storage.clone(),
+            HarnessOptions {
+                registry: Arc::new(HarnessRegistry::Local(registry)),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await?;
+        let root = harness.root(&ctx).await?;
+        let (parent, child) = root
+            .commit(
+                async |tx| {
+                    let parent = tx
+                        .create_task(
+                            &task,
+                            json!(null),
+                            TaskOptions::new(TaskOwnership::Conversation),
+                        )
+                        .await?;
+                    let child = tx
+                        .create_task(
+                            &task,
+                            json!(null),
+                            TaskOptions::new(TaskOwnership::Task { task_id: parent }),
+                        )
+                        .await?;
+                    Ok((parent, child))
+                },
+                &ctx,
+                Default::default(),
+            )
+            .await?;
+        let deadline = Duration::from_secs(5);
+        storage.hold_abort_of.store(child, Ordering::Release);
+        harness.resume()?;
+        tokio::time::timeout(deadline, entered.notified()).await?;
+        let aborting = tokio::spawn({
+            let harness = harness.clone();
+            let ctx = ctx.clone();
+            async move { harness.abort_task(parent, &ctx).await }
+        });
+        tokio::time::timeout(deadline, storage.started.acquire())
+            .await??
+            .forget();
+        assert!(
+            storage
+                .task(parent)?
+                .ok_or("missing parent")?
+                .abort_requested
+        );
+        assert!(!storage.task(child)?.ok_or("missing child")?.abort_requested);
+        advance.notify_one();
+        tokio::time::timeout(deadline, attempted.notified()).await?;
+        assert!(!ran_next.load(Ordering::Acquire));
+        release.send(())?;
+        tokio::time::timeout(deadline, aborting).await???;
+        let leaf = tokio::time::timeout(deadline, harness.wait_for_task(child, &ctx)).await??;
+        assert!(matches!(
+            leaf.state,
+            TaskState::Terminal {
+                outcome: TaskOutcome::Aborted { .. }
+            }
+        ));
+        assert!(!ran_next.load(Ordering::Acquire));
+        harness.close(&ctx).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn publishes_only_received_prefix_and_rejects_the_remainder() -> Result<(), Error> {
         let dir = tempfile::tempdir().map_err(StorageError::from)?;
@@ -802,6 +955,7 @@ mod grouped {
         let storage = Arc::new(PausedStorage {
             backing: SqliteStorage::open(&path)?,
             pause: AtomicBool::new(false),
+            hold_abort_of: AtomicU64::new(0),
             started: Semaphore::new(0),
             resume: Mutex::new(resume),
             calls: Mutex::default(),

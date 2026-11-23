@@ -17,7 +17,7 @@ pub const DURABLE_TELEMETRY_SCHEMA: &str = include_str!("telemetry.json");
 mod runtime;
 pub use runtime::{
     AbortTaskResult, BuildEnv, Conversation, DEFAULT_HARNESS_IDENTITY, EnvTarget, Harness,
-    HarnessOptions,
+    HarnessOptions, HookError, HookReporter,
 };
 mod context;
 pub use context::{ContextView, derive_context, order_tool_results};

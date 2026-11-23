@@ -26,7 +26,24 @@ pub type BuildEnv = Arc<
         > + Send
         + Sync,
 >;
+/// Errors from one extension hook, with rejected requests in their original order.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HookError {
+    #[error("{0}")]
+    Single(String),
+    #[error("{message}")]
+    Aggregate {
+        message: String,
+        errors: Vec<String>,
+    },
+}
+
+pub type HookReporter = Arc<dyn Fn(&str, &HookError) + Send + Sync>;
+
 pub struct HarnessOptions {
+    /// Receives the owning extension name and one report per failed hook invocation.
+    /// The session reporter also receives its existing text notification.
+    pub report_hook: Option<HookReporter>,
     pub env: Option<BuildEnv>,
     pub on_wake: Option<Arc<dyn Fn(super::Wake) + Send + Sync>>,
     pub session: SessionOptions,
@@ -39,6 +56,7 @@ pub struct HarnessOptions {
 impl Default for HarnessOptions {
     fn default() -> Self {
         Self {
+            report_hook: None,
             env: None,
             on_wake: None,
             session: Default::default(),
@@ -52,6 +70,7 @@ impl Default for HarnessOptions {
 }
 #[derive(Clone)]
 pub struct Harness {
+    pub(super) report_hook: Option<HookReporter>,
     pub(super) telemetry: Arc<super::telemetry::HarnessTelemetry>,
     pub(super) env: Option<BuildEnv>,
     pub(super) on_wake: Option<Arc<dyn Fn(super::Wake) + Send + Sync>>,
@@ -124,6 +143,7 @@ impl Harness {
             host_options.telemetry,
         ));
         let harness = Self {
+            report_hook: host_options.report_hook,
             env: host_options.env,
             on_wake: host_options.on_wake,
             driver: Arc::default(),

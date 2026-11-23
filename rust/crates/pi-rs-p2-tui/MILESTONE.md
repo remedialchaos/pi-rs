@@ -14,4 +14,20 @@ Crate formatting, offline all-target Clippy with warnings denied, and all 20 tes
 
 The 15-test baseline command took 13m40.989s including dependency compilation. The final 20-test command took 2m23.915s including a wait for Clippy's build-directory lock. Its unit, headless and rendering binaries reported 0.00s, 0.67s and 0.03s. Build and lock times prevent a performance comparison.
 
-The crate is a native library. The terminal checks cover its mounted client and a registered Rust contribution. Standalone p2 startup, dynamically loaded guests, mouse scrolling and full upstream screen comparison were outside these checks. The crate has no cases.jsonl or rust-anything.json, so rust-anything diff and gate could not run a crate differential. The coordinator reported 6/6 for the separate p2 HTTP oracle and owns root replay.
+Those library checks covered the mounted client and a registered Rust contribution. The standalone launcher checks below extend that coverage. The crate has no cases.jsonl or rust-anything.json, so rust-anything diff and gate could not run a crate differential. The coordinator reported 6/6 for the separate p2 HTTP oracle and owns root replay.
+
+## Standalone launcher
+
+The Rust `p2 tui` executable connected to a disposable upstream p2 server over its authenticated Chord WebSocket. The server held a session with 32 labeled transcript entries. The launcher used the canonical Sessions and Chat declarations for hold versions, fingerprints, and the bound variant’s state and method indexes.
+
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| Upstream wheel oracle | Pass | Upstream `apps/p2/test/p2/tui-mouse.test.ts` real-worker test sent SGR wheel-up at column 10, row 4 until an earlier echo returned. Node reported one pass in 15.021 s (20.700 s including setup). |
+| Standalone wheel | Pass | A 60-column, eight-row pseudoterminal initially showed `terminal-line-31`. SGR wheel-up at column 10, row 4 revealed `terminal-line-0`. The Rust panel regression also checks that the heading and editor stay on screen. |
+| Standalone theme reload | Pass | In the same process, the selected custom palette initially emitted RGB 18/52/86. Atomic replacement changed the emitted foreground to RGB 101/67/33 without keyboard input or a restart. |
+
+The upstream panel places its header outside the body scroll view in `apps/p2/src/tui/components/panel.ts`. The launcher uses that layout for its transcript and session list. These checks cover the standalone launcher panel and the upstream transcript oracle. They do not exercise dynamically loaded plugin side panels.
+
+One regression test was added and zero removed. Disabling mouse handling made its viewport-offset assertion fail. The existing nine headless tests took 0.04 s on the candidate with the new test filtered out. With mouse handling enabled, all ten took 0.06 s, and all three launcher admission tests took 0.09 s. These timings exclude compilation. The upstream custom-theme hot-reload test command also passed.
+
+After restoration, both complete crate suites passed all 30 tests (9 in p2, 21 in p2-tui). Cargo reported 8m09s for the build. The headless binary took 0.20 s and the launcher admission binary took 0.41 s in that run.

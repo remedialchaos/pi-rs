@@ -26,6 +26,7 @@ fn main() -> io::Result<()> {
     // Cargo always provides OUT_DIR to build scripts.
     let out = env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("missing OUT_DIR"))?;
     let out = PathBuf::from(out);
+    write_contract_index(&out)?;
     let mut manifest = fs::File::create(out.join("browser_bundle.rs"))?;
     match env::var_os("P2_BROWSER_ASSETS") {
         Some(directory) => embed_bundle(Path::new(&directory), &out, &mut manifest),
@@ -34,6 +35,42 @@ fn main() -> io::Result<()> {
             "const BROWSER_BUNDLE: Option<BrowserBundle> = None;"
         ),
     }
+}
+
+fn write_contract_index(out: &Path) -> io::Result<()> {
+    let directory = "src/api/v1/p2_contracts";
+    println!("cargo:rerun-if-changed={directory}");
+    let mut declarations = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| io::Error::other("invalid contract filename"))?;
+        let declaration: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        declarations.insert(name.to_owned(), declaration["route"] == "session");
+    }
+    let mut index = fs::File::create(out.join("p2_contract_index.rs"))?;
+    writeln!(
+        index,
+        "fn declaration_source(name: &str) -> Option<&'static str> {{ match name {{"
+    )?;
+    for name in declarations.keys() {
+        let path = format!("/{directory}/{name}.json");
+        writeln!(
+            index,
+            "{name:?} => Some(include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), {path:?}))),"
+        )?;
+    }
+    writeln!(index, "_ => None, }} }}")?;
+    writeln!(index, "pub(crate) const SESSION_CONTRACTS: &[&str] = &[")?;
+    for (name, _) in declarations.into_iter().filter(|(_, session)| *session) {
+        writeln!(index, "{name:?},")?;
+    }
+    writeln!(index, "];")
 }
 
 fn embed_bundle(directory: &Path, out: &Path, manifest: &mut fs::File) -> io::Result<()> {

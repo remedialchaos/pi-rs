@@ -183,3 +183,29 @@ worker-startup timeout under load, so a passing time for that run is unavailable
 The fixture now uses the production startup deadline. All ten tests passed in
 23.22 s of test execution with production browser assets. Workspace formatting
 and strict all-target Clippy for p2 and Chord passed.
+
+## Standalone terminal
+
+The terminal launcher negotiated the owner's local session, saved credentials across a
+restart, and redeemed a guest share link against the upstream server using a real PTY.
+Its three new tests protect owner and guest credential separation, redirect handling
+during validation, and rejection of owner or share links for a different origin.
+Breaking those checks failed all three tests. After restoration, seven tests passed in
+2.27 s, compared with four tests in 5.14 s on the worker's base. Zero tests were removed.
+Mouse scrolling, theme changes and the integrated worker still need a combined run.
+
+## Standalone development commands
+
+The unchanged upstream development client connected to the native server's private socket.
+Reload reported no dirty plugins and exited 0. An unknown plugin exited 1 and named the
+missing plugin. Standalone restart exited 1 and named the required npm supervisor.
+Both `--dev` and `P2_DEV=1` enabled the socket. With development mode disabled, the
+server started without it. SIGTERM closed the socket and exited 0.
+The three unchanged upstream development module tests passed from the hydrated checkout.
+
+The development command work added four tests and removed zero. All four failed under
+their respective mutations. Removing the command-line dispatch caused the upstream
+client to fail to connect. All eight native tests passed after restoration. Summed test
+execution was 3.84 s before the final command-line integration and 3.23 s after it.
+Formatting and offline all-target Clippy passed with warnings denied. Dynamic source
+rebuilding, cross-host rollout and supervisor process replacement require separate checks.

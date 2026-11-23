@@ -631,10 +631,40 @@ impl Invocation {
             let mut hook_terminate = false;
             if phase == "afterTools" {
                 for child in serde_json::from_value::<Vec<u64>>(checkpoint["tasks"].clone())? {
-                    if let Some(task) = self.harness.session.task(child, ctx).await?
-                        && matches!(&task.state,TaskState::Terminal{outcome:TaskOutcome::Completed{result}} if result["terminate"]==true)
+                    let Some(task) = self.harness.session.task(child, ctx).await? else {
+                        continue;
+                    };
+                    let TaskState::Terminal {
+                        outcome: TaskOutcome::Completed { result },
+                    } = &task.state
+                    else {
+                        continue;
+                    };
+                    if result.is_null() || result.as_object().is_some_and(|v| v.is_empty()) {
+                        continue;
+                    }
+                    if result
+                        .as_object()
+                        .is_some_and(|v| v.len() == 1 && result["terminate"] == true)
                     {
                         hook_terminate = true;
+                        continue;
+                    }
+                    let message = format!(
+                        "afterTools task {child} ({}) completed with no AfterToolsDecision",
+                        task.kind
+                    );
+                    let registry = self.harness.registry.snapshot();
+                    if let Some(extension) = registry
+                        .installed()
+                        .filter(|ext| ext.tasks.iter().any(|t| t.name() == task.kind))
+                        .last()
+                    {
+                        self.report_hook_error(&extension.name, vec![message]);
+                    } else {
+                        self.harness
+                            .session
+                            .harness_report(crate::session::ReportKind::Extension, &message);
                     }
                 }
             } else if !agent.hooks("pi.generation", "afterTools").is_empty() {

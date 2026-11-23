@@ -1,20 +1,28 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
+#[cfg(unix)]
+use super::dev::{DevCommand, DevControl, DevResult, channel};
 use pi_rs_chord::{
     context::Context,
+    contracts::Contract,
     host::{Host, HostOptions, PluginFacet, ReloadReport, create_host},
     json::JsonValue,
     node::{
-        app::{Files, FilesCaps, private_directory},
+        app::{Files, FilesCaps, host_data_contract, private_directory},
         http::{
             Http, HttpContribution, HttpError, HttpOptions, HttpServer, HttpWrap, Provenance,
             RouteOptions, WrapPhase, json_response,
         },
-        workers::ProcessLock,
+        workers::{ProcessLock, WorkerOptions},
     },
     store::StoreEngine,
 };
-use serde_json::json;
+use serde_json::{Map, json};
+
+use super::{
+    session_workers::{SessionWorkers, catalog_session},
+    worker::WorkerInit,
+};
 
 use crate::{
     api::v1::{FacetKind, PluginRegistry},
@@ -50,9 +58,14 @@ pub struct ServerOptions {
     pub app_dir: Option<PathBuf>,
     pub port: u16,
     pub fake: bool,
+    pub dev: bool,
     pub allowed_hosts: Vec<String>,
     pub registry: PluginRegistry,
     pub plugins: Option<Vec<String>>,
+    /// Additional session RPC contracts supplied by plugins outside the built-in catalog.
+    pub worker_contracts: Vec<Arc<Contract>>,
+    /// Defaults to this application with the native `--worker` entry point.
+    pub worker_process: Option<WorkerOptions>,
 }
 
 impl ServerOptions {
@@ -62,9 +75,12 @@ impl ServerOptions {
             app_dir: None,
             port: 8788,
             fake: false,
+            dev: std::env::var("P2_DEV").as_deref() == Ok("1"),
             allowed_hosts: Vec::new(),
             registry: PluginRegistry::new(),
             plugins: None,
+            worker_contracts: Vec::new(),
+            worker_process: None,
         }
     }
 }
@@ -74,10 +90,90 @@ pub struct P2Server {
     pub address: SocketAddr,
     pub data_dir: PathBuf,
     pub plugins: Vec<String>,
+    pub workers: SessionWorkers,
     core: Vec<PluginFacet>,
     http: HttpServer,
     store: StoreEngine,
     _lock: ProcessLock,
+    #[cfg(unix)]
+    dev: Option<(Arc<StandaloneDev>, channel::Channel)>,
+}
+
+#[cfg(unix)]
+struct StandaloneDev {
+    control: DevControl,
+    host: Host,
+    workers: SessionWorkers,
+    core: Vec<PluginFacet>,
+    selection: tokio::sync::Mutex<(PluginRegistry, Vec<String>)>,
+}
+
+#[cfg(unix)]
+impl StandaloneDev {
+    async fn execute(&self, command: DevCommand) -> DevResult {
+        let DevCommand::Reload { plugins } = command else {
+            let result = DevResult {
+                ok: false,
+                message: "Restart refused: Restart needs the npm run dev supervisor".into(),
+                plugins: None,
+            };
+            self.control.notify(&result, str::to_owned).await;
+            return result;
+        };
+        let result = self
+            .control
+            .reload(
+                plugins,
+                Default::default(),
+                |names| async move {
+                    let selection = self.selection.lock().await;
+                    let (registry, selected) = &*selection;
+                    registry
+                        .select(Some(&names))
+                        .map_err(|err| err.to_string())?;
+                    if let Some(name) = names.iter().find(|name| !selected.contains(name)) {
+                        return Err(format!("Cannot reload unloaded p2 plugin: {name}"));
+                    }
+                    let mut facets = self.core.clone();
+                    facets.extend(registry.facets(FacetKind::Server, selected));
+                    let report = self
+                        .host
+                        .reload(facets, &Context::background())
+                        .await
+                        .map_err(|err| err.to_string())?;
+                    self.workers
+                        .update_authorizers(registry.session_authorizers(selected), &report.failed);
+                    if let Some(failure) = report.failed.first() {
+                        return Err(format!("{} (server): {}", failure.plugin, failure.error));
+                    }
+                    let changed: Vec<_> = report
+                        .changed
+                        .into_iter()
+                        .chain(report.added)
+                        .chain(report.removed)
+                        .collect();
+                    Ok((changed.clone(), changed))
+                },
+                str::to_owned,
+            )
+            .await;
+        match result {
+            Ok(plugins) => DevResult {
+                ok: true,
+                message: if plugins.is_empty() {
+                    "No dirty plugins".into()
+                } else {
+                    format!("Reloaded {}", plugins.join(", "))
+                },
+                plugins: Some(plugins),
+            },
+            Err(error) => DevResult {
+                ok: false,
+                message: format!("Reload refused: {error}"),
+                plugins: None,
+            },
+        }
+    }
 }
 
 impl P2Server {
@@ -89,9 +185,16 @@ impl P2Server {
         requested: Option<&[String]>,
     ) -> Result<ReloadReport> {
         let selected = registry.select(requested)?;
+        #[cfg(unix)]
+        let mut dev_selection = match &self.dev {
+            Some((dev, _)) => Some(dev.selection.lock().await),
+            None => None,
+        };
         let mut facets = self.core.clone();
         facets.extend(registry.facets(FacetKind::Server, &selected));
         let report = self.host.reload(facets, &Context::background()).await?;
+        self.workers
+            .update_authorizers(registry.session_authorizers(&selected), &report.failed);
         self.plugins.retain(|name| {
             selected.contains(name) || report.failed.iter().any(|f| &f.plugin == name)
         });
@@ -102,11 +205,21 @@ impl P2Server {
         );
         self.plugins.sort();
         self.plugins.dedup();
+        #[cfg(unix)]
+        if let Some(selection) = &mut dev_selection {
+            **selection = (registry.clone(), self.plugins.clone());
+        }
         Ok(report)
     }
 
     pub async fn close(self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some((dev, channel)) = self.dev {
+            dev.control.close().await;
+            channel.close().await;
+        }
         let http = self.http.close().await.map_err(Error::from);
+        self.workers.close().await;
         let host = self
             .host
             .close(&Context::background())
@@ -135,12 +248,13 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     let directory = host_dirs::server_directory(&options.data_dir);
     let store = host_dirs::open_host_store(&directory).await?;
     let host = create_host(HostOptions {
+        principal_policy: Some(crate::runtime::principals::Principal::POLICY),
         address: Some(JsonValue::from_serde(
             crate::runtime::address::server_address(),
         )),
         principal: Some(json!({"kind":"server"})),
         store: Some(store.clone()),
-        on_error: Arc::new(|error| eprintln!("p2 server: {}", error.error)),
+        on_error: Arc::new(|error| server_error(&error.error)),
         ..Default::default()
     })?;
     let files = Files::open(
@@ -199,18 +313,76 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     });
     health.cross_site = true;
     routes.route("GET /health", health)?;
+    let mut process = match options.worker_process {
+        Some(process) => process,
+        None => {
+            let mut process =
+                WorkerOptions::new(std::env::current_exe()?, directory.join("worker-locks"));
+            process.args.push("--worker".into());
+            if let Ok(idle) = std::env::var("P2_IDLE_MS")
+                && let Ok(idle) = idle.parse::<u64>()
+            {
+                process.idle_timeout = Duration::from_millis(idle);
+            }
+            process
+        }
+    };
+    process.lock_dir = directory.join("worker-locks");
+    let mut worker_contracts = BTreeMap::new();
+    for name in crate::api::v1::p2_contracts::SESSION_CONTRACTS {
+        let contract = crate::api::v1::p2_contracts::lookup(name)?;
+        worker_contracts.insert((*name).to_owned(), Arc::new(contract));
+    }
+    for contract in options
+        .worker_contracts
+        .into_iter()
+        .chain([host_data_contract()?])
+    {
+        let name = contract.name().to_owned();
+        if worker_contracts.insert(name.clone(), contract).is_some() {
+            return Err(
+                pi_rs_chord::Error::Invalid(format!("Duplicate worker contract: {name}")).into(),
+            );
+        }
+    }
+    let catalog = Arc::new(crate::api::v1::p2_contracts::lookup("p2.catalog")?);
+    let catalog_host = host.clone();
+    let data_dir = std::fs::canonicalize(&options.data_dir)?;
+    let app = options.app_dir.clone().unwrap_or_default();
+    let fake = options.fake;
+    let workers = SessionWorkers::new(&host, process, move |session, generation, context| {
+        let (host, catalog, data_dir, app) = (
+            catalog_host.clone(),
+            catalog.clone(),
+            data_dir.clone(),
+            app.clone(),
+        );
+        Box::pin(async move {
+            let value = catalog_session(&host, catalog, &session, &context).await?;
+            Ok(WorkerInit {
+                app,
+                data_dir,
+                fake,
+                telemetry: false,
+                generation,
+                values: Map::from_iter([("session".into(), value)]),
+            })
+        })
+    })?;
+    let route_workers = workers.clone();
     let http = Http::new(
         host.clone(),
         HttpOptions {
             links_path: Some("/chord".into()),
+            remote: Arc::new(move |principal| {
+                route_workers.remote_options(principal, worker_contracts.clone())
+            }),
             prefer_principal: |principal| principal["kind"] == "owner",
-            admit_link: |request| {
-                crate::runtime::http::admit_link(request, super::web::browser_base())
-            },
+            admit_link: crate::runtime::http::browser_links(super::web::browser_base()),
             max_payload: 1024 * 1024,
             max_buffered: 4 * 1024 * 1024,
             close_timeout: Duration::from_secs(8),
-            on_error: Arc::new(|error| eprintln!("p2 server: {error}")),
+            on_error: Arc::new(|error| server_error(&error)),
             ..Default::default()
         },
     );
@@ -222,10 +394,13 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         address: http.address,
         data_dir: options.data_dir,
         plugins: selected,
+        workers,
         core: Vec::new(),
         http,
         store,
         _lock: lock,
+        #[cfg(unix)]
+        dev: None,
     };
     let load = async {
         let info = ServerInfo {
@@ -239,7 +414,7 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
             port: server.address.port(),
         };
         server.core = vec![
-            PluginFacet::new("@p2/core", info_facet(info)?),
+            PluginFacet::new("@p2/core", info_facet(info, server.host.downgrade())?),
             PluginFacet::new("p2.core-http", routes.facet()),
             PluginFacet::new("chord.app.files", files.facet()?),
         ];
@@ -252,6 +427,34 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
                 reason: failure.error,
             });
         }
+        server
+            .workers
+            .update_authorizers(options.registry.session_authorizers(&server.plugins), &[]);
+        if options.dev {
+            #[cfg(unix)]
+            {
+                let dev = Arc::new(StandaloneDev {
+                    control: DevControl::default(),
+                    host: server.host.clone(),
+                    workers: server.workers.clone(),
+                    core: server.core.clone(),
+                    selection: tokio::sync::Mutex::new((options.registry, server.plugins.clone())),
+                });
+                let handler = dev.clone();
+                let channel = channel::serve(&server.data_dir, move |cmd| {
+                    let handler = handler.clone();
+                    async move { handler.execute(cmd).await }
+                })
+                .await?;
+                server.dev = Some((dev, channel));
+            }
+            #[cfg(not(unix))]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Private dev control requires Unix sockets",
+            )
+            .into());
+        }
         Ok(())
     }
     .await;
@@ -259,9 +462,16 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         Ok(()) => Ok(server),
         Err(error) => {
             if let Err(close) = server.close().await {
-                eprintln!("p2 server: {close}");
+                server_error(&close);
             }
             Err(error)
         }
     }
+}
+
+fn server_error(error: &impl std::fmt::Display) {
+    use crate::runtime::logs::{LogLevel, process_logs};
+    let message = format!("p2 server: {error}");
+    eprintln!("{message}");
+    process_logs().append("server", LogLevel::Stderr, &message);
 }

@@ -69,6 +69,18 @@ impl Channel {
         handler: Arc<dyn ChannelHandler>,
         options: ChannelOptions,
     ) -> Result<Arc<Self>> {
+        let (channel, dispatch) = Self::prepare(link, handler, options)?;
+        dispatch();
+        Ok(channel)
+    }
+
+    /// Install transport listeners before the caller publishes the channel. Dispatch
+    /// queued messages only after publication so an early hello sees the current link.
+    pub(crate) fn prepare(
+        link: Arc<dyn Link>,
+        handler: Arc<dyn ChannelHandler>,
+        options: ChannelOptions,
+    ) -> Result<(Arc<Self>, impl FnOnce())> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|e| invalid(&format!("channel runtime: {e}")))?;
         let hello = options.codec.encode(&Message {
@@ -127,28 +139,41 @@ impl Channel {
         }));
         let weak = Arc::downgrade(&channel);
         let mut closed = channel.closed.subscribe();
-        runtime.spawn(async move {
-            loop {
-                if *closed.borrow() { return; }
-                let bytes = tokio::select! {biased;_=closed.changed()=>return,bytes=receiver.recv()=>match bytes{Some(b)=>b,None=>return}};
-                let Some(c) = weak.upgrade() else {
-                    return;
-                };
-                let result = match c.handle(bytes) {
-                    Ok(Some(handled)) => {
-                        tokio::select! {biased;_=closed.changed()=>return,result=handled=>result}
+        let dispatch = move || {
+            runtime.spawn(async move {
+                loop {
+                    if *closed.borrow() {
+                        return;
                     }
-                    Ok(None) => Ok(()),
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = result {
-                    (c.options.report)(error);
-                    c.close();
-                    return;
+                    let bytes = tokio::select! {
+                        biased;
+                        _ = closed.changed() => return,
+                        bytes = receiver.recv() => match bytes {
+                            Some(bytes) => bytes,
+                            None => return,
+                        },
+                    };
+                    let Some(c) = weak.upgrade() else {
+                        return;
+                    };
+                    let result = match c.handle(bytes) {
+                        Ok(Some(handled)) => tokio::select! {
+                            biased;
+                            _ = closed.changed() => return,
+                            result = handled => result,
+                        },
+                        Ok(None) => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        (c.options.report)(error);
+                        c.close();
+                        return;
+                    }
                 }
-            }
-        });
-        Ok(channel)
+            });
+        };
+        Ok((channel, dispatch))
     }
     fn now(&self) -> u64 {
         self.clock.elapsed().as_millis().min(u64::MAX as u128) as u64

@@ -39,7 +39,10 @@ pub async fn start_client_host(
     }
     let selected = registry.select(requested)?;
     core.extend(registry.facets(kind, &selected));
-    let host = create_host(HostOptions::default())?;
+    let host = create_host(HostOptions {
+        principal_policy: Some(crate::runtime::principals::Principal::POLICY),
+        ..Default::default()
+    })?;
     let server = host.connect(link, RemoteOptions::new(json!({"kind":"server"})))?;
     let client = ClientHost { host, server };
     let result = client.host.load(core, context).await.and_then(|report| {

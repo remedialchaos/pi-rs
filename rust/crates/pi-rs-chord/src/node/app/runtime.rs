@@ -309,6 +309,15 @@ pub async fn boot_worker(mut session: WorkerSession, core: Vec<PluginFacet>) -> 
     .await
 }
 pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> Result<WorkerApp> {
+    start_worker_with_host(session, options, HostOptions::default()).await
+}
+
+/// Start a worker with the application's principal and reference policies.
+pub async fn start_worker_with_host(
+    session: WorkerSession,
+    options: WorkerAppOptions,
+    host_options: HostOptions,
+) -> Result<WorkerApp> {
     private_directory(&options.directory)?;
     let path = options.directory.join("store.sqlite");
     private_store(&path)?;
@@ -318,7 +327,7 @@ pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> 
         principal: Some(options.principal),
         address: Some(JsonValue::from_serde(session.address.clone())),
         store: Some(store.clone()),
-        ..Default::default()
+        ..host_options
     })?;
     let result = async {
         let mut parent_options = RemoteOptions::new(options.server_principal.clone());

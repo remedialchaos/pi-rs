@@ -76,7 +76,7 @@ impl RemotePeer {
                             principal
                                 .map(|p| p.to_serde())
                                 .transpose()?
-                                .unwrap_or_else(|| self.0.options.principal.clone()),
+                                .unwrap_or_else(|| lock(&self.0.principal).clone()),
                         ),
                         incarnation: incarnation
                             .map(|i| uuid::Uuid::from_bytes(i).to_string())
@@ -84,7 +84,7 @@ impl RemotePeer {
                     }
                 } else {
                     Caller {
-                        principal: Some(self.0.options.principal.clone()),
+                        principal: Some(lock(&self.0.principal).clone()),
                         incarnation: peer_id,
                     }
                 };
@@ -106,7 +106,8 @@ impl RemotePeer {
                     }
                 };
                 if let Some(route) = self.0.options.route.clone() {
-                    crate::data::principal_key(caller.principal.as_ref().ok_or(Error::Closed)?)?;
+                    let principal = caller.principal.as_ref().ok_or(Error::Closed)?;
+                    crate::data::principal_key(principal)?;
                     let key = Arc::new(());
                     let mut pending = lock(&self.0.pending_routes);
                     self.send(Body::Loading { hold })?;
@@ -114,6 +115,7 @@ impl RemotePeer {
                         hold,
                         PendingRoute {
                             key: key.clone(),
+                            principal: principal.clone(),
                             cancel: cancel.clone(),
                         },
                     );

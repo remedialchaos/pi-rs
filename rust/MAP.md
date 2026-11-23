@@ -14,6 +14,7 @@
 | --- | --- | --- |
 | 2.1 worker fixture | Coordinator | Build the ownership tests' subprocess with Cargo so cached Tokio feature sets cannot change its linkage |
 | 2.2b | Astra Low #1 | Durable harness |
+| 2.2b differential proof | Astra Low #5 | Replay the same durable submission and transcript operations through the upstream and native Harness entry points |
 | 3.2 worker harness | Sol Medium #1 | Native worker process registries, liveness and durable harness ownership |
 | 3.2 server registries | Sol Medium #2 | Native server service registries, request contributions and p2.hosts |
 | 3.2 durable session documents | Astra Low #2 | Durable storage owner, main conversation records and session lock document |
