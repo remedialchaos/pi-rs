@@ -22,6 +22,7 @@ percent-encoding = "2"
 regex = "1"
 url = "2"
 sha2 = "0.10"
+pi-rs-ai = { path = "../pi-rs-ai" }
 pi-rs-chord = { path = "../pi-rs-chord" }
 pi-rs-durable = { path = "../pi-rs-durable" }
 pi-rs-env = { path = "../pi-rs-env" }

@@ -74,7 +74,7 @@ async fn revoking_a_forwarded_caller_cancels_pending_demand_without_closing_the_
     child.role = pi_rs_chord::remote::LinkRole::Child;
     child.trusted = true;
     let client = RemotePeer::connect(b, child, Batch::new(|_| {}))?;
-    let guest = serde_json::json!("guest");
+    let guest = serde_json::json!({"kind":"guest"});
     let held = client.hold_as(
         contract,
         empty(),

@@ -15,7 +15,6 @@ use pi_rs_chord::{
         },
         workers::{ProcessLock, WorkerOptions},
     },
-    store::StoreEngine,
 };
 use serde_json::{Map, json};
 
@@ -28,7 +27,7 @@ use crate::{
     api::v1::{FacetKind, PluginRegistry},
     runtime::{
         host_dirs,
-        server::{ServerInfo, info_facet},
+        server::{ServerInfo, ServerNatives, add_request_services, info_facet, install_natives},
     },
 };
 
@@ -93,7 +92,7 @@ pub struct P2Server {
     pub workers: SessionWorkers,
     core: Vec<PluginFacet>,
     http: HttpServer,
-    store: StoreEngine,
+    natives: Arc<ServerNatives>,
     _lock: ProcessLock,
     #[cfg(unix)]
     dev: Option<(Arc<StandaloneDev>, channel::Channel)>,
@@ -225,7 +224,13 @@ impl P2Server {
             .close(&Context::background())
             .await
             .map_err(Error::from);
-        let store = self.store.database().close().await.map_err(Error::from);
+        let store = self
+            .natives
+            .store()
+            .database()
+            .close()
+            .await
+            .map_err(Error::from);
         http.and(host).and(store)
     }
 }
@@ -389,6 +394,21 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     let http = http
         .listen(SocketAddr::from(([127, 0, 0, 1], options.port)))
         .await?;
+    let natives = Arc::new(ServerNatives::new(
+        ServerInfo {
+            app: options
+                .app_dir
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            data_dir: options.data_dir.to_string_lossy().into_owned(),
+            fake: options.fake,
+            allowed_hosts: options.allowed_hosts,
+            port: http.address.port(),
+        },
+        workers.clone(),
+        host.clone(),
+        store,
+    ));
     let mut server = P2Server {
         host,
         address: http.address,
@@ -397,24 +417,19 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         workers,
         core: Vec::new(),
         http,
-        store,
+        natives,
         _lock: lock,
         #[cfg(unix)]
         dev: None,
     };
     let load = async {
-        let info = ServerInfo {
-            app: options
-                .app_dir
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            data_dir: server.data_dir.to_string_lossy().into_owned(),
-            fake: options.fake,
-            allowed_hosts: options.allowed_hosts,
-            port: server.address.port(),
-        };
+        install_natives(&server.host, &server.natives)?;
+        add_request_services(&mut routes, &server.natives);
         server.core = vec![
-            PluginFacet::new("@p2/core", info_facet(info, server.host.downgrade())?),
+            PluginFacet::new(
+                "@p2/core",
+                info_facet(&server.natives, server.host.downgrade())?,
+            ),
             PluginFacet::new("p2.core-http", routes.facet()),
             PluginFacet::new("chord.app.files", files.facet()?),
         ];
