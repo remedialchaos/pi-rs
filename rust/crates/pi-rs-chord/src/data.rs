@@ -241,14 +241,18 @@ pub fn join_key(parts: &[String]) -> String {
 
 pub struct Validator {
     inner: pi_rs_schema::Validator,
+    schema: Value,
 }
 impl Validator {
     pub fn compile(schema: &Value) -> Result<Self> {
         let inner = pi_rs_schema::compile(schema).map_err(|e| Error::Invalid(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            schema: schema.clone(),
+        })
     }
     pub fn check(&self, value: &Value, reason: &str) -> Result<()> {
-        let value = pi_rs_schema::Value::from(value);
+        let value = schema_value_with_bytes(value, &self.schema);
         if self.inner.check(&value) {
             return Ok(());
         }
@@ -271,5 +275,68 @@ impl Validator {
             Some(json!({"path":path})),
         )
         .into())
+    }
+}
+
+fn schema_value_with_bytes(value: &Value, schema: &Value) -> pi_rs_schema::Value {
+    let Some(obj) = schema.as_object() else {
+        return pi_rs_schema::Value::from(value);
+    };
+    if matches!(obj.get("type").and_then(Value::as_str), Some("bytes")) {
+        if let Value::Array(items) = value {
+            let mut bytes = Vec::with_capacity(items.len());
+            let mut all_u8 = true;
+            for item in items {
+                if let Some(n) = item.as_u64().and_then(|v| u8::try_from(v).ok()) {
+                    bytes.push(n);
+                } else {
+                    all_u8 = false;
+                    break;
+                }
+            }
+            if all_u8 {
+                return pi_rs_schema::Value::Bytes(bytes);
+            }
+        }
+        return pi_rs_schema::Value::from(value);
+    }
+    if let Some(branches) = obj.get("anyOf").and_then(Value::as_array) {
+        for branch in branches {
+            let converted = schema_value_with_bytes(value, branch);
+            if matches!(converted, pi_rs_schema::Value::Bytes(_)) {
+                return converted;
+            }
+        }
+    }
+    match value {
+        Value::Object(map) => {
+            let props = obj.get("properties").and_then(Value::as_object);
+            let additional = obj.get("additionalProperties");
+            let mut out = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                let converted = if let Some(prop_schema) = props.and_then(|p| p.get(k)) {
+                    schema_value_with_bytes(v, prop_schema)
+                } else if let Some(add_schema) = additional {
+                    schema_value_with_bytes(v, add_schema)
+                } else {
+                    pi_rs_schema::Value::from(v)
+                };
+                out.push((k.clone(), converted));
+            }
+            pi_rs_schema::Value::Object(out.into_iter().collect())
+        }
+        Value::Array(items) => {
+            if let Some(item_schema) = obj.get("items") {
+                pi_rs_schema::Value::Array(
+                    items
+                        .iter()
+                        .map(|v| schema_value_with_bytes(v, item_schema))
+                        .collect(),
+                )
+            } else {
+                pi_rs_schema::Value::from(value)
+            }
+        }
+        _ => pi_rs_schema::Value::from(value),
     }
 }

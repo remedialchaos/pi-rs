@@ -361,14 +361,23 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
             app.clone(),
         );
         Box::pin(async move {
-            let value = catalog_session(&host, catalog, &session, &context).await?;
+            let values = if let Ok(provider) =
+                crate::api::v1::server::service_of::<super::session_workers::WorkerInitProvider>(
+                    &host,
+                    super::session_workers::WORKER_INIT_PROVIDER_SERVICE,
+                ) {
+                (*provider)(session, generation, context).await?
+            } else {
+                let value = catalog_session(&host, catalog, &session, &context).await?;
+                Map::from_iter([("session".into(), value)])
+            };
             Ok(WorkerInit {
                 app,
                 data_dir,
                 fake,
                 telemetry: false,
                 generation,
-                values: Map::from_iter([("session".into(), value)]),
+                values,
             })
         })
     })?;
