@@ -1,5 +1,6 @@
 //! Built-in native `p2` plugins (Wave 2).
 
+pub mod artifacts;
 pub mod mcp;
 pub mod radius;
 mod search;
