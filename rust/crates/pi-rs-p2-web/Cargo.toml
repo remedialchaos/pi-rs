@@ -18,6 +18,11 @@ serde_json = "1"
 thiserror = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-net = { version = "0.6", default-features = false, features = ["websocket", "http"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
+futures-util = { version = "0.3", features = ["sink"] }
+futures-channel = "0.3"
+miniz_oxide = "0.8"
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -25,6 +30,9 @@ web-sys = { version = "0.3", features = [
     "AudioContext",
     "BinaryType",
     "Clipboard",
+    "Crypto",
+    "Url",
+    "ServiceWorkerContainer",
     "CssStyleDeclaration",
     "CustomEvent",
     "Document",

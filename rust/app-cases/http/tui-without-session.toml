@@ -1,0 +1,14 @@
+[request]
+method = "GET"
+path = "/__p2_tui"
+
+[response]
+status = 401
+
+[response.headers]
+cache-control = "no-store"
+content-security-policy = "default-src 'none'; script-src 'nonce-[..]'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+content-type = "text/html; charset=utf-8"
+referrer-policy = "no-referrer"
+x-content-type-options = "nosniff"
+x-frame-options = "DENY"

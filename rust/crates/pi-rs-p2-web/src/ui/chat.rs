@@ -98,7 +98,7 @@ pub fn Chat(messages: RwSignal<Vec<ChatMessage>>) -> impl IntoView {
             <div class="chat-transcript" role="log" aria-live="polite">
                 <For
                     each=move || messages.get()
-                    key=|message| message.id.clone()
+                    key=|message| (message.id.clone(), message.text.clone(), message.streaming)
                     children={move |message: ChatMessage| view! { <MessageRow message=message /> }}
                 />
             </div>

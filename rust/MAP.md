@@ -8,6 +8,15 @@
 - Current session handoff: [HANDOFF.md](HANDOFF.md)
 - Generated port map (created once crates exist): `rust/PORT_MAP.md` (`rust-anything map --write`)
 
+## Current wave claims
+
+| Unit | Owner | Scope |
+| --- | --- | --- |
+| 2.2b | Astra Low #1 | Durable harness |
+| 2.3b | Astra Low #2 | Remote execution environment bridge |
+| 3.2-tui follow-up | Astra Low #3 | Transcript, panels, trees, dispatch, themes |
+| 3.2 core | Sol Medium #1 | Server, hosts, runtime, plugin interface |
+
 ## ADR Index
 
 | ADR | Title | Status |
@@ -128,9 +137,9 @@ Shape: CLI (`pi`). Research complete ([rust/research/wasm-extensions.md](researc
 | 2.1b-2 | `pi-rs-chord` (Node/Platform Host: `node/{http,workers,plugins,surfaces,tui,app}`, WASM/WIT plugins) | `packages/chord` | ~14.6k | 6 subsystems | **done (bounded)** (`jcode`, verified 2026-11-22) | `rust/crates/pi-rs-chord`: `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **163/163** tests PASS (+20 new, all 20 mutation-checked: live Axum HTTP/WS RPC, `wit/plugin.wit` bindgen, real child workers, surfaces/TUI/app auth/files/archive); remaining HostData address-ownership/worker-routing/registry-adapter gaps logged in [MILESTONE.md](crates/pi-rs-chord/MILESTONE.md) |
 | 2.1b-3 | `pi-rs-chord` (Platform Orchestration Gap Closure: `HostData` address ownership/export/import/delete, worker routing, registry-bound `Http`/`Files`/`Users`, guest WASM fixture) | `packages/chord` | gap closure | 4 areas | **done** (`jcode / GPT-6.2 Sol`, verified 2026-11-22) | `rust/crates/pi-rs-chord`: `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **178/178** tests PASS (+15 new, all 15 mutation-checked, real checked-in WASM guest components, `HostData` owner transfer, worker routing, registry-bound `Http`/`Files`/`Users`, TUI launcher); merged into `main` |
 | 2.2a | `pi-rs-durable` (Foundation, Env, Images, Tools, Tool-Search, Codemode, Storage backends & Session engine) | `packages/durable` | ~23.4k | 18 units | **done** (`omp / GPT-6.2-Sol`, verified 2026-11-22) | `rust/crates/pi-rs-durable`: `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **77/77** contract tests PASS in 19.80s (memory/SQLite/Chord-store/JSONL storage conformance + local `ExecutionEnv` conformance + 16 mutation checks); details in [MILESTONE.md](crates/pi-rs-durable/MILESTONE.md) |
-| 2.2b | `pi-rs-durable` (Durable Harness: `src/harness/` agent/compaction/scheduler/submissions/task-graph/views) | `packages/durable` | ~12.5k | 24 files | open (follows 2.2a) | Milestone 2.2a |
+| 2.2b | `pi-rs-durable` (Durable Harness: `src/harness/` agent/compaction/scheduler/submissions/task-graph/views) | `packages/durable` | ~12.5k | 25 files | claimed (see current wave) | Milestone 2.2a |
 | 2.3a | `pi-rs-env` (Daemon + Transport: integrated `packages/env/daemon/` as `pi-env` bin + `connection`, `ssh`, `process`, `terminal`, `watch`, `errors`) | `packages/env` (+ Rust `daemon/`) | 1.5k TS + 5.8k Rust | 6 client units + daemon | **done** (`opencode`, verified 2026-11-22) | `rust/crates/pi-rs-env` (`pi-env` bin): `fmt`/`clippy -D warnings` PASS, 0 `#[allow]`, `unsafe` isolated to `daemon/sys/`, **41/41** tests PASS in 1.17s (33 unit + 8 live `pi-env` binary integration); details in [MILESTONE.md](crates/pi-rs-env/MILESTONE.md) |
-| 2.3b | `pi-rs-env` (Durable Bridge: `list-files`, `remote-env` implementing `ExecutionEnv`) | `packages/env` | 1.1k TS | 2 units | open (follows 2.2, 2.3a) | `pi-rs-chord`, `pi-rs-durable`, 2.3a |
+| 2.3b | `pi-rs-env` (Durable Bridge: `list-files`, `remote-env` implementing `ExecutionEnv`) | `packages/env` | 1.1k TS | 2 units | claimed (see current wave) | `pi-rs-chord`, `pi-rs-durable`, 2.3a |
 | 2.4 | `pi-rs-evals` | `packages/evals` | 1.4k | 7 units | **done** (`opencode`, verified 2026-11-22) | `rust/crates/pi-rs-evals` (`pi-evals` bin): `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **44/44** tests PASS in 0.02s (5/5 mutation-checked, upstream golden report/SHA parity, TTY-deterministic styling); details in [MILESTONE.md](crates/pi-rs-evals/MILESTONE.md) |
 
 ---
@@ -140,9 +149,9 @@ Shape: CLI (`pi`). Research complete ([rust/research/wasm-extensions.md](researc
 | Milestone | Crate | Upstream App | Src LOC | Units / Pieces | State | Notes |
 | --- | --- | --- | ---: | --- | --- | --- |
 | 3.1 | `pi-rs-p3` | `apps/p3` (`src/` + `plugins/`; `old/` skipped) | 2.5k | 21 src + 4 plugins | **done** (`opencode / DeepSeek` + `codex / GPT-6.2-Astra`, verified 2026-11-22) | `rust/crates/pi-rs-p3` (`p3` bin): `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **79/79** tests PASS in 1.97s (69 lib + 6 live `p3` binary CLI + 4 live child-worker runner + 5/5 mutation checks); details & `2.1b-3` seam notes in [MILESTONE.md](crates/pi-rs-p3/MILESTONE.md) |
-| 3.2-web | `pi-rs-p2-web` (Leptos `0.8.x` CSR WASM frontend, ADR-011) | `apps/p2/src/web` | ~13.0k | ~65 web UI files | **done** (`opencode / Hy4 Flash`, verified 2026-11-22) | `rust/crates/pi-rs-p2-web`: `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **134/134** native tests PASS + `wasm32-unknown-unknown` PASS + exact embedded Elanor CSS; details in [MILESTONE.md](crates/pi-rs-p2-web/MILESTONE.md) |
+| 3.2-web | `pi-rs-p2-web` (Leptos CSR frontend and browser host) | `apps/p2/src/web`, `apps/p2/src/hosts/web` | ~13.0k | Browser | **partial** | 135 native tests, native and WASM Clippy, Chromium session creation and chat with the upstream server. The browser check injected built assets. Production asset serving, plugin UI loading, attachments, telemetry and offline persistence remain open. [Milestone](crates/pi-rs-p2-web/MILESTONE.md) |
 | 3.2-tui | `pi-rs-p2-tui` (`p2` Terminal UI client on `pi-rs-tui`) | `apps/p2/src/tui` | ~6.9k | 34 TUI files | **done (bounded)** (`omp / Nemotron` + `codex / GPT-6.2-Astra`, verified 2026-11-22) | `rust/crates/pi-rs-p2-tui`: `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **15/15** tests PASS (5 unit + 10 integration, all 15 mutation-checked: native Mermaid, headless masked input, shell status, settings paths, slash completion, list actions, palette validation, transcript anchors); remaining incremental transcript/panel-scroll/tree-layout/plugin-dispatch parity noted in [MILESTONE.md](crates/pi-rs-p2-tui/MILESTONE.md) |
-| 3.2 | `pi-rs-p2` (Server + hosts/runtime + 20 plugins) | `apps/p2` | ~89.6k | server + runtime + plugins | open | Binary `p2`; follows `2.1b-3`, `2.2`, `2.3b`, `3.2-web`, `3.2-tui` |
+| 3.2 | `pi-rs-p2` (Server + hosts/runtime + 49 plugins) | `apps/p2` | ~89.6k | server + runtime + plugins | open | Binary `p2`; follows `2.1b-3`, `2.2`, `2.3b`, `3.2-web`, `3.2-tui` |
 | 3.3 | `pi-rs-p2-mac` | `apps/p2-mac` | 3.5k Swift | macOS shell | **done** (`omp`, verified 2026-11-22) | `rust/crates/pi-rs-p2-mac` (`pi-mac` binary): `fmt`/`clippy -D warnings` PASS, **16/16** Linux x86_64 tests PASS (network/portable/supervisor) + `aarch64-apple-darwin` type-check PASS + real upstream `p2` smoke PASS; live macOS AppKit/WKWebView & signing deferred per ADR-005 |
 | 3.4 | `pi-rs-voice-server` | `apps/p2/voice-server` | Python | 4 units | **done** (`omp`, verified 2026-11-22) | `rust/crates/pi-rs-voice-server` (`pi-voice-server` binary): `fmt`/`clippy -D warnings` PASS, **17/17** offline HTTP/WS/segmenter/text tests PASS in 0.74s + real Supertonic 44.1 kHz, Kokoro 24 kHz, and Silero/Parakeet (`sherpa-onnx 1.13.8` parity) verified; Pocket synthesis hook ready for native ONNX/Candle adapter |
 

@@ -3,6 +3,9 @@
 //! `web/theme.ts`, `web/shell-bridge.ts`).
 
 // ---------------------------------------------------------------------------
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod replica;
+
 // Binary link framing (the primitives of Chord's `binary.ts` codec).
 // ---------------------------------------------------------------------------
 

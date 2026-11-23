@@ -1,0 +1,12 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "p2",
+  "run": [
+    "node",
+    "--import",
+    "./apps/p2/src/source.ts",
+    "apps/p2/src/hosts/server.ts"
+  ],
+  "timeout_secs": 90,
+  "http": {}
+}

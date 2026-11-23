@@ -47,13 +47,19 @@ pub fn FileCompletionPopover(popover: Popover, on_choose: Callback<usize>) -> im
 
 /// The message composer: a textarea with reactive draft state and a send button.
 #[component]
-pub fn Composer(draft: RwSignal<String>, on_send: Callback<String>) -> impl IntoView {
+pub fn Composer(
+    draft: RwSignal<String>,
+    on_send: Callback<String>,
+    #[prop(default = true)] clear_on_send: bool,
+) -> impl IntoView {
     let send = {
         move |_| {
             let text = draft.get();
             if !text.trim().is_empty() {
                 on_send.run(text);
-                draft.set(String::new());
+                if clear_on_send {
+                    draft.set(String::new());
+                }
             }
         }
     };
@@ -72,7 +78,7 @@ pub fn Composer(draft: RwSignal<String>, on_send: Callback<String>) -> impl Into
                         let text = draft.get();
                         if !text.trim().is_empty() {
                             on_send.run(text);
-                            draft.set(String::new());
+                            if clear_on_send {draft.set(String::new());}
                         }
                     }
                 }

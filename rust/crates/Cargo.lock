@@ -1965,6 +1965,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gloo-timers"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4460540da666acdb5722b2a62ac47d18f627fcfc0c728d04dc7226b3f6d40a7"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "gloo-utils"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4051,9 +4063,14 @@ dependencies = [
 name = "pi-rs-p2-web"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
+ "futures-util",
+ "gloo-net",
+ "gloo-timers",
  "indexmap 2.14.2",
  "js-sys",
  "leptos",
+ "miniz_oxide 0.8.9",
  "pulldown-cmark",
  "serde",
  "serde_json",

@@ -1,0 +1,13 @@
+[request]
+method = "GET"
+path = "/__p2_dev"
+
+[response]
+status = 403
+
+[response.headers]
+cache-control = "no-store"
+content-security-policy = "default-src 'none'; script-src 'self' 'nonce-[..]-[..]-[..]-[..]-[..]' 'wasm-unsafe-eval'; connect-src 'self' ws://127.0.0.1:[..]; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; manifest-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+referrer-policy = "no-referrer"
+x-content-type-options = "nosniff"
+x-frame-options = "DENY"
