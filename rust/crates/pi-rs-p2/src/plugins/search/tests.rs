@@ -2,7 +2,7 @@
 
 use crate::{
     api::v1::{FacetKind, PluginRegistry, p2_contracts::lookup},
-    runtime::{principals::Principal, server::ServerInfo},
+    runtime::principals::Principal,
 };
 use pi_rs_chord::{
     Error, Result,
@@ -51,20 +51,10 @@ async fn host(directory: &Path) -> Result<Host> {
         principal_policy: Some(Principal::POLICY),
         ..Default::default()
     })?;
-    let info = ServerInfo {
-        app: String::new(),
-        data_dir: directory.to_string_lossy().into_owned(),
-        fake: true,
-        allowed_hosts: Vec::new(),
-        port: 0,
-    };
     let mut registry = PluginRegistry::new();
     crate::plugins::shard_c::register(&mut registry)?;
     let mut facets = registry.facets(FacetKind::Server, &registry.select(None)?);
-    facets.push(PluginFacet::new(
-        "@p2/core",
-        crate::runtime::server::info_facet(info, host.downgrade())?,
-    ));
+    facets.push(PluginFacet::new("@p2/core", server_facet(directory)?));
     let ready = host.load(facets, &context).await?;
     if let Some(failure) = ready.failed.first() {
         return Err(Error::Invalid(format!(
@@ -73,6 +63,39 @@ async fn host(directory: &Path) -> Result<Host> {
         )));
     }
     Ok(host)
+}
+
+/// The server's own contract, with the data directory the index lives in.
+fn server_facet(directory: &Path) -> Result<pi_rs_chord::host::Facet> {
+    use pi_rs_chord::host::{FacetHost, Members, ObjectSelf, ServeOptions, define_facet};
+    let contract = Arc::new(lookup("p2.server")?);
+    let info = JsonValue::from_serde(json!({
+        "app": "",
+        "dataDir": directory.to_string_lossy(),
+        "fake": true,
+        "allowedHosts": [],
+        "port": 0,
+    }));
+    let served = info.clone();
+    Ok(define_facet(move |host: &mut FacetHost| {
+        let info = served.clone();
+        host.serve(
+            contract.clone(),
+            move |_params, _principal, object: &mut ObjectSelf| {
+                let mut members = Members::new();
+                members.state("info", object.writable(info.clone())?)?;
+                members.method("revokeOwners", |_args, _ctx| {
+                    Box::pin(async { Ok(JsonValue::Null) })
+                })?;
+                members.method("revokeGuests", |_args, _ctx| {
+                    Box::pin(async { Ok(JsonValue::Null) })
+                })?;
+                Ok(members)
+            },
+            ServeOptions::default(),
+        )?;
+        Ok(())
+    }))
 }
 
 /// A peer that holds contracts as `principal`.
