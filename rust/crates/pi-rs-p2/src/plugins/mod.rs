@@ -25,6 +25,7 @@ pub mod status;
 pub mod subagents;
 pub mod sync;
 pub mod telemetry;
+pub mod voice;
 pub mod web_shell;
 
 use crate::api::v1::PluginRegistry;

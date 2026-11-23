@@ -7,5 +7,6 @@ use crate::api::v1::PluginRegistry;
 /// Registers the Shard C2 built-in plugins into `registry`.
 pub fn register(registry: &mut PluginRegistry) -> Result<()> {
     super::subagents::register(registry)?;
+    super::voice::register(registry)?;
     Ok(())
 }

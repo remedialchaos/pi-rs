@@ -60,8 +60,19 @@ fn subagents_contracts_and_helpers() -> TestResult {
     register_builtins(&mut registry)?;
     let selected = registry.select(None)?;
     assert!(selected.contains(&"subagents".to_owned()));
-    assert_eq!(registry.facets(FacetKind::Server, &selected).len(), 1);
-    assert_eq!(registry.facets(FacetKind::Worker, &selected).len(), 1);
+    assert!(selected.contains(&"voice".to_owned()));
+    assert_eq!(
+        registry
+            .facets(FacetKind::Server, &["subagents".into()])
+            .len(),
+        1
+    );
+    assert_eq!(
+        registry
+            .facets(FacetKind::Worker, &["subagents".into()])
+            .len(),
+        1
+    );
 
     assert_eq!(child_store_contract()?.name(), "p2.child-store");
     assert_eq!(subagents_contract()?.name(), "p2.subagents");
@@ -368,6 +379,25 @@ async fn subagents_server_facet_serves_child_store_and_strips_guest_detail() -> 
     let mut options = ServerOptions::new(dir.path().into());
     options.port = 0;
     register_builtins(&mut options.registry)?;
+    let mut auth = pi_rs_p2::runtime::server::ServerServices::default();
+    auth.authenticators.insert(
+        "test-owner".into(),
+        Arc::new(|req, _| {
+            Box::pin(async move {
+                let is_owner = req
+                    .headers
+                    .get(http::header::COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|c| c.contains("fixture=owner"));
+                Ok(is_owner.then_some(Principal::Owner {
+                    access: OwnerAccess::Local,
+                }))
+            })
+        }),
+    );
+    options
+        .registry
+        .register("test-auth", FacetKind::Server, auth.facet())?;
     let server = start_server(options).await?;
     let ctx = Context::background();
     let root = server.host.root();
@@ -452,6 +482,347 @@ async fn subagents_server_facet_serves_child_store_and_strips_guest_detail() -> 
             .to_json()
             .to_serde()?,
         json!({ "sess-1": [] })
+    );
+
+    drop(root);
+    let _ = server.close().await;
+    Ok(())
+}
+
+#[test]
+fn voice_protocol_frames_and_validation() {
+    use pi_rs_p2::plugins::voice::protocol::{
+        AGENT_AUDIO, is_valid_room_command, is_valid_room_personal, parse_room_frame, room_name,
+        validate_log_batch, validate_sample, validate_voices,
+    };
+
+    // Odd ID length (3) -> 2 + 3 = 5 (odd) -> 1 pad byte -> offset 6
+    let frame_odd = [AGENT_AUDIO, 3, b'a', b'b', b'c', 0, 10, 20, 30, 40];
+    let parsed_odd = parse_room_frame(&frame_odd).expect("odd frame");
+    assert_eq!(parsed_odd.kind, AGENT_AUDIO);
+    assert_eq!(parsed_odd.id, "abc");
+    assert_eq!(parsed_odd.pcm, vec![10, 20, 30, 40]);
+
+    // Even ID length (2) -> 2 + 2 = 4 (even) -> no pad byte -> offset 4
+    let frame_even = [AGENT_AUDIO, 2, b'x', b'y', 1, 2];
+    let parsed_even = parse_room_frame(&frame_even).expect("even frame");
+    assert_eq!(parsed_even.id, "xy");
+    assert_eq!(parsed_even.pcm, vec![1, 2]);
+    assert_eq!(parse_room_frame(&[1, 5, b'a']), None);
+
+    assert_eq!(room_name("abc", 1), Some("p2-abc-1".into()));
+    assert_eq!(room_name("bad/id", 1), None);
+
+    assert!(is_valid_room_personal(&json!({ "type": "reset" })));
+    assert!(is_valid_room_personal(
+        &json!({ "type": "vad", "silence": 0.8 })
+    ));
+    assert!(!is_valid_room_personal(
+        &json!({ "type": "vad", "silence": 5.0 })
+    ));
+    assert!(!is_valid_room_personal(
+        &json!({ "type": "speak", "id": "u1", "text": "hi" })
+    ));
+    assert!(is_valid_room_command(
+        &json!({ "type": "speak", "id": "u1", "text": "hi" })
+    ));
+
+    assert!(validate_sample(&json!({ "speed": 1.0, "engine": "kokoro" })).is_some());
+    assert!(validate_sample(&json!({ "speed": 3.0 })).is_none());
+    assert!(
+        validate_log_batch(
+            &json!({ "client": "tab1", "events": [{ "t": 1000, "message": "ok" }] })
+        )
+        .is_some()
+    );
+    assert!(validate_log_batch(&json!({ "client": "bad/client", "events": [] })).is_none());
+
+    let voices_json = json!({
+        "engines": [{
+            "id": "kokoro",
+            "name": "Kokoro",
+            "streaming": true,
+            "sampleRate": 24000,
+            "voices": [{ "id": "af_heart", "name": "Heart" }],
+            "languages": [{ "id": "fr", "name": "French" }, { "id": "en", "name": "English" }],
+            "defaultLanguage": "en"
+        }],
+        "default": { "engine": "kokoro", "voice": "af_heart", "language": "en" }
+    });
+    assert!(validate_voices(&voices_json).is_some());
+}
+
+#[test]
+fn voice_choice_and_policy() {
+    use pi_rs_p2::plugins::voice::{
+        choice::{VoiceSettings, engine_label, languages_of, resolve_voice, resolved},
+        policy::{BargeInPhase, barge_in_phase},
+        protocol::{DefaultVoice, LanguageInfo, TtsEngine, VoiceInfo, Voices},
+    };
+
+    assert_eq!(barge_in_phase(true, false), BargeInPhase::Hearing);
+    assert_eq!(barge_in_phase(false, true), BargeInPhase::Speaking);
+    assert_eq!(barge_in_phase(false, false), BargeInPhase::Listening);
+
+    let config = Voices {
+        engines: vec![
+            TtsEngine {
+                id: "pocket".into(),
+                name: "Pocket TTS".into(),
+                streaming: true,
+                sample_rate: 24000,
+                voices: vec![VoiceInfo {
+                    id: "alba".into(),
+                    name: "Alba".into(),
+                }],
+                languages: Some(vec![LanguageInfo {
+                    id: "en".into(),
+                    name: "English".into(),
+                }]),
+                default_language: Some("en".into()),
+            },
+            TtsEngine {
+                id: "kokoro".into(),
+                name: "Kokoro".into(),
+                streaming: false,
+                sample_rate: 24000,
+                voices: vec![VoiceInfo {
+                    id: "heart".into(),
+                    name: "Heart".into(),
+                }],
+                languages: Some(vec![
+                    LanguageInfo {
+                        id: "fr".into(),
+                        name: "French".into(),
+                    },
+                    LanguageInfo {
+                        id: "de".into(),
+                        name: "German".into(),
+                    },
+                    LanguageInfo {
+                        id: "en".into(),
+                        name: "English".into(),
+                    },
+                ]),
+                default_language: Some("en".into()),
+            },
+        ],
+        default: DefaultVoice {
+            engine: "pocket".into(),
+            voice: "alba".into(),
+            language: Some("en".into()),
+        },
+    };
+
+    assert_eq!(engine_label(&config.engines[0]), "Pocket");
+    let langs = languages_of(Some(&config.engines[1]));
+    assert_eq!(
+        langs.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+        vec!["en", "de", "fr"]
+    );
+
+    let fallback = resolve_voice(
+        Some(&config),
+        &VoiceSettings {
+            engine: "missing".into(),
+            voice: "missing".into(),
+            speed: 1.0,
+            language: Some("ja".into()),
+        },
+    );
+    assert_eq!(fallback.engine.map(|e| e.id.as_str()), Some("pocket"));
+    assert_eq!(fallback.voice, "alba");
+    assert_eq!(fallback.language.as_deref(), Some("en"));
+
+    let switched = resolved(
+        Some(&config),
+        &VoiceSettings {
+            engine: "pocket".into(),
+            voice: "heart".into(),
+            speed: 1.2,
+            language: Some("de".into()),
+        },
+    );
+    assert_eq!(switched.voice, "alba");
+    assert_eq!(switched.language.as_deref(), Some("en"));
+}
+
+#[test]
+fn voice_speech_text_chunking_and_stop_commands() {
+    use pi_rs_p2::plugins::voice::speech_text::{SpeechChunker, is_stop_command, speakable};
+
+    assert_eq!(
+        speakable("## **Hello** [world](https://example.com)!"),
+        "Hello world!"
+    );
+    assert_eq!(speakable("| a | b |"), "");
+    assert_eq!(speakable("---"), "");
+    assert_eq!(
+        speakable("Visit https://example.com now"),
+        "Visit a link now"
+    );
+
+    let mut chunker = SpeechChunker::new();
+    let text = "Dr. Smith ran `a.out`. Then:\n1. First item.\n```rust\nlet x = 1;\n```\nDone";
+    let first = chunker.push(&text[..text.len() - 4], false);
+    assert_eq!(first, vec!["Dr. Smith ran a.out.", "Then:", "First item."]);
+    let rest = chunker.push(text, true);
+    assert_eq!(rest, vec!["Done"]);
+
+    assert!(is_stop_command("Stop!"));
+    assert!(is_stop_command("Okay, stop."));
+    assert!(is_stop_command("never mind"));
+    assert!(!is_stop_command("stop the server please"));
+}
+
+#[test]
+fn voice_worker_prompt_and_doc() {
+    use pi_rs_p2::plugins::voice::worker::{
+        VOICE_PROMPT, language_name, voice_mode_doc, voice_prompt,
+    };
+
+    assert_eq!(language_name("de"), "German");
+    assert_eq!(voice_prompt(None), VOICE_PROMPT);
+    assert_eq!(voice_prompt(Some("en-US")), VOICE_PROMPT);
+    let de_prompt = voice_prompt(Some("de"));
+    assert!(de_prompt.contains("Speak German: reply in German"));
+
+    let doc = voice_mode_doc();
+    assert_eq!(doc.kind, "voice.mode");
+    assert_eq!(doc.version, 2);
+}
+
+#[tokio::test]
+async fn voice_server_facet_and_routes() -> TestResult {
+    use pi_rs_p2::plugins::voice::{
+        contract::{voice_service_contract, voice_service_store_contract},
+        server::{read_config, strip_json_comments},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    assert_eq!(
+        strip_json_comments(
+            "{\n// comment\n\"url\": \"https://a//b\", /* block */ \"token\": \"t\"\n}"
+        ),
+        "{\n\n\"url\": \"https://a//b\",  \"token\": \"t\"\n}"
+    );
+
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("voice.json"),
+        "// config\n{\"url\": \"https://voice.example.com/\", \"token\": \"secret\"}\n",
+    )?;
+    let cfg = read_config(dir.path()).await.expect("valid voice.json");
+    assert_eq!(cfg.url, "https://voice.example.com");
+    assert_eq!(cfg.token, "secret");
+
+    // Start server without voice.json to avoid external network calls.
+    std::fs::remove_file(dir.path().join("voice.json"))?;
+    let mut options = ServerOptions::new(dir.path().into());
+    options.port = 0;
+    register_builtins(&mut options.registry)?;
+    let mut auth = pi_rs_p2::runtime::server::ServerServices::default();
+    auth.authenticators.insert(
+        "test-owner".into(),
+        Arc::new(|req, _| {
+            Box::pin(async move {
+                let is_owner = req
+                    .headers
+                    .get(http::header::COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|c| c.contains("fixture=owner"));
+                Ok(is_owner.then_some(Principal::Owner {
+                    access: OwnerAccess::Local,
+                }))
+            })
+        }),
+    );
+    options
+        .registry
+        .register("test-auth", FacetKind::Server, auth.facet())?;
+    let server = start_server(options).await?;
+    let ctx = Context::background();
+    let root = server.host.root();
+
+    let store = root.hold(
+        Arc::new(voice_service_store_contract()?),
+        JsonValue::Object(IndexMap::new()),
+    )?;
+    store.wait(&ctx).await?;
+    assert_eq!(
+        store.member("voices")?.value()?.to_json().to_serde()?,
+        json!(null)
+    );
+
+    let voice_svc = Arc::new(voice_service_contract()?);
+    let owner_svc = server.host.hold_as(
+        voice_svc.clone(),
+        JsonValue::Object(IndexMap::new()),
+        Caller {
+            principal: Some(serde_json::to_value(Principal::Owner {
+                access: OwnerAccess::Local,
+            })?),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        },
+        &ctx,
+    )?;
+    owner_svc.wait(&ctx).await?;
+    assert_eq!(owner_svc.variant()?, "talker");
+
+    let mut view_sessions = IndexMap::new();
+    view_sessions.insert("s1".into(), GrantMode::View);
+    let view_guest = server.host.hold_as(
+        voice_svc,
+        JsonValue::Object(IndexMap::new()),
+        Caller {
+            principal: Some(serde_json::to_value(Principal::Guest {
+                id: "g-view".into(),
+                name: "Viewer".into(),
+                email: None,
+                home: "s1".into(),
+                sessions: view_sessions,
+                revision: 1,
+            })?),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        },
+        &ctx,
+    )?;
+    assert!(view_guest.wait(&ctx).await.is_err());
+
+    // Local owner HTTP POST /voice/log -> 204, POST /voice/sample -> 503 (voice.json missing)
+    let mut conn = tokio::net::TcpStream::connect(server.address).await?;
+    let log_body =
+        json!({ "client": "tab1", "events": [{ "t": 1000, "message": "hello" }] }).to_string();
+    let req = format!(
+        "POST /voice/log HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\nCookie: fixture=owner\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        server.address,
+        server.address,
+        log_body.len(),
+        log_body
+    );
+    conn.write_all(req.as_bytes()).await?;
+    let mut resp = String::new();
+    conn.read_to_string(&mut resp).await?;
+    assert!(
+        resp.starts_with("HTTP/1.1 204 "),
+        "unexpected log response: {resp}"
+    );
+
+    let mut conn2 = tokio::net::TcpStream::connect(server.address).await?;
+    let sample_body = json!({ "speed": 1.0 }).to_string();
+    let req2 = format!(
+        "POST /voice/sample HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\nCookie: fixture=owner\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        server.address,
+        server.address,
+        sample_body.len(),
+        sample_body
+    );
+    conn2.write_all(req2.as_bytes()).await?;
+    let mut resp2 = String::new();
+    conn2.read_to_string(&mut resp2).await?;
+    assert!(
+        resp2.starts_with("HTTP/1.1 503 "),
+        "unexpected sample response: {resp2}"
     );
 
     drop(root);
