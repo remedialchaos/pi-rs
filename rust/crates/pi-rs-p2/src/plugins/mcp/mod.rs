@@ -2,4 +2,6 @@
 //! sign-ins the owner's browser walks through.
 
 pub mod config;
+pub mod config_file;
 pub mod leases;
+pub mod probe;
