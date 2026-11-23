@@ -1,7 +1,11 @@
 mod catalog;
+mod copy;
+mod lifecycle;
 mod preferences;
+mod public;
 #[cfg(test)]
 mod tests;
+mod transfer;
 
 use crate::api::v1::{FacetKind, PluginRegistry, p2_contracts::lookup};
 use indexmap::IndexMap;
@@ -35,12 +39,12 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                     ..Default::default()
                 },
             )?;
-            let catalog = catalog.clone();
+            let index_catalog = catalog.clone();
             host.serve(
                 index.clone(),
                 move |_, _, object| {
                     let rows = object
-                        .get(catalog.clone(), wire(json!({})))?
+                        .get(index_catalog.clone(), wire(json!({})))?
                         .member("sessions")?;
                     let by_id = Source::derive(
                         object.batch(),
@@ -61,9 +65,12 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                     Ok(members)
                 },
                 ServeOptions::default(),
-            )
+            )?;
+            lifecycle::serve(host, catalog.clone())?;
+            public::serve(host, catalog.clone(), index.clone())
         }),
-    )
+    )?;
+    registry.register("sessions", FacetKind::Worker, transfer::facet()?)
 }
 
 fn wire(value: Value) -> JsonValue {
@@ -74,6 +81,10 @@ fn arg<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value[field]
         .as_str()
         .ok_or_else(|| Error::Invalid(format!("Missing {field}")))
+}
+
+fn clean_title(title: &str) -> String {
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn now() -> i64 {
