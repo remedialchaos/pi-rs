@@ -3,8 +3,9 @@ use crate::{
     context::{Context, lock},
 };
 use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Condvar, Mutex},
+    thread::{self, ThreadId},
 };
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchError {
@@ -14,9 +15,14 @@ pub enum BatchError {
 type Work = Box<dyn FnOnce() -> Result<()> + Send>;
 type Delivery = Box<dyn FnOnce(&Context) -> Result<()> + Send>;
 #[derive(Default)]
+struct Scope {
+    running: usize,
+    computing: usize,
+}
+#[derive(Default)]
 struct State {
-    running: bool,
-    computing: bool,
+    scopes: HashMap<ThreadId, Scope>,
+    owner: Option<ThreadId>,
     sending: bool,
     changed: VecDeque<Delivery>,
     flushes: VecDeque<Delivery>,
@@ -25,31 +31,62 @@ struct State {
 }
 struct Inner {
     state: Mutex<State>,
+    available: Condvar,
     report: Arc<dyn Fn(BatchError) + Send + Sync>,
 }
 #[derive(Clone)]
 pub struct Batch(Arc<Inner>);
 struct Flags {
     batch: Batch,
-    running: bool,
-    computing: bool,
+    thread: ThreadId,
+    compute: bool,
 }
 impl Drop for Flags {
     fn drop(&mut self) {
         let mut state = lock(&self.batch.0.state);
-        state.running = self.running;
-        state.computing = self.computing;
+        if let Some(scope) = state.scopes.get_mut(&self.thread) {
+            scope.running -= 1;
+            scope.computing -= usize::from(self.compute);
+            if scope.running == 0 {
+                state.scopes.remove(&self.thread);
+            }
+        }
+    }
+}
+struct Commit<'a> {
+    batch: &'a Batch,
+    outer: bool,
+}
+impl Commit<'_> {
+    fn release(&mut self, state: &mut State) {
+        if self.outer {
+            self.outer = false;
+            state.owner = None;
+            self.batch.0.available.notify_all();
+        }
+    }
+}
+impl Drop for Commit<'_> {
+    fn drop(&mut self) {
+        if self.outer {
+            let mut state = lock(&self.batch.0.state);
+            state.sending = false;
+            self.release(&mut state);
+        }
     }
 }
 impl Batch {
     pub fn new(report: impl Fn(BatchError) + Send + Sync + 'static) -> Self {
         Self(Arc::new(Inner {
             state: Mutex::new(State::default()),
+            available: Condvar::new(),
             report: Arc::new(report),
         }))
     }
     pub fn running(&self) -> bool {
-        lock(&self.0.state).running
+        lock(&self.0.state)
+            .scopes
+            .contains_key(&thread::current().id())
     }
     pub fn assert_outside(&self, operation: &str) -> Result<()> {
         if self.running() {
@@ -61,7 +98,11 @@ impl Batch {
         }
     }
     pub fn assert_not_computing(&self, operation: &str) -> Result<()> {
-        if lock(&self.0.state).computing {
+        if lock(&self.0.state)
+            .scopes
+            .get(&thread::current().id())
+            .is_some_and(|scope| scope.computing > 0)
+        {
             Err(Error::Invalid(format!(
                 "invalid/reentrant: {operation} inside a derive compute or a compose"
             )))
@@ -70,15 +111,16 @@ impl Batch {
         }
     }
     fn flags(&self, compute: bool) -> Flags {
+        let thread = thread::current().id();
         let mut state = lock(&self.0.state);
-        let flags = Flags {
+        let scope = state.scopes.entry(thread).or_default();
+        scope.running += 1;
+        scope.computing += usize::from(compute);
+        Flags {
             batch: self.clone(),
-            running: state.running,
-            computing: state.computing,
-        };
-        state.running = true;
-        state.computing |= compute;
-        flags
+            thread,
+            compute,
+        }
     }
     pub fn compute<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
         let _flags = self.flags(true);
@@ -95,70 +137,94 @@ impl Batch {
         (self.0.report)(BatchError::DeliveryFailed(error.to_string()))
     }
     pub fn commit(&self, context: &Context, adopt: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.commit_boxed(context, Box::new(adopt))
+        let thread = thread::current().id();
+        let mut state = self
+            .0
+            .available
+            .wait_while(lock(&self.0.state), |state| {
+                state.owner.is_some_and(|owner| owner != thread)
+            })
+            .unwrap_or_else(|error| error.into_inner());
+        let outer = state.owner.replace(thread).is_none();
+        drop(state);
+        self.commit_boxed(context, Box::new(adopt), Commit { batch: self, outer })
     }
     fn commit_boxed(
         &self,
         context: &Context,
-        adopt: Box<dyn FnOnce() -> Result<()> + '_>,
+        mut adopt: Box<dyn FnOnce() -> Result<()> + '_>,
+        mut commit: Commit<'_>,
     ) -> Result<()> {
-        let flags = self.flags(false);
-        let result = adopt();
-        if result.is_ok() {
-            loop {
-                let work = lock(&self.0.state).changed.pop_front();
-                let Some(work) = work else { break };
-                if let Err(error) = work(context) {
-                    self.report_delivery(error)
-                }
-            }
-            lock(&self.0.state).sending = true;
-            loop {
-                let flush = lock(&self.0.state).flushes.pop_front();
-                let Some(flush) = flush else { break };
-                if let Err(error) = flush(context) {
-                    self.report_delivery(error)
-                }
-            }
-        }
-        let later = {
-            let mut state = lock(&self.0.state);
-            state.sending = false;
-            state.changed.clear();
-            state.flushes.clear();
-            std::mem::take(&mut state.later)
-        };
-        drop(flags);
-        result?;
-        if !later.is_empty() {
-            self.commit_boxed(
-                context,
-                Box::new(move || {
-                    for work in later {
-                        work()?
+        let mut result = Ok(());
+        loop {
+            let flags = self.flags(false);
+            let adopted = adopt();
+            if adopted.is_ok() {
+                loop {
+                    let work = lock(&self.0.state).changed.pop_front();
+                    let Some(work) = work else { break };
+                    if let Err(error) = work(context) {
+                        self.report_delivery(error)
                     }
-                    Ok(())
-                }),
-            )?
+                }
+                lock(&self.0.state).sending = true;
+                loop {
+                    let flush = lock(&self.0.state).flushes.pop_front();
+                    let Some(flush) = flush else { break };
+                    if let Err(error) = flush(context) {
+                        self.report_delivery(error)
+                    }
+                }
+            }
+            result = result.and(adopted);
+            drop(flags);
+            let later = {
+                let mut state = lock(&self.0.state);
+                state.sending = false;
+                state.changed.clear();
+                state.flushes.clear();
+                let later = std::mem::take(&mut state.later);
+                if later.is_empty() {
+                    commit.release(&mut state);
+                }
+                later
+            };
+            if later.is_empty() {
+                return result;
+            }
+            adopt = Box::new(move || {
+                for work in later {
+                    work()?;
+                }
+                Ok(())
+            });
         }
-        Ok(())
     }
     pub fn within(
         &self,
         context: &Context,
         adopt: impl FnOnce() -> Result<()> + Send + 'static,
     ) -> Result<()> {
-        let state = lock(&self.0.state);
-        if state.sending {
-            drop(state);
-            lock(&self.0.state).later.push(Box::new(adopt));
+        let thread = thread::current().id();
+        let mut state = lock(&self.0.state);
+        if state.sending || state.owner.is_some_and(|owner| owner != thread) {
+            // An independent thread may still enqueue work as the owner drains deliveries.
+            state.later.push(Box::new(adopt));
             Ok(())
-        } else if state.running {
+        } else if state.scopes.contains_key(&thread) {
             drop(state);
             adopt()
         } else {
+            state.owner = Some(thread);
             drop(state);
-            self.commit(context, adopt)
+            self.commit_boxed(
+                context,
+                Box::new(adopt),
+                Commit {
+                    batch: self,
+                    outer: true,
+                },
+            )
         }
     }
     pub fn soon(

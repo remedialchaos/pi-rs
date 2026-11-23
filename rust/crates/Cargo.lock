@@ -4027,6 +4027,7 @@ dependencies = [
  "indexmap 2.14.2",
  "nix 0.30.1",
  "percent-encoding",
+ "pi-rs-ai",
  "pi-rs-chord",
  "pi-rs-durable",
  "pi-rs-env",

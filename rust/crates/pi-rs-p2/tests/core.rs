@@ -151,7 +151,7 @@ async fn worker_opens_matching_session_and_refuses_mismatched_address() -> TestR
         "fake": true,
         "telemetry": false,
         "generation": 1,
-        "values": {"session":{"id":"active","cwd":"/","model":{"provider":"faux","modelId":"model"},"thinkingLevel":"off"}}
+        "values": {"session":{"id":"active","cwd":"/","model":{"provider":"faux","modelId":"faux-1"},"thinkingLevel":"off"}}
     });
     let host = create_host(HostOptions {
         principal: Some(json!({"kind":"server"})),
