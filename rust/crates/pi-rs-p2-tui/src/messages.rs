@@ -23,5 +23,10 @@ pub fn transcript_component(
         expanded: expanded_tools,
         show_thinking,
         transcript: transcript.clone(),
+        rows: transcript
+            .items
+            .iter()
+            .map(|_| Default::default())
+            .collect(),
     }
 }

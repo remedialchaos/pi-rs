@@ -185,3 +185,215 @@ fn settings_preserve_mermaid_enum_and_emit_nested_path() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+fn mount(root: ComponentRef, input: &[u8]) -> io::Result<(TuiClient, Arc<Mutex<String>>)> {
+    let output = Arc::new(Mutex::new(String::new()));
+    let terminal = VirtualTerminal {
+        output: output.clone(),
+        input: input.into(),
+    };
+    let mut client = TuiClient::mount(terminal, root, false);
+    client.screen.base.start()?;
+    Ok((client, output))
+}
+
+#[test]
+fn panel_page_down_scrolls_body_and_keeps_title() -> io::Result<()> {
+    use pi_rs_p2_tui::components::{PanelContent, PanelFrame};
+    use pi_rs_tui::Component;
+    struct Lines;
+    impl Component for Lines {
+        fn render(&self, _: usize) -> Vec<String> {
+            (0..12).map(|i| format!("item-{i:02}")).collect()
+        }
+    }
+    impl PanelContent for Lines {}
+    let mut panel = PanelFrame::new(
+        Box::new(Context(ThemeRef::new(Theme::default()))),
+        "list".into(),
+        Box::new(Lines),
+        || "Items".into(),
+    );
+    panel.set_height(4);
+    let (mut client, output) = mount(ComponentRef::new(panel), b"\x1b[6~")?;
+    client.step(Duration::ZERO)?;
+    let frame = output
+        .lock()
+        .map_err(|_| io::Error::other("capture poisoned"))?;
+    assert!(
+        frame.contains("Items") && frame.contains("item-03") && frame.contains("item-05"),
+        "{frame:?}"
+    );
+    assert!(!frame.contains("item-06"));
+    Ok(())
+}
+
+#[test]
+fn tree_shows_active_branch_first_and_keeps_linear_ancestors_flat() -> io::Result<()> {
+    use pi_rs_p2_tui::components::{TreeRole, TreeSelectorComponent, TreeSelectorNode};
+    let nodes = [
+        (1, None, "root"),
+        (2, Some(1), "chain"),
+        (3, Some(2), "other"),
+        (4, Some(2), "active"),
+    ]
+    .map(|(entry, parent, text)| TreeSelectorNode {
+        entry,
+        parent,
+        conversation: entry,
+        role: TreeRole::User,
+        text: text.into(),
+    })
+    .to_vec();
+    let ctx = SelectorContext::new(
+        Box::new(Context(ThemeRef::new(Theme::default()))),
+        Box::new(Keys),
+    );
+    let tree = TreeSelectorComponent::new(ctx, nodes, |_| {}, |_| {}, || {}, Some(4));
+    let (mut client, output) = mount(ComponentRef::new(tree), b"")?;
+    client.step(Duration::ZERO)?;
+    let frame = pi_rs_tui::strip_terminal_sequences(
+        output
+            .lock()
+            .map_err(|_| io::Error::other("capture poisoned"))?
+            .as_str(),
+    );
+    assert!(
+        frame.contains("  • user: chain")
+            && frame.contains("› ├─ • user: active")
+            && frame.contains("  └─ user: other"),
+        "{frame:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn registered_plugin_receives_terminal_shortcut_before_editor() -> io::Result<()> {
+    use pi_rs_p2_tui::{
+        CoreAction,
+        host::{TuiContribution, TuiHost},
+    };
+    struct Host(Vec<CoreAction>);
+    impl TuiHost for Host {
+        fn run_core_action(&mut self, action: CoreAction) {
+            self.0.push(action);
+        }
+    }
+    struct Plugin;
+    impl TuiContribution for Plugin {
+        fn id(&self) -> &str {
+            "example.open"
+        }
+        fn run(&self, host: &mut dyn TuiHost) {
+            host.run_core_action(CoreAction::PanelFocus);
+        }
+    }
+    let ctx = SelectorContext::new(
+        Box::new(Context(ThemeRef::new(Theme::default()))),
+        Box::new(Keys),
+    );
+    let editor = Rc::new(RefCell::new(SecretInput::new(ctx)));
+    let (mut client, _) = mount(ComponentRef::from_shared(editor.clone()), b"x")?;
+    let host = Rc::new(RefCell::new(Host(Vec::new())));
+    assert!(client.register_shortcut("x".into(), Box::new(Plugin), host.clone()));
+    client.step(Duration::ZERO)?;
+    assert_eq!(host.borrow().0, [CoreAction::PanelFocus]);
+    assert_eq!(editor.borrow().length(), 0);
+    Ok(())
+}
+
+#[test]
+fn replacing_theme_file_recolors_the_mounted_component() -> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_p2_tui::theme::{DARK_THEME, TerminalState};
+    struct Swatch(ThemeRef);
+    impl pi_rs_tui::Component for Swatch {
+        fn render(&self, _: usize) -> Vec<String> {
+            vec![self.0.current().fg("accent", "sample")]
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("theme.json");
+    let mut palette = serde_json::to_value(&*DARK_THEME)?;
+    palette["colors"]["accent"] = "#010203".into();
+    std::fs::write(&path, serde_json::to_vec(&palette)?)?;
+    let target = ThemeRef::new(Theme::default());
+    let (mut client, output) = mount(ComponentRef::new(Swatch(target.clone())), b"")?;
+    client.watch_theme(
+        &path,
+        target,
+        pi_rs_tui::TerminalColorMode::Truecolor,
+        TerminalState::default(),
+    )?;
+    client.step(Duration::ZERO)?;
+    assert!(
+        output
+            .lock()
+            .map_err(|_| "capture poisoned")?
+            .contains("38;2;1;2;3m")
+    );
+    palette["colors"]["accent"] = "#040506".into();
+    let next = dir.path().join("replacement");
+    std::fs::write(&next, serde_json::to_vec(&palette)?)?;
+    std::fs::rename(next, path)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        client.step(Duration::ZERO)?;
+        if output
+            .lock()
+            .map_err(|_| "capture poisoned")?
+            .contains("38;2;4;5;6m")
+        {
+            return Ok(());
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replacement never reached the screen"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn prepending_history_retains_plugin_entry_until_its_record_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_p2_tui::{Transcript, TranscriptComponentOptions, transcript_component};
+    let calls = Rc::new(std::cell::Cell::new(0));
+    let count = calls.clone();
+    let mut options = TranscriptComponentOptions::default();
+    options.entry_renderers.insert(
+        "example".into(),
+        Box::new(move |record, _, _| {
+            count.set(count.get() + 1);
+            Some(Box::new(pi_rs_tui::Text::new(
+                record.data.as_str().unwrap_or_default(),
+                0,
+                0,
+                None,
+            )))
+        }),
+    );
+    let item = serde_json::json!({"type":"entry","key":"7","entry":{"id":7,"kind":"example","data":"original"}});
+    let initial: Transcript = serde_json::from_value(serde_json::json!({"items":[item]}))?;
+    let view = Rc::new(RefCell::new(transcript_component(
+        &initial, false, false, options,
+    )));
+    let (mut client, output) = mount(ComponentRef::from_shared(view.clone()), b"")?;
+    client.step(Duration::ZERO)?;
+    let mut changed =
+        serde_json::json!({"items":[{"type":"failure","key":"0","text":"earlier"},item]});
+    for value in ["original", "replacement"] {
+        changed["items"][1]["entry"]["data"] = value.into();
+        view.borrow_mut()
+            .sync(&serde_json::from_value(changed.clone())?);
+        client.screen.base.request_render(true);
+        client.step(Duration::ZERO)?;
+    }
+    assert_eq!(calls.get(), 2);
+    assert!(
+        output
+            .lock()
+            .map_err(|_| "capture poisoned")?
+            .contains("replacement")
+    );
+    Ok(())
+}

@@ -101,7 +101,7 @@ pub struct ToolView {
     pub calls: Option<Vec<NestedCall>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolStatus {
     Pending,

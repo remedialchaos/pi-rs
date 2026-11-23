@@ -20,8 +20,11 @@ pub enum TreeRole {
 #[derive(Debug, Clone)]
 struct FlatNode {
     node: TreeSelectorNode,
-    depth: usize,
+    prefix: String,
+    active: bool,
 }
+
+const VISIBLE_ROWS: usize = 16;
 
 pub struct TreeList {
     nodes: Vec<FlatNode>,
@@ -44,6 +47,19 @@ impl TreeList {
                 .or_default()
                 .push(node);
         }
+        let parents: std::collections::HashMap<_, _> =
+            nodes.iter().map(|n| (n.entry, n.parent)).collect();
+        let mut active = std::collections::HashSet::new();
+        let mut current = initial_selected;
+        while let Some(id) = current {
+            if !active.insert(id) {
+                break;
+            }
+            current = parents.get(&id).copied().flatten();
+        }
+        for siblings in children.values_mut() {
+            siblings.sort_by_key(|n| !active.contains(&n.entry));
+        }
         let mut flat = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut stack: Vec<_> = children
@@ -51,28 +67,45 @@ impl TreeList {
             .into_iter()
             .flatten()
             .rev()
-            .map(|n| (*n, 0))
+            .map(|n| (*n, String::new(), None, children[&None].len() > 1))
             .collect();
-        while let Some((node, depth)) = stack.pop() {
+        while let Some((node, mut gutter, connector, virtual_root)) = stack.pop() {
             if !seen.insert(node.entry) {
                 continue;
             }
             flat.push(FlatNode {
                 node: node.clone(),
-                depth,
+                prefix: format!(
+                    "{gutter}{}",
+                    match connector {
+                        Some(true) => "└─ ",
+                        Some(false) => "├─ ",
+                        None => "",
+                    }
+                ),
+                active: active.contains(&node.entry),
             });
-            stack.extend(
-                children
-                    .get(&Some(node.entry))
-                    .into_iter()
-                    .flatten()
-                    .rev()
-                    .map(|n| (*n, depth + 1)),
-            );
+            if let Some(last) = connector {
+                gutter.push_str(if last { "   " } else { "│  " });
+            }
+            if let Some(kids) = children.get(&Some(node.entry)) {
+                let branches = kids.len() > 1;
+                if !branches && (connector.is_some() || virtual_root) {
+                    gutter.push_str("   ");
+                }
+                for (i, kid) in kids.iter().enumerate().rev() {
+                    stack.push((
+                        *kid,
+                        gutter.clone(),
+                        branches.then_some(i + 1 == kids.len()),
+                        false,
+                    ));
+                }
+            }
         }
         let selected = initial_selected
             .and_then(|id| flat.iter().position(|n| n.node.entry == id))
-            .unwrap_or(0);
+            .unwrap_or_else(|| flat.len().saturating_sub(1));
         Self {
             nodes: flat,
             selected,
@@ -82,30 +115,63 @@ impl TreeList {
 }
 
 impl Component for TreeList {
-    fn render(&self, _width: usize) -> Vec<String> {
-        let _theme = self.ctx.theme.theme().current();
+    fn render(&self, width: usize) -> Vec<String> {
+        let theme = self.ctx.theme.theme().current();
+        if self.nodes.is_empty() {
+            return vec![theme.fg("muted", "  No messages yet")];
+        }
         let mut lines = Vec::new();
 
         for (i, node) in self
             .nodes
             .iter()
             .enumerate()
-            .skip(self.selected.saturating_sub(19))
-            .take(20)
+            .skip(
+                self.selected
+                    .saturating_sub(VISIBLE_ROWS / 2)
+                    .min(self.nodes.len().saturating_sub(VISIBLE_ROWS)),
+            )
+            .take(VISIBLE_ROWS)
         {
-            let prefix = if i == self.selected { "→ " } else { "  " };
-            let indent = "│ ".repeat(node.depth);
+            let prefix = if i == self.selected {
+                theme.fg("accent", "› ")
+            } else {
+                "  ".into()
+            };
             let role_marker = match node.node.role {
-                TreeRole::User => "U",
-                TreeRole::Assistant => "A",
+                TreeRole::User => theme.fg("accent", "user: "),
+                TreeRole::Assistant => theme.fg("muted", "assistant: "),
             };
             let text = line_text(&node.node.text);
-            lines.push(format!(
-                "{}{}{} {}: {}",
-                prefix, indent, role_marker, node.node.entry, text
-            ));
+            let text = if i == self.selected {
+                theme.bold(&text)
+            } else {
+                text
+            };
+            let marker = if node.active {
+                theme.fg("accent", "• ")
+            } else {
+                String::new()
+            };
+            let line = pi_rs_tui::truncate_to_width(
+                &format!(
+                    "{prefix}{}{marker}{role_marker}{text}",
+                    theme.fg("dim", &node.prefix)
+                ),
+                width,
+                true,
+            );
+            lines.push(if i == self.selected {
+                theme.bg("selectedBg", &line)
+            } else {
+                line
+            });
         }
 
+        lines.push(theme.fg(
+            "muted",
+            &format!("  ({}/{})", self.selected + 1, self.nodes.len()),
+        ));
         lines
     }
 
@@ -234,10 +300,23 @@ impl Component for TreeSelectorComponent {
         }
         let keys = &self.ctx.keys;
         if keys.matches(data, "tui.select.up") {
-            self.tree_list.selected = self.tree_list.selected.saturating_sub(1);
+            self.tree_list.selected = self
+                .tree_list
+                .selected
+                .checked_sub(1)
+                .unwrap_or_else(|| self.tree_list.nodes.len().saturating_sub(1));
         } else if keys.matches(data, "tui.select.down") {
             self.tree_list.selected =
-                (self.tree_list.selected + 1).min(self.tree_list.nodes.len().saturating_sub(1));
+                (self.tree_list.selected + 1) % self.tree_list.nodes.len().max(1);
+        } else if keys.matches(data, "tui.select.pageUp")
+            || keys.matches(data, "tui.editor.cursorLeft")
+        {
+            self.tree_list.selected = self.tree_list.selected.saturating_sub(VISIBLE_ROWS);
+        } else if keys.matches(data, "tui.select.pageDown")
+            || keys.matches(data, "tui.editor.cursorRight")
+        {
+            self.tree_list.selected = (self.tree_list.selected + VISIBLE_ROWS)
+                .min(self.tree_list.nodes.len().saturating_sub(1));
         } else if keys.matches(data, "tui.select.confirm") {
             if let Some(row) = self.tree_list.nodes.get(self.tree_list.selected) {
                 (self.on_select)(row.node.entry);

@@ -28,7 +28,7 @@
 | **2.4** `pi-rs-evals` (`pi-evals` bin) | **PASS** | **44/44** tests (5/5 mutation checks, golden report/SHA parity, TTY-deterministic styling), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
 | **3.1** `pi-rs-p3` (`p3` bin; `old/` skipped) | **PASS** | **79/79** tests (69 lib + 6 live `p3` binary CLI + 4 live child-worker runner, 5/5 mutation checks), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
 | **3.2-web** Browser | PARTIAL | 135 native tests. Compiled WASM created a session and exchanged chat messages with the upstream server in Chromium. The fixture injected assets with CSP bypass. Production browser routing, CSP and plugin integration remain open. |
-| **3.2-tui** `pi-rs-p2-tui` (`p2` TUI client on `pi-rs-tui`) | **PASS (bounded)** | **15/15** tests (5 unit + 10 integration, 15/15 mutation checks: native Mermaid, masked input, shell status, settings, slash completion, palettes, transcript anchors), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
+| **3.2-tui** Mounted client | PARTIAL | 20 tests, including five new mutation-verified terminal cases for transcript, keyboard paging, tree layout, native shortcut dispatch and theme reload. Dynamic guests, mouse scroll and whole-screen replay remain open. |
 | **3.2** `pi-rs-p2` server + runtime + 49 plugins (`p2` bin) | PENDING | ~89.6k LOC; uses the `ExecutionEnv` contract from 2.2a + `2.3b` |
 | **3.3** `pi-rs-p2-mac` (`pi-mac` bin) | **PASS** | 16/16 Linux tests + `aarch64-apple-darwin` check + real upstream `p2` smoke PASS |
 | **3.4** `pi-rs-voice-server` (`pi-voice-server` bin) | **PASS** | 17/17 offline tests + real Supertonic/Kokoro/Silero/Parakeet verified |
@@ -45,7 +45,7 @@ The upstream server and the standalone Rust Wave 1 binary (SHA-256 `4f1868202683
 2. **Build cache & temp disk**: `/tmp` is a 4 GiB tmpfs. For concurrent worktrees, always set both `CARGO_TARGET_DIR=/var/tmp/pi-rs-target-<worker>` and `TMPDIR=/var/tmp/pi-rs-tmp-<worker>` with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`, and clean both after merging.
 3. **Documented fidelity limits** (recorded per crate `MILESTONE.md`):
    - `pi-rs-coding-agent`: external live OAuth browser sign-in, startup background catalog refresh/auto-install, named single-server MCP reconnect (currently rebuilds all session MCP connections), and exact interactive pixel replay remain future polish.
-   - `pi-rs-p2-tui`: bounded checkpoint — incremental transcript lifecycle, panel scrolling, tree layout, plugin dispatch, and live theme reload parity remain open (see `pi-rs-p2-tui/MILESTONE.md`).
+   - `pi-rs-p2-tui` has mounted terminal checks. Standalone host wiring and full upstream screen comparison remain open.
    - `pi-rs-env`: `packaged_daemon()` assumes npm `bin/` layout (`local_daemon()` is the native path); live `sshd`/Windows/macOS runtime untested on Linux host.
    - `pi-rs-evals`: offline Docker verification via injectable runner; no live Docker daemon run.
    - `pi-rs-p2-mac` & `pi-rs-voice-server`: macOS UI/signing deferred per ADR-005; Pocket TTS is a discovery/streaming hook.
