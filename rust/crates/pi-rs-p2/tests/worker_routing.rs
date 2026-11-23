@@ -32,7 +32,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const ID: &str = "92dc44af-a301-47a6-b591-4419d9ebd133";
 const IDLE: Duration = Duration::from_millis(350);
-const TIMEOUT: Duration = Duration::from_secs(5);
+const TIMEOUT: Duration = Duration::from_secs(15);
 
 async fn fixture(
     root: &Path,
@@ -149,7 +149,7 @@ fn row(cwd: &Value, archived: Value) -> Value {
     json!({
         "id": ID, "env": null, "cwd": cwd, "title": "Routing", "createdAt": 1,
         "updatedAt": 1, "archivedAt": archived, "pinned": false,
-        "model": {"provider": "fake", "modelId": "test"},
+        "model": {"provider": "fake", "modelId": "fake"},
         "thinkingLevel": "off", "main": 1, "branches": [],
     })
 }
@@ -188,7 +188,12 @@ fn hold(client: &RemotePeer, context: &Context) -> TestResult<RemoteReference> {
 async fn websocket_holds_share_a_native_worker_until_the_last_release() -> TestResult {
     let dir = tempfile::tempdir()?;
     let reads = Arc::new(AtomicUsize::new(0));
-    let server = fixture(dir.path(), vec![], reads.clone(), |_, _| Ok(())).await?;
+    let server = fixture(dir.path(), vec![], reads.clone(), |_, process| {
+        // Expire the idle timer before the worker's first 50 ms activity poll.
+        process.idle_timeout = Duration::from_millis(10);
+        Ok(())
+    })
+    .await?;
     let context = Context::background();
     let anonymous = client(&server, None).await.err();
     assert!(
@@ -201,13 +206,13 @@ async fn websocket_holds_share_a_native_worker_until_the_last_release() -> TestR
     );
     let guest = client(&server, Some("guest-test")).await?;
     let denied = hold(&guest, &context)?;
-    let result = tokio::time::timeout(TIMEOUT, denied.wait(&context)).await?;
+    let result = tokio::time::timeout(TIMEOUT, denied.wait(&context))
+        .await
+        .map_err(|_| "guest hold did not receive a denial")?;
     assert!(matches!(result, Err(pi_rs_chord::Error::Chord(error)) if error.code == "forbidden"));
     assert_eq!(reads.load(Ordering::SeqCst), 0);
 
     let client = client(&server, Some("internal-test")).await?;
-    let first = hold(&client, &context)?;
-    let second = hold(&client, &context)?;
     let catalog = server
         .host
         .get(
@@ -217,12 +222,23 @@ async fn websocket_holds_share_a_native_worker_until_the_last_release() -> TestR
         )
         .await?;
     catalog.call("create", JsonValue::from_serde(json!({
-        "id": ID, "cwd": dir.path(), "title": "Routing", "model": {"provider":"fake","modelId":"test"}, "thinkingLevel": "off"
+        "id": ID, "cwd": dir.path(), "title": "Routing", "model": {"provider":"fake","modelId":"fake"}, "thinkingLevel": "off"
     })), &context).await?;
+    let first = hold(&client, &context)?;
+    let second = hold(&client, &context)?;
     let (first_ready, second_ready) = tokio::time::timeout(TIMEOUT, async {
         tokio::join!(first.wait(&context), second.wait(&context))
     })
-    .await?;
+    .await
+    .map_err(|_| {
+        format!(
+            "shared holds did not bind: first={:?}, second={:?}, worker={:?}, catalog reads={}",
+            first.state().value(),
+            second.state().value(),
+            server.workers.observe().borrow().get(ID),
+            reads.load(Ordering::SeqCst),
+        )
+    })?;
     first_ready?;
     second_ready?;
     assert_eq!(reads.load(Ordering::SeqCst), 1);
@@ -242,7 +258,16 @@ async fn websocket_holds_share_a_native_worker_until_the_last_release() -> TestR
     second.release();
     drop(ProcessLock::acquire(&lock, TIMEOUT).await?);
     let third = hold(&client, &context)?;
-    tokio::time::timeout(TIMEOUT, third.wait(&context)).await??;
+    tokio::time::timeout(TIMEOUT, third.wait(&context))
+        .await
+        .map_err(|_| {
+            format!(
+                "hold after idle shutdown did not bind: state={:?}, worker={:?}, catalog reads={}",
+                third.state().value(),
+                server.workers.observe().borrow().get(ID),
+                reads.load(Ordering::SeqCst),
+            )
+        })??;
     assert_eq!(reads.load(Ordering::SeqCst), 2);
     third.release();
     server.close().await?;

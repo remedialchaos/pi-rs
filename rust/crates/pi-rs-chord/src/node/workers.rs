@@ -287,6 +287,18 @@ impl Workers {
         start: serde_json::Value,
         scripts: Vec<DeliveredPlugin>,
     ) -> Result<Arc<WorkerHandle>> {
+        self.demand_with_idle_guard(address, start, scripts, || true)
+            .await
+    }
+
+    /// Start a worker whose idle shutdown also depends on demand held by its caller.
+    pub async fn demand_with_idle_guard(
+        &self,
+        address: serde_json::Value,
+        start: serde_json::Value,
+        scripts: Vec<DeliveredPlugin>,
+        can_stop_idle: impl Fn() -> bool + Send + 'static,
+    ) -> Result<Arc<WorkerHandle>> {
         let mut handles = self.handles.lock().await;
         if *self.closed.lock().unwrap_or_else(|e| e.into_inner()) {
             return Err(Error::Closed);
@@ -385,9 +397,21 @@ impl Workers {
                     }},
                     ()=tokio::time::sleep_until(deadline),if timed=>{
                         if stopping {let _=child.kill().await;break;}
-                        if matches!(*state.borrow(),WorkerState::Starting) {failure=Some("worker startup timed out".into());}
-                        stopping=true;deadline=tokio::time::Instant::now()+options.shutdown_timeout;
-                        let _=link.outgoing.try_send(Frame::Control(Control::Shutdown));
+                        let starting = matches!(*state.borrow(), WorkerState::Starting);
+                        if !starting && !can_stop_idle() {
+                            // Ready and Idle describe the child's view, which can lag pending holds.
+                            deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+                            continue;
+                        }
+                        stopping = true;
+                        deadline = tokio::time::Instant::now() + options.shutdown_timeout;
+                        if starting {
+                            failure = Some("worker startup timed out".into());
+                            let _ = link.outgoing.try_send(Frame::Control(Control::Shutdown));
+                        } else {
+                            // Demand arriving during teardown belongs to the next worker.
+                            link.close();
+                        }
                     },
                     ()=async {while !link.closed(){tokio::time::sleep(Duration::from_millis(20)).await;}},if !stopping=>{stopping=true;timed=true;deadline=tokio::time::Instant::now()+options.shutdown_timeout;}
                 }
@@ -443,7 +467,8 @@ pub struct WorkerSession {
     pub parent: Arc<dyn Link>,
     pub controls: mpsc::Receiver<Control>,
     sender: mpsc::Sender<Frame>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    receive_task: tokio::task::JoinHandle<()>,
+    send_task: tokio::task::JoinHandle<Result<()>>,
     _lock: ProcessLock,
 }
 impl WorkerSession {
@@ -487,12 +512,18 @@ impl WorkerSession {
         });
         let link = parent.clone();
         let send_task = tokio::spawn(async move {
-            while let Some(frame) = outgoing.recv().await {
-                if write_frame(&mut writer, &frame).await.is_err() {
-                    break;
+            let result = async {
+                while let Some(frame) = outgoing.recv().await {
+                    write_frame(&mut writer, &frame).await?;
+                    if matches!(frame, Frame::Control(Control::Fatal { .. })) {
+                        break;
+                    }
                 }
+                Ok(())
             }
+            .await;
             link.end.ended();
+            result
         });
         sender
             .send(Frame::Control(Control::Started))
@@ -505,7 +536,8 @@ impl WorkerSession {
             parent,
             controls,
             sender,
-            tasks: vec![receive_task, send_task],
+            receive_task,
+            send_task,
             _lock: lock,
         })
     }
@@ -515,12 +547,17 @@ impl WorkerSession {
             .await
             .map_err(|_| Error::Closed)
     }
+
+    pub(crate) async fn report_start_failure(&mut self, message: String) -> Result<()> {
+        self.report(Control::Fatal { message }).await?;
+        // Dropping the session cancels the writer. Let it flush the terminal frame first.
+        (&mut self.send_task).await.map_err(|_| Error::Closed)?
+    }
 }
 impl Drop for WorkerSession {
     fn drop(&mut self) {
         self.parent.close();
-        for task in &self.tasks {
-            task.abort();
-        }
+        self.receive_task.abort();
+        self.send_task.abort();
     }
 }

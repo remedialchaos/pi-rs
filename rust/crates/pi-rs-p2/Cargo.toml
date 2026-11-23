@@ -22,10 +22,15 @@ percent-encoding = "2"
 regex = "1"
 url = "2"
 sha2 = "0.10"
+pi-rs-ai = { path = "../pi-rs-ai" }
 pi-rs-chord = { path = "../pi-rs-chord" }
+pi-rs-codemode = { path = "../pi-rs-codemode" }
 pi-rs-durable = { path = "../pi-rs-durable" }
 pi-rs-env = { path = "../pi-rs-env" }
+pi-rs-mcp = { path = "../pi-rs-mcp" }
 pi-rs-p2-tui = { path = "../pi-rs-p2-tui" }
+pi-rs-schema = { path = "../pi-rs-schema" }
+pi-rs-telemetry = { path = "../pi-rs-telemetry" }
 pi-rs-tui = { path = "../pi-rs-tui" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }

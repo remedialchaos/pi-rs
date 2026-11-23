@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use indexmap::IndexMap;
 use pi_rs_chord::{
     Error, Result,
     context::{Cancel, Context},
@@ -20,6 +21,8 @@ use pi_rs_chord::{
     remote::{LinkRole, RemoteOptions, RemotePeer, RemoteReference},
     sync::SyncFuture,
 };
+use serde::Serialize;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::worker::WorkerInit;
@@ -34,6 +37,8 @@ const CRASH_WINDOW: Duration = Duration::from_secs(60);
 struct Session {
     peer: RemotePeer,
     active: bool,
+    handle: Option<Arc<WorkerHandle>>,
+    stopping: Option<watch::Sender<bool>>,
     failure: Option<ChordError>,
     crashes: Vec<Instant>,
 }
@@ -47,6 +52,16 @@ impl Drop for Session {
 #[derive(Clone)]
 pub struct SessionWorkers(Arc<Supervisor>);
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SessionWorkerState {
+    pub running: bool,
+    pub generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 struct Supervisor {
     host: Host,
     processes: Workers,
@@ -54,6 +69,7 @@ struct Supervisor {
     start: Box<Start>,
     generation: AtomicU64,
     sessions: Mutex<BTreeMap<String, Arc<Slot>>>,
+    states: watch::Sender<IndexMap<String, SessionWorkerState>>,
     authorizers: Mutex<Arc<BTreeMap<String, SessionAuthorizer>>>,
     context: Context,
     cancel: Cancel,
@@ -73,10 +89,94 @@ impl SessionWorkers {
             start: Box::new(start),
             generation: AtomicU64::new(0),
             sessions: Mutex::default(),
+            states: watch::channel(IndexMap::new()).0,
             authorizers: Mutex::default(),
             context,
             cancel,
         })))
+    }
+
+    pub fn observe(&self) -> watch::Receiver<IndexMap<String, SessionWorkerState>> {
+        self.0.states.subscribe()
+    }
+
+    pub fn generation(&self, session: &str) -> u64 {
+        self.0
+            .states
+            .borrow()
+            .get(session)
+            .map_or(0, |state| state.generation)
+    }
+
+    pub fn running(&self) -> Vec<String> {
+        self.0
+            .states
+            .borrow()
+            .iter()
+            .filter(|(_, state)| state.running)
+            .map(|(session, _)| session.clone())
+            .collect()
+    }
+
+    /// Stop the current child and clear sticky failure. Existing holds survive and
+    /// demand a new generation once the old process has exited.
+    pub async fn stop(&self, session: &str) -> Result<()> {
+        let Some(slot) = self
+            .0
+            .sessions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(session)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let (mut stopped, handle) = {
+            let mut state = slot.lock().await;
+            if !state.active {
+                state.failure = None;
+                state.crashes.clear();
+                self.publish(session, self.generation(session), false, None, None);
+                self.supervise(session, &slot, &mut state);
+                return Ok(());
+            }
+            let stopped = state
+                .stopping
+                .get_or_insert_with(|| watch::channel(false).0)
+                .subscribe();
+            (stopped, state.handle.clone())
+        };
+        if let Some(handle) = handle {
+            handle.shutdown().await?;
+        }
+        stopped
+            .wait_for(|done| *done)
+            .await
+            .map_err(|_| Error::Closed)?;
+        Ok(())
+    }
+
+    fn publish(
+        &self,
+        session: &str,
+        generation: u64,
+        running: bool,
+        pid: Option<u32>,
+        error: Option<String>,
+    ) {
+        let next = SessionWorkerState {
+            running,
+            generation,
+            pid,
+            error,
+        };
+        self.0.states.send_if_modified(|states| {
+            if states.get(session) == Some(&next) {
+                return false;
+            }
+            states.insert(session.into(), next);
+            true
+        });
     }
 
     pub fn remote_options(
@@ -282,6 +382,8 @@ impl SessionWorkers {
         let slot = Arc::new(Slot::new(Session {
             peer,
             active: false,
+            handle: None,
+            stopping: None,
             failure: None,
             crashes: Vec::new(),
         }));
@@ -306,25 +408,32 @@ impl SessionWorkers {
         while let Some(supervisor) = workers.upgrade() {
             let context = supervisor.context.clone();
             let supervisor = Self(supervisor);
+            let generation = supervisor.0.generation.fetch_add(1, Ordering::Relaxed) + 1;
+            supervisor.publish(&session, generation, false, None, None);
             let outcome = context
-                .await_with(supervisor.start_child(&session, &peer))
+                .await_with(supervisor.start_child(&session, generation, &slot, &peer))
                 .await;
             drop(supervisor);
-            let result = match outcome {
-                Ok(Ok(Some(handle))) => handle.wait_exit().await,
-                Ok(Ok(None)) | Err(_) => WorkerState::Stopped,
-                Ok(Err(_)) => {
-                    let mut state = slot.lock().await;
-                    let failure = ChordError::new("unavailable", "worker failed to start");
-                    state.failure = Some(failure.clone());
-                    state.active = false;
-                    let _ = peer.fail_child(failure);
-                    return;
-                }
+            let result = if let Ok(Ok(Some(handle))) = &outcome {
+                handle.wait_exit().await
+            } else {
+                WorkerState::Stopped
+            };
+            let Some(supervisor) = workers.upgrade().map(Self) else {
+                return;
             };
             let mut state = slot.lock().await;
+            state.handle = None;
             let closed = context.is_aborted();
-            if matches!(result, WorkerState::Failed(_)) {
+            let stopping = state.stopping.take();
+            if stopping.is_some() {
+                state.crashes.clear();
+                state.failure = None;
+            } else if !closed && matches!(outcome, Ok(Err(_))) {
+                let failure = ChordError::new("unavailable", "worker failed to start");
+                state.failure = Some(failure.clone());
+                let _ = peer.fail_child(failure);
+            } else if matches!(result, WorkerState::Failed(_)) {
                 let now = Instant::now();
                 state
                     .crashes
@@ -337,6 +446,23 @@ impl SessionWorkers {
                     state.crashes.push(now);
                 }
             }
+            supervisor.publish(
+                &session,
+                generation,
+                false,
+                None,
+                state
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.message.clone())
+                    .or_else(|| {
+                        (matches!(result, WorkerState::Failed(_)) && stopping.is_none() && !closed)
+                            .then(|| "worker exited".into())
+                    }),
+            );
+            if let Some(stopping) = stopping {
+                stopping.send_replace(true);
+            }
             if closed || state.failure.is_some() || !peer.has_holds() {
                 state.active = false;
                 return;
@@ -348,9 +474,10 @@ impl SessionWorkers {
     async fn start_child(
         &self,
         session: &str,
+        generation: u64,
+        slot: &Slot,
         peer: &RemotePeer,
     ) -> Result<Option<Arc<WorkerHandle>>> {
-        let generation = self.0.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let mut init =
             (self.0.start)(session.to_owned(), generation, self.0.context.clone()).await?;
         init.generation = generation;
@@ -360,7 +487,7 @@ impl SessionWorkers {
             ));
         }
         crate::runtime::host_dirs::session_directory(&init.data_dir, session)?;
-        if !peer.has_holds() {
+        if !peer.has_holds() || slot.lock().await.stopping.is_some() {
             return Ok(None);
         }
         let wire = session_address(session);
@@ -371,7 +498,25 @@ impl SessionWorkers {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let handle = demand_session(&self.0.processes, init, &reserved).await?;
+        let scripts = super::plugins::worker_scripts(&init.data_dir, &reserved)?;
+        let demand = peer.clone();
+        let handle = self
+            .0
+            .processes
+            .demand_with_idle_guard(wire, serde_json::to_value(init)?, scripts, move || {
+                !demand.has_holds()
+            })
+            .await?;
+        let stopped = {
+            let mut state = slot.lock().await;
+            state.handle = Some(handle.clone());
+            self.publish(session, generation, false, Some(handle.pid), None);
+            state.stopping.is_some()
+        };
+        if stopped {
+            handle.shutdown().await?;
+            return Ok(Some(handle));
+        }
         if let Err(error) = peer.connect_child(
             handle.link.clone(),
             serde_json::to_value(Principal::Worker {
@@ -383,12 +528,25 @@ impl SessionWorkers {
             handle.wait_exit().await;
             return Err(error);
         }
-        handle.wait_ready().await?;
-        if let Err(error) = peer.child_ready() {
+        if let Err(error) = handle.wait_ready().await {
             handle.shutdown().await?;
             handle.wait_exit().await;
             return Err(error);
         }
+        let state = slot.lock().await;
+        if state.stopping.is_some() {
+            return Ok(Some(handle));
+        }
+        if let Err(error) = peer.child_ready() {
+            drop(state);
+            if handle.link.closed() {
+                return Ok(Some(handle));
+            }
+            handle.shutdown().await?;
+            handle.wait_exit().await;
+            return Err(error);
+        }
+        self.publish(session, generation, true, Some(handle.pid), None);
         Ok(Some(handle))
     }
 }

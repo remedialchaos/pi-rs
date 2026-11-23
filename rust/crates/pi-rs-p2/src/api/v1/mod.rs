@@ -12,8 +12,8 @@ use pi_rs_chord::sync::SyncFuture;
 pub use pi_rs_chord::{
     Error, Result, context, contracts, data, documents,
     host::{
-        Ctx, Facet, FacetHost, Held, Host, Members, ObjectSelf, PluginFacet, ServeOptions,
-        define_facet,
+        Ctx, EventChannel, EventSubscription, Facet, FacetHost, Held, Host, Members, ObjectSelf,
+        PluginFacet, ServeOptions, define_facet,
     },
     jobs, json, registries, state, store, watch,
 };
@@ -150,13 +150,17 @@ pub mod server {
     pub use crate::runtime::{
         http::*,
         local_owner::*,
-        server::{ServerInfo, server_contract},
+        server::{
+            ServerInfo, ServerNatives, install_service, server_contract, server_of, service_of,
+        },
     };
     pub use pi_rs_chord::node::{http::*, workers::ProcessLock};
 }
 
 pub mod worker {
-    pub use crate::hosts::worker::WorkerInit;
+    pub use crate::hosts::worker::{
+        WorkerInit, WorkerProcess, WorkerRegistries, durable, worker_of,
+    };
     pub use crate::runtime::session_worker::*;
     pub use pi_rs_chord::node::workers::{Control, WorkerOptions, WorkerSession};
 }
