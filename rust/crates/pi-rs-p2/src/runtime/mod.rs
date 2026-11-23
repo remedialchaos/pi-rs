@@ -1,4 +1,6 @@
 pub mod address;
+pub mod files;
+pub mod session_files;
 pub mod host_dirs;
 pub mod http;
 pub mod local_owner;
