@@ -1,5 +1,6 @@
 //! Built-in native `p2` plugins (Wave 2).
 
+pub mod agent;
 pub mod agent_plugins;
 pub mod cache_warming;
 pub mod codemode;
@@ -21,6 +22,7 @@ pub mod settings;
 pub mod shard_a;
 pub mod shard_c2;
 pub mod shard_d;
+pub mod shard_e;
 pub mod status;
 pub mod subagents;
 pub mod sync;
@@ -35,5 +37,6 @@ pub fn register_builtins(registry: &mut PluginRegistry) -> pi_rs_chord::Result<(
     shard_a::register(registry)?;
     shard_c2::register(registry)?;
     shard_d::register(registry)?;
+    shard_e::register(registry)?;
     Ok(())
 }
