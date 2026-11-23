@@ -8,7 +8,9 @@
 - Current session handoff: [HANDOFF.md](HANDOFF.md)
 - Generated port map (created once crates exist): `rust/PORT_MAP.md` (`rust-anything map --write`)
 
-## Current wave claims
+## Wave 1 ownership at shutdown
+
+All workers stopped on 2026-11-23. The following table records their last assignments. Local checkpoint commits, verification results, and the resume sequence are in [HANDOFF.md](HANDOFF.md).
 
 | Unit | Owner | Scope |
 | --- | --- | --- |
