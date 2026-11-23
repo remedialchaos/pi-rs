@@ -146,7 +146,9 @@ pub mod node {
 }
 
 pub mod server {
-    pub use crate::hosts::session_workers::SessionWorkers;
+    pub use crate::hosts::session_workers::{
+        SessionSuspendGuard, SessionWorkers, WORKER_INIT_PROVIDER_SERVICE, WorkerInitProvider,
+    };
     pub use crate::runtime::{
         http::*,
         local_owner::*,

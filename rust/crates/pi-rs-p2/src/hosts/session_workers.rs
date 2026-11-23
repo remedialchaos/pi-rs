@@ -37,11 +37,56 @@ const CRASH_WINDOW: Duration = Duration::from_secs(60);
 struct Session {
     peer: RemotePeer,
     active: bool,
+    suspended: usize,
     handle: Option<Arc<WorkerHandle>>,
     stopping: Option<watch::Sender<bool>>,
     failure: Option<ChordError>,
     crashes: Vec<Instant>,
 }
+
+/// Keeps a session worker stopped (and blocks new starts on incoming holds) until resumed or dropped.
+pub struct SessionSuspendGuard {
+    workers: Weak<Supervisor>,
+    session: String,
+    released: bool,
+}
+
+impl SessionSuspendGuard {
+    pub async fn resume(mut self) -> Result<()> {
+        self.released = true;
+        if let Some(workers) = self.workers.upgrade() {
+            SessionWorkers(workers)
+                .release_suspend(&self.session)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SessionSuspendGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Some(workers) = self.workers.upgrade() {
+            let session = self.session.clone();
+            tokio::spawn(async move {
+                let _ = SessionWorkers(workers).release_suspend(&session).await;
+            });
+        }
+    }
+}
+
+/// Optional host-lifetime native service key (`install_service` / `service_of`) allowing the
+/// `sessions` plugin to override worker start preparation (start barrier, archived-index starts,
+/// and extra `WorkerInit.values`).
+pub const WORKER_INIT_PROVIDER_SERVICE: &str = "p2.worker-init-provider";
+
+pub type WorkerInitProvider = Arc<
+    dyn Fn(String, u64, Context) -> SyncFuture<serde_json::Map<String, serde_json::Value>>
+        + Send
+        + Sync,
+>;
 
 impl Drop for Session {
     fn drop(&mut self) {
@@ -116,6 +161,58 @@ impl SessionWorkers {
             .filter(|(_, state)| state.running)
             .map(|(session, _)| session.clone())
             .collect()
+    }
+
+    /// Stop any running child for `session` and keep it stopped (blocking restarts on held
+    /// references or new holds) until the returned guard is resumed or dropped.
+    pub async fn suspend(&self, session: &str) -> Result<SessionSuspendGuard> {
+        let slot = self.slot(session)?;
+        let (mut stopped, handle) = {
+            let mut state = slot.lock().await;
+            state.suspended += 1;
+            if !state.active {
+                state.failure = None;
+                state.crashes.clear();
+                return Ok(SessionSuspendGuard {
+                    workers: Arc::downgrade(&self.0),
+                    session: session.to_owned(),
+                    released: false,
+                });
+            }
+            let stopped = state
+                .stopping
+                .get_or_insert_with(|| watch::channel(false).0)
+                .subscribe();
+            (stopped, state.handle.clone())
+        };
+        if let Some(handle) = handle {
+            let _ = handle.shutdown().await;
+        }
+        let _ = stopped.wait_for(|done| *done).await;
+        Ok(SessionSuspendGuard {
+            workers: Arc::downgrade(&self.0),
+            session: session.to_owned(),
+            released: false,
+        })
+    }
+
+    async fn release_suspend(&self, session: &str) -> Result<()> {
+        let Some(slot) = self
+            .0
+            .sessions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(session)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let mut state = slot.lock().await;
+        state.suspended = state.suspended.saturating_sub(1);
+        if state.suspended == 0 && !state.active && state.failure.is_none() {
+            self.supervise(session, &slot, &mut state);
+        }
+        Ok(())
     }
 
     /// Stop the current child and clear sticky failure. Existing holds survive and
@@ -382,6 +479,7 @@ impl SessionWorkers {
         let slot = Arc::new(Slot::new(Session {
             peer,
             active: false,
+            suspended: 0,
             handle: None,
             stopping: None,
             failure: None,
@@ -392,7 +490,7 @@ impl SessionWorkers {
     }
 
     fn supervise(&self, session: &str, slot: &Arc<Slot>, state: &mut Session) {
-        if state.active || !state.peer.has_holds() {
+        if state.active || state.suspended > 0 || !state.peer.has_holds() {
             return;
         }
         state.active = true;
@@ -463,7 +561,7 @@ impl SessionWorkers {
             if let Some(stopping) = stopping {
                 stopping.send_replace(true);
             }
-            if closed || state.failure.is_some() || !peer.has_holds() {
+            if closed || state.suspended > 0 || state.failure.is_some() || !peer.has_holds() {
                 state.active = false;
                 return;
             }
@@ -487,7 +585,10 @@ impl SessionWorkers {
             ));
         }
         crate::runtime::host_dirs::session_directory(&init.data_dir, session)?;
-        if !peer.has_holds() || slot.lock().await.stopping.is_some() {
+        if !peer.has_holds() || {
+            let guard = slot.lock().await;
+            guard.stopping.is_some() || guard.suspended > 0
+        } {
             return Ok(None);
         }
         let wire = session_address(session);
