@@ -864,14 +864,14 @@ fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
 fn finite_millis(duration: Duration) -> Option<u64> {
     u64::try_from(duration.as_millis()).ok()
 }
-fn wall_clock() -> u64 {
+pub(crate) fn wall_clock() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(finite_millis)
         .unwrap_or(0)
 }
-fn panic_message(value: &(dyn Any + Send)) -> String {
+pub(crate) fn panic_message(value: &(dyn Any + Send)) -> String {
     value
         .downcast_ref::<String>()
         .cloned()

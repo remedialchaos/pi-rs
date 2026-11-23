@@ -200,12 +200,16 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
             })?;
         }
         let ctx = Context::background();
+        let fake = faux_provider(Default::default());
+        let models = pi_rs_ai::registry::Models::default();
+        models.set_provider(fake.provider.clone());
         let harness = Harness::open_with(
             Arc::new(MemoryStorage::new()),
             HarnessOptions {
                 report_hook: Some(Arc::new(move |name, error| {
                     let _ = report.send((name.to_owned(), error.to_string()));
                 })),
+                models: models.into(),
                 registry: Arc::new(HarnessRegistry::Local(registry)),
                 telemetry: telemetry.clone(),
                 ..Default::default()
@@ -213,7 +217,6 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
             &ctx,
         )
         .await?;
-        let fake = faux_provider(Default::default());
         let model = &fake.models[0];
         let mut first = faux_assistant_message(vec![faux_tool_call(
             if available { "echo" } else { "unavailable" },
@@ -229,7 +232,6 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
             first.into(),
             faux_assistant_message(vec![faux_text("answer")]).into(),
         ]);
-        harness.models.set_provider(fake.provider.clone());
         let root = harness.root(&ctx).await?;
         root.configure(
             &[(
@@ -474,16 +476,19 @@ async fn automatic_compaction_places_one_summary_before_answering_second_input()
             ..Default::default()
         })?;
         let ctx = Context::background();
+        let fake = faux_provider(Default::default());
+        let models = pi_rs_ai::registry::Models::default();
+        models.set_provider(fake.provider.clone());
         let harness = Harness::open_with(
             Arc::new(MemoryStorage::new()),
             HarnessOptions {
+                models: models.into(),
                 registry: Arc::new(HarnessRegistry::Local(registry)),
                 ..Default::default()
             },
             &ctx,
         )
         .await?;
-        let fake = faux_provider(Default::default());
         let model = &fake.models[0];
         let mut responses = vec![faux_assistant_message(vec![faux_text("first answer")]).into()];
         if trigger == "overflow" {
@@ -494,7 +499,6 @@ async fn automatic_compaction_places_one_summary_before_answering_second_input()
         }
         responses.push(faux_assistant_message(vec![faux_text("second answer")]).into());
         fake.set_responses(responses);
-        harness.models.set_provider(fake.provider.clone());
         let root = harness.root(&ctx).await?;
         root.configure(
             &[
@@ -583,19 +587,22 @@ async fn failed_run_policy_settles_or_preserves_the_queued_follow_up()
     use tokio::sync::Notify;
     for policy in ["keep", "withdraw", "continue"] {
         let ctx = Context::background();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let gate = (started.clone(), release.clone());
+        let fake = faux_provider(Default::default());
+        let models = pi_rs_ai::registry::Models::default();
+        models.set_provider(fake.provider.clone());
         let harness = Harness::open_with(
             Arc::new(MemoryStorage::new()),
             HarnessOptions {
+                models: models.into(),
                 settings: Arc::new(move || json!({"afterFailedRun": policy})),
                 ..Default::default()
             },
             &ctx,
         )
         .await?;
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let gate = (started.clone(), release.clone());
-        let fake = faux_provider(Default::default());
         let model = &fake.models[0];
         fake.set_responses([
             FauxStep::Factory(Arc::new(move |_, _, _, _| {
@@ -611,7 +618,6 @@ async fn failed_run_policy_settles_or_preserves_the_queued_follow_up()
             })),
             faux_assistant_message(vec![faux_text("next answer")]).into(),
         ]);
-        harness.models.set_provider(fake.provider.clone());
         let root = harness.root(&ctx).await?;
         root.configure(
             &[(
@@ -805,9 +811,14 @@ async fn after_run_reports_rejected_task_requests_and_preserves_answer()
     let (attributed, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (send, mut reports) = tokio::sync::mpsc::unbounded_channel();
     let ctx = Context::background();
+    let fake = faux_provider(Default::default());
+    fake.set_responses([faux_assistant_message(vec![faux_text("answer")]).into()]);
+    let models = pi_rs_ai::registry::Models::default();
+    models.set_provider(fake.provider.clone());
     let harness = Harness::open_with(
         Arc::new(MemoryStorage::new()),
         HarnessOptions {
+            models: models.into(),
             registry: Arc::new(HarnessRegistry::Local(registry)),
             report_hook: Some(Arc::new(move |name, error| {
                 let _ = attributed.send((name.to_owned(), error.clone()));
@@ -823,10 +834,7 @@ async fn after_run_reports_rejected_task_requests_and_preserves_answer()
         &ctx,
     )
     .await?;
-    let fake = faux_provider(Default::default());
-    fake.set_responses([faux_assistant_message(vec![faux_text("answer")]).into()]);
     let model = &fake.models[0];
-    harness.models.set_provider(fake.provider.clone());
     let root = harness.root(&ctx).await?;
     root.configure(
         &[(
@@ -955,11 +963,6 @@ async fn clean_close_resends_the_inflight_request_without_charging_a_retry()
     let ctx = Context::background();
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("resend.sqlite");
-    let options = || HarnessOptions {
-        settings: Arc::new(|| json!({"retry":{"enabled":false}})),
-        ..Default::default()
-    };
-    let first = Harness::open_with(Arc::new(SqliteStorage::open(&path)?), options(), &ctx).await?;
     let started = Arc::new(tokio::sync::Notify::new());
     let entered = started.clone();
     let fake = faux_provider(Default::default());
@@ -967,7 +970,14 @@ async fn clean_close_resends_the_inflight_request_without_charging_a_retry()
         entered.notify_one();
         Box::pin(std::future::pending())
     }))]);
-    first.models.set_provider(fake.provider.clone());
+    let models = pi_rs_ai::registry::Models::default();
+    models.set_provider(fake.provider.clone());
+    let options = || HarnessOptions {
+        models: models.clone().into(),
+        settings: Arc::new(|| json!({"retry":{"enabled":false}})),
+        ..Default::default()
+    };
+    let first = Harness::open_with(Arc::new(SqliteStorage::open(&path)?), options(), &ctx).await?;
     let model = &fake.models[0];
     let root = first.root(&ctx).await?;
     root.configure(
@@ -992,7 +1002,6 @@ async fn clean_close_resends_the_inflight_request_without_charging_a_retry()
     tokio::time::timeout(timeout, first.close(&ctx)).await??;
     let next = Harness::open_with(Arc::new(SqliteStorage::open(&path)?), options(), &ctx).await?;
     fake.set_responses([faux_assistant_message(vec![faux_text("answer")]).into()]);
-    next.models.set_provider(fake.provider.clone());
     next.resume()?;
     let submission = next
         .submission(id, &ctx)
@@ -1014,15 +1023,7 @@ async fn crashed_poll_retries_the_same_job_or_cancels_it_at_exhaustion()
         let dir = tempfile::tempdir()?;
         let live = dir.path().join("live.sqlite");
         let crash = dir.path().join("crash.sqlite");
-        let options = || HarnessOptions {
-            settings: Arc::new(
-                move || json!({"stream":{"deferred":true},"retry":{"enabled":retry,"baseDelayMs":1}}),
-            ),
-            ..Default::default()
-        };
         let ctx = Context::background();
-        let first =
-            Harness::open_with(Arc::new(SqliteStorage::open(&live)?), options(), &ctx).await?;
         let fake = faux_provider(FauxOptions {
             poll_after_ms: Some(1),
             ..Default::default()
@@ -1038,7 +1039,17 @@ async fn crashed_poll_retries_the_same_job_or_cancels_it_at_exhaustion()
                 Ok(faux_assistant_message(vec![faux_text("answer")]))
             })
         }))]);
-        first.models.set_provider(fake.provider.clone());
+        let models = pi_rs_ai::registry::Models::default();
+        models.set_provider(fake.provider.clone());
+        let options = || HarnessOptions {
+            models: models.clone().into(),
+            settings: Arc::new(
+                move || json!({"stream":{"deferred":true},"retry":{"enabled":retry,"baseDelayMs":1}}),
+            ),
+            ..Default::default()
+        };
+        let first =
+            Harness::open_with(Arc::new(SqliteStorage::open(&live)?), options(), &ctx).await?;
         let root = first.root(&ctx).await?;
         let model = &fake.models[0];
         root.configure(
@@ -1067,7 +1078,6 @@ async fn crashed_poll_retries_the_same_job_or_cancels_it_at_exhaustion()
         release.notify_one();
         let recovered =
             Harness::open_with(Arc::new(SqliteStorage::open(crash)?), options(), &ctx).await?;
-        recovered.models.set_provider(fake.provider.clone());
         recovered.resume()?;
         let receipt = recovered
             .submission(item.id, &ctx)

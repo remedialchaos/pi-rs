@@ -330,7 +330,7 @@ impl Invocation {
             && let Some((provider, model)) = poll["model"]["provider"]
                 .as_str()
                 .zip(poll["model"]["modelId"].as_str())
-            && let Some(model) = self.harness.models.get_model(provider, model)
+            && let Some(model) = self.harness.models().get_model(provider, model)
             && let Ok(handle) = serde_json::from_value(poll["handle"].clone())
         {
             let options = StreamOptions {
@@ -339,7 +339,7 @@ impl Invocation {
             };
             let _ = self
                 .harness
-                .models
+                .models()
                 .cancel_deferred(model, handle, options)
                 .await;
             ctx.check().map_err(Error::from)?;
@@ -846,7 +846,7 @@ impl Invocation {
         let model = reference["provider"]
             .as_str()
             .zip(reference["modelId"].as_str())
-            .and_then(|(p, m)| self.harness.models.get_model(p, m));
+            .and_then(|(p, m)| self.harness.models().get_model(p, m));
         let Some(model) = model else {
             let text = if reference.is_null() {
                 "No model is configured".into()
@@ -1072,7 +1072,7 @@ impl Invocation {
         }
         let message = if phase == "poll" {
             self.harness
-                .models
+                .models()
                 .fetch_deferred(
                     model,
                     serde_json::from_value(checkpoint["handle"].clone())?,
@@ -1098,7 +1098,7 @@ impl Invocation {
                 .map(serde_json::from_value)
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             self.stream_response(
-                &self.harness.models,
+                &self.harness.models(),
                 GenerationRequest {
                     model,
                     context: pi_rs_ai::types::Context {

@@ -24,5 +24,7 @@ mod tools;
 
 #[path = "contracts/harness.rs"]
 mod harness;
+#[path = "contracts/harness_host_inputs.rs"]
+mod harness_host_inputs;
 #[path = "contracts/telemetry.rs"]
 mod telemetry;
