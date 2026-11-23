@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["workers",{"state":0}],
+      ["stop",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"patternProperties":{"^.*$":{"additionalProperties":false,"properties":{"error":{"type":"string"},"generation":{"type":"number"},"pid":{"type":"number"},"running":{"type":"boolean"}},"required":["generation","running"],"type":"object"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"session":{"type":"string"}},"required":["session"],"type":"object"},
+    {"type":"null"}
+  ]
+}

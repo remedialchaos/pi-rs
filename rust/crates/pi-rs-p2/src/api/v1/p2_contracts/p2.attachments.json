@@ -1,0 +1,14 @@
+{
+  "version": 3,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["resolve",{"method":[0,1]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"conversation":{"type":"number"},"ids":{"items":{"type":"string"},"maxItems":20,"type":"array"}},"required":["conversation","ids"],"type":"object"},
+    {"items":{"additionalProperties":false,"properties":{"id":{"type":"string"},"localPath":{"type":"string"},"mimeType":{"type":"string"},"name":{"type":"string"},"path":{"type":"string"},"size":{"type":"number"}},"required":["id","name","path","size"],"type":"object"},"type":"array"}
+  ]
+}

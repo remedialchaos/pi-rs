@@ -1,0 +1,44 @@
+{
+  "version": 2,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["worker", [["servers",{"state":0}],
+      ["errors",{"state":1}],
+      ["setLocations",{"method":[2,3]}],
+      ["call",{"method":[4,5]}]]],
+    ["owner", [["instances",{"state":0}],
+      ["errors",{"state":1}],
+      ["signIns",{"state":6}],
+      ["restart",{"method":[7,3]}],
+      ["signIn",{"method":[8,9]}],
+      ["paste",{"method":[10,3]}],
+      ["cancelSignIn",{"method":[11,3]}],
+      ["signOut",{"method":[8,3]}]]]
+  ],
+  "history": [
+    [{"put":["worker","servers",{"state":12},false]},
+     {"put":["owner","instances",{"state":12},false]}],
+    [{"put":["worker","servers",{"state":13},false]},
+     {"put":["worker","leases",{"state":14},true]},
+     {"put":["owner","instances",{"state":13},false]}]
+  ],
+  "admission": null,
+  "schemas": [
+    {"items":{"additionalProperties":false,"properties":{"auth":{"const":"oauth","type":"string"},"error":{"type":"string"},"id":{"type":"string"},"location":{"anyOf":[{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},{"type":"null"}]},"runsOn":{"anyOf":[{"const":"host","type":"string"},{"additionalProperties":false,"properties":{"env":{"type":"string"}},"required":["env"],"type":"object"}]},"server":{"type":"string"},"source":{"enum":["owner","project"]},"status":{"enum":["connected","failed","sign-in","starting"]},"tools":{"items":{"additionalProperties":false,"properties":{"annotations":{},"description":{"type":"string"},"inputSchema":{},"name":{"type":"string"},"outputSchema":{},"title":{"type":"string"}},"required":["inputSchema","name"],"type":"object"},"type":"array"}},"required":["id","location","runsOn","server","source","status","tools"],"type":"object"},"type":"array"},
+    {"items":{"type":"string"},"type":"array"},
+    {"additionalProperties":false,"properties":{"locations":{"items":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"type":"array"},"projects":{"items":{"anyOf":[{"additionalProperties":false,"properties":{"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"text":{"maxLength":262144,"type":"string"}},"required":["location","text"],"type":"object"},{"additionalProperties":false,"properties":{"error":{"maxLength":2000,"type":"string"},"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"}},"required":["error","location"],"type":"object"}]},"type":"array"}},"required":["locations"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"args":{"patternProperties":{"^.*$":{}},"type":"object"},"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"server":{"type":"string"},"tool":{"type":"string"}},"required":["args","location","server","tool"],"type":"object"},
+    {"type":"object"},
+    {"items":{"additionalProperties":false,"properties":{"error":{"type":"string"},"id":{"type":"string"},"server":{"type":"string"},"status":{"enum":["failed","waiting"]},"via":{"enum":["loopback","route"]}},"required":["id","server","status","via"],"type":"object"},"type":"array"},
+    {"additionalProperties":false,"properties":{"instance":{"type":"string"}},"required":["instance"],"type":"object"},
+    {"additionalProperties":false,"properties":{"server":{"type":"string"}},"required":["server"],"type":"object"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"authorized","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"redirect","type":"string"},"url":{"type":"string"}},"required":["kind","url"],"type":"object"}]},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"},"redirectUrl":{"maxLength":8192,"type":"string"}},"required":["id","redirectUrl"],"type":"object"},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"}},"required":["id"],"type":"object"},
+    {"items":{"additionalProperties":false,"properties":{"auth":{"const":"oauth","type":"string"},"error":{"type":"string"},"id":{"type":"string"},"instructions":{"type":"string"},"location":{"anyOf":[{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},{"type":"null"}]},"runsOn":{"anyOf":[{"const":"host","type":"string"},{"additionalProperties":false,"properties":{"env":{"type":"string"}},"required":["env"],"type":"object"}]},"server":{"type":"string"},"source":{"enum":["owner","project"]},"status":{"enum":["connected","failed","sign-in","starting"]},"tools":{"items":{"additionalProperties":false,"properties":{"annotations":{},"description":{"type":"string"},"inputSchema":{},"name":{"type":"string"},"outputSchema":{},"title":{"type":"string"}},"required":["inputSchema","name"],"type":"object"},"type":"array"}},"required":["id","location","runsOn","server","source","status","tools"],"type":"object"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"auth":{"const":"oauth","type":"string"},"description":{"type":"string"},"error":{"type":"string"},"id":{"type":"string"},"instructions":{"type":"string"},"location":{"anyOf":[{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},{"type":"null"}]},"runsOn":{"anyOf":[{"const":"host","type":"string"},{"additionalProperties":false,"properties":{"env":{"type":"string"}},"required":["env"],"type":"object"}]},"server":{"type":"string"},"source":{"enum":["owner","project"]},"status":{"enum":["connected","failed","sign-in","starting"]},"tools":{"items":{"additionalProperties":false,"properties":{"annotations":{},"description":{"type":"string"},"inputSchema":{},"name":{"type":"string"},"outputSchema":{},"title":{"type":"string"}},"required":["inputSchema","name"],"type":"object"},"type":"array"}},"required":["id","location","runsOn","server","source","status","tools"],"type":"object"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"instances":{"items":{"type":"string"},"type":"array"},"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"}},"required":["instances","location"],"type":"object"},"type":"array"}
+  ]
+}

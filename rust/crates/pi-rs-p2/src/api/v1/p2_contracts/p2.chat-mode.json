@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "params": [["session",6],["conversation",7]],
+  "route": "session",
+  "variants": [
+    ["reader", [["enabled",{"state":0}],
+      ["waiting",{"state":1}],
+      ["name",{"state":2}]]],
+    ["owner", [["enabled",{"state":0}],
+      ["waiting",{"state":1}],
+      ["name",{"state":2}],
+      ["set",{"method":[3,4]}],
+      ["rename",{"method":[5,4]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"boolean"},
+    {"type":"number"},
+    {"pattern":"^[A-Za-z][A-Za-z0-9_-]{0,31}$","type":"string"},
+    {"additionalProperties":false,"properties":{"enabled":{"type":"boolean"}},"required":["enabled"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"name":{"pattern":"^[A-Za-z][A-Za-z0-9_-]{0,31}$","type":"string"}},"required":["name"],"type":"object"},
+    {"type":"string"},
+    {"type":"integer"}
+  ]
+}

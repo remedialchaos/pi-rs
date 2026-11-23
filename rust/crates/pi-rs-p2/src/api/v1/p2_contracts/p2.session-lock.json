@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["owner", [["locks",{"state":0}],
+      ["set",{"method":[1,2]}]]],
+    ["worker", [["lock",{"state":3}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"patternProperties":{"^.*$":{"additionalProperties":false,"properties":{"capabilities":{"items":{"anyOf":[{"const":"ports","type":"string"},{"const":"conversations","type":"string"}]},"maxItems":8,"type":"array"},"instructions":{"type":"boolean"},"mcp":{"items":{"maxLength":200,"type":"string"},"maxItems":200,"type":"array"},"projectMcp":{"type":"boolean"}},"required":["capabilities","instructions","mcp","projectMcp"],"type":"object"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"lock":{"anyOf":[{"additionalProperties":false,"properties":{"capabilities":{"items":{"anyOf":[{"const":"ports","type":"string"},{"const":"conversations","type":"string"}]},"maxItems":8,"type":"array"},"instructions":{"type":"boolean"},"mcp":{"items":{"maxLength":200,"type":"string"},"maxItems":200,"type":"array"},"projectMcp":{"type":"boolean"}},"required":["capabilities","instructions","mcp","projectMcp"],"type":"object"},{"type":"null"}]},"session":{"type":"string"}},"required":["lock","session"],"type":"object"},
+    {"type":"null"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"capabilities":{"items":{"anyOf":[{"const":"ports","type":"string"},{"const":"conversations","type":"string"}]},"maxItems":8,"type":"array"},"instructions":{"type":"boolean"},"mcp":{"items":{"maxLength":200,"type":"string"},"maxItems":200,"type":"array"},"projectMcp":{"type":"boolean"}},"required":["capabilities","instructions","mcp","projectMcp"],"type":"object"},{"type":"null"}]}
+  ]
+}

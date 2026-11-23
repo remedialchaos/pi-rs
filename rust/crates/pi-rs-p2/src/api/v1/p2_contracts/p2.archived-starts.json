@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["allowed",{"state":0}],
+      ["allow",{"method":[1,2]}],
+      ["end",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"items":{"type":"string"},"type":"array"},
+    {"additionalProperties":false,"properties":{"session":{"type":"string"}},"required":["session"],"type":"object"},
+    {"type":"null"}
+  ]
+}

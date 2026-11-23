@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "params": [["session",3],["conversation",4]],
+  "route": "session",
+  "variants": [
+    ["author", [["drafts",{"state":0}],
+      ["claim",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"items":{"additionalProperties":false,"properties":{"id":{"type":"number"},"text":{"type":"string"}},"required":["id","text"],"type":"object"},"type":"array"},
+    {"additionalProperties":false,"properties":{"ids":{"items":{"type":"number"},"type":"array"}},"required":["ids"],"type":"object"},
+    {"additionalProperties":false,"properties":{"texts":{"items":{"type":"string"},"type":"array"}},"required":["texts"],"type":"object"},
+    {"type":"string"},
+    {"type":"integer"}
+  ]
+}

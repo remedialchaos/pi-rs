@@ -13,8 +13,13 @@
 | Unit | Owner | Scope |
 | --- | --- | --- |
 | 2.2b | Astra Low #1 | Durable harness |
+| 2.2b observation | Astra Low #2 | Conversation observation and task-graph watches against the durable harness snapshot |
 | 2.3b differential verification | Astra Low #5 | Daemon-backed local and remote file listing against upstream |
 | 3.2 asset delivery | Sol Medium #2 | Authenticated browser page, static assets and production CSP |
+| 3.2 worker routing | Sol Medium #1 | Automatic Chord session routing, idle shutdown, retry and catalog integration |
+| 3.2 TUI launcher | Astra Low #3 | Native p2 TUI entry, fixed-origin connection and mounted terminal lifecycle |
+| 3.2 stale browser page | Coordinator | Authenticated WebSocket version check before attaching a Chord link |
+| 3.2 development controls | Astra Low #4 | Private development command socket, reload state and loaded file changes |
 
 ## ADR Index
 
@@ -150,7 +155,7 @@ Shape: CLI (`pi`). Research complete ([rust/research/wasm-extensions.md](researc
 | 3.1 | `pi-rs-p3` | `apps/p3` (`src/` + `plugins/`; `old/` skipped) | 2.5k | 21 src + 4 plugins | **done** (`opencode / DeepSeek` + `codex / GPT-6.2-Astra`, verified 2026-11-22) | `rust/crates/pi-rs-p3` (`p3` bin): `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **79/79** tests PASS in 1.97s (69 lib + 6 live `p3` binary CLI + 4 live child-worker runner + 5/5 mutation checks); details & `2.1b-3` seam notes in [MILESTONE.md](crates/pi-rs-p3/MILESTONE.md) |
 | 3.2-web | `pi-rs-p2-web` (Leptos CSR frontend and browser host) | `apps/p2/src/web`, `apps/p2/src/hosts/web` | ~13.0k | Browser | **partial** | 135 native tests, native and WASM Clippy, Chromium session creation and chat with the upstream server. The browser check injected built assets. Production asset serving, plugin UI loading, attachments, telemetry and offline persistence remain open. [Milestone](crates/pi-rs-p2-web/MILESTONE.md) |
 | 3.2-tui | `pi-rs-p2-tui` mounted client | `apps/p2/src/tui` | ~6.9k | 34 TUI files | **partial** | 20 native tests. Five new mutation-checked cases cover retained transcript rows, panel paging, tree layout, registered shortcuts and atomic theme replacement. Dynamic guest dispatch and whole-screen parity remain open. [Milestone](crates/pi-rs-p2-tui/MILESTONE.md) |
-| 3.2 | `pi-rs-p2` (Server + hosts/runtime + 49 plugins) | `apps/p2` | ~89.6k | server + runtime + plugins | **partial**: native core, registration interface, worker boundary and 6/6 HTTP replay | Production routing and 49 plugin integrations remain. Binary `p2` follows `2.1b-3`, `2.2`, `2.3b`, `3.2-web`, `3.2-tui` |
+| 3.2 | `pi-rs-p2` (server, runtime, hosts and 49 plugins) | `apps/p2` | ~89.6k | server + runtime + plugins | **partial** | The native core passed six HTTP replay cases. Shared declarations match 106 upstream contracts across 130 versions. Production worker routing, plugin implementations and authenticated native chat remain open. |
 | 3.3 | `pi-rs-p2-mac` | `apps/p2-mac` | 3.5k Swift | macOS shell | **done** (`omp`, verified 2026-11-22) | `rust/crates/pi-rs-p2-mac` (`pi-mac` binary): `fmt`/`clippy -D warnings` PASS, **16/16** Linux x86_64 tests PASS (network/portable/supervisor) + `aarch64-apple-darwin` type-check PASS + real upstream `p2` smoke PASS; live macOS AppKit/WKWebView & signing deferred per ADR-005 |
 | 3.4 | `pi-rs-voice-server` | `apps/p2/voice-server` | Python | 4 units | **done** (`omp`, verified 2026-11-22) | `rust/crates/pi-rs-voice-server` (`pi-voice-server` binary): `fmt`/`clippy -D warnings` PASS, **17/17** offline HTTP/WS/segmenter/text tests PASS in 0.74s + real Supertonic 44.1 kHz, Kokoro 24 kHz, and Silero/Parakeet (`sherpa-onnx 1.13.8` parity) verified; Pocket synthesis hook ready for native ONNX/Candle adapter |
 

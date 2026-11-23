@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "params": [["session",7]],
+  "route": "server",
+  "variants": [
+    ["owner", [["env",{"state":0}],
+      ["links",{"state":1}],
+      ["guests",{"state":2}],
+      ["people",{"state":2}],
+      ["peopleUrl",{"state":0}],
+      ["link",{"method":[3,4]}],
+      ["share",{"method":[5,4]}],
+      ["remove",{"method":[6,4]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"anyOf":[{"type":"string"},{"type":"null"}]},
+    {"items":{"additionalProperties":false,"properties":{"mode":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]},"token":{"type":"string"},"url":{"type":"string"}},"required":["mode","token","url"],"type":"object"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"id":{"type":"string"},"mode":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]},"name":{"type":"string"}},"required":["id","mode","name"],"type":"object"},"type":"array"},
+    {"additionalProperties":false,"properties":{"mode":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]},"remoteConfirmed":{"type":"boolean"},"reset":{"type":"boolean"}},"required":["mode"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"email":{"type":"string"},"mode":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]},"remoteConfirmed":{"type":"boolean"}},"required":["email","mode"],"type":"object"},
+    {"additionalProperties":false,"properties":{"guestId":{"type":"string"}},"required":["guestId"],"type":"object"},
+    {"type":"string"}
+  ]
+}

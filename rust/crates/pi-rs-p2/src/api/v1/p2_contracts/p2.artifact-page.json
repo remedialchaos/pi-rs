@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "params": [["session",7],["id",7]],
+  "route": "server",
+  "variants": [
+    ["viewer", [["summary",{"state":0}],
+      ["value",{"state":1}],
+      ["report",{"method":[2,3]}],
+      ["answer",{"method":[4,3]}],
+      ["request",{"event":5}]]],
+    ["editor", [["summary",{"state":0}],
+      ["value",{"state":1}],
+      ["report",{"method":[2,3]}],
+      ["answer",{"method":[4,3]}],
+      ["setState",{"method":[6,3]}],
+      ["request",{"event":5}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"anyOf":[{"additionalProperties":false,"properties":{"id":{"pattern":"^[a-z0-9][a-z0-9_-]{0,63}$","type":"string"},"kind":{"enum":["html","md"]},"title":{"maxLength":200,"minLength":1,"type":"string"},"updated":{"type":"number"},"version":{"minimum":1,"type":"integer"}},"required":["id","kind","title","updated","version"],"type":"object"},{"type":"null"}]},
+    {},
+    {"additionalProperties":false,"properties":{"errors":{"items":{"maxLength":4000,"type":"string"},"maxItems":100,"type":"array"},"logs":{"items":{"additionalProperties":false,"properties":{"level":{"maxLength":16,"type":"string"},"text":{"maxLength":4000,"type":"string"}},"required":["level","text"],"type":"object"},"maxItems":500,"type":"array"}},"required":["errors","logs"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"request":{"type":"string"},"result":{"anyOf":[{"additionalProperties":false,"properties":{"ok":{"const":true,"type":"boolean"},"value":{}},"required":["ok","value"],"type":"object"},{"additionalProperties":false,"properties":{"error":{"type":"string"},"ok":{"const":false,"type":"boolean"}},"required":["error","ok"],"type":"object"}]}},"required":["request","result"],"type":"object"},
+    {"additionalProperties":false,"properties":{"code":{"type":"string"},"request":{"type":"string"}},"required":["code","request"],"type":"object"},
+    {"additionalProperties":false,"properties":{"state":{}},"required":["state"],"type":"object"},
+    {"type":"string"}
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "params": [["source",2]],
+  "route": "server",
+  "variants": [
+    ["owner", [["sources",{"state":0}],
+      ["lines",{"state":1}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"items":{"additionalProperties":false,"properties":{"id":{"type":"string"},"lines":{"type":"number"},"updatedAt":{"type":"number"}},"required":["id","lines","updatedAt"],"type":"object"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"id":{"type":"number"},"level":{"anyOf":[{"const":"stdout","type":"string"},{"const":"stderr","type":"string"},{"const":"event","type":"string"},{"const":"error","type":"string"}]},"text":{"type":"string"},"time":{"type":"number"}},"required":["id","level","text","time"],"type":"object"},"type":"array"},
+    {"maxLength":128,"type":"string"}
+  ]
+}

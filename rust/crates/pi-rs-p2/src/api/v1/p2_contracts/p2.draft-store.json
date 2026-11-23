@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["drafts",{"state":0}],
+      ["add",{"method":[1,2]}],
+      ["claim",{"method":[3,4]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"patternProperties":{"^.*$":{"items":{"additionalProperties":false,"properties":{"id":{"type":"number"},"text":{"type":"string"}},"required":["id","text"],"type":"object"},"type":"array"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"conversation":{"type":"number"},"items":{"items":{"additionalProperties":false,"properties":{"author":{"additionalProperties":false,"properties":{"id":{"type":"string"},"kind":{"anyOf":[{"const":"owner","type":"string"},{"const":"guest","type":"string"}]},"name":{"type":"string"}},"required":["id","kind","name"],"type":"object"},"text":{"type":"string"}},"required":["author","text"],"type":"object"},"type":"array"}},"required":["conversation","items"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"authorId":{"type":"string"},"conversation":{"type":"number"},"ids":{"items":{"type":"number"},"type":"array"}},"required":["authorId","conversation","ids"],"type":"object"},
+    {"additionalProperties":false,"properties":{"texts":{"items":{"type":"string"},"type":"array"}},"required":["texts"],"type":"object"}
+  ]
+}

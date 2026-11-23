@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "params": [["conversation",5]],
+  "route": null,
+  "variants": [
+    ["members", [["changes",{"state":0}],
+      ["complete",{"method":[1,2]}],
+      ["list",{"method":[3,4]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"number"},
+    {"additionalProperties":false,"properties":{"kind":{"anyOf":[{"const":"any","type":"string"},{"const":"file","type":"string"},{"const":"dir","type":"string"}]},"limit":{"maximum":100,"minimum":1,"type":"integer"},"query":{"maxLength":200,"type":"string"}},"required":["query"],"type":"object"},
+    {"additionalProperties":false,"properties":{"items":{"items":{"additionalProperties":false,"properties":{"dir":{"type":"boolean"},"path":{"type":"string"}},"required":["dir","path"],"type":"object"},"type":"array"},"truncated":{"type":"boolean"}},"required":["items","truncated"],"type":"object"},
+    {"additionalProperties":false,"properties":{"path":{"maxLength":4096,"type":"string"}},"required":["path"],"type":"object"},
+    {"additionalProperties":false,"properties":{"entries":{"items":{"additionalProperties":false,"properties":{"dir":{"type":"boolean"},"name":{"type":"string"}},"required":["dir","name"],"type":"object"},"type":"array"},"truncated":{"type":"boolean"}},"required":["entries","truncated"],"type":"object"},
+    {"minimum":1,"type":"integer"}
+  ]
+}

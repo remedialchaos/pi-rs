@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["info",{"state":0}],
+      ["revokeOwners",{"method":[1,2]}],
+      ["revokeGuests",{"method":[3,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"allowedHosts":{"items":{"type":"string"},"type":"array"},"app":{"type":"string"},"dataDir":{"type":"string"},"fake":{"type":"boolean"},"port":{"type":"number"}},"required":["allowedHosts","app","dataDir","fake","port"],"type":"object"},
+    {"additionalProperties":false,"properties":{"device":{"type":"string"}},"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"}},"required":["id"],"type":"object"}
+  ]
+}

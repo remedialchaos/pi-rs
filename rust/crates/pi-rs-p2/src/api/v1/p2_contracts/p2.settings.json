@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["owner", [["settings",{"state":0}],
+      ["error",{"state":1}],
+      ["update",{"method":[2,3]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {},
+    {"anyOf":[{"type":"string"},{"type":"null"}]},
+    {"additionalProperties":false,"properties":{"set":{},"unset":{"items":{"maxLength":64,"type":"string"},"maxItems":64,"type":"array"}},"required":["set","unset"],"type":"object"},
+    {"type":"null"}
+  ]
+}

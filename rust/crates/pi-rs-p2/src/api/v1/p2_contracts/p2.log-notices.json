@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["owner", [["notices",{"state":0}],
+      ["dismiss",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"items":{"additionalProperties":false,"properties":{"id":{"type":"number"},"message":{"type":"string"},"source":{"type":"string"},"time":{"type":"number"}},"required":["id","message","source","time"],"type":"object"},"type":"array"},
+    {"additionalProperties":false,"properties":{"id":{"type":"number"}},"required":["id"],"type":"object"},
+    {"type":"null"}
+  ]
+}

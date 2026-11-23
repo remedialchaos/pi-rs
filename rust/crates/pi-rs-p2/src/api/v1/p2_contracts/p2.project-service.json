@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["projects",{"state":0}],
+      ["archived",{"state":1}],
+      ["sessions",{"state":2}],
+      ["assign",{"method":[3,4]}],
+      ["copy",{"method":[5,4]}],
+      ["create",{"method":[6,4]}],
+      ["rename",{"method":[7,4]}],
+      ["locate",{"method":[6,4]}],
+      ["move",{"method":[8,4]}],
+      ["archive",{"method":[9,4]}],
+      ["restore",{"method":[9,4]}],
+      ["remove",{"method":[9,4]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"items":{"additionalProperties":false,"properties":{"name":{"type":"string"},"places":{"items":{"additionalProperties":false,"properties":{"env":{"anyOf":[{"type":"string"},{"type":"null"}]},"path":{"type":"string"}},"required":["env","path"],"type":"object"},"type":"array"}},"required":["name","places"],"type":"object"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"archivedAt":{"type":"number"},"name":{"type":"string"},"places":{"items":{"additionalProperties":false,"properties":{"env":{"anyOf":[{"type":"string"},{"type":"null"}]},"path":{"type":"string"}},"required":["env","path"],"type":"object"},"type":"array"}},"required":["archivedAt","name","places"],"type":"object"},"type":"array"},
+    {"patternProperties":{"^.*$":{"type":"string"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"project":{"anyOf":[{"maxLength":64,"type":"string"},{"type":"null"}]},"session":{"maxLength":64,"type":"string"}},"required":["project","session"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"copy":{"type":"string"},"source":{"type":"string"}},"required":["copy","source"],"type":"object"},
+    {"additionalProperties":false,"properties":{"name":{"maxLength":64,"minLength":1,"type":"string"},"place":{"additionalProperties":false,"properties":{"env":{"anyOf":[{"maxLength":32,"type":"string"},{"type":"null"}]},"path":{"maxLength":4096,"minLength":1,"type":"string"}},"required":["env","path"],"type":"object"}},"required":["name","place"],"type":"object"},
+    {"additionalProperties":false,"properties":{"name":{"maxLength":64,"minLength":1,"type":"string"},"to":{"maxLength":64,"minLength":1,"type":"string"}},"required":["name","to"],"type":"object"},
+    {"additionalProperties":false,"properties":{"before":{"anyOf":[{"maxLength":64,"minLength":1,"type":"string"},{"type":"null"}]},"name":{"maxLength":64,"minLength":1,"type":"string"}},"required":["before","name"],"type":"object"},
+    {"additionalProperties":false,"properties":{"name":{"maxLength":64,"minLength":1,"type":"string"}},"required":["name"],"type":"object"}
+  ]
+}

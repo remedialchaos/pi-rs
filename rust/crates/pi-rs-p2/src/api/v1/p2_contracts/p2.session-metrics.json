@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "params": [["session",2],["viewer",3]],
+  "route": "server",
+  "variants": [
+    ["reader", [["clients",{"state":0}],
+      ["usage",{"state":1}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"number"},
+    {"anyOf":[{},{"type":"null"}]},
+    {"type":"string"},
+    {"maxLength":80,"minLength":1,"type":"string"}
+  ]
+}

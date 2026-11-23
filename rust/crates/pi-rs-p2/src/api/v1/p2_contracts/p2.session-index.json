@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["byId",{"state":0}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"patternProperties":{"^.*$":{"additionalProperties":false,"properties":{"archivedAt":{"anyOf":[{"type":"number"},{"type":"null"}]},"branches":{"items":{"additionalProperties":false,"properties":{"conversation":{"minimum":1,"type":"integer"},"label":{"anyOf":[{"type":"string"},{"type":"null"}]},"parent":{"minimum":1,"type":"integer"}},"required":["conversation","label"],"type":"object"},"type":"array"},"createdAt":{"type":"number"},"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]},"id":{"type":"string"},"main":{"minimum":1,"type":"integer"},"model":{"additionalProperties":false,"properties":{"modelId":{"minLength":1,"type":"string"},"provider":{"minLength":1,"type":"string"}},"required":["modelId","provider"],"type":"object"},"pinned":{"type":"boolean"},"thinkingLevel":{"type":"string"},"title":{"type":"string"},"updatedAt":{"type":"number"}},"required":["archivedAt","branches","createdAt","cwd","id","main","model","pinned","thinkingLevel","title","updatedAt"],"type":"object"}},"type":"object"}
+  ]
+}

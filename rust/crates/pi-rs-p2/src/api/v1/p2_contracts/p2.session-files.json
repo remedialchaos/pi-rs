@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "params": [["session",4]],
+  "route": "session",
+  "variants": [
+    ["server", [["begin",{"method":[0,1]}],
+      ["append",{"method":[2,3]}],
+      ["finish",{"method":[4,5]}],
+      ["cancel",{"method":[4,3]}],
+      ["download",{"method":[6,7]}],
+      ["read",{"method":[8,9]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"name":{"type":"string"},"source":{"type":"string"},"space":{"anyOf":[{"const":"uploads"},{"const":"downloads"}]}},"required":["name","source","space"],"type":"object"},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"},"upload":{"type":"string"}},"required":["id","upload"],"type":"object"},
+    {"additionalProperties":false,"properties":{"bytes":{"type":"bytes"},"offset":{"minimum":0,"type":"integer"},"upload":{"type":"string"}},"required":["bytes","offset","upload"],"type":"object"},
+    {"type":"null"},
+    {"type":"string"},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"},"mimeType":{"type":"string"},"name":{"type":"string"},"size":{"type":"number"}},"required":["id","name","size"],"type":"object"},
+    {"maxLength":64,"type":"string"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"file":{"type":"string"},"name":{"type":"string"},"size":{"type":"number"}},"required":["file","name","size"],"type":"object"},{"type":"null"}]},
+    {"additionalProperties":false,"properties":{"file":{"type":"string"},"length":{"maximum":1048576,"minimum":0,"type":"integer"},"offset":{"minimum":0,"type":"integer"}},"required":["file","length","offset"],"type":"object"},
+    {"type":"bytes"}
+  ]
+}

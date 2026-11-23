@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "params": [["session",2]],
+  "route": "session",
+  "variants": [
+    ["reader", [["preview",{"method":[0,1]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"id":{"maxLength":64,"type":"string"}},"required":["id"],"type":"object"},
+    {"additionalProperties":false,"properties":{"name":{"type":"string"},"size":{"type":"number"},"text":{"anyOf":[{"type":"string"},{"type":"null"}]},"truncated":{"type":"boolean"}},"required":["name","size","text","truncated"],"type":"object"},
+    {"type":"string"}
+  ]
+}

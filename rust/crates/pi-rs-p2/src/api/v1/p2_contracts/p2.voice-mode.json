@@ -1,0 +1,25 @@
+{
+  "version": 3,
+  "params": [["session",5],["conversation",6]],
+  "route": "session",
+  "variants": [
+    ["owner", [["enabled",{"state":0}],
+      ["voice",{"state":1}],
+      ["set",{"method":[2,3]}],
+      ["choose",{"method":[4,3]}]]],
+    ["participant", [["enabled",{"state":0}],
+      ["voice",{"state":1}],
+      ["set",{"method":[2,3]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"boolean"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"engine":{"pattern":"^[A-Za-z0-9_-]{1,64}$","type":"string"},"language":{"pattern":"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$","type":"string"},"speed":{"maximum":2,"minimum":0.5,"type":"number"},"voice":{"pattern":"^[A-Za-z0-9_-]{1,64}$","type":"string"}},"required":["engine","speed","voice"],"type":"object"},{"type":"null"}]},
+    {"additionalProperties":false,"properties":{"enabled":{"type":"boolean"}},"required":["enabled"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"engine":{"pattern":"^[A-Za-z0-9_-]{1,64}$","type":"string"},"language":{"pattern":"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$","type":"string"},"speed":{"maximum":2,"minimum":0.5,"type":"number"},"voice":{"pattern":"^[A-Za-z0-9_-]{1,64}$","type":"string"}},"required":["engine","speed","voice"],"type":"object"},
+    {"type":"string"},
+    {"type":"integer"}
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["bots",{"state":0}],
+      ["bindings",{"state":1}],
+      ["addBot",{"method":[2,3]}],
+      ["setBotToken",{"method":[4,5]}],
+      ["removeBot",{"method":[6,5]}],
+      ["server",{"method":[7,8]}],
+      ["mcpServers",{"method":[5,9]}],
+      ["link",{"method":[10,5]}],
+      ["unlink",{"method":[11,5]}],
+      ["updateLink",{"method":[12,5]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"items":{"additionalProperties":false,"properties":{"id":{"type":"string"},"status":{"anyOf":[{"additionalProperties":false,"properties":{"state":{"const":"connecting","type":"string"}},"required":["state"],"type":"object"},{"additionalProperties":false,"properties":{"error":{"type":"string"},"state":{"const":"error","type":"string"}},"required":["error","state"],"type":"object"},{"additionalProperties":false,"properties":{"applicationId":{"type":"string"},"avatarUrl":{"type":"string"},"guilds":{"items":{"additionalProperties":false,"properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"type":"object"},"type":"array"},"inviteUrl":{"type":"string"},"state":{"const":"connected","type":"string"},"user":{"type":"string"}},"required":["applicationId","guilds","inviteUrl","state","user"],"type":"object"}]}},"required":["id","status"],"type":"object"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"botId":{"type":"string"},"channelId":{"type":"string"},"channelName":{"type":"string"},"createdAt":{"type":"number"},"cursor":{"anyOf":[{"type":"string"},{"type":"null"}]},"guildId":{"type":"string"},"guildName":{"type":"string"},"session":{"type":"string"},"threads":{"patternProperties":{"^.*$":{"additionalProperties":false,"properties":{"conversation":{"minimum":1,"type":"integer"},"cursor":{"anyOf":[{"type":"string"},{"type":"null"}]},"name":{"type":"string"}},"required":["conversation","cursor","name"],"type":"object"}},"type":"object"},"wake":{"additionalProperties":false,"properties":{"anyone":{"type":"boolean"},"roles":{"items":{"maxLength":32,"type":"string"},"maxItems":100,"type":"array"},"users":{"items":{"maxLength":32,"type":"string"},"maxItems":100,"type":"array"}},"required":["anyone","roles","users"],"type":"object"}},"required":["botId","channelId","channelName","createdAt","cursor","guildId","guildName","session","threads","wake"],"type":"object"},"type":"array"},
+    {"additionalProperties":false,"properties":{"token":{"maxLength":200,"minLength":10,"type":"string"}},"required":["token"],"type":"object"},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"}},"required":["id"],"type":"object"},
+    {"additionalProperties":false,"properties":{"bot":{"type":"string"},"token":{"maxLength":200,"minLength":10,"type":"string"}},"required":["bot","token"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"bot":{"type":"string"}},"required":["bot"],"type":"object"},
+    {"additionalProperties":false,"properties":{"bot":{"type":"string"},"guild":{"type":"string"}},"required":["bot","guild"],"type":"object"},
+    {"additionalProperties":false,"properties":{"channels":{"items":{"additionalProperties":false,"properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"type":"object"},"type":"array"},"roles":{"items":{"additionalProperties":false,"properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"type":"object"},"type":"array"}},"required":["channels","roles"],"type":"object"},
+    {"items":{"type":"string"},"type":"array"},
+    {"additionalProperties":false,"properties":{"bot":{"type":"string"},"channel":{"type":"string"},"guild":{"type":"string"},"lock":{"additionalProperties":false,"properties":{"capabilities":{"items":{"anyOf":[{"const":"ports","type":"string"},{"const":"conversations","type":"string"}]},"maxItems":8,"type":"array"},"instructions":{"type":"boolean"},"mcp":{"items":{"maxLength":200,"type":"string"},"maxItems":200,"type":"array"},"projectMcp":{"type":"boolean"}},"required":["capabilities","instructions","mcp","projectMcp"],"type":"object"},"sandbox":{"type":"string"},"session":{"type":"string"},"wake":{"additionalProperties":false,"properties":{"anyone":{"type":"boolean"},"roles":{"items":{"maxLength":32,"type":"string"},"maxItems":100,"type":"array"},"users":{"items":{"maxLength":32,"type":"string"},"maxItems":100,"type":"array"}},"required":["anyone","roles","users"],"type":"object"}},"required":["bot","channel","guild","lock","sandbox","session","wake"],"type":"object"},
+    {"additionalProperties":false,"properties":{"session":{"type":"string"}},"required":["session"],"type":"object"},
+    {"additionalProperties":false,"properties":{"lock":{"additionalProperties":false,"properties":{"capabilities":{"items":{"anyOf":[{"const":"ports","type":"string"},{"const":"conversations","type":"string"}]},"maxItems":8,"type":"array"},"instructions":{"type":"boolean"},"mcp":{"items":{"maxLength":200,"type":"string"},"maxItems":200,"type":"array"},"projectMcp":{"type":"boolean"}},"required":["capabilities","instructions","mcp","projectMcp"],"type":"object"},"session":{"type":"string"},"wake":{"additionalProperties":false,"properties":{"anyone":{"type":"boolean"},"roles":{"items":{"maxLength":32,"type":"string"},"maxItems":100,"type":"array"},"users":{"items":{"maxLength":32,"type":"string"},"maxItems":100,"type":"array"}},"required":["anyone","roles","users"],"type":"object"}},"required":["lock","session","wake"],"type":"object"}
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "version": 3,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["children",{"state":0}],
+      ["report",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"patternProperties":{"^.*$":{"items":{"additionalProperties":false,"properties":{"archived":{"type":"boolean"},"callId":{"type":"string"},"conversationId":{"type":"number"},"failure":{"additionalProperties":false,"properties":{"detail":{"type":"string"},"reason":{"type":"string"}},"required":["reason"],"type":"object"},"kind":{"const":"agent","type":"string"},"lastEntryId":{"type":"number"},"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"model":{"type":"string"},"name":{"type":"string"},"thinkingLevel":{"type":"string"},"tools":{"items":{"type":"string"},"type":"array"},"updatedAt":{"type":"number"}},"required":["conversationId","lastEntryId","model","name","thinkingLevel","tools"],"type":"object"},"type":"array"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"children":{"items":{"additionalProperties":false,"properties":{"archived":{"type":"boolean"},"callId":{"type":"string"},"conversationId":{"type":"number"},"failure":{"additionalProperties":false,"properties":{"detail":{"type":"string"},"reason":{"type":"string"}},"required":["reason"],"type":"object"},"kind":{"const":"agent","type":"string"},"lastEntryId":{"type":"number"},"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"model":{"type":"string"},"name":{"type":"string"},"thinkingLevel":{"type":"string"},"tools":{"items":{"type":"string"},"type":"array"},"updatedAt":{"type":"number"}},"required":["conversationId","lastEntryId","model","name","thinkingLevel","tools"],"type":"object"},"type":"array"},"generation":{"type":"number"},"session":{"type":"string"}},"required":["children","generation","session"],"type":"object"},
+    {"type":"null"}
+  ]
+}

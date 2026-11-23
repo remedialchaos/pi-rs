@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["owner", [["name",{"state":0}],
+      ["chosen",{"state":0}],
+      ["device",{"state":0}],
+      ["rename",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"anyOf":[{"type":"string"},{"type":"null"}]},
+    {"additionalProperties":false,"properties":{"name":{"anyOf":[{"maxLength":1024,"type":"string"},{"type":"null"}]}},"required":["name"],"type":"object"},
+    {"type":"null"}
+  ]
+}

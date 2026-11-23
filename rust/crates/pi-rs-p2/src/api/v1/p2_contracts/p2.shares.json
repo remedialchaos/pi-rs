@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["links",{"state":0}],
+      ["emails",{"state":1}],
+      ["people",{"state":2}],
+      ["authenticate",{"method":[3,4]}],
+      ["authenticateEmail",{"method":[5,4]}],
+      ["grant",{"method":[6,4]}],
+      ["active",{"method":[7,8]}],
+      ["link",{"method":[9,10]}],
+      ["share",{"method":[11,10]}],
+      ["remove",{"method":[12,10]}],
+      ["join",{"method":[13,14]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"items":{"additionalProperties":false,"properties":{"id":{"type":"string"},"mode":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]},"session":{"type":"string"},"token":{"type":"string"}},"required":["id","mode","session","token"],"type":"object"},"type":"array"},
+    {"items":{"type":"string"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"id":{"type":"string"},"mode":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]},"name":{"type":"string"},"session":{"type":"string"}},"required":["id","mode","name","session"],"type":"object"},"type":"array"},
+    {"additionalProperties":false,"properties":{"cookie":{"type":"string"}},"required":["cookie"],"type":"object"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"email":{"type":"string"},"home":{"type":"string"},"id":{"type":"string"},"kind":{"const":"guest","type":"string"},"name":{"type":"string"},"revision":{"type":"number"},"sessions":{"patternProperties":{"^.*$":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]}},"type":"object"}},"required":["home","id","kind","name","revision","sessions"],"type":"object"},{"type":"null"}]},
+    {"additionalProperties":false,"properties":{"email":{"type":"string"}},"required":["email"],"type":"object"},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"}},"required":["id"],"type":"object"},
+    {"additionalProperties":false,"properties":{"token":{"type":"string"}},"required":["token"],"type":"object"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"id":{"type":"string"},"mode":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]},"session":{"type":"string"},"token":{"type":"string"}},"required":["id","mode","session","token"],"type":"object"},{"type":"null"}]},
+    {"additionalProperties":false,"properties":{"mode":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]},"remoteConfirmed":{"type":"boolean"},"reset":{"type":"boolean"},"session":{"type":"string"}},"required":["mode","reset","session"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"email":{"type":"string"},"mode":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]},"remoteConfirmed":{"type":"boolean"},"session":{"type":"string"}},"required":["email","mode","session"],"type":"object"},
+    {"additionalProperties":false,"properties":{"guestId":{"type":"string"},"session":{"type":"string"}},"required":["guestId","session"],"type":"object"},
+    {"additionalProperties":false,"properties":{"cookie":{"type":"string"},"name":{"type":"string"},"token":{"type":"string"}},"required":["name","token"],"type":"object"},
+    {"additionalProperties":false,"properties":{"cookie":{"type":"string"},"session":{"type":"string"}},"required":["session"],"type":"object"}
+  ]
+}

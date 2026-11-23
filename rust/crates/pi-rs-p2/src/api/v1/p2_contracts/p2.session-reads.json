@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["owner", [["answers",{"state":0}],
+      ["reads",{"state":0}],
+      ["markRead",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"patternProperties":{"^.*$":{"type":"number"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"session":{"type":"string"},"through":{"type":"number"}},"required":["session","through"],"type":"object"},
+    {"type":"null"}
+  ]
+}

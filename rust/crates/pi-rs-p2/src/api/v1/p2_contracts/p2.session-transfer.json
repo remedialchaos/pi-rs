@@ -1,0 +1,19 @@
+{
+  "version": 3,
+  "params": [["session",4]],
+  "route": "session",
+  "variants": [
+    ["server", [["history",{"method":[0,1]}],
+      ["seed",{"method":[1,2]}],
+      ["copyFiles",{"method":[3,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"before":{"minimum":1,"type":"integer"},"conversation":{"minimum":1,"type":"integer"}},"required":["before","conversation"],"type":"object"},
+    {"additionalProperties":false,"properties":{"entries":{"items":{},"type":"array"}},"required":["entries"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"to":{"type":"string"}},"required":["to"],"type":"object"},
+    {"type":"string"}
+  ]
+}

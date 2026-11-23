@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["settings",{"state":0}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {}
+  ]
+}

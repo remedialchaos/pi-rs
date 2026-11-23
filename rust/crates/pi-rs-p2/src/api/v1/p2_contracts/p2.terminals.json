@@ -1,0 +1,30 @@
+{
+  "version": 2,
+  "params": [["session",9],["view",9]],
+  "route": "server",
+  "variants": [
+    ["owner", [["channel",{"method":[0,1]}],
+      ["list",{"method":[0,2]}],
+      ["open",{"method":[3,2]}],
+      ["attach",{"method":[4,2]}],
+      ["close",{"method":[5,2]}],
+      ["resize",{"method":[6,2]}],
+      ["theme",{"method":[7,2]}],
+      ["ack",{"method":[8,2]}],
+      ["restartHost",{"method":[0,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{},"type":"object"},
+    {"additionalProperties":false,"properties":{"token":{"type":"string"}},"required":["token"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"cols":{"maximum":1000,"minimum":1,"type":"integer"},"conversation":{"minimum":1,"type":"integer"},"rows":{"maximum":1000,"minimum":1,"type":"integer"}},"required":["cols","conversation","rows"],"type":"object"},
+    {"additionalProperties":false,"properties":{"terminalId":{"maxLength":64,"minLength":1,"type":"string"}},"required":["terminalId"],"type":"object"},
+    {"additionalProperties":false,"properties":{"force":{"type":"boolean"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"cols":{"maximum":1000,"minimum":1,"type":"integer"},"rows":{"maximum":1000,"minimum":1,"type":"integer"}},"required":["cols","rows"],"type":"object"},
+    {"additionalProperties":false,"properties":{"background":{"maximum":16777215,"minimum":0,"type":"integer"},"foreground":{"maximum":16777215,"minimum":0,"type":"integer"},"scheme":{"anyOf":[{"const":"light","type":"string"},{"const":"dark","type":"string"}]}},"required":["background","foreground","scheme"],"type":"object"},
+    {"additionalProperties":false,"properties":{"bytes":{"maximum":9007199254740991,"minimum":1,"type":"integer"}},"required":["bytes"],"type":"object"},
+    {"type":"string"}
+  ]
+}

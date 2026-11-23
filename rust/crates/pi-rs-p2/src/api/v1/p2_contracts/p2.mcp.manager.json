@@ -1,0 +1,43 @@
+{
+  "version": 4,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["instances",{"state":0}],
+      ["signIns",{"state":1}],
+      ["leases",{"state":2}],
+      ["errors",{"state":3}],
+      ["setLocations",{"method":[4,5]}],
+      ["releaseLeases",{"method":[6,5]}],
+      ["call",{"method":[7,8]}],
+      ["restart",{"method":[9,5]}],
+      ["beginSignIn",{"method":[10,11]}],
+      ["completeSignIn",{"method":[12,13]}],
+      ["pasteSignIn",{"method":[14,5]}],
+      ["cancelSignIn",{"method":[15,5]}],
+      ["signOut",{"method":[13,5]}],
+      ["probe",{"method":[16,17]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"items":{"additionalProperties":false,"properties":{"auth":{"const":"oauth","type":"string"},"description":{"type":"string"},"error":{"type":"string"},"id":{"type":"string"},"instructions":{"type":"string"},"location":{"anyOf":[{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},{"type":"null"}]},"runsOn":{"anyOf":[{"const":"host","type":"string"},{"additionalProperties":false,"properties":{"env":{"type":"string"}},"required":["env"],"type":"object"}]},"server":{"type":"string"},"source":{"enum":["owner","project"]},"status":{"enum":["connected","failed","sign-in","starting"]},"tools":{"items":{"additionalProperties":false,"properties":{"annotations":{},"description":{"type":"string"},"inputSchema":{},"name":{"type":"string"},"outputSchema":{},"title":{"type":"string"}},"required":["inputSchema","name"],"type":"object"},"type":"array"}},"required":["id","location","runsOn","server","source","status","tools"],"type":"object"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"error":{"type":"string"},"id":{"type":"string"},"server":{"type":"string"},"status":{"enum":["failed","waiting"]},"via":{"enum":["loopback","route"]}},"required":["id","server","status","via"],"type":"object"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"errors":{"items":{"type":"string"},"type":"array"},"instances":{"items":{"type":"string"},"type":"array"},"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"session":{"type":"string"}},"required":["errors","instances","location","session"],"type":"object"},"type":"array"},
+    {"items":{"type":"string"},"type":"array"},
+    {"additionalProperties":false,"properties":{"generation":{"type":"integer"},"incarnation":{"type":"string"},"locations":{"items":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"type":"array"},"projects":{"items":{"anyOf":[{"additionalProperties":false,"properties":{"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"text":{"maxLength":262144,"type":"string"}},"required":["location","text"],"type":"object"},{"additionalProperties":false,"properties":{"error":{"maxLength":2000,"type":"string"},"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"}},"required":["error","location"],"type":"object"}]},"type":"array"},"session":{"type":"string"}},"required":["generation","incarnation","locations","session"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"generation":{"type":"integer"},"session":{"type":"string"}},"required":["generation","session"],"type":"object"},
+    {"additionalProperties":false,"properties":{"args":{"patternProperties":{"^.*$":{}},"type":"object"},"generation":{"type":"integer"},"incarnation":{"type":"string"},"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"server":{"type":"string"},"session":{"type":"string"},"tool":{"type":"string"}},"required":["args","generation","incarnation","location","server","session","tool"],"type":"object"},
+    {"type":"object"},
+    {"additionalProperties":false,"properties":{"instance":{"type":"string"}},"required":["instance"],"type":"object"},
+    {"additionalProperties":false,"properties":{"redirect":{"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"loopback","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"route","type":"string"},"url":{"type":"string"}},"required":["kind","url"],"type":"object"}]},"server":{"type":"string"}},"required":["redirect","server"],"type":"object"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"authorized","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"redirect","type":"string"},"url":{"type":"string"}},"required":["kind","url"],"type":"object"}]},
+    {"additionalProperties":false,"properties":{"code":{"type":"string"},"error":{"type":"string"},"iss":{"type":"string"},"state":{"type":"string"}},"required":["state"],"type":"object"},
+    {"additionalProperties":false,"properties":{"server":{"type":"string"}},"required":["server"],"type":"object"},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"},"redirectUrl":{"maxLength":8192,"type":"string"}},"required":["id","redirectUrl"],"type":"object"},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"}},"required":["id"],"type":"object"},
+    {"additionalProperties":false,"properties":{"origin":{"type":"string"}},"required":["origin"],"type":"object"},
+    {"additionalProperties":false,"properties":{"url":{"type":"string"}},"required":["url"],"type":"object"}
+  ]
+}

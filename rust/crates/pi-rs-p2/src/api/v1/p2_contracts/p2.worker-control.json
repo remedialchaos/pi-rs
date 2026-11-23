@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "params": [["session",1]],
+  "route": "server",
+  "variants": [
+    ["owner", [["restart",{"method":[0,0]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"null"},
+    {"type":"string"}
+  ]
+}

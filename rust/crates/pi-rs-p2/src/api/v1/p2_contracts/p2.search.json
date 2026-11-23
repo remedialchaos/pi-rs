@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["owner", [["search",{"method":[0,1]}],
+      ["rebuildIndex",{"method":[2,3]}]]]
+  ],
+  "history": [
+    [{"put":["owner","rebuilds",{"state":4},true]}],
+    [{"args":["search",5]}]
+  ],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"archived":{"type":"boolean"},"query":{"maxLength":500,"type":"string"}},"required":["query"],"type":"object"},
+    {"additionalProperties":false,"properties":{"messages":{"items":{"additionalProperties":false,"properties":{"conversationId":{"type":"number"},"entryId":{"type":"number"},"role":{"anyOf":[{"const":"user","type":"string"},{"const":"assistant","type":"string"}]},"session":{"type":"string"},"text":{"type":"string"},"title":{"type":"string"}},"required":["conversationId","entryId","role","session","text","title"],"type":"object"},"type":"array"},"sessions":{"items":{"type":"string"},"type":"array"}},"required":["messages","sessions"],"type":"object"},
+    {"additionalProperties":false,"properties":{"session":{"type":"string"}},"required":["session"],"type":"object"},
+    {"type":"null"},
+    {"items":{"anyOf":[{"additionalProperties":false,"properties":{"phase":{"const":"running","type":"string"},"session":{"type":"string"}},"required":["phase","session"],"type":"object"},{"additionalProperties":false,"properties":{"error":{"type":"string"},"phase":{"const":"failed","type":"string"},"session":{"type":"string"}},"required":["error","phase","session"],"type":"object"}]},"type":"array"},
+    {"additionalProperties":false,"properties":{"archived":{"type":"boolean"},"query":{"maxLength":500,"type":"string"},"sessions":{"items":{"maxLength":64,"type":"string"},"maxItems":10000,"type":"array"}},"required":["query"],"type":"object"}
+  ]
+}

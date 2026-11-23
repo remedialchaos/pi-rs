@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "params": [["session",4],["conversation",5]],
+  "route": "session",
+  "variants": [
+    ["participant", [["templates",{"state":0}],
+      ["skills",{"state":1}],
+      ["expand",{"method":[2,3]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"items":{"additionalProperties":false,"properties":{"argumentHint":{"type":"string"},"description":{"type":"string"},"name":{"type":"string"},"source":{"anyOf":[{"const":"global","type":"string"},{"const":"project","type":"string"}]}},"required":["description","name","source"],"type":"object"},"type":"array"},
+    {"items":{"additionalProperties":false,"properties":{"description":{"type":"string"},"name":{"type":"string"}},"required":["description","name"],"type":"object"},"type":"array"},
+    {"additionalProperties":false,"properties":{"text":{"maxLength":1000000,"type":"string"}},"required":["text"],"type":"object"},
+    {"additionalProperties":false,"properties":{"skill":{"additionalProperties":false,"properties":{"name":{"type":"string"}},"required":["name"],"type":"object"},"text":{"type":"string"}},"required":["text"],"type":"object"},
+    {"type":"string"},
+    {"minimum":1,"type":"integer"}
+  ]
+}

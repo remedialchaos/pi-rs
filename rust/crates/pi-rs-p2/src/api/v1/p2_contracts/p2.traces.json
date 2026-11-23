@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["owner", [["findTraces",{"method":[0,1]}],
+      ["getTrace",{"method":[2,3]}],
+      ["findMetrics",{"method":[4,5]}]]],
+    ["agent", [["findTraces",{"method":[0,1]}],
+      ["getTrace",{"method":[2,3]}],
+      ["findMetrics",{"method":[4,5]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"attributes":{"patternProperties":{"^.*$":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"}]}},"type":"object"},"cursor":{"maxLength":1000,"type":"string"},"errors":{"type":"boolean"},"limit":{"maximum":50,"minimum":1,"type":"integer"},"name":{"maxLength":128,"minLength":1,"type":"string"},"startMax":{"type":"number"},"startMin":{"type":"number"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"cursor":{"type":"string"},"traces":{"items":{"additionalProperties":false,"properties":{"durationMs":{"type":"number"},"errors":{"type":"integer"},"hosts":{"items":{"type":"string"},"type":"array"},"name":{"type":"string"},"spans":{"type":"integer"},"startedMs":{"type":"number"},"traceId":{"type":"string"}},"required":["durationMs","errors","hosts","name","spans","startedMs","traceId"],"type":"object"},"type":"array"}},"required":["traces"],"type":"object"},
+    {"additionalProperties":false,"properties":{"traceId":{"maxLength":256,"minLength":1,"type":"string"}},"required":["traceId"],"type":"object"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"spans":{"items":{"additionalProperties":false,"properties":{"attributes":{"patternProperties":{"^.*$":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},{"items":{"type":"string"},"type":"array"},{"items":{"type":"number"},"type":"array"},{"items":{"type":"boolean"},"type":"array"}]}},"type":"object"},"endedMs":{"type":"number"},"events":{"items":{"additionalProperties":false,"properties":{"attributes":{"patternProperties":{"^.*$":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},{"items":{"type":"string"},"type":"array"},{"items":{"type":"number"},"type":"array"},{"items":{"type":"boolean"},"type":"array"}]}},"type":"object"},"name":{"type":"string"},"timeMs":{"type":"number"}},"required":["attributes","name","timeMs"],"type":"object"},"type":"array"},"id":{"type":"string"},"links":{"items":{"additionalProperties":false,"properties":{"attributes":{"patternProperties":{"^.*$":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},{"items":{"type":"string"},"type":"array"},{"items":{"type":"number"},"type":"array"},{"items":{"type":"boolean"},"type":"array"}]}},"type":"object"},"spanId":{"type":"string"},"traceId":{"type":"string"}},"required":["spanId","traceId"],"type":"object"},"type":"array"},"name":{"type":"string"},"parentId":{"type":"string"},"startedMs":{"type":"number"},"status":{"anyOf":[{"additionalProperties":false,"properties":{"status":{"const":"ok","type":"string"}},"required":["status"],"type":"object"},{"additionalProperties":false,"properties":{"error":{"additionalProperties":false,"properties":{"message":{"type":"string"},"name":{"type":"string"}},"required":["message","name"],"type":"object"},"status":{"const":"error","type":"string"}},"required":["status"],"type":"object"}]},"traceId":{"type":"string"}},"required":["attributes","endedMs","events","id","links","name","startedMs","status","traceId"],"type":"object"},"type":"array"},"traceId":{"type":"string"},"truncated":{"type":"boolean"}},"required":["spans","traceId","truncated"],"type":"object"},{"type":"null"}]},
+    {"additionalProperties":false,"properties":{"attributes":{"patternProperties":{"^.*$":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"}]}},"type":"object"},"name":{"maxLength":128,"minLength":1,"type":"string"},"startMax":{"type":"number"},"startMin":{"type":"number"}},"required":["name"],"type":"object"},
+    {"additionalProperties":false,"properties":{"metrics":{"items":{"additionalProperties":false,"properties":{"attributes":{"patternProperties":{"^.*$":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},{"items":{"type":"string"},"type":"array"},{"items":{"type":"number"},"type":"array"},{"items":{"type":"boolean"},"type":"array"}]}},"type":"object"},"count":{"type":"number"},"intervalMs":{"type":"number"},"kind":{"enum":["counter","histogram","upDownCounter"]},"max":{"type":"number"},"min":{"type":"number"},"name":{"type":"string"},"sum":{"type":"number"},"unit":{"type":"string"}},"required":["attributes","count","intervalMs","kind","max","min","name","sum"],"type":"object"},"type":"array"},"truncated":{"type":"boolean"}},"required":["metrics","truncated"],"type":"object"}
+  ]
+}

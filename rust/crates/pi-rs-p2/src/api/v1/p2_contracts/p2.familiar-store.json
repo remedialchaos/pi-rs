@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["session",{"state":0}],
+      ["open",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"anyOf":[{"type":"string"},{"type":"null"}]},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"id":{"type":"string"}},"required":["id"],"type":"object"}
+  ]
+}

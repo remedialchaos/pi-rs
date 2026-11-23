@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "params": [["session",2],["conversation",3]],
+  "route": "session",
+  "variants": [
+    ["viewer", [["costs",{"method":[0,1]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"null"},
+    {"items":{"additionalProperties":false,"properties":{"cacheHit":{"type":"number"},"cost":{"type":"number"},"entryId":{"type":"string"},"model":{"type":"string"},"provider":{"type":"string"},"stopReason":{"type":"string"},"timestamp":{"type":"number"}},"required":["cost","entryId","model","provider","stopReason","timestamp"],"type":"object"},"type":"array"},
+    {"type":"string"},
+    {"type":"integer"}
+  ]
+}

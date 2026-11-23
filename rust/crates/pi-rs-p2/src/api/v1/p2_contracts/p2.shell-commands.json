@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["shells",{"state":0}],
+      ["start",{"method":[1,2]}],
+      ["abort",{"method":[2,3]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":{"additionalProperties":false,"properties":{"author":{"additionalProperties":false,"properties":{"id":{"type":"string"},"kind":{"anyOf":[{"const":"owner","type":"string"},{"const":"guest","type":"string"}]},"name":{"type":"string"}},"required":["id","kind","name"],"type":"object"},"cancelled":{"type":"boolean"},"command":{"type":"string"},"error":{"type":"string"},"exitCode":{"type":"number"},"id":{"type":"string"},"includeInContext":{"type":"boolean"},"output":{"type":"string"},"running":{"type":"boolean"},"truncated":{"type":"boolean"}},"required":["author","cancelled","command","id","includeInContext","output","running","truncated"],"type":"object"},"type":"object"},
+    {"additionalProperties":false,"properties":{"author":{"additionalProperties":false,"properties":{"id":{"type":"string"},"kind":{"anyOf":[{"const":"owner","type":"string"},{"const":"guest","type":"string"}]},"name":{"type":"string"}},"required":["id","kind","name"],"type":"object"},"command":{"maxLength":100000,"minLength":1,"type":"string"},"conversation":{"minimum":1,"type":"integer"},"includeInContext":{"type":"boolean"},"requestId":{"maxLength":200,"minLength":1,"type":"string"}},"required":["author","command","conversation","includeInContext","requestId"],"type":"object"},
+    {"additionalProperties":false,"properties":{"shellId":{"type":"string"}},"required":["shellId"],"type":"object"},
+    {"additionalProperties":false,"properties":{"aborted":{"type":"boolean"}},"required":["aborted"],"type":"object"}
+  ]
+}

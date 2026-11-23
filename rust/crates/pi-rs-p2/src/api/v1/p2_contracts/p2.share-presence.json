@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["guests",{"state":0}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"patternProperties":{"^.*$":{"additionalProperties":false,"properties":{"id":{"type":"string"},"name":{"type":"string"},"sessions":{"patternProperties":{"^.*$":{"anyOf":[{"const":"view","type":"string"},{"const":"full","type":"string"}]}},"type":"object"}},"required":["id","name","sessions"],"type":"object"}},"type":"object"}
+  ]
+}

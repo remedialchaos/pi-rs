@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "params": [["conversation",6]],
+  "route": null,
+  "variants": [
+    ["members", [["changes",{"state":0}],
+      ["query",{"method":[1,2]}],
+      ["read",{"method":[3,2]}],
+      ["write",{"method":[4,5]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"number"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"list","type":"string"},"path":{"maxLength":4096,"type":"string"}},"required":["kind","path"],"type":"object"},{"additionalProperties":false,"properties":{"commit":{"pattern":"^[0-9a-f]{7,64}$","type":"string"},"kind":{"const":"file","type":"string"},"path":{"maxLength":4096,"type":"string"}},"required":["kind","path"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"files","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"status","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"exclude":{"maxLength":500,"type":"string"},"include":{"maxLength":500,"type":"string"},"kind":{"const":"search","type":"string"},"path":{"maxLength":4096,"type":"string"},"text":{"maxLength":200,"minLength":1,"type":"string"}},"required":["kind","path","text"],"type":"object"},{"additionalProperties":false,"properties":{"commit":{"pattern":"^[0-9a-f]{7,64}$","type":"string"},"context":{"maximum":1000,"minimum":0,"type":"integer"},"full":{"type":"boolean"},"kind":{"const":"diff","type":"string"},"path":{"maxLength":4096,"type":"string"}},"required":["kind","path"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"log","type":"string"},"limit":{"maximum":500,"minimum":1,"type":"integer"},"skip":{"maximum":100000,"minimum":0,"type":"integer"}},"required":["kind","limit","skip"],"type":"object"},{"additionalProperties":false,"properties":{"commit":{"pattern":"^[0-9a-f]{7,64}$","type":"string"},"kind":{"const":"commit","type":"string"}},"required":["commit","kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"place","type":"string"}},"required":["kind"],"type":"object"}]},
+    {},
+    {"additionalProperties":false,"properties":{"end":{"minimum":0,"type":"integer"},"path":{"maxLength":4096,"type":"string"},"start":{"minimum":0,"type":"integer"},"suffix":{"minimum":1,"type":"integer"}},"required":["path"],"type":"object"},
+    {"additionalProperties":false,"properties":{"abort":{"type":"boolean"},"data":{"maxLength":1400000,"type":"string"},"final":{"type":"boolean"},"name":{"maxLength":255,"minLength":1,"type":"string"},"offset":{"minimum":0,"type":"integer"},"path":{"maxLength":4096,"type":"string"},"token":{"pattern":"^[0-9a-f-]{36}$","type":"string"}},"required":["data","final","name","offset","path","token"],"type":"object"},
+    {"type":"null"},
+    {"minimum":1,"type":"integer"}
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["device",{"state":0}],
+      ["statuses",{"state":1}],
+      ["report",{"method":[2,3]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"anyOf":[{"type":"string"},{"type":"null"}]},
+    {"patternProperties":{"^.*$":{"additionalProperties":false,"properties":{"at":{"type":"number"},"error":{"type":"string"},"state":{"anyOf":[{"const":"synced","type":"string"},{"const":"uploading","type":"string"},{"const":"error","type":"string"},{"const":"behind","type":"string"},{"const":"diverged","type":"string"}]},"syncedHead":{"type":"integer"}},"required":["at","state"],"type":"object"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"status":{"additionalProperties":false,"properties":{"at":{"type":"number"},"error":{"type":"string"},"state":{"anyOf":[{"const":"synced","type":"string"},{"const":"uploading","type":"string"},{"const":"error","type":"string"},{"const":"behind","type":"string"},{"const":"diverged","type":"string"}]},"syncedHead":{"type":"integer"}},"required":["at","state"],"type":"object"},"store":{"type":"string"}},"required":["status","store"],"type":"object"},
+    {"type":"null"}
+  ]
+}

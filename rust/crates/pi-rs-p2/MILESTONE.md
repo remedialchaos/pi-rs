@@ -37,6 +37,26 @@ files and browser sign-in page.
 | Mutation checks | Four tests retained. Each failed its intended mutation. The mutations changed health success, replaced plugin root priority, bypassed worker address or admission checks, and lifted the relocation fence early. The sources were restored. |
 | Rust-anything leaf build, diff, benchmark and gate | Commands reported missing bridge metadata or leaf recordings for this native whole-app crate. The coordinator's app replay is the HTTP behavior gate. No worker oracle replay or performance benchmark has run. |
 
+## Shared plugin contracts
+
+The native `api::v1::p2_contracts::lookup` resolves 106 exported Chord
+contracts. The parity fixture covers all 130 historical versions, including
+variant and member order, schema and byte markers, admission fingerprints
+and edit history. Plugin-private declarations belong to their plugins.
+
+| Contract | Version | Wire fingerprint |
+| --- | ---: | --- |
+| `p2.access` | 1 | `2435548bc2ca4912` |
+| `p2.sessions` | 7 | `1e273ec42b804553` |
+| `p2.chat` | 6 | `15b5fd3b4b340eca` |
+| `p2.catalog` | 5 | `77531524b1ada01d` |
+
+Two contract tests were added and zero removed. Making the chat request ID
+optional failed both tests. Restoring the upstream schema passed both in
+0.54 seconds. Formatting and affected-crate Clippy passed. The existing
+native worker test group timed out before and after this change in 3.93 and
+5.73 seconds, respectively. Those runs did not complete the full crate suite.
+
 ## Limits
 
 The standalone entry point starts with an empty native plugin registry. The session catalog

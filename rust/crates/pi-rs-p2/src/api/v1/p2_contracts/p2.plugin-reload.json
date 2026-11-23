@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["worker", [["reload",{"method":[0,1]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"plugins":{"items":{"maxLength":100,"minLength":1,"type":"string"},"maxItems":100,"type":"array"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"logs":{"items":{"type":"string"},"type":"array"},"plugins":{"items":{"additionalProperties":false,"properties":{"errors":{"items":{"type":"string"},"type":"array"},"outcome":{"enum":["applied","failed","refused","removed"]},"plugin":{"type":"string"}},"required":["outcome","plugin"],"type":"object"},"type":"array"},"refused":{"type":"string"}},"required":["logs","plugins"],"type":"object"}
+  ]
+}

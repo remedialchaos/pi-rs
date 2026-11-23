@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "params": [["session",4],["conversation",5]],
+  "route": "session",
+  "variants": [
+    ["server", [["read",{"method":[0,1]}],
+      ["write",{"method":[2,3]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"end":{"minimum":0,"type":"integer"},"path":{"maxLength":4096,"type":"string"},"start":{"minimum":0,"type":"integer"},"suffix":{"minimum":1,"type":"integer"}},"required":["path"],"type":"object"},
+    {},
+    {"additionalProperties":false,"properties":{"abort":{"type":"boolean"},"data":{"maxLength":1400000,"type":"string"},"final":{"type":"boolean"},"name":{"maxLength":255,"minLength":1,"type":"string"},"offset":{"minimum":0,"type":"integer"},"path":{"maxLength":4096,"type":"string"},"token":{"pattern":"^[0-9a-f-]{36}$","type":"string"}},"required":["data","final","name","offset","path","token"],"type":"object"},
+    {"type":"null"},
+    {"type":"string"},
+    {"minimum":1,"type":"integer"}
+  ]
+}

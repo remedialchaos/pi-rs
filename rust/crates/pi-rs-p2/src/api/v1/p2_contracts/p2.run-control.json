@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "params": [["session",1],["conversation",2]],
+  "route": "session",
+  "variants": [
+    ["participant", [["stop",{"method":[0,0]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"null"},
+    {"type":"string"},
+    {"type":"integer"}
+  ]
+}

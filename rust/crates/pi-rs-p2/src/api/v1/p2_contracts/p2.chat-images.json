@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "params": [["session",2],["conversation",3]],
+  "route": "session",
+  "variants": [
+    ["server", [["image",{"method":[0,1]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"entry":{"minimum":1,"type":"integer"},"message":{"minimum":0,"type":"integer"},"part":{"minimum":0,"type":"integer"}},"required":["entry","message","part"],"type":"object"},
+    {"additionalProperties":false,"properties":{"data":{"type":"string"},"mimeType":{"type":"string"}},"required":["data","mimeType"],"type":"object"},
+    {"type":"string"},
+    {"type":"integer"}
+  ]
+}

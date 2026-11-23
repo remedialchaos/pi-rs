@@ -1,0 +1,23 @@
+{
+  "version": 3,
+  "params": [["conversation",6]],
+  "route": null,
+  "variants": [
+    ["members", [["enabled",{"state":0}],
+      ["name",{"state":1}],
+      ["waiting",{"state":2}],
+      ["set",{"method":[3,4]}],
+      ["rename",{"method":[5,4]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"boolean"},
+    {"pattern":"^[A-Za-z][A-Za-z0-9_-]{0,31}$","type":"string"},
+    {"type":"number"},
+    {"additionalProperties":false,"properties":{"enabled":{"type":"boolean"}},"required":["enabled"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"name":{"pattern":"^[A-Za-z][A-Za-z0-9_-]{0,31}$","type":"string"}},"required":["name"],"type":"object"},
+    {"type":"integer"}
+  ]
+}

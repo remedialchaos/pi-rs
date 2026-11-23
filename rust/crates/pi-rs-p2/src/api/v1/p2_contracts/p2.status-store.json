@@ -1,0 +1,16 @@
+{
+  "version": 3,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["statuses",{"state":0}],
+      ["report",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"patternProperties":{"^.*$":{"additionalProperties":false,"properties":{"busy":{"items":{"type":"number"},"type":"array"},"error":{"type":"string"},"failure":{"additionalProperties":false,"properties":{"detail":{"type":"string"},"reason":{"type":"string"}},"required":["reason"],"type":"object"},"running":{"type":"boolean"},"tasks":{"type":"number"},"usage":{},"work":{"patternProperties":{"^.*$":{"additionalProperties":false,"properties":{"rounds":{"type":"number"},"since":{"type":"number"},"step":{"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"thinking","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"tools","type":"string"},"names":{"items":{"type":"string"},"minItems":1,"type":"array"}},"required":["kind","names"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"compacting","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"working","type":"string"}},"required":["kind"],"type":"object"}]}},"required":["rounds","since","step"],"type":"object"}},"type":"object"}},"required":["busy","running","tasks","work"],"type":"object"}},"type":"object"},
+    {"additionalProperties":false,"properties":{"busy":{"items":{"type":"number"},"type":"array"},"failure":{"additionalProperties":false,"properties":{"detail":{"type":"string"},"reason":{"type":"string"}},"required":["reason"],"type":"object"},"generation":{"type":"number"},"session":{"type":"string"},"tasks":{"type":"number"},"usage":{},"work":{"patternProperties":{"^.*$":{"additionalProperties":false,"properties":{"rounds":{"type":"number"},"since":{"type":"number"},"step":{"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"thinking","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"tools","type":"string"},"names":{"items":{"type":"string"},"minItems":1,"type":"array"}},"required":["kind","names"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"compacting","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"working","type":"string"}},"required":["kind"],"type":"object"}]}},"required":["rounds","since","step"],"type":"object"}},"type":"object"}},"required":["busy","generation","session","tasks","work"],"type":"object"},
+    {"type":"null"}
+  ]
+}

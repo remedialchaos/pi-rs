@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["viewer", [["read",{"method":[0,1]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"keybindings":{"patternProperties":{"^.*$":{"anyOf":[{"type":"string"},{"items":{"type":"string"},"type":"array"}]}},"type":"object"},"settings":{"additionalProperties":false,"properties":{"autocompleteMaxVisible":{"maximum":20,"minimum":3,"type":"integer"},"doubleEscapeAction":{"anyOf":[{"const":"tree","type":"string"},{"const":"fork","type":"string"},{"const":"none","type":"string"}]},"editorPaddingX":{"maximum":3,"minimum":0,"type":"integer"},"fullscreenCopyOnSelect":{"type":"boolean"},"fullscreenExitOutput":{"anyOf":[{"const":"transcript","type":"string"},{"const":"resume-hint","type":"string"}]},"fullscreenScrollbar":{"anyOf":[{"const":"auto","type":"string"},{"const":"always","type":"string"},{"const":"hidden","type":"string"}]},"fullscreenWheelScrollLines":{"anyOf":[{"const":"auto","type":"string"},{"maximum":100,"minimum":1,"type":"integer"}]},"hideThinkingBlock":{"type":"boolean"},"markdown":{"additionalProperties":false,"properties":{"codeBlockIndent":{"maxLength":8,"pattern":"^[ \\t]*$","type":"string"},"mermaid":{"anyOf":[{"const":"off","type":"string"},{"const":"final","type":"string"},{"const":"streaming","type":"string"}]}},"type":"object"},"outputPad":{"anyOf":[{"const":0,"type":"number"},{"const":1,"type":"number"}]},"plugins":{"additionalProperties":{"additionalProperties":{"anyOf":[{"type":"boolean"},{"type":"number"},{"maxLength":200,"type":"string"}]},"maxProperties":32,"type":"object"},"maxProperties":64,"type":"object"},"quietStartup":{"anyOf":[{"type":"boolean"},{"const":"header","type":"string"}]},"showHardwareCursor":{"type":"boolean"},"terminal":{"additionalProperties":false,"properties":{"clearOnShrink":{"type":"boolean"},"hyperlinks":{"type":"boolean"},"imageWidthCells":{"maximum":500,"minimum":1,"type":"integer"},"images":{"anyOf":[{"const":"kitty","type":"string"},{"const":"iterm2","type":"string"},{"const":false,"type":"boolean"}]},"showImages":{"type":"boolean"},"showTerminalProgress":{"type":"boolean"},"trueColor":{"type":"boolean"}},"type":"object"}},"type":"object"},"theme":{"type":"string"}},"required":["keybindings","settings"],"type":"object"}
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["summary",{"state":0}],
+      ["snapshot",{"state":1}],
+      ["setDefault",{"method":[2,3]}],
+      ["setEnabledModels",{"method":[4,3]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"defaultModel":{"anyOf":[{"additionalProperties":false,"properties":{"modelId":{"minLength":1,"type":"string"},"provider":{"minLength":1,"type":"string"},"thinkingLevel":{"minLength":1,"type":"string"}},"required":["modelId","provider","thinkingLevel"],"type":"object"},{"type":"null"}]},"errors":{"items":{"type":"string"},"type":"array"},"models":{"items":{"additionalProperties":false,"properties":{"contextWindow":{"type":"number"},"modelId":{"type":"string"},"name":{"type":"string"},"provider":{"type":"string"},"thinkingLevels":{"items":{"type":"string"},"type":"array"}},"required":["contextWindow","modelId","name","provider","thinkingLevels"],"type":"object"},"type":"array"}},"required":["defaultModel","errors","models"],"type":"object"},
+    {},
+    {"additionalProperties":false,"properties":{"modelId":{"minLength":1,"type":"string"},"provider":{"minLength":1,"type":"string"},"thinkingLevel":{"minLength":1,"type":"string"}},"required":["modelId","provider","thinkingLevel"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"patterns":{"items":{"maxLength":300,"minLength":1,"type":"string"},"maxItems":500,"type":"array"}},"required":["patterns"],"type":"object"}
+  ]
+}

@@ -1,5 +1,7 @@
 //! Native equivalents of the p2 v1 plugin entry points.
 
+pub mod p2_contracts;
+
 use std::collections::{BTreeMap, btree_map::Entry};
 
 pub use pi_rs_chord::{

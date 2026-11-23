@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "params": [],
+  "route": "server",
+  "variants": [
+    ["talker", [["voices",{"state":0}],
+      ["failure",{"state":1}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"anyOf":[{"properties":{"default":{"properties":{"engine":{"pattern":"^[A-Za-z0-9_-]{1,64}$","type":"string"},"language":{"pattern":"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$","type":"string"},"voice":{"pattern":"^[A-Za-z0-9_-]{1,64}$","type":"string"}},"required":["engine","voice"],"type":"object"},"engines":{"items":{"additionalProperties":false,"properties":{"defaultLanguage":{"pattern":"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$","type":"string"},"id":{"pattern":"^[A-Za-z0-9_-]{1,64}$","type":"string"},"languages":{"items":{"additionalProperties":false,"properties":{"id":{"pattern":"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$","type":"string"},"name":{"type":"string"}},"required":["id","name"],"type":"object"},"type":"array"},"name":{"type":"string"},"sampleRate":{"type":"number"},"streaming":{"type":"boolean"},"voices":{"items":{"additionalProperties":false,"properties":{"id":{"pattern":"^[A-Za-z0-9_-]{1,64}$","type":"string"},"name":{"type":"string"}},"required":["id","name"],"type":"object"},"type":"array"}},"required":["id","name","sampleRate","streaming","voices"],"type":"object"},"type":"array"}},"required":["default","engines"],"type":"object"},{"type":"null"}]},
+    {"anyOf":[{"type":"string"},{"type":"null"}]}
+  ]
+}

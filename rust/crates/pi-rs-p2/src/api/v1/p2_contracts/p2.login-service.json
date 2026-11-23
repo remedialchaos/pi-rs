@@ -1,0 +1,28 @@
+{
+  "version": 3,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["login",{"state":0}],
+      ["owner",{"state":1}],
+      ["start",{"method":[2,3]}],
+      ["answer",{"method":[4,5]}],
+      ["cancel",{"method":[6,5]}],
+      ["dismiss",{"method":[6,5]}],
+      ["logout",{"method":[7,5]}],
+      ["refresh",{"method":[7,8]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"anyOf":[{"additionalProperties":false,"properties":{"attemptId":{"type":"string"},"authType":{"anyOf":[{"const":"api_key","type":"string"},{"const":"oauth","type":"string"}]},"message":{"type":"string"},"notices":{"items":{"additionalProperties":false,"properties":{"event":{},"id":{"type":"number"}},"required":["event","id"],"type":"object"},"type":"array"},"prompt":{"anyOf":[{"additionalProperties":false,"properties":{"id":{"type":"string"},"type":{"type":"string"}},"required":["id","type"],"type":"object"},{"type":"null"}]},"providerId":{"type":"string"},"status":{"anyOf":[{"const":"working","type":"string"},{"const":"success","type":"string"},{"const":"cancelled","type":"string"},{"const":"error","type":"string"}]}},"required":["attemptId","authType","notices","prompt","providerId","status"],"type":"object"},{"type":"null"}]},
+    {"anyOf":[{"type":"string"},{"type":"null"}]},
+    {"additionalProperties":false,"properties":{"authType":{"anyOf":[{"const":"api_key","type":"string"},{"const":"oauth","type":"string"}]},"owner":{"minLength":1,"type":"string"},"providerId":{"type":"string"},"remote":{"type":"boolean"}},"required":["authType","owner","providerId","remote"],"type":"object"},
+    {"additionalProperties":false,"properties":{"attemptId":{"type":"string"}},"required":["attemptId"],"type":"object"},
+    {"additionalProperties":false,"properties":{"attemptId":{"type":"string"},"owner":{"minLength":1,"type":"string"},"promptId":{"type":"string"},"value":{"type":"string"}},"required":["attemptId","owner","promptId","value"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"attemptId":{"type":"string"},"owner":{"minLength":1,"type":"string"}},"required":["attemptId","owner"],"type":"object"},
+    {"additionalProperties":false,"properties":{"providerId":{"type":"string"}},"required":["providerId"],"type":"object"},
+    {"additionalProperties":false,"properties":{"models":{"type":"number"}},"required":["models"],"type":"object"}
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "params": [["session",4]],
+  "route": "session",
+  "variants": [
+    ["server", [["prepare",{"method":[0,1]}],
+      ["cancel",{"method":[2,2]}],
+      ["relocate",{"method":[3,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"anyOf":[{"type":"null"},{"additionalProperties":false,"properties":{"to":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"}},"required":["to"],"type":"object"}]},
+    {"additionalProperties":false,"properties":{"accepted":{"type":"boolean"},"busy":{"items":{"type":"number"},"type":"array"},"refusal":{"type":"string"},"tasks":{"type":"number"}},"required":["accepted","busy","tasks"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},
+    {"type":"string"}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "version": 3,
+  "params": [],
+  "route": null,
+  "variants": [
+    ["members", [["write",{"method":[0,1]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"location":{"additionalProperties":false,"properties":{"cwd":{"type":"string"},"env":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["cwd","env"],"type":"object"},"upload":{"additionalProperties":false,"properties":{"abort":{"type":"boolean"},"data":{"maxLength":1400000,"type":"string"},"final":{"type":"boolean"},"name":{"maxLength":255,"minLength":1,"type":"string"},"offset":{"minimum":0,"type":"integer"},"path":{"maxLength":4096,"type":"string"},"token":{"pattern":"^[0-9a-f-]{36}$","type":"string"}},"required":["data","final","name","offset","path","token"],"type":"object"}},"required":["location","upload"],"type":"object"},
+    {"type":"null"}
+  ]
+}

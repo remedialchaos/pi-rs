@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "params": [["session",2]],
+  "route": "session",
+  "variants": [
+    ["participant", [["archive",{"method":[0,1]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"archived":{"type":"boolean"},"conversation":{"type":"number"}},"required":["archived","conversation"],"type":"object"},
+    {"type":"null"},
+    {"type":"string"}
+  ]
+}

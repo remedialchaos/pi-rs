@@ -1,0 +1,20 @@
+{
+  "version": 3,
+  "params": [["session",5]],
+  "route": "session",
+  "variants": [
+    ["broker", [["send",{"method":[0,1]}],
+      ["answer",{"method":[2,3]}],
+      ["stop",{"method":[2,4]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"additionalProperties":false,"properties":{"followUp":{"type":"boolean"},"message":{"type":"string"},"requestId":{"type":"string"},"source":{"type":"string"},"title":{"type":"string"}},"required":["message","requestId","source","title"],"type":"object"},
+    {"additionalProperties":false,"properties":{"submissionId":{"type":"number"}},"required":["submissionId"],"type":"object"},
+    {"type":"null"},
+    {"additionalProperties":false,"properties":{"busy":{"type":"boolean"},"limited":{"type":"boolean"},"text":{"type":"string"},"truncated":{"type":"boolean"}},"required":["busy","limited","truncated"],"type":"object"},
+    {"additionalProperties":false,"properties":{"stopped":{"type":"boolean"}},"required":["stopped"],"type":"object"},
+    {"type":"string"}
+  ]
+}

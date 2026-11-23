@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "params": [["session",3],["conversation",4]],
+  "route": "session",
+  "variants": [
+    ["reader", [["changes",{"state":0}],
+      ["query",{"method":[1,2]}]]]
+  ],
+  "history": [],
+  "admission": null,
+  "schemas": [
+    {"type":"number"},
+    {"anyOf":[{"additionalProperties":false,"properties":{"kind":{"const":"list","type":"string"},"path":{"maxLength":4096,"type":"string"}},"required":["kind","path"],"type":"object"},{"additionalProperties":false,"properties":{"commit":{"pattern":"^[0-9a-f]{7,64}$","type":"string"},"kind":{"const":"file","type":"string"},"path":{"maxLength":4096,"type":"string"}},"required":["kind","path"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"files","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"status","type":"string"}},"required":["kind"],"type":"object"},{"additionalProperties":false,"properties":{"exclude":{"maxLength":500,"type":"string"},"include":{"maxLength":500,"type":"string"},"kind":{"const":"search","type":"string"},"path":{"maxLength":4096,"type":"string"},"text":{"maxLength":200,"minLength":1,"type":"string"}},"required":["kind","path","text"],"type":"object"},{"additionalProperties":false,"properties":{"commit":{"pattern":"^[0-9a-f]{7,64}$","type":"string"},"context":{"maximum":1000,"minimum":0,"type":"integer"},"full":{"type":"boolean"},"kind":{"const":"diff","type":"string"},"path":{"maxLength":4096,"type":"string"}},"required":["kind","path"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"log","type":"string"},"limit":{"maximum":500,"minimum":1,"type":"integer"},"skip":{"maximum":100000,"minimum":0,"type":"integer"}},"required":["kind","limit","skip"],"type":"object"},{"additionalProperties":false,"properties":{"commit":{"pattern":"^[0-9a-f]{7,64}$","type":"string"},"kind":{"const":"commit","type":"string"}},"required":["commit","kind"],"type":"object"},{"additionalProperties":false,"properties":{"kind":{"const":"place","type":"string"}},"required":["kind"],"type":"object"}]},
+    {},
+    {"type":"string"},
+    {"minimum":1,"type":"integer"}
+  ]
+}
