@@ -380,13 +380,6 @@ fn remote_watcher_reports_created_modified_and_removed_files() {
 fn a_lost_connection_fails_in_flight_requests_and_the_next_one_restarts_the_daemon() {
     let connection = connection();
     let pid = connection.info().unwrap().pid;
-    let killed = std::process::Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .status()
-        .unwrap();
-    assert!(killed.success());
-
     // A request already in flight when the daemon dies fails as connection-lost; a fresh one restarts the daemon.
     let (started_sender, started_receiver) = mpsc::channel::<()>();
     let started_sender = Arc::new(Mutex::new(started_sender));
@@ -405,6 +398,13 @@ fn a_lost_connection_fails_in_flight_requests_and_the_next_one_restarts_the_daem
         )
     });
     wait_for(&started_receiver);
+    let killed = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status()
+        .unwrap();
+    assert!(killed.success());
+
     let error: RemoteError = handle.join().unwrap().unwrap_err();
     assert!(is_connection_lost(&error), "unexpected error: {error:?}");
 

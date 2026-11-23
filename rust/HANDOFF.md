@@ -1,6 +1,6 @@
 # `pi-rs` Handoff
 
-- **Previous checkpoint**: `b4a61f54e` (mounted TUI) on local `main`.
+- **Previous checkpoint**: `dee4c4492` (native p2 server core) on local `main`.
 - **Stage**: Wave 1 in progress. The previous checkpoint recorded 17 workspace crates, 21 leaf gates and 2,236 native tests.
 - **Fallback rate**: `pi`, `pi-ai`, `pi-env`, `pi-evals`, `p3`, `pi-mac`, and `pi-voice-server` binaries run 100% natively; `packages/` and `apps/` untouched.
 - **Next action**: Verify and integrate the Wave 1 claims in [MAP.md](MAP.md) before assigning the 49 built-in plugins. Isolated worktrees under `.worktrees/` contain unmerged work.
@@ -24,12 +24,12 @@
 | **2.2a** `pi-rs-durable` foundation, env, images, tools, codemode, storage & session | **PASS** | **77/77** contract tests (memory/SQLite/Chord-store/JSONL + local `ExecutionEnv` conformance, 16 mutation checks), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
 | **2.2b** `pi-rs-durable` harness (`src/harness/`) | PENDING | ~12.5k LOC (25 files); in progress |
 | **2.3a** `pi-rs-env` daemon (`pi-env` bin) + client transport | **PASS** | **41/41** tests (33 unit + 8 live `pi-env` binary integration; `RemoteError.fields` boxed for workspace `preserve_order`), `unsafe` isolated to `daemon/sys/`, 0 `#[allow]` |
-| **2.3b** `pi-rs-env` durable `ExecutionEnv` bridge | PENDING | ~1.1k LOC (2 units); uses the `ExecutionEnv` contract from 2.2a |
+| **2.3b** `pi-rs-env` durable `ExecutionEnv` bridge | Native gates passed | 46 tests, 5 new mutation checks. Rust and upstream agreed on the exercised daemon, shell and error cases. Formal listing replay pending. |
 | **2.4** `pi-rs-evals` (`pi-evals` bin) | **PASS** | **44/44** tests (5/5 mutation checks, golden report/SHA parity, TTY-deterministic styling), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
 | **3.1** `pi-rs-p3` (`p3` bin; `old/` skipped) | **PASS** | **79/79** tests (69 lib + 6 live `p3` binary CLI + 4 live child-worker runner, 5/5 mutation checks), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
 | **3.2-web** Browser | PARTIAL | 135 native tests. Compiled WASM created a session and exchanged chat messages with the upstream server in Chromium. The fixture injected assets with CSP bypass. Production browser routing, CSP and plugin integration remain open. |
 | **3.2-tui** Mounted client | PARTIAL | 20 tests, including five new mutation-verified terminal cases for transcript, keyboard paging, tree layout, native shortcut dispatch and theme reload. Dynamic guests, mouse scroll and whole-screen replay remain open. |
-| **3.2** `pi-rs-p2` server + runtime + 49 plugins (`p2` bin) | PENDING | ~89.6k LOC; uses the `ExecutionEnv` contract from 2.2a + `2.3b` |
+| **3.2** `pi-rs-p2` standalone server | PARTIAL | 4 native tests and 6/6 upstream HTTP cases passed. Authenticated native chat, remaining hosts and 49 built-in plugins are open. |
 | **3.3** `pi-rs-p2-mac` (`pi-mac` bin) | **PASS** | 16/16 Linux tests + `aarch64-apple-darwin` check + real upstream `p2` smoke PASS |
 | **3.4** `pi-rs-voice-server` (`pi-voice-server` bin) | **PASS** | 17/17 offline tests + real Supertonic/Kokoro/Silero/Parakeet verified |
 

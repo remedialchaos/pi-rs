@@ -2,7 +2,7 @@
 //!
 //! The `daemon` module is the integrated Rust `pi-env` daemon (upstream `packages/env/daemon`). The other modules are
 //! the Rust port of the TypeScript client transport: binary framing, connection lifecycle, SSH bootstrap, and the
-//! process, terminal and watcher handles. The durable-facing `ExecutionEnv` adapters follow in 2.3b.
+//! process, terminal and watcher handles. The remote module exposes the durable filesystem and shell adapters.
 
 mod sha256;
 
@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod errors;
 pub mod framing;
 pub mod process;
+pub mod remote;
 pub mod ssh;
 pub mod terminal;
 pub mod watch;
@@ -31,4 +32,8 @@ pub use ssh::{
 pub use terminal::{RemoteTerminal, TerminalForeground, TerminalOptions, open_terminal};
 pub use watch::{
     FileChange, RemoteWatchOptions, RemoteWatcher, WatchExclude, WatchMode, WatchTarget,
+};
+
+pub use remote::{
+    LocalExecutionEnv, RemoteExecutionEnv, RemoteExecutionEnvOptions, list_files_over,
 };

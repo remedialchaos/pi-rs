@@ -13,7 +13,7 @@
 | Unit | Owner | Scope |
 | --- | --- | --- |
 | 2.2b | Astra Low #1 | Durable harness |
-| 2.3b | Astra Low #2 | Remote execution environment bridge |
+| 2.3b differential verification | Astra Low #5 | Daemon-backed local and remote file listing against upstream |
 | 3.2 asset delivery | Sol Medium #2 | Authenticated browser page, static assets and production CSP |
 
 ## ADR Index
@@ -138,7 +138,7 @@ Shape: CLI (`pi`). Research complete ([rust/research/wasm-extensions.md](researc
 | 2.2a | `pi-rs-durable` (Foundation, Env, Images, Tools, Tool-Search, Codemode, Storage backends & Session engine) | `packages/durable` | ~23.4k | 18 units | **done** (`omp / GPT-6.2-Sol`, verified 2026-11-22) | `rust/crates/pi-rs-durable`: `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **77/77** contract tests PASS in 19.80s (memory/SQLite/Chord-store/JSONL storage conformance + local `ExecutionEnv` conformance + 16 mutation checks); details in [MILESTONE.md](crates/pi-rs-durable/MILESTONE.md) |
 | 2.2b | `pi-rs-durable` (Durable Harness: `src/harness/` agent/compaction/scheduler/submissions/task-graph/views) | `packages/durable` | ~12.5k | 25 files | claimed (see current wave) | Milestone 2.2a |
 | 2.3a | `pi-rs-env` (Daemon + Transport: integrated `packages/env/daemon/` as `pi-env` bin + `connection`, `ssh`, `process`, `terminal`, `watch`, `errors`) | `packages/env` (+ Rust `daemon/`) | 1.5k TS + 5.8k Rust | 6 client units + daemon | **done** (`opencode`, verified 2026-11-22) | `rust/crates/pi-rs-env` (`pi-env` bin): `fmt`/`clippy -D warnings` PASS, 0 `#[allow]`, `unsafe` isolated to `daemon/sys/`, **41/41** tests PASS in 1.17s (33 unit + 8 live `pi-env` binary integration); details in [MILESTONE.md](crates/pi-rs-env/MILESTONE.md) |
-| 2.3b | `pi-rs-env` (Durable Bridge: `list-files`, `remote-env` implementing `ExecutionEnv`) | `packages/env` | 1.1k TS | 2 units | claimed (see current wave) | `pi-rs-chord`, `pi-rs-durable`, 2.3a |
+| 2.3b | `pi-rs-env` durable bridge | `packages/env` | 1.1k TS | 2 units | Native gates passed, formal listing replay pending | 46 tests. Both adapters agree on live listing, shell output and old-daemon errors for the exercised cases. See [milestone](crates/pi-rs-env/MILESTONE.md). |
 | 2.4 | `pi-rs-evals` | `packages/evals` | 1.4k | 7 units | **done** (`opencode`, verified 2026-11-22) | `rust/crates/pi-rs-evals` (`pi-evals` bin): `fmt`/`clippy -D warnings` PASS, `#![forbid(unsafe_code)]`, 0 `#[allow]`, **44/44** tests PASS in 0.02s (5/5 mutation-checked, upstream golden report/SHA parity, TTY-deterministic styling); details in [MILESTONE.md](crates/pi-rs-evals/MILESTONE.md) |
 
 ---

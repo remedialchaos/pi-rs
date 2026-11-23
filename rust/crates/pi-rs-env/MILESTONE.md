@@ -69,3 +69,57 @@ and re-verified green:
   but only compiled on Windows targets; no live Windows/macOS runtime test was possible here (ADR-005).
 - `tokio` remains an available dependency for later async front doors; this transport uses std threads and channels for
   deterministic request/event dispatch and drop-in wire behavior.
+
+## Milestone 2.3b — durable execution environments
+
+The public `RemoteExecutionEnv` and `LocalExecutionEnv` implement the durable crate's
+`ExecutionEnv`. Both recursively list through the caller's daemon connection. Other
+local operations delegate to the durable local environment. Remote operations use
+daemon file handles, session-bound reads and writes, shell configuration, output
+callbacks, command cleanup and filesystem watch events.
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Formatting and lint | Pass | Crate-scoped Cargo fmt check and all-targets Clippy with warnings denied |
+| Native suite, offline | Pass | 33 library tests, 8 daemon integration tests and 4 durable adapter tests on Linux x86_64 |
+| Live listing and shell comparison | Pass for the exercised cases | Unmodified TypeScript adapter and Rust adapter against the compiled stdio daemon both returned directory `sub`, file `sub/a`, no truncation, exit code 7, stdout `configured` and stderr `problem` |
+| Offline listing contract | Pass for the exercised cases | Both implementations rejected a limit of 2^53 as invalid before checking cancellation and returned aborted for a valid cancelled request |
+| Reader and watch integration | Pass | A 600,000-byte open file survived rename and replacement. The polling watcher reported the new file's absolute path |
+| Mutation checks | 4/4 detected | Mapping directories to files, swapping stdout and stderr, accepting 2^53 and reporting polling as native each failed its corresponding test. All four passed after restoration |
+| rust-anything | Analyze succeeded. Formal diff, bench and gate unavailable | This native crate has neither recorded bridge cases nor a rust-anything.json bridge manifest. Diff reported missing cases. Bench and gate reported the missing manifest |
+| App replay | Coordinator-owned | Coordinator reported 6/6 for the root p2 HTTP oracle. This crate run did not replay p2 |
+
+Four tests added, zero removed. The original crate at `1e6e4aa16` passed all 41 tests.
+Measured execution times excluding builds were 1.37 s before (1.05 s library, 0.32 s
+daemon) and 1.78 s after (0.89 s library, 0.82 s daemon, 0.07 s durable).
+The baseline library timing was taken from a separate successful run of the same
+binary with the assigned temporary directory. An exploratory invocation without
+that directory failed the pre-existing gitignore fixture. The offline test build
+with the durable dependencies took 17 min 22 s.
+
+The compatibility comparison covers the listed examples. Both adapters returned `not_supported` with the same update message against the
+unmodified upstream old-daemon fixture. Cross-platform path behavior, live SSH,
+transfer throughput and comprehensive differential replay remain unverified. Remote
+file transfers use sequential chunks, while the upstream client pipelines them.
+
+### Async transport review
+
+Filesystem requests and handle acquisition now run on Tokio's blocking pool.
+The acquisition worker owns the returned handle before handing it to the caller.
+Explicit close awaits a worker, and Drop schedules best-effort close using the
+original daemon session and handle ID. Watch setup, watcher joins and shell
+cleanup also run outside the executor thread.
+
+The new Unix current-thread Tokio test starts the compiled daemon and reads a
+FIFO. A heartbeat cancels the context and releases the writer while the daemon
+is waiting for data. The read returns the durable aborted error. The test failed
+on the original implementation and again when only the shared request was made
+synchronous (2.01 s watchdog). It passed after restoration.
+
+Formatting, all-targets Clippy with warnings denied, and all 46 crate tests
+passed offline. One test added, zero removed. Test execution totaled 2.39 s
+(1.56 s library, 0.77 s daemon, 0.06 s durable), versus 1.78 s in the prior run.
+The existing disconnect test now waits for request start before killing the
+daemon. Its former ordering sometimes killed the daemon before the request
+started, allowing the request to succeed on a replacement session.
+The earlier parity results and formal bridge gate limits still apply.

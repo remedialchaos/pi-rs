@@ -11,6 +11,12 @@ name = "pi-env"
 path = "src/bin/pi_env.rs"
 
 [dependencies]
+async-trait = "0.1"
+pi-rs-chord = { path = "../pi-rs-chord" }
+pi-rs-durable = { path = "../pi-rs-durable" }
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+percent-encoding = "2"
 base64 = "0.22"
 encoding_rs = "0.8"
 ignore = "0.4"

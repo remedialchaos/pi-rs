@@ -339,11 +339,15 @@ impl RemoteWatcher {
 
     /// Stop watching. The daemon's request is cancelled and the background thread is joined.
     pub fn stop(&self) {
-        self.shared.stop();
-        self.controller.abort();
-        if let Some(thread) = lock(&self.thread).take() {
+        if let Some(thread) = self.begin_stop() {
             let _ = thread.join();
         }
+    }
+
+    pub(crate) fn begin_stop(&self) -> Option<JoinHandle<()>> {
+        self.shared.stop();
+        self.controller.abort();
+        lock(&self.thread).take()
     }
 }
 
