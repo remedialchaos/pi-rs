@@ -209,7 +209,19 @@ struct HostBridge {
     tool_handler: Arc<Mutex<Option<HostToolHandler>>>,
 }
 
+#[derive(Default)]
+struct GuestRegistrations {
+    providers: Vec<(String, Value)>,
+    virtual_models: Vec<(String, String, Value)>,
+    tools: Vec<super::types::ToolDefinition>,
+    commands: Vec<(String, Option<String>)>,
+    flags: Vec<super::types::FlagDefinition>,
+}
+
 struct WasmState {
+    host: Option<std::sync::Weak<super::types::ExtensionHost>>,
+    registrations: Option<GuestRegistrations>,
+    ui: Option<super::types::ExtensionUi>,
     generation: u64,
     stale: bool,
     bridge: HostBridge,
@@ -218,6 +230,135 @@ struct WasmState {
 impl wit_bindings::pi::extension::types::Host for WasmState {}
 
 impl wit_bindings::pi::extension::host::Host for WasmState {
+    async fn register_provider(&mut self, name: String, config_json: String) -> Result<(), String> {
+        let config = serde_json::from_str(&config_json).map_err(|e| e.to_string())?;
+        self.registrations
+            .as_mut()
+            .ok_or("Providers must be registered during init")?
+            .providers
+            .push((name, config));
+        Ok(())
+    }
+    async fn register_virtual_model(
+        &mut self,
+        provider: String,
+        id: String,
+        definition_json: String,
+    ) -> Result<(), String> {
+        let definition = serde_json::from_str(&definition_json).map_err(|e| e.to_string())?;
+        self.registrations
+            .as_mut()
+            .ok_or("Virtual models must be registered during init")?
+            .virtual_models
+            .push((provider, id, definition));
+        Ok(())
+    }
+    async fn register_tool(
+        &mut self,
+        name: String,
+        description: String,
+        schema_json: String,
+    ) -> Result<(), String> {
+        let schema: Value = serde_json::from_str(&schema_json).map_err(|e| e.to_string())?;
+        if name.is_empty() || !schema.is_object() {
+            return Err("Expected a tool name and an object schema".into());
+        }
+        let mut tool = super::types::ToolDefinition::new(name, schema);
+        tool.description = description;
+        self.registrations
+            .as_mut()
+            .ok_or("Tools must be registered during init")?
+            .tools
+            .push(tool);
+        Ok(())
+    }
+    async fn register_command(
+        &mut self,
+        name: String,
+        description: Option<String>,
+    ) -> Result<(), String> {
+        self.registrations
+            .as_mut()
+            .ok_or("Commands must be registered during init")?
+            .commands
+            .push((name, description));
+        Ok(())
+    }
+    async fn register_flag(
+        &mut self,
+        name: String,
+        description: Option<String>,
+        boolean: bool,
+        default_value: Option<String>,
+    ) -> Result<(), String> {
+        use super::types::{FlagDefinition, FlagKind, FlagValue};
+        let (kind, default) = if boolean {
+            (
+                FlagKind::Boolean,
+                default_value
+                    .map(|s| s.parse::<bool>().map(FlagValue::Bool))
+                    .transpose()
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            (FlagKind::String, default_value.map(FlagValue::Str))
+        };
+        self.registrations
+            .as_mut()
+            .ok_or("Flags must be registered during init")?
+            .flags
+            .push(FlagDefinition {
+                name,
+                description,
+                kind,
+                default,
+                extension_path: String::new(),
+            });
+        Ok(())
+    }
+
+    async fn ui_select(&mut self, title: String, items: Vec<String>) -> Option<String> {
+        self.ui
+            .as_ref()?
+            .select_with_options(title, items, Default::default())
+            .await
+    }
+
+    async fn ui_confirm(&mut self, title: String, message: String) -> bool {
+        match &self.ui {
+            Some(ui) => {
+                ui.confirm_with_options(title, message, Default::default())
+                    .await
+            }
+            None => false,
+        }
+    }
+
+    async fn ui_input(&mut self, title: String, placeholder: Option<String>) -> Option<String> {
+        self.ui
+            .as_ref()?
+            .input_with_options(title, placeholder, Default::default())
+            .await
+    }
+
+    async fn ui_notify(&mut self, message: String, kind: Option<String>) {
+        if let Some(ui) = &self.ui {
+            ui.notify_with_type(message, kind.as_deref());
+        }
+    }
+
+    async fn ui_set_status(&mut self, key: String, text: Option<String>) {
+        if let Some(ui) = &self.ui {
+            ui.set_status(key, text);
+        }
+    }
+
+    async fn ui_set_widget(&mut self, key: String, lines: Option<Vec<String>>) {
+        if let Some(ui) = &self.ui {
+            ui.set_widget(key, lines, None);
+        }
+    }
+
     async fn notify(&mut self, level: String, message: String) {
         if self.stale {
             return;
@@ -232,6 +373,14 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
     async fn get_flag(&mut self, name: String) -> Option<String> {
         if self.stale {
             return None;
+        }
+        if let Some(host) = self.host.as_ref().and_then(std::sync::Weak::upgrade)
+            && let Some(value) = host.get_flag(&name)
+        {
+            return Some(match value {
+                super::types::FlagValue::Bool(value) => value.to_string(),
+                super::types::FlagValue::Str(value) => value,
+            });
         }
         self.bridge
             .flags
@@ -261,6 +410,20 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
 struct InstantiatedGuest {
     store: Store<WasmState>,
     instance: wit_bindings::Extension,
+}
+
+async fn run_guest_command(
+    guest: &tokio::sync::Mutex<InstantiatedGuest>,
+    name: &str,
+    args: &str,
+    ctx: &super::types::ExtensionCommandContext,
+) -> Result<(), String> {
+    let mut guard = guest.lock().await;
+    let InstantiatedGuest { store, instance } = &mut *guard;
+    store.data_mut().ui = Some(ctx.base.ui.clone());
+    let result = instance.call_run_command(&mut *store, name, args).await;
+    store.data_mut().ui = None;
+    result.map_err(|e| format!("guest run-command trap: {e}"))?
 }
 
 /// Owner of a single guest `Store`. Dropping the store on invalidation
@@ -304,6 +467,9 @@ impl WasmStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Store::new(
             &self.engine,
             WasmState {
+                host: None,
+                ui: None,
+                registrations: None,
                 generation,
                 stale: false,
                 bridge: self.bridge.clone(),
@@ -583,6 +749,9 @@ impl WasmExtension {
         let mut wasm_store = Store::new(
             &engine,
             WasmState {
+                host: None,
+                ui: None,
+                registrations: None,
                 generation,
                 stale: false,
                 bridge,
@@ -717,7 +886,7 @@ impl Extension for WasmExtension {
         self.registration = registration;
     }
 
-    async fn init(&mut self, _ctx: &mut ExtensionInitContext<'_>) -> Result<(), String> {
+    async fn init(&mut self, ctx: &mut ExtensionInitContext<'_>) -> Result<(), String> {
         self.assert_current()?;
         let Some(guest) = self.ensure_guest().await? else {
             return Ok(());
@@ -725,10 +894,57 @@ impl Extension for WasmExtension {
         let result = {
             let mut guard = guest.lock().await;
             let InstantiatedGuest { store, instance } = &mut *guard;
+            store.data_mut().host = Some(Arc::downgrade(ctx.host));
+            store.data_mut().registrations = Some(GuestRegistrations::default());
             instance
-                .call_init(store)
+                .call_init(&mut *store)
                 .await
-                .map_err(|error| format!("guest init trap: {error}"))?
+                .map_err(|error| format!("guest init trap: {error}"))??;
+            let registrations = store
+                .data_mut()
+                .registrations
+                .take()
+                .ok_or("Missing guest registration state")?;
+            for (name, config) in registrations.providers {
+                ctx.register_provider(super::types::ProviderRegistration {
+                    name,
+                    config,
+                    extension_path: ctx.registration.path.clone(),
+                })?;
+            }
+            for (provider, id, definition) in registrations.virtual_models {
+                ctx.register_virtual_model(super::types::VirtualModelRegistration {
+                    provider,
+                    id,
+                    definition,
+                    extension_path: ctx.registration.path.clone(),
+                })?;
+            }
+            for tool in registrations.tools {
+                ctx.register_tool(tool)?;
+            }
+            for (name, description) in registrations.commands {
+                let weak = Arc::downgrade(&guest);
+                let command = name.clone();
+                ctx.register_command(super::types::CommandDefinition {
+                    name,
+                    description,
+                    handler: Arc::new(move |args, ctx| {
+                        let guest = weak.upgrade();
+                        let command = command.clone();
+                        Box::pin(async move {
+                            ctx.base.host.assert_active()?;
+                            let guest = guest.ok_or(STALE_MESSAGE)?;
+                            run_guest_command(&guest, &command, &args, &ctx).await
+                        })
+                    }),
+                })?;
+            }
+            for mut flag in registrations.flags {
+                flag.extension_path.clone_from(&ctx.registration.path);
+                ctx.register_flag(flag)?;
+            }
+            Ok(())
         };
         self.assert_current()?;
         result
@@ -738,7 +954,7 @@ impl Extension for WasmExtension {
         &self,
         name: &str,
         args: Value,
-        _ctx: &ExtensionToolContext,
+        ctx: &ExtensionToolContext,
     ) -> Result<ToolOutcome, String> {
         self.assert_current()?;
         let Some(guest) = self.ensure_guest().await? else {
@@ -751,10 +967,12 @@ impl Extension for WasmExtension {
         let raw = {
             let mut guard = guest.lock().await;
             let InstantiatedGuest { store, instance } = &mut *guard;
-            instance
-                .call_execute_tool(store, name, &args_json)
-                .await
-                .map_err(|error| format!("guest execute-tool trap: {error}"))??
+            store.data_mut().ui = Some(ctx.base.ui.clone());
+            let result = instance
+                .call_execute_tool(&mut *store, name, &args_json)
+                .await;
+            store.data_mut().ui = None;
+            result.map_err(|error| format!("guest execute-tool trap: {error}"))??
         };
         self.assert_current()?;
         let payload: Value = serde_json::from_str(&raw.payload_json)
@@ -774,7 +992,7 @@ impl Extension for WasmExtension {
         &self,
         name: &str,
         args: &str,
-        _ctx: &super::types::ExtensionCommandContext,
+        ctx: &super::types::ExtensionCommandContext,
     ) -> Result<(), String> {
         self.assert_current()?;
         let Some(guest) = self.ensure_guest().await? else {
@@ -783,14 +1001,7 @@ impl Extension for WasmExtension {
                 self.name
             ));
         };
-        let result = {
-            let mut guard = guest.lock().await;
-            let InstantiatedGuest { store, instance } = &mut *guard;
-            instance
-                .call_run_command(store, name, args)
-                .await
-                .map_err(|error| format!("guest run-command trap: {error}"))?
-        };
+        let result = run_guest_command(&guest, name, args, ctx).await;
         self.assert_current()?;
         result
     }
@@ -833,6 +1044,53 @@ impl InputPatch {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn guest_dialogs_receive_host_answers_and_deliver_notifications() {
+        use super::wit_bindings::pi::extension::host::Host;
+        use crate::core::extensions::types::{ExtensionMode, ExtensionUi};
+        let mut ui = ExtensionUi::no_op(ExtensionMode::Tui);
+        ui.select = Arc::new(|_, items| Box::pin(async move { items.into_iter().last() }));
+        ui.confirm = Arc::new(|_, prompt| Box::pin(async move { prompt == "continue?" }));
+        ui.input = Arc::new(|_, placeholder| Box::pin(async move { placeholder }));
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let sink = notes.clone();
+        ui.notify = Arc::new(move |message, level| {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((message, level))
+        });
+        let mut state = WasmState {
+            host: None,
+            registrations: None,
+            ui: Some(ui),
+            generation: 0,
+            stale: false,
+            bridge: HostBridge::default(),
+        };
+        assert_eq!(
+            state
+                .ui_select("select".into(), vec!["a".into(), "b".into()])
+                .await
+                .as_deref(),
+            Some("b")
+        );
+        assert!(state.ui_confirm("title".into(), "continue?".into()).await);
+        assert_eq!(
+            state
+                .ui_input("input".into(), Some("value".into()))
+                .await
+                .as_deref(),
+            Some("value")
+        );
+        state
+            .ui_notify("message".into(), Some("warning".into()))
+            .await;
+        assert_eq!(
+            *notes.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![("message".to_owned(), "warning".to_owned())]
+        );
+    }
+
     use super::*;
 
     fn extension() -> WasmExtension {

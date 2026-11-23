@@ -1,0 +1,26 @@
+[package]
+name = "pi-rs-p2-tui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Terminal UI client for p2 built on pi-rs-tui (Rust port of apps/p2/src/tui)"
+
+[dependencies]
+pi-rs-ai = { path = "../pi-rs-ai" }
+pi-rs-chord = { path = "../pi-rs-chord" }
+pi-rs-schema = { path = "../pi-rs-schema" }
+pi-rs-telemetry = { path = "../pi-rs-telemetry" }
+pi-rs-tui = { path = "../pi-rs-tui" }
+
+indexmap = { version = "2", features = ["serde"] }
+notify = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+similar = { version = "3", features = ["inline"] }
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

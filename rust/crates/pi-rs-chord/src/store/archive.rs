@@ -19,19 +19,19 @@ use std::{
 };
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Manifest {
-    kind: String,
-    format: i64,
-    schema: i64,
-    last_seq: i64,
-    next_id: i64,
-    host: Option<String>,
+pub(super) struct Manifest {
+    pub kind: String,
+    pub format: i64,
+    pub schema: i64,
+    pub last_seq: i64,
+    pub next_id: i64,
+    pub host: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct End {
-    kind: String,
-    writes: i64,
+pub(super) struct End {
+    pub kind: String,
+    pub writes: i64,
 }
 /// Decodes one gzip member. Malformed UTF-8, empty lines and malformed JSON are refused.
 pub fn decode_archive(bytes: &[u8]) -> Result<Vec<Value>> {
@@ -134,6 +134,14 @@ impl StoreEngine {
     }
 }
 fn export_to(c: &rusqlite::Connection, meta: super::MetaRow, writer: impl Write) -> Result<()> {
+    export_scoped(c, meta, writer, None)
+}
+pub(super) fn export_scoped(
+    c: &rusqlite::Connection,
+    meta: super::MetaRow,
+    writer: impl Write,
+    scope: Option<&crate::contracts::Address>,
+) -> Result<()> {
     let mut gzip = GzEncoder::new(writer, Compression::default());
     let mut count = 0i64;
     let mut emit = |part: Value| -> Result<()> {
@@ -142,10 +150,23 @@ fn export_to(c: &rusqlite::Connection, meta: super::MetaRow, writer: impl Write)
         count += 1;
         Ok(())
     };
-    emit(
-        json!({"kind":"manifest","format":1,"schema":3,"lastSeq":meta.last_seq,"nextId":meta.next_id}),
-    )?;
+    let mut manifest = json!({"kind":"manifest","format":1,"schema":3,"lastSeq":meta.last_seq,"nextId":meta.next_id});
+    if let Some(scope) = scope {
+        manifest["host"] = json!(scope.key);
+    }
+    emit(manifest)?;
     for (name, r) in applier::catalog(c)? {
+        let (filter, key) = if let Some(scope) = scope {
+            let Some(column) = super::host_data::host_column(&r.columns, &scope.kind) else {
+                continue;
+            };
+            (
+                format!(" WHERE {} = ?", quote(column)),
+                Some(scope.key.as_str()),
+            )
+        } else {
+            (String::new(), None)
+        };
         emit(serde_json::to_value(StoreWrite::Table {
             table: name.clone(),
             version: r.version,
@@ -155,7 +176,7 @@ fn export_to(c: &rusqlite::Connection, meta: super::MetaRow, writer: impl Write)
             fingerprint: r.fingerprint.clone(),
         })?)?;
         let sql = format!(
-            "SELECT {} FROM {} ORDER BY {}",
+            "SELECT {} FROM {}{filter} ORDER BY {}",
             r.physical()
                 .iter()
                 .map(|n| quote(n))
@@ -169,7 +190,7 @@ fn export_to(c: &rusqlite::Connection, meta: super::MetaRow, writer: impl Write)
                 .join(", ")
         );
         let mut statement = c.prepare(&sql)?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query(rusqlite::params_from_iter(key))?;
         while let Some(stored) = rows.next()? {
             let mut row = IndexMap::new();
             let mut versions = IndexMap::new();
@@ -215,8 +236,12 @@ fn export_to(c: &rusqlite::Connection, meta: super::MetaRow, writer: impl Write)
             })?)?;
         }
     }
-    let mut docs = c.prepare("SELECT id FROM chord_documents ORDER BY id")?;
-    let mut documents = docs.query([])?;
+    let mut docs = c.prepare(if scope.is_some() {
+        "SELECT id FROM chord_documents WHERE host = ? AND retired_at IS NULL ORDER BY id"
+    } else {
+        "SELECT id FROM chord_documents ORDER BY id"
+    })?;
+    let mut documents = docs.query(rusqlite::params_from_iter(scope.map(|s| s.key.as_str())))?;
     while let Some(document) = documents.next()? {
         let id = document.get(0)?;
         let record = applier::document_row(c, id)?

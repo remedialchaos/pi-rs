@@ -2,10 +2,20 @@
 use crate::{
     Error, Result,
     link::Link,
-    tui::{LauncherMessage, SandboxMessage},
+    tui::{BridgeRequest, BridgeStart, LauncherMessage, SandboxChannel, SandboxMessage},
 };
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::mpsc;
 pub const MAX_PIPE_FRAME: usize = 17 * 1024 * 1024;
 pub const MAX_HEADER: usize = 1024 * 1024;
 pub fn frame(header: &Value, body: &[u8]) -> Result<Vec<u8>> {
@@ -330,6 +340,290 @@ impl TerminalLauncher {
     }
 }
 impl Drop for TerminalLauncher {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+const PREFIX: &str = "/_chord/tui/";
+const MAX_BUNDLE: usize = 8 * 1024 * 1024;
+const MAX_SOCKETS: usize = 4;
+const QUEUE_LENGTH: usize = 16;
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Trusted host-side GET adapter. It must use the exact URI, disable redirects, and stop
+/// reading after the supplied byte limit. The sandbox never receives this capability or token.
+pub trait SurfaceGet {
+    fn get(
+        &self,
+        uri: http::Uri,
+        authorization: http::HeaderValue,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<u8>>> + Send;
+}
+
+fn surface_path(path: &str) -> Result<&str> {
+    if path.len() > 4096 {
+        return Err(Error::Invalid("terminal surface path too long".into()));
+    }
+    let name = path
+        .strip_prefix(PREFIX)
+        .map(|name| name.strip_prefix("plugin/").unwrap_or(name))
+        .filter(|name| !matches!(*name, "" | "." | ".."))
+        .filter(|name| {
+            name.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.~@-".contains(&b))
+        });
+    name.map(|_| path)
+        .ok_or_else(|| Error::Invalid("not a terminal surface file".into()))
+}
+
+/// Terminal settings supplied by the native host, independent of the server manifest.
+pub struct TerminalSettings {
+    pub columns: usize,
+    pub rows: usize,
+    pub colors: crate::surfaces::ColorDepth,
+    pub mode: crate::surfaces::ThemeMode,
+    pub locales: Vec<String>,
+}
+
+/// One authenticated sandbox session. Drive it with `step` until exit or host shutdown.
+/// Local machine actions are refused here; they require a separate trusted UI.
+pub struct TerminalSession<G> {
+    launcher: TerminalLauncher,
+    get: G,
+    origin: http::Uri,
+    authorization: http::HeaderValue,
+    websocket: String,
+    channel: SandboxChannel,
+    requests: mpsc::Receiver<SandboxMessage>,
+    overloaded: Arc<AtomicBool>,
+}
+
+impl<G: SurfaceGet> TerminalSession<G> {
+    /// Fetch the live manifest and its artifacts, returning the session and native base bytes.
+    pub async fn start(
+        origin: http::Uri,
+        token: String,
+        settings: TerminalSettings,
+        get: G,
+    ) -> Result<(Self, Vec<u8>)> {
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            base: String,
+            script: String,
+            combined: String,
+        }
+        let ws = match origin.scheme_str() {
+            Some("http") => "ws",
+            Some("https") => "wss",
+            _ => return Err(Error::Invalid("invalid terminal origin".into())),
+        };
+        let authority = origin
+            .authority()
+            .filter(|authority| !authority.as_str().contains('@'))
+            .filter(|_| origin.path() == "/" && origin.query().is_none())
+            .ok_or_else(|| Error::Invalid("invalid terminal origin".into()))?;
+        let websocket = format!("{ws}://{authority}/_chord/link");
+        let mut authorization = http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| Error::Invalid("invalid terminal token".into()))?;
+        authorization.set_sensitive(true);
+        let manifest: Manifest = serde_json::from_slice(
+            &Self::fetch(&get, &origin, &authorization, "/_chord/tui/start").await?,
+        )?;
+        let (script, combined) = tokio::try_join!(
+            Self::fetch(&get, &origin, &authorization, &manifest.script),
+            Self::fetch(&get, &origin, &authorization, &manifest.combined),
+        )?;
+        let combined = String::from_utf8(combined)
+            .map_err(|_| Error::Invalid("invalid terminal plugin manifest".into()))?;
+        let (sender, requests) = mpsc::channel(QUEUE_LENGTH);
+        let overloaded = Arc::new(AtomicBool::new(false));
+        let sender_overloaded = overloaded.clone();
+        let channel = SandboxChannel::new(
+            BridgeStart {
+                base: manifest.base,
+                combined,
+                columns: settings.columns,
+                rows: settings.rows,
+                colors: settings.colors,
+                mode: settings.mode,
+                locales: settings.locales,
+            },
+            move |message| {
+                if matches!(&message, SandboxMessage::SocketSend { bytes, .. } if bytes.len() > 1024 * 1024)
+                {
+                    return Err(Error::Invalid("terminal socket frame too large".into()));
+                }
+                if let SandboxMessage::Request {
+                    request: BridgeRequest::Fetch { path },
+                    ..
+                } = &message
+                {
+                    surface_path(path)?;
+                }
+                sender.try_send(message).map_err(|err| {
+                    if matches!(err, mpsc::error::TrySendError::Full(_)) {
+                        sender_overloaded.store(true, Ordering::Release);
+                    }
+                    Error::Closed
+                })
+            },
+        );
+        Ok((
+            Self {
+                launcher: TerminalLauncher::new(token),
+                get,
+                origin,
+                authorization,
+                websocket,
+                channel,
+                requests,
+                overloaded,
+            },
+            script,
+        ))
+    }
+
+    async fn fetch(
+        get: &G,
+        origin: &http::Uri,
+        auth: &http::HeaderValue,
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        let mut parts = origin.clone().into_parts();
+        parts.path_and_query = Some(
+            surface_path(path)?
+                .parse()
+                .map_err(|_| Error::Invalid("invalid terminal path".into()))?,
+        );
+        let uri = http::Uri::from_parts(parts)
+            .map_err(|_| Error::Invalid("invalid terminal URI".into()))?;
+        let bytes = tokio::time::timeout(NETWORK_TIMEOUT, get.get(uri, auth.clone(), MAX_BUNDLE))
+            .await
+            .map_err(|_| Error::Invalid("terminal fetch timed out".into()))??;
+        if bytes.len() > MAX_BUNDLE {
+            return Err(Error::Invalid("terminal artifact exceeds 8 MiB".into()));
+        }
+        Ok(bytes)
+    }
+
+    pub fn channel(&self) -> &SandboxChannel {
+        &self.channel
+    }
+
+    async fn open(&mut self, socket: u64) -> Result<()> {
+        self.launcher.links.retain(|_, link| !link.closed());
+        if self.launcher.links.contains_key(&socket) {
+            return Ok(());
+        }
+        let link = if self.launcher.links.len() < MAX_SOCKETS {
+            tokio::time::timeout(
+                NETWORK_TIMEOUT,
+                self.launcher.connect(socket, &self.websocket),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+        } else {
+            None
+        };
+        let Some(link) = link else {
+            return self
+                .channel
+                .receive(LauncherMessage::SocketClosed { socket });
+        };
+        let channel = self.channel.clone();
+        link.on_close(Arc::new(move || {
+            let _ = channel.receive(LauncherMessage::SocketClosed { socket });
+        }));
+        self.channel
+            .receive(LauncherMessage::SocketOpened { socket })?;
+        let channel = self.channel.clone();
+        let weak = Arc::downgrade(&link);
+        link.on_message(Arc::new(move |bytes| {
+            if channel
+                .receive(LauncherMessage::SocketMessage { socket, bytes })
+                .is_err()
+                && let Some(link) = weak.upgrade()
+            {
+                link.close();
+            }
+        }));
+        Ok(())
+    }
+
+    /// Process one message. Returns the sandbox exit code when the session ends.
+    /// Cancelling an in-progress step may discard its message; cancel only when closing.
+    pub async fn step(&mut self, output: &mut impl std::io::Write) -> Result<Option<i32>> {
+        let result = self.step_inner(output).await;
+        if !matches!(result, Ok(None)) {
+            self.close();
+        }
+        result
+    }
+
+    async fn step_inner(&mut self, output: &mut impl std::io::Write) -> Result<Option<i32>> {
+        let message = self.requests.recv().await;
+        if self.overloaded.load(Ordering::Acquire) {
+            return Err(Error::Invalid("terminal bridge queue full".into()));
+        }
+        match message {
+            None => return Ok(Some(0)),
+            Some(SandboxMessage::Exit { code }) => return Ok(Some(code)),
+            Some(SandboxMessage::SocketOpen { socket }) => self.open(socket).await?,
+            Some(SandboxMessage::SocketSend { socket, bytes }) => {
+                if let Some(link) = self.launcher.links.get(&socket)
+                    && link.send(bytes).is_err()
+                {
+                    link.close();
+                }
+            }
+            Some(SandboxMessage::Request { id, request }) => {
+                let (path, json) = match &request {
+                    BridgeRequest::Fetch { path } => (Some(path.as_str()), false),
+                    BridgeRequest::Base => (Some("/_chord/tui/base"), true),
+                    _ => (None, false),
+                };
+                let result = if let Some(path) = path {
+                    Self::fetch(&self.get, &self.origin, &self.authorization, path)
+                        .await
+                        .and_then(|bytes| {
+                            if json {
+                                Ok(serde_json::from_slice(&bytes)?)
+                            } else {
+                                Ok(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+                            }
+                        })
+                } else {
+                    Err(Error::Invalid("terminal action requires trusted UI".into()))
+                };
+                self.channel.receive(match result {
+                    Ok(value) => LauncherMessage::Reply { id, value },
+                    Err(_) => LauncherMessage::Refused {
+                        id,
+                        message: "terminal request refused".into(),
+                    },
+                })?;
+            }
+            Some(message) => {
+                self.launcher.apply(message, output)?;
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl<G> TerminalSession<G> {
+    pub fn close(&mut self) {
+        self.requests.close();
+        while self.requests.try_recv().is_ok() {}
+        self.channel.close();
+        self.launcher.close();
+    }
+}
+
+impl<G> Drop for TerminalSession<G> {
     fn drop(&mut self) {
         self.close();
     }

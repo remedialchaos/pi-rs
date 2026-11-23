@@ -458,6 +458,10 @@ pub struct RolloutStep<'a> {
     pub runtime: &'a PluginRuntime,
     pub scripts: Vec<PluginScript>,
 }
+/// Reload runtimes in order, with independent publication at each host.
+/// A rejected plugin is held back in its host's report without preventing
+/// later steps. An error from the reload itself stops the rollout; earlier
+/// steps are not rolled back.
 pub async fn rollout(
     steps: Vec<RolloutStep<'_>>,
     context: &Context,

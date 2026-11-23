@@ -18,6 +18,7 @@ use pi_rs_coding_agent::{
         auth_command,
         initial_message::prepare_initial_message,
         list_models::format_models,
+        mcp::run_command as mcp_command,
         session_picker, setup, startup_ui,
     },
     config::{self, ENV_SESSION_DIR, VERSION},
@@ -81,6 +82,9 @@ async fn run(argv: &[String]) -> Result<u8, String> {
     }
     package_manager_cli::cleanup_installation();
     if let Some(code) = package_manager_cli::run(argv, &cwd, &agent_dir).await {
+        return Ok(code);
+    }
+    if let Some(code) = mcp_command(argv, &cwd, &agent_dir).await {
         return Ok(code);
     }
 

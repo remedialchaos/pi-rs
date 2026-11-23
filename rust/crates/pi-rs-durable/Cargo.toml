@@ -1,0 +1,39 @@
+[package]
+name = "pi-rs-durable"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Durable conversation, task, and document runtime for Pi (Rust port of packages/durable)"
+
+[dependencies]
+pi-rs-chord = { path = "../pi-rs-chord" }
+pi-rs-ai = { path = "../pi-rs-ai" }
+pi-rs-codemode = { path = "../pi-rs-codemode" }
+pi-rs-schema = { path = "../pi-rs-schema" }
+pi-rs-telemetry = { path = "../pi-rs-telemetry" }
+
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+encoding_rs = "0.8"
+futures-util = "0.3"
+globset = "0.4"
+ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+indexmap = { version = "2", features = ["serde"] }
+notify = "9"
+rand = "0.9"
+regex = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "unbounded_depth"] }
+sha2 = "0.10"
+similar = { version = "3", features = ["inline"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"

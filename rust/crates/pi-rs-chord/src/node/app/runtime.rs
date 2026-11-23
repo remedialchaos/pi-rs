@@ -1,3 +1,4 @@
+use super::owners::{WorkerBoot, WorkerOwners, host_data_facet};
 use super::*;
 use crate::node::{
     http::{Http, HttpOptions, HttpServer},
@@ -78,6 +79,9 @@ pub struct AppOptions {
     pub plugins: Vec<PluginScript>,
     pub surfaces: Vec<Surface>,
     pub files: FilesCaps,
+    pub workers: Vec<AppWorkerKind>,
+    /// Application profile schema for the local Users facet. Defaults to any JSON value.
+    pub users_profile: JsonValue,
 }
 impl AppOptions {
     pub fn new(name: &str, data_dir: PathBuf, owner: Value, principal: Value) -> Self {
@@ -92,6 +96,8 @@ impl AppOptions {
             plugins: vec![],
             surfaces: vec![],
             files: FilesCaps::default(),
+            workers: vec![],
+            users_profile: s::unknown(),
         }
     }
 }
@@ -107,8 +113,9 @@ pub struct AppServer {
     pub owner_link: String,
     listener: Option<HttpServer>,
     _lock: ProcessLock,
-    name: String,
-    version: String,
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) workers: Arc<WorkerOwners>,
 }
 pub async fn start_server(options: AppOptions) -> Result<AppServer> {
     crate::contracts::check_name(&options.name, "app name")?;
@@ -123,7 +130,7 @@ pub async fn start_server(options: AppOptions) -> Result<AppServer> {
     let db = SqliteDatabase::open(&layout.server_store, Options::default()).await?;
     let store = StoreEngine::open(db.clone()).await?;
     let host = create_host(HostOptions {
-        principal: Some(options.principal),
+        principal: Some(options.principal.clone()),
         address: Some(JsonValue::from_serde(
             json!({"kind":"server","key":"server","params":{}}),
         )),
@@ -131,6 +138,13 @@ pub async fn start_server(options: AppOptions) -> Result<AppServer> {
         ..Default::default()
     })?;
     let result = async {
+        let workers = WorkerOwners::new(
+            options.workers,
+            layout.clone(),
+            options.principal,
+            options.files,
+            &host,
+        )?;
         let sign_ins = SignIns::open(
             store.clone(),
             options.owner.clone(),
@@ -141,6 +155,9 @@ pub async fn start_server(options: AppOptions) -> Result<AppServer> {
         let owner_link = sign_ins.owner_link();
         let files = Files::open(store.clone(), layout.server.join("files"), options.files).await?;
         let mut core = options.core;
+        core.push(PluginFacet::new("chord.app.files", files.facet()?));
+        let (_, users) = define_users(options.users_profile)?;
+        core.push(PluginFacet::new("chord.app.users", users));
         core.push(PluginFacet::new("chord.app.sign-ins", sign_ins.facet()?));
         core.push(PluginFacet::new(
             "chord.app.info",
@@ -157,7 +174,7 @@ pub async fn start_server(options: AppOptions) -> Result<AppServer> {
         for surface in &options.surfaces {
             core.push(PluginFacet::new(
                 format!("chord.surface.{}", surface.manifest().base),
-                surface.facet()?,
+                surface.http_facet(false)?,
             ));
         }
         let (plugins, report) =
@@ -170,10 +187,15 @@ pub async fn start_server(options: AppOptions) -> Result<AppServer> {
             )));
         }
         let opened = sign_ins.clone();
+        let router = Arc::downgrade(&workers);
         let http = Http::new(
             host.clone(),
             HttpOptions {
                 opened: Arc::new(move |request| opened.opened(request)),
+                remote: Arc::new(move |principal| match router.upgrade() {
+                    Some(router) => router.remote_options(principal),
+                    None => RemoteOptions::new(principal),
+                }),
                 ..Default::default()
             },
         );
@@ -183,23 +205,17 @@ pub async fn start_server(options: AppOptions) -> Result<AppServer> {
                 .map_err(|e| Error::Invalid(e.to_string()))?,
         )
         .map_err(|e| Error::Invalid(e.to_string()))?;
-        for surface in options.surfaces {
-            http.contribute(
-                surface
-                    .contribution(false)
-                    .map_err(|e| Error::Invalid(e.to_string()))?,
-            )
-            .map_err(|e| Error::Invalid(e.to_string()))?;
-        }
         let listener = http
             .listen(options.listen)
             .await
             .map_err(|e| Error::Invalid(e.to_string()))?;
-        Ok((sign_ins, owner_link, files, plugins, http, listener))
+        Ok((
+            sign_ins, owner_link, files, plugins, http, listener, workers,
+        ))
     }
     .await;
     match result {
-        Ok((sign_ins, owner_link, files, plugins, http, listener)) => Ok(AppServer {
+        Ok((sign_ins, owner_link, files, plugins, http, listener, workers)) => Ok(AppServer {
             host,
             http,
             layout,
@@ -213,6 +229,7 @@ pub async fn start_server(options: AppOptions) -> Result<AppServer> {
             _lock: lock,
             name: options.name,
             version: options.version,
+            workers,
         }),
         Err(error) => {
             let _ = host.close(&Context::background()).await;
@@ -240,15 +257,19 @@ impl AppServer {
         .await
     }
     pub async fn close(mut self) -> Result<()> {
-        self.host.close(&Context::background()).await?;
-        if let Some(listener) = self.listener.take() {
+        let listener = if let Some(listener) = self.listener.take() {
             listener
                 .close()
                 .await
-                .map_err(|e| Error::Invalid(e.to_string()))?;
-        }
+                .map_err(|e| Error::Invalid(e.to_string()))
+        } else {
+            Ok(())
+        };
+        self.workers.close().await;
+        let host = self.host.close(&Context::background()).await;
         self.sign_ins.close();
-        self.store.database().close().await
+        let store = self.store.database().close().await;
+        listener.and(host).and(store)
     }
 }
 pub struct WorkerAppOptions {
@@ -266,6 +287,27 @@ pub struct WorkerApp {
     pub session: WorkerSession,
     _parent: RemotePeer,
 }
+/// Start a worker with the kit configuration sent by AppServer's native supervisor.
+pub async fn boot_worker(mut session: WorkerSession, core: Vec<PluginFacet>) -> Result<WorkerApp> {
+    let boot: WorkerBoot = serde_json::from_value(std::mem::take(&mut session.start))?;
+    session.start = boot.app;
+    let (max_file, max_total, max_uploads) = boot.files;
+    start_worker(
+        session,
+        WorkerAppOptions {
+            directory: boot.directory,
+            principal: boot.principal,
+            server_principal: boot.server_principal,
+            core,
+            files: FilesCaps {
+                max_file,
+                max_total,
+                max_uploads,
+            },
+        },
+    )
+    .await
+}
 pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> Result<WorkerApp> {
     private_directory(&options.directory)?;
     let path = options.directory.join("store.sqlite");
@@ -279,10 +321,9 @@ pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> 
         ..Default::default()
     })?;
     let result = async {
-        let parent = host.accept(
-            session.parent.clone(),
-            RemoteOptions::new(options.server_principal),
-        )?;
+        let mut parent_options = RemoteOptions::new(options.server_principal.clone());
+        parent_options.trusted = true;
+        let parent = host.connect(session.parent.clone(), parent_options)?;
         let files = Files::open(
             store.clone(),
             options.directory.join("files"),
@@ -290,6 +331,16 @@ pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> 
         )
         .await?;
         let mut core = options.core;
+        core.push(PluginFacet::new("chord.app.files", files.facet()?));
+        core.push(PluginFacet::new(
+            "chord.app.data",
+            host_data_facet(
+                store.clone(),
+                files.directory().to_owned(),
+                options.server_principal,
+                session.address.clone(),
+            )?,
+        ));
         core.push(PluginFacet::new(
             "chord.app.worker-info",
             info_facet(

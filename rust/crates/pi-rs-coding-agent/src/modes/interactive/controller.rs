@@ -323,8 +323,6 @@ impl Controller {
             if let Some(flags) = &flags {
                 native.host.restore_flag_values(flags);
             }
-            native.bind_provider_registrations();
-            native.bind_virtual_models();
             native.refresh_tools();
         }
         drop(runtime);

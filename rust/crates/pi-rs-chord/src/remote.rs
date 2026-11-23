@@ -31,6 +31,18 @@ pub enum LinkRole {
     Child,
     Route,
 }
+/// A validated inbound hold and the identity established by its link.
+pub struct RouteHold {
+    pub address_kind: String,
+    pub address_params: JsonValue,
+    pub contract: Arc<Contract>,
+    pub params: JsonValue,
+    pub caller: Caller,
+    pub context: Context,
+}
+
+pub type HoldRouter = Arc<dyn Fn(RouteHold) -> SyncFuture<Option<RemoteReference>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct RemoteOptions {
     pub role: LinkRole,
@@ -39,6 +51,10 @@ pub struct RemoteOptions {
     pub codec: Codec,
     pub call_window: usize,
     pub report: Arc<dyn Fn(String) + Send + Sync>,
+    /// Resolve a forward destination. `Ok(None)` dispatches locally.
+    pub route: Option<HoldRouter>,
+    /// Declarations of routable types that need not have a local implementation.
+    pub route_contracts: BTreeMap<String, Arc<Contract>>,
 }
 impl RemoteOptions {
     pub fn new(principal: serde_json::Value) -> Self {
@@ -49,6 +65,8 @@ impl RemoteOptions {
             codec: Codec::Binary,
             call_window: 64,
             report: Arc::new(|_| {}),
+            route: None,
+            route_contracts: BTreeMap::new(),
         }
     }
 }
@@ -57,14 +75,25 @@ struct Outgoing {
     reply: oneshot::Sender<Result<JsonValue>>,
 }
 struct Serving {
-    held: Held,
+    key: Arc<()>,
+    held: Provided,
     cancel: Cancel,
     _observation: Option<crate::state::NativeObservation<RefState>>,
     subscriptions: Vec<Subscription>,
     methods: Vec<String>,
 }
+#[derive(Clone)]
+enum Provided {
+    Local(Held),
+    Routed(RemoteReference),
+}
 struct Incoming {
+    key: Arc<()>,
     hold: u64,
+    cancel: Cancel,
+}
+struct PendingRoute {
+    key: Arc<()>,
     cancel: Cancel,
 }
 #[derive(Default)]
@@ -86,6 +115,7 @@ struct Inner {
     holds: Mutex<BTreeMap<u64, Weak<Reference>>>,
     outgoing: Mutex<BTreeMap<u64, Outgoing>>,
     serving: Mutex<BTreeMap<u64, Serving>>,
+    pending_routes: Mutex<BTreeMap<u64, PendingRoute>>,
     incoming: Mutex<BTreeMap<u64, Incoming>>,
     window: Mutex<Arc<Semaphore>>,
     closed: AtomicBool,
@@ -146,6 +176,7 @@ struct Reference {
     id: u64,
     contract: Arc<Contract>,
     params: JsonValue,
+    stamp: Option<(Box<JsonValue>, [u8; 16])>,
     peer: Weak<Inner>,
     state: NativeSource<RefState>,
     changed: watch::Sender<u64>,
@@ -189,6 +220,7 @@ impl RemotePeer {
             holds: Mutex::new(BTreeMap::new()),
             outgoing: Mutex::new(BTreeMap::new()),
             serving: Mutex::new(BTreeMap::new()),
+            pending_routes: Mutex::new(BTreeMap::new()),
             incoming: Mutex::new(BTreeMap::new()),
             window: Mutex::new(Arc::new(Semaphore::new(0))),
             closed: AtomicBool::new(false),
@@ -320,6 +352,42 @@ impl RemotePeer {
         params: JsonValue,
         context: &Context,
     ) -> Result<RemoteReference> {
+        self.hold_with_stamp(contract, params, None, context)
+    }
+    /// Forward a link-stamped caller over a trusted link to a child.
+    pub fn hold_as(
+        &self,
+        contract: Arc<Contract>,
+        params: JsonValue,
+        caller: Caller,
+        context: &Context,
+    ) -> Result<RemoteReference> {
+        if !self.0.options.trusted || self.0.options.role != LinkRole::Child {
+            return Err(ChordError::new(
+                "forbidden",
+                "caller stamping requires a trusted child link",
+            )
+            .into());
+        }
+        let principal = caller
+            .principal
+            .ok_or_else(|| ChordError::new("forbidden", "remote reference requires a principal"))?;
+        crate::data::principal_key(&principal)?;
+        let incarnation = uuid::Uuid::parse_str(&caller.incarnation)
+            .map_err(|_| Error::Invalid("invalid caller incarnation".into()))?;
+        let stamp = (
+            Box::new(JsonValue::from_serde(principal)),
+            *incarnation.as_bytes(),
+        );
+        self.hold_with_stamp(contract, params, Some(stamp), context)
+    }
+    fn hold_with_stamp(
+        &self,
+        contract: Arc<Contract>,
+        params: JsonValue,
+        stamp: Option<(Box<JsonValue>, [u8; 16])>,
+        context: &Context,
+    ) -> Result<RemoteReference> {
         if contract.kind() != crate::contracts::ContractKind::Remote {
             return Err(ChordError::invalid("type", "local types never cross links", None).into());
         }
@@ -333,6 +401,7 @@ impl RemotePeer {
             id,
             contract,
             params,
+            stamp,
             peer: Arc::downgrade(&self.0),
             state: NativeSource::new(self.0.batch.clone(), RefState::Loading, |a, b| a == b),
             changed,
@@ -374,13 +443,17 @@ impl RemotePeer {
             params: Part::Text(held.params.to_json()?),
             address_kind: kind,
             address_params: Box::new(params),
-            principal: None,
-            incarnation: None,
+            principal: held.stamp.as_ref().map(|(principal, _)| principal.clone()),
+            incarnation: held.stamp.as_ref().map(|(_, incarnation)| *incarnation),
             chain: None,
             limit: None,
         })
     }
     fn dropped(&self) {
+        let pending_routes = std::mem::take(&mut *lock(&self.0.pending_routes));
+        for (_, route) in pending_routes {
+            route.cancel.cancel("link dropped");
+        }
         *lock(&self.0.replica) = ReplicaFlow::default();
         let serving = std::mem::take(&mut *lock(&self.0.serving));
         for (_, entry) in serving {
@@ -754,9 +827,12 @@ impl RemoteReference {
         result
     }
     pub fn retry(&self) -> Result<()> {
+        self.retry_with_hops(16)
+    }
+    fn retry_with_hops(&self, hops: u64) -> Result<()> {
         RemotePeer(self.0.peer.upgrade().ok_or(Error::Closed)?).send(Body::Retry {
             hold: self.0.id,
-            hops: 16,
+            hops,
         })
     }
     pub fn release(&self) {

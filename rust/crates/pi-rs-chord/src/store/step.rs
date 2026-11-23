@@ -42,6 +42,9 @@ impl<'a> Step<'a> {
     pub fn table(&self, name: &str) -> Option<&TableRecord> {
         self.tables.get(name)
     }
+    pub(super) fn tables(&self) -> &applier::Catalog {
+        &self.tables
+    }
     pub fn mint(&mut self) -> Result<i64> {
         let id = self.next_id;
         safe(id, 2)?;

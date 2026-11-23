@@ -10,6 +10,7 @@ pub mod tools;
 pub mod auth_storage;
 pub mod bash_executor;
 pub mod footer_data;
+pub(crate) mod mcp_oauth;
 pub mod messages;
 pub mod model_registry;
 pub mod model_resolver;

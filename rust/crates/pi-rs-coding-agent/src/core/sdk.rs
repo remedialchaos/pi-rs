@@ -137,6 +137,15 @@ pub fn create_sdk_session(options: PiSdkOptions) -> Result<PiSdk> {
         stream_fn: Some(stream_fn),
         ..AgentOptions::default()
     })?;
+    if let Some(native) = extensions.native() {
+        agent.set_tools(
+            native
+                .extensions()
+                .iter()
+                .flat_map(|extension| extension.agent_tools())
+                .collect(),
+        );
+    }
     let session = AgentSession::new(AgentSessionConfig {
         agent,
         session_manager,
@@ -185,6 +194,118 @@ mod tests {
         };
         options.cwd = "/tmp/pi-sdk".to_string();
         Ok((options, faux))
+    }
+
+    #[tokio::test]
+    async fn session_executes_a_discovered_mcp_tool_on_a_faux_turn() -> TestResult {
+        use crate::core::{
+            event_bus::EventBus,
+            extensions::{runner::ExtensionRunner as NativeRunner, types::ExtensionHost},
+        };
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        struct Native(Arc<NativeRunner>);
+        impl ExtensionRunner for Native {
+            fn emit(&self, _: &Value) -> Value {
+                Value::Null
+            }
+            fn native(&self) -> Option<&Arc<NativeRunner>> {
+                Some(&self.0)
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let dir = tempfile::tempdir()?;
+        let config = json!({"mcpServers":{"demo":{"url":format!("http://{}/mcp",listener.local_addr()?),"exposure":"direct"}}});
+        std::fs::write(dir.path().join("mcp.json"), serde_json::to_vec(&config)?)?;
+        let url = config["mcpServers"]["demo"]["url"]
+            .as_str()
+            .ok_or("missing fixture URL")?;
+        std::fs::write(
+            dir.path().join("mcp-auth.json"),
+            serde_json::to_vec(
+                &json!({(url):{"serverUrl":url,"tokens":{"token_type":"Bearer","access_token":"offline-fixture"}}}),
+            )?,
+        )?;
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await?;
+                let mut reader = BufReader::new(socket);
+                let mut length = 0;
+                let mut authorized = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await? == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("authorization")
+                    {
+                        authorized = value.trim() == "Bearer offline-fixture";
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse()?;
+                    }
+                }
+                assert!(authorized, "MCP transport must send the saved OAuth token");
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).await?;
+                let request: Value = serde_json::from_slice(&bytes)?;
+                let method = request["method"].as_str().ok_or("Missing method")?;
+                let result = match method {
+                    "initialize" => {
+                        json!({"protocolVersion":pi_rs_mcp::LATEST_PROTOCOL_VERSION,"capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
+                    }
+                    "notifications/initialized" => {
+                        reader.get_mut().write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                        continue;
+                    }
+                    "tools/list" => {
+                        json!({"tools":[{"name":"echo","inputSchema":{"type":"object","properties":{}}}]})
+                    }
+                    "tools/call" => {
+                        assert_eq!(request["params"]["name"], "echo");
+                        json!({"content":[{"type":"text","text":"from the MCP server"}]})
+                    }
+                    _ => return Err(format!("Unexpected method {method}").into()),
+                };
+                let response =
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
+                reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}", response.len()).as_bytes()).await?;
+                if method == "tools/call" {
+                    return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+                }
+            }
+        });
+        let bus = Arc::new(EventBus::new());
+        let runner = Arc::new(NativeRunner::new(
+            Vec::new(),
+            Arc::new(ExtensionHost::new(bus.clone())),
+            bus,
+            dir.path().to_string_lossy(),
+        ));
+        let factory = crate::extensions::headless::factory("builtin:mcp", dir.path(), false)
+            .ok_or("Missing MCP extension")?;
+        let loaded = runner.load_extensions(&[factory]).await;
+        assert!(loaded.errors.is_empty());
+        let (mut opts, faux) = options()?;
+        opts.extensions = Some(Arc::new(Native(runner.clone())));
+        let mut call = faux_assistant_message(vec![pi_rs_ai::faux::faux_tool_call(
+            "mcp__demo__echo",
+            Default::default(),
+            None,
+        )]);
+        call.stop_reason = StopReason::ToolUse;
+        faux.set_responses([call.into(), answer("done")]);
+        let sdk = create_sdk_session(opts)?;
+        sdk.prompt("echo", Default::default()).await?;
+        let delivered = sdk.session().messages().into_iter().any(|msg| matches!(msg, pi_rs_agent::AgentMessage::ToolResult(result) if !result.is_error && matches!(result.content.first(),Some(pi_rs_ai::InputContent::Text(text)) if text.text == "from the MCP server")));
+        assert!(delivered);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
+        runner.invalidate();
+        Ok(())
     }
 
     fn answer(text: &str) -> FauxStep {

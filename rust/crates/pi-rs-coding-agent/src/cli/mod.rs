@@ -11,6 +11,7 @@ pub mod credential_print;
 pub mod file_processor;
 pub mod initial_message;
 pub mod list_models;
+pub mod mcp;
 pub mod project_trust;
 pub mod session_picker;
 pub mod setup;

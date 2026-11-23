@@ -244,7 +244,7 @@ pub(super) fn ensure_file_exists(path: &Path) -> Result<(), String> {
     }
 }
 
-fn write_file(path: &Path, content: &str) -> Result<(), String> {
+pub(super) fn write_file(path: &Path, content: &str) -> Result<(), String> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).truncate(true).create(true);
     #[cfg(unix)]

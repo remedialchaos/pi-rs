@@ -152,6 +152,7 @@ impl Host {
                     }
                     dependency.wait(&context).await?;
                 }
+                let data_load = host.0.host_data.read().await;
                 if let Some(store) = &host.0.options.store
                     && !declaration.recorded.tables.is_empty()
                 {
@@ -167,6 +168,7 @@ impl Host {
                         .await?;
                 }
                 attempt.activate(&context).await?;
+                drop(data_load);
                 for opener in std::mem::take(&mut declaration.openers) {
                     context
                         .await_with(opener(opening.clone()))
@@ -554,6 +556,10 @@ impl Host {
             state.objects.values().cloned().collect::<Vec<_>>()
         };
         self.0.cancel.cancel("host closed");
+        if let Some(http) = self.0.http.last_good() {
+            http.retire_missing(None);
+        }
+        self.0.http.close();
         let links = std::mem::take(&mut lock(&self.0.state).links);
         for link in links {
             link.close();

@@ -17,9 +17,15 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
+mod facet;
+pub use facet::{files_contract, files_folder_contract};
 const OWNER: &str = "chord.app.files";
 const CHUNK: usize = 4 * 1024 * 1024;
+const FOLDER_VIEW: usize = 500;
+const UPLOAD_IDLE: Duration = Duration::from_secs(3600);
+const UPLOAD_SWEEP: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FileInfo {
     pub id: String,
@@ -112,7 +118,7 @@ struct Upload {
     write: FileWrite,
     path: PathBuf,
     size: u64,
-    touched: u64,
+    touched: tokio::time::Instant,
 }
 struct Inner {
     store: StoreEngine,
@@ -123,6 +129,28 @@ struct Inner {
     line: tokio::sync::Mutex<()>,
     uploads: Mutex<BTreeMap<String, Upload>>,
     views: Mutex<BTreeMap<String, (String, String, Source)>>,
+    summary: Source,
+    sweep: Mutex<Option<tokio::task::AbortHandle>>,
+}
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .sweep
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+        for upload in self
+            .uploads
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            let _ = std::fs::remove_file(&upload.path);
+        }
+    }
 }
 #[derive(Clone)]
 pub struct Files(Arc<Inner>);
@@ -379,7 +407,8 @@ impl Files {
                 std::fs::remove_file(entry.path())?;
             }
         }
-        Ok(Self(Arc::new(Inner {
+        let summary = Source::new(store.batch(), Self::summaries(&index)?)?;
+        let files = Self(Arc::new(Inner {
             store,
             dir,
             caps,
@@ -388,7 +417,22 @@ impl Files {
             line: tokio::sync::Mutex::new(()),
             uploads: Mutex::new(BTreeMap::new()),
             views: Mutex::new(BTreeMap::new()),
-        })))
+            summary,
+            sweep: Mutex::new(None),
+        }));
+        let weak = Arc::downgrade(&files.0);
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + UPLOAD_SWEEP, UPLOAD_SWEEP);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let sweep = tokio::spawn(async move {
+            loop {
+                interval.tick().await;
+                let Some(inner) = weak.upgrade() else { break };
+                let _ = Self(inner).expire_uploads(UPLOAD_IDLE.as_secs());
+            }
+        });
+        *files.0.sweep.lock().unwrap_or_else(|e| e.into_inner()) = Some(sweep.abort_handle());
+        Ok(files)
     }
     pub fn directory(&self) -> &Path {
         &self.0.dir
@@ -547,7 +591,10 @@ impl Files {
             });
         }
         self.0.store.commit(writes).await?;
+        let summary = Self::summaries(&next)?;
         *self.0.index.lock().unwrap_or_else(|e| e.into_inner()) = next;
+        let context = Context::background();
+        self.0.summary.set(summary, &context)?;
         for id in old_blobs.keys().filter(|id| !blobs.contains_key(*id)) {
             match std::fs::remove_file(self.0.dir.join("blobs").join(id)) {
                 Ok(()) => {}
@@ -564,10 +611,7 @@ impl Files {
             .cloned()
             .collect::<Vec<_>>();
         for (space, folder, source) in views {
-            source.set(
-                JsonValue::from_serde(json!({"entries":self.list(&space,&folder)?,"more":false})),
-                &Context::background(),
-            )?;
+            source.set(self.listing(&space, &folder)?, &context)?;
         }
         Ok(())
     }
@@ -715,30 +759,51 @@ impl Files {
     }
     pub fn summary(&self, space: &str) -> Result<SpaceSummary> {
         check_space(space)?;
-        let index = self.snapshot();
-        let mut newest = index
-            .files
-            .values()
-            .filter(|r| r.info.space == space)
-            .map(|r| r.info.clone())
-            .collect::<Vec<_>>();
+        let index = self.0.index.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(Self::summarize(
+            index
+                .files
+                .values()
+                .filter(|r| r.info.space == space)
+                .map(|r| &r.info)
+                .collect(),
+        ))
+    }
+    fn summaries(index: &Index) -> Result<JsonValue> {
+        let mut spaces = BTreeMap::<&str, Vec<&FileInfo>>::new();
+        for record in index.files.values() {
+            spaces
+                .entry(&record.info.space)
+                .or_default()
+                .push(&record.info);
+        }
+        let summaries = spaces
+            .into_iter()
+            .map(|(space, files)| (space, Self::summarize(files)))
+            .collect::<BTreeMap<_, _>>();
+        Ok(JsonValue::from_serde(serde_json::to_value(summaries)?))
+    }
+    fn summarize(mut newest: Vec<&FileInfo>) -> SpaceSummary {
         let versions = newest.len();
         let bytes = newest.iter().map(|f| f.size).sum();
         let files = newest
             .iter()
-            .map(|f| f.path.clone())
+            .map(|f| &f.path)
             .collect::<std::collections::BTreeSet<_>>()
             .len();
         newest.sort_by_key(|f| std::cmp::Reverse(f.created));
         newest.truncate(20);
-        Ok(SpaceSummary {
+        SpaceSummary {
             files,
             versions,
             bytes,
-            newest,
-        })
+            newest: newest.into_iter().cloned().collect(),
+        }
     }
     pub async fn mkdir(&self, space: &str, path: &str) -> Result<()> {
+        self.make_folder(space, path).await.map(drop)
+    }
+    async fn make_folder(&self, space: &str, path: &str) -> Result<FolderInfo> {
         check_space(space)?;
         check_path(path)?;
         let _line = self.0.line.lock().await;
@@ -762,7 +827,13 @@ impl Files {
                 });
             folder = parent(folder);
         }
-        self.commit(&before, next).await
+        let info = next
+            .folders
+            .get(&(space.into(), path.into()))
+            .cloned()
+            .ok_or_else(|| Error::Invalid("folder not found".into()))?;
+        self.commit(&before, next).await?;
+        Ok(info)
     }
     pub async fn copy(&self, id: &str, write: FileWrite) -> Result<FileInfo> {
         check_write(&write)?;
@@ -849,6 +920,24 @@ impl Files {
         }
         self.commit(&before, next).await
     }
+    async fn remove_id(&self, id: &str) -> Result<()> {
+        let _line = self.0.line.lock().await;
+        let before = self.snapshot();
+        let mut next = before.clone();
+        if next.files.remove(id).is_some() {
+            self.commit(&before, next).await?;
+        }
+        Ok(())
+    }
+    async fn remove_space(&self, space: &str) -> Result<()> {
+        check_space(space)?;
+        let _line = self.0.line.lock().await;
+        let before = self.snapshot();
+        let mut next = before.clone();
+        next.files.retain(|_, record| record.info.space != space);
+        next.folders.retain(|(s, _), _| s != space);
+        self.commit(&before, next).await
+    }
     pub fn begin(&self, write: FileWrite) -> Result<String> {
         check_write(&write)?;
         let mut uploads = self.0.uploads.lock().unwrap_or_else(|e| e.into_inner());
@@ -869,7 +958,7 @@ impl Files {
                 write,
                 path,
                 size: 0,
-                touched: crate::node::http::now_seconds(),
+                touched: tokio::time::Instant::now(),
             },
         );
         Ok(id)
@@ -903,7 +992,7 @@ impl Files {
         file.write_all(bytes)?;
         file.sync_data()?;
         upload.size += bytes.len() as u64;
-        upload.touched = crate::node::http::now_seconds();
+        upload.touched = tokio::time::Instant::now();
         Ok(upload.size)
     }
     pub async fn finish(&self, id: &str) -> Result<FileInfo> {
@@ -957,30 +1046,49 @@ impl Files {
         Ok(())
     }
     pub fn expire_uploads(&self, idle_seconds: u64) -> Result<usize> {
-        let now = crate::node::http::now_seconds();
-        let expired = self
-            .0
-            .uploads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|(_, u)| now.saturating_sub(u.touched) >= idle_seconds)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in &expired {
-            self.cancel(id)?;
-        }
-        Ok(expired.len())
+        let mut uploads = self.0.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        let mut count = 0;
+        let mut error = None;
+        uploads.retain(|_, upload| {
+            if upload.touched.elapsed() < Duration::from_secs(idle_seconds) {
+                return true;
+            }
+            match std::fs::remove_file(&upload.path) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => {
+                    error = Some(e);
+                    return true;
+                }
+            }
+            count += 1;
+            false
+        });
+        error.map_or(Ok(count), |e| Err(e.into()))
+    }
+    fn listing(&self, space: &str, path: &str) -> Result<JsonValue> {
+        let mut entries = self.list(space, path)?;
+        let more = entries.len() > FOLDER_VIEW;
+        entries.truncate(FOLDER_VIEW);
+        Ok(JsonValue::from_serde(
+            json!({"entries":entries,"more":more}),
+        ))
     }
     pub fn folder(&self, space: &str, path: &str) -> Result<FilesFolder> {
-        let value = JsonValue::from_serde(json!({"entries":self.list(space,path)?,"more":false}));
-        let source = Source::new(self.0.store.batch(), value)?;
+        let source = Source::new(self.0.store.batch(), JsonValue::Null)?;
+        self.watch_folder(space, path, source, &Context::background())
+    }
+    fn watch_folder(
+        &self,
+        space: &str,
+        path: &str,
+        source: Source,
+        ctx: &Context,
+    ) -> Result<FilesFolder> {
+        let mut views = self.0.views.lock().unwrap_or_else(|e| e.into_inner());
+        source.set(self.listing(space, path)?, ctx)?;
         let id = new_token(12);
-        self.0
-            .views
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), (space.into(), path.into(), source.clone()));
+        views.insert(id.clone(), (space.into(), path.into(), source.clone()));
         Ok(FilesFolder {
             files: self.clone(),
             id,

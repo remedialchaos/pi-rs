@@ -98,6 +98,84 @@ struct Inner {
 #[derive(Clone)]
 pub struct Documents(Arc<Inner>);
 impl Documents {
+    pub(crate) async fn lock_host_data(&self) -> Result<LineLease> {
+        self.0.line.acquire().await
+    }
+
+    pub(crate) fn prepare_host_data(
+        &self,
+        connection: &rusqlite::Connection,
+        address: &crate::contracts::Address,
+    ) -> Result<Vec<crate::store::HostDataAdoption>> {
+        let mut changes: Vec<crate::store::HostDataAdoption> = Vec::new();
+        let Some(store) = &self.0.store else {
+            return Ok(changes);
+        };
+        let slots = lock(&self.0.state)
+            .slots
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for slot in slots {
+            let (name, prior, pin) = {
+                let state = lock(&slot.state);
+                if !state.hydrated
+                    || !state.definition.persist
+                    || !matches!(&state.definition.keyed, KeyedBy::Host(host) if host.kind == address.kind)
+                {
+                    continue;
+                }
+                let prior = state
+                    .residents
+                    .get(&address.key)
+                    .and_then(|r| r.stored.clone());
+                let pin = state.pins.get(&address.key).and_then(Weak::upgrade);
+                if prior.is_none() && pin.is_none() {
+                    continue;
+                }
+                (state.definition.name.clone(), prior, pin)
+            };
+            let loaded = store.read_in(connection, &name, &address.key, true)?;
+            if loaded.as_ref().map(|r| &r.stored) == prior.as_ref() {
+                continue;
+            }
+            let retired = loaded.is_none();
+            let resident = match loaded.map(|r| slot.decode(r)).transpose() {
+                Ok(resident) => resident,
+                Err(error) => {
+                    let owner = self.clone();
+                    changes.push(Box::new(move |_| {
+                        owner.fail(&error);
+                        Ok(())
+                    }));
+                    break;
+                }
+            };
+            let key = address.key.clone();
+            changes.push(Box::new(move |context| {
+                let mut state = lock(&slot.state);
+                let value = if let Some(resident) = resident {
+                    let value = resident.tracker.value();
+                    state.residents.insert(key.clone(), resident);
+                    Some(value)
+                } else {
+                    state.residents.shift_remove(&key);
+                    pin.as_ref().map(|pin| lock(&pin.initial).clone())
+                };
+                drop(state);
+                if let (Some(pin), Some(value)) = (pin, value) {
+                    pin.source.address_revision(
+                        value.clone(),
+                        vec![Op::Replace(value.to_json())],
+                        retired,
+                        context,
+                    )?;
+                }
+                Ok(())
+            }));
+        }
+        Ok(changes)
+    }
     pub fn new(
         label: impl Into<String>,
         batch: Batch,

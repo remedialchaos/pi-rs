@@ -63,6 +63,7 @@ impl Host {
                 }
                 let mut setup = FacetHost {
                     plugin: facet.name.clone(),
+                    http: None,
                     host: self.clone(),
                     types: IndexMap::new(),
                     registries: IndexMap::new(),
@@ -95,6 +96,7 @@ impl Host {
                             facet.name.clone(),
                             Plugin {
                                 facet: facet.facet.clone(),
+                                http: setup.http,
                                 types: setup.types,
                                 registries: setup.registries,
                                 contributions: setup.contributions,
@@ -258,6 +260,23 @@ impl Host {
                 } else {
                     record.unserve(&Context::background())?;
                 }
+            }
+            let previous_http = host.0.http.last_good();
+            host.0.http.replace(
+                crate::node::http::registry_provider(),
+                plugins
+                    .iter()
+                    .filter_map(|(owner, plugin)| {
+                        plugin
+                            .http
+                            .clone()
+                            .map(|http| (crate::registries::Contributor::facet(owner), 1, http))
+                    })
+                    .collect(),
+                &Context::background(),
+            )?;
+            if let Some(previous) = previous_http {
+                previous.retire_missing(host.0.http.last_good().as_ref());
             }
             for object in active {
                 let mut state = lock(&object.state);

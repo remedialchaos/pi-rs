@@ -5,7 +5,12 @@ use crate::{
     store::StoreEngine,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, io::Read, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::{self, BufReader, BufWriter, Read, Write},
+    path::{Path, PathBuf},
+};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TarEntry {
     pub path: String,
@@ -27,37 +32,44 @@ pub fn write_tar(entries: &[TarEntry]) -> Result<Vec<u8>> {
         if !seen.insert(&entry.path) {
             return Err(Error::Invalid("duplicate tar path".into()));
         }
-        let mut header = [0; 512];
-        let (prefix, name) = if entry.path.len() > 100 {
-            let (prefix, name) = entry
-                .path
-                .rsplit_once('/')
-                .ok_or_else(|| Error::Invalid("tar path too long".into()))?;
-            if prefix.len() > 155 || name.len() > 100 {
-                return Err(Error::Invalid("tar path too long".into()));
-            }
-            (prefix, name)
-        } else {
-            ("", entry.path.as_str())
-        };
-        field(&mut header, 0, 100, name)?;
-        field(&mut header, 100, 8, "0000644")?;
-        field(&mut header, 108, 8, "0000000")?;
-        field(&mut header, 116, 8, "0000000")?;
-        field(&mut header, 124, 12, &format!("{:011o}", entry.bytes.len()))?;
-        field(&mut header, 136, 12, "00000000000")?;
-        header[148..156].fill(b' ');
-        header[156] = if entry.directory { b'5' } else { b'0' };
-        field(&mut header, 257, 8, "ustar\x0000")?;
-        field(&mut header, 345, 155, prefix)?;
-        let sum = header.iter().map(|b| u64::from(*b)).sum::<u64>();
-        field(&mut header, 148, 8, &format!("{sum:06o}\0 "))?;
-        tar.extend_from_slice(&header);
+        tar.extend_from_slice(&tar_header(
+            &entry.path,
+            entry.bytes.len() as u64,
+            entry.directory,
+        )?);
         tar.extend_from_slice(&entry.bytes);
         tar.resize(tar.len().next_multiple_of(512), 0);
     }
     tar.resize(tar.len() + 1024, 0);
     Ok(tar)
+}
+fn tar_header(path: &str, size: u64, directory: bool) -> Result<[u8; 512]> {
+    safe_relative(path)?;
+    let mut header = [0; 512];
+    let (prefix, name) = if path.len() > 100 {
+        let (prefix, name) = path
+            .rsplit_once('/')
+            .ok_or_else(|| Error::Invalid("tar path too long".into()))?;
+        if prefix.len() > 155 || name.len() > 100 {
+            return Err(Error::Invalid("tar path too long".into()));
+        }
+        (prefix, name)
+    } else {
+        ("", path)
+    };
+    field(&mut header, 0, 100, name)?;
+    field(&mut header, 100, 8, "0000644")?;
+    field(&mut header, 108, 8, "0000000")?;
+    field(&mut header, 116, 8, "0000000")?;
+    field(&mut header, 124, 11, &format!("{size:011o}"))?;
+    field(&mut header, 136, 12, "00000000000")?;
+    header[148..156].fill(b' ');
+    header[156] = if directory { b'5' } else { b'0' };
+    field(&mut header, 257, 8, "ustar\x0000")?;
+    field(&mut header, 345, 155, prefix)?;
+    let sum = header.iter().map(|b| u64::from(*b)).sum::<u64>();
+    field(&mut header, 148, 8, &format!("{sum:06o}\0 "))?;
+    Ok(header)
 }
 fn text(field: &[u8]) -> Result<&str> {
     std::str::from_utf8(field.split(|b| *b == 0).next().unwrap_or_default())
@@ -103,47 +115,11 @@ pub fn read_tar(bytes: &[u8], limits: ArchiveLimits) -> Result<Vec<TarEntry>> {
             }
             return Ok(entries);
         }
-        let expected = octal(&header[148..156])?;
-        let actual = header
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                if (148..156).contains(&i) {
-                    32
-                } else {
-                    u64::from(*b)
-                }
-            })
-            .sum::<u64>();
-        if expected != actual {
-            return Err(Error::Invalid("tar checksum mismatch".into()));
+        let (path, size, directory) = parse_header(header)?;
+        if !seen.insert(path.clone()) {
+            return Err(Error::Invalid("duplicate tar path".into()));
         }
-        if &header[257..263] != b"ustar\0" {
-            return Err(Error::Invalid("not a ustar archive".into()));
-        }
-        let name = text(&header[..100])?;
-        let prefix = text(&header[345..500])?;
-        let path = if prefix.is_empty() {
-            name.into()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        safe_relative(&path)?;
-        if path.len() > 255 || !seen.insert(path.clone()) {
-            return Err(Error::Invalid("invalid or duplicate tar path".into()));
-        }
-        let size = octal(&header[124..136])?;
-        total = total
-            .checked_add(size)
-            .ok_or_else(|| Error::Invalid("tar size overflow".into()))?;
-        if total > limits.bytes || entries.len() >= limits.entries {
-            return Err(Error::Invalid("archive limit exceeded".into()));
-        }
-        let directory = match header[156] {
-            0 | b'0' => false,
-            b'5' if size == 0 => true,
-            _ => return Err(Error::Invalid("tar special file refused".into())),
-        };
+        charge(&mut total, size, entries.len(), limits)?;
         let length = usize::try_from(size)
             .map_err(|_| Error::Invalid("tar entry exceeds address space".into()))?;
         let end = at
@@ -158,9 +134,59 @@ pub fn read_tar(bytes: &[u8], limits: ArchiveLimits) -> Result<Vec<TarEntry>> {
             directory,
         });
         at = end
-            .checked_add((512 - length % 512) % 512)
+            .checked_add(padding(size))
             .ok_or_else(|| Error::Invalid("tar offset overflow".into()))?;
     }
+}
+fn padding(size: u64) -> usize {
+    ((512 - size % 512) % 512) as usize
+}
+fn charge(total: &mut u64, size: u64, entries: usize, limits: ArchiveLimits) -> Result<()> {
+    *total = total
+        .checked_add(size)
+        .ok_or_else(|| Error::Invalid("tar size overflow".into()))?;
+    if *total > limits.bytes || entries >= limits.entries {
+        return Err(Error::Invalid("archive limit exceeded".into()));
+    }
+    Ok(())
+}
+fn parse_header(header: &[u8]) -> Result<(String, u64, bool)> {
+    let expected = octal(&header[148..156])?;
+    let actual = header
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if (148..156).contains(&i) {
+                32
+            } else {
+                u64::from(*b)
+            }
+        })
+        .sum::<u64>();
+    if expected != actual {
+        return Err(Error::Invalid("tar checksum mismatch".into()));
+    }
+    if &header[257..263] != b"ustar\0" {
+        return Err(Error::Invalid("not a ustar archive".into()));
+    }
+    let name = text(&header[..100])?;
+    let prefix = text(&header[345..500])?;
+    let path = if prefix.is_empty() {
+        name.into()
+    } else {
+        format!("{prefix}/{name}")
+    };
+    safe_relative(&path)?;
+    if path.len() > 255 {
+        return Err(Error::Invalid("tar path too long".into()));
+    }
+    let size = octal(&header[124..136])?;
+    let directory = match header[156] {
+        0 | b'0' => false,
+        b'5' if size == 0 => true,
+        _ => return Err(Error::Invalid("tar special file refused".into())),
+    };
+    Ok((path, size, directory))
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -175,6 +201,295 @@ pub struct ArchiveManifest {
 pub struct ArchiveAddress {
     pub kind: String,
     pub key: String,
+}
+
+const MANIFEST_LIMIT: u64 = 64 * 1024;
+
+struct Staging(Option<PathBuf>);
+
+impl Staging {
+    fn create(path: &Path) -> Result<Self> {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path)?;
+        Ok(Self(Some(path.to_owned())))
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn new_private_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+
+fn copy_entry(input: &mut impl Read, output: &mut impl Write, size: u64) -> Result<()> {
+    if io::copy(&mut input.take(size), output)? != size {
+        return Err(Error::Invalid("truncated tar body".into()));
+    }
+    Ok(())
+}
+
+fn write_entry(output: &mut impl Write, name: &str, size: u64, mut input: impl Read) -> Result<()> {
+    output.write_all(&tar_header(name, size, false)?)?;
+    copy_entry(&mut input, output, size)?;
+    output.write_all(&[0; 512][..padding(size)])?;
+    Ok(())
+}
+
+fn write_file_entry(output: &mut impl Write, name: &str, file: File) -> Result<()> {
+    let info = file.metadata()?;
+    if !info.is_file() {
+        return Err(Error::Invalid("archive input is not a regular file".into()));
+    }
+    write_entry(output, name, info.len(), BufReader::new(file))
+}
+
+fn write_blobs(output: &mut impl Write, root: &Path, relative: &str) -> Result<()> {
+    let path = root.join(relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() {
+        return Err(Error::Invalid(
+            "archive blob directory is not a directory".into(),
+        ));
+    }
+    let children = match fs::read_dir(&path) {
+        Ok(children) => children,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut children = children.collect::<io::Result<Vec<_>>>()?;
+    children.sort_by_key(|child| child.file_name());
+    for child in children {
+        let name = child.file_name();
+        if name.as_encoded_bytes().starts_with(b".") {
+            continue;
+        }
+        let name = name
+            .to_str()
+            .ok_or_else(|| Error::Invalid("non UTF-8 blob name".into()))?;
+        let inside = if relative.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{relative}/{name}")
+        };
+        let entry = format!("files/{inside}");
+        safe_relative(&entry)?;
+        if entry.len() > 255 {
+            return Err(Error::Invalid("tar path too long".into()));
+        }
+        let kind = match child.file_type() {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if kind.is_symlink() {
+            return Err(Error::Invalid("archive files contain a symlink".into()));
+        }
+        if kind.is_dir() {
+            write_blobs(output, root, &inside)?;
+        } else if kind.is_file() {
+            match File::open(child.path()) {
+                Ok(file) => write_file_entry(output, &entry, file)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write format 2 to a private sibling temporary file and rename it over `target`.
+/// The store snapshot is spooled to disk because ustar needs its size before its body.
+pub async fn pack_data_to(
+    manifest: ArchiveManifest,
+    store: &StoreEngine,
+    files: &Path,
+    server_archive: &Path,
+    target: &Path,
+) -> Result<()> {
+    if manifest.format != 2 {
+        return Err(Error::Invalid("unsupported archive format".into()));
+    }
+    let manifest = serde_json::to_vec(&manifest)?;
+    if manifest.len() as u64 > MANIFEST_LIMIT {
+        return Err(Error::Invalid("archive manifest too large".into()));
+    }
+    let (_, body) = store.export_stream().await?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::Invalid("archive target has no parent".into()))?;
+    let scratch = parent.join(format!(".chord-export-{}", uuid::Uuid::new_v4()));
+    let (files, server_archive) = (files.to_owned(), server_archive.to_owned());
+    let (archive, _cleanup) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let cleanup = Staging::create(&scratch)?;
+        let raw = scratch.join("store.archive");
+        let mut snapshot = new_private_file(&raw)?;
+        let mut decoder = flate2::read::GzDecoder::new(body.reader());
+        io::copy(&mut decoder, &mut snapshot)?;
+        // Observe terminal errors from the store actor even after the gzip trailer.
+        io::copy(&mut decoder.into_inner(), &mut io::sink())?;
+        drop(snapshot);
+        let archive = scratch.join("archive.tar");
+        let mut output = BufWriter::new(new_private_file(&archive)?);
+        write_entry(
+            &mut output,
+            "manifest.json",
+            manifest.len() as u64,
+            manifest.as_slice(),
+        )?;
+        write_file_entry(&mut output, "store.archive", File::open(raw)?)?;
+        write_file_entry(&mut output, "server.archive", File::open(server_archive)?)?;
+        write_blobs(&mut output, &files, "")?;
+        output.write_all(&[0; 1024])?;
+        output.flush()?;
+        drop(output);
+        Ok((archive, cleanup))
+    })
+    .await
+    .map_err(io::Error::other)??;
+    fs::rename(archive, target)?;
+    Ok(())
+}
+
+fn extract_entries(
+    path: &Path,
+    app: &str,
+    target_kind: &str,
+    staging: &Path,
+    limits: ArchiveLimits,
+) -> Result<(ArchiveManifest, File, Staging)> {
+    let mut input = BufReader::new(File::open(path)?);
+    let mut header = [0; 512];
+    input.read_exact(&mut header)?;
+    let (name, size, directory) = parse_header(&header)?;
+    if name != "manifest.json" || directory || size > MANIFEST_LIMIT {
+        return Err(Error::Invalid(
+            "archive must start with a bounded manifest.json".into(),
+        ));
+    }
+    let mut total = 0;
+    charge(&mut total, size, 0, limits)?;
+    let mut bytes = Vec::new();
+    copy_entry(&mut input, &mut bytes, size)?;
+    let manifest: ArchiveManifest = serde_json::from_slice(&bytes)?;
+    if manifest.format != 2 || manifest.app != app || manifest.address.kind != target_kind {
+        return Err(Error::Invalid(
+            "archive manifest does not match target".into(),
+        ));
+    }
+    input.read_exact(&mut header[..padding(size)])?;
+
+    let cleanup = Staging::create(staging)?;
+    let mut seen = BTreeSet::from([name]);
+    let mut store = None;
+    loop {
+        input.read_exact(&mut header)?;
+        if header == [0; 512] {
+            input.read_exact(&mut header)?;
+            if header != [0; 512] {
+                return Err(Error::Invalid("invalid tar end".into()));
+            }
+            let mut tail = [0; 8192];
+            loop {
+                let n = input.read(&mut tail)?;
+                if tail[..n].iter().any(|&byte| byte != 0) {
+                    return Err(Error::Invalid("invalid tar end".into()));
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            break;
+        }
+        let (name, size, directory) = parse_header(&header)?;
+        charge(&mut total, size, seen.len(), limits)?;
+        if !seen.insert(name.clone()) {
+            return Err(Error::Invalid("duplicate tar path".into()));
+        }
+        let dest = staging.join(&name);
+        match (name.as_str(), directory) {
+            ("store.archive", false) => {
+                // Reuse the streaming gzip store importer without ever holding the JSONL in memory.
+                let gzip = staging.join(".store.archive.gz");
+                let mut output = flate2::write::GzEncoder::new(
+                    new_private_file(&gzip)?,
+                    flate2::Compression::fast(),
+                );
+                copy_entry(&mut input, &mut output, size)?;
+                output.finish()?;
+                store = Some(File::open(gzip)?);
+            }
+            ("files", true) => private_directory(&dest)?,
+            (name, true) if name.starts_with("files/") => private_directory(&dest)?,
+            (name, false) if name == "server.archive" || name.starts_with("files/") => {
+                if let Some(parent) = dest.parent() {
+                    private_directory(parent)?;
+                }
+                copy_entry(&mut input, &mut new_private_file(&dest)?, size)?;
+            }
+            _ => return Err(Error::Invalid("unexpected archive entry".into())),
+        }
+        input.read_exact(&mut header[..padding(size)])?;
+    }
+    let store = store.ok_or_else(|| Error::Invalid("archive has no store".into()))?;
+    if !seen.contains("server.archive") {
+        return Err(Error::Invalid("archive has no server part".into()));
+    }
+    Ok((manifest, store, cleanup))
+}
+
+/// Restore to a new private `staging` directory. Validate the app and address kind,
+/// but allow the caller to select a different destination key. The SQLite database
+/// is closed on return and `server.archive` remains for the caller to import.
+pub async fn unpack_staging_from(
+    path: &Path,
+    app: &str,
+    target_kind: &str,
+    staging: &Path,
+    limits: ArchiveLimits,
+) -> Result<ArchiveManifest> {
+    let (path, app, target_kind, stage) = (
+        path.to_owned(),
+        app.to_owned(),
+        target_kind.to_owned(),
+        staging.to_owned(),
+    );
+    let (manifest, reader, mut cleanup) = tokio::task::spawn_blocking(move || {
+        extract_entries(&path, &app, &target_kind, &stage, limits)
+    })
+    .await
+    .map_err(io::Error::other)??;
+    let path = staging.join("store.sqlite");
+    private_store(&path)?;
+    let db = SqliteDatabase::open(&path, Options::default()).await?;
+    let imported = StoreEngine::import_reader(db.clone(), BufReader::new(reader), true).await;
+    let closed = db.close().await;
+    imported?;
+    closed?;
+    fs::remove_file(staging.join(".store.archive.gz"))?;
+    cleanup.0 = None;
+    Ok(manifest)
 }
 pub async fn pack_data(
     manifest: ArchiveManifest,

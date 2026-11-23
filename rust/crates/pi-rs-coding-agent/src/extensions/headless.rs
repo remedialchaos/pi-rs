@@ -7,18 +7,12 @@ use std::{
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
-use pi_rs_mcp::{
-    McpClient, McpClientOptions, McpServerConfigOptions, McpServerConfigResult, McpTransport,
-    StdioTransport, StdioTransportOptions, StreamableHttpTransport, StreamableHttpTransportOptions,
-    validate_mcp_server_config,
-};
+use pi_rs_mcp::McpClient;
 use serde_json::Value;
 
-use crate::{
-    config::VERSION,
-    core::extensions::types::{
-        CommandDefinition, Extension, ExtensionFactory, ExtensionInitContext, ExtensionRegistration,
-    },
+use crate::core::extensions::types::{
+    CommandDefinition, Extension, ExtensionFactory, ExtensionInitContext, ExtensionRegistration,
+    ExtensionToolContext, ToolDefinition, ToolExposure, ToolOutcome,
 };
 
 pub(crate) const COMMANDS: &[&str] = &["builtin:llama.cpp", "builtin:mcp"];
@@ -38,6 +32,8 @@ pub(crate) fn factory(
     };
     Some(Arc::new(move || {
         Ok(Box::new(HeadlessExtension {
+            tools: IndexMap::new(),
+            clients: Vec::new(),
             registration: ExtensionRegistration::new(command.path()),
             command: command.clone(),
         }))
@@ -62,19 +58,141 @@ impl Command {
     }
 }
 
+struct McpAgentTool {
+    declaration: pi_rs_ai::Tool,
+    label: String,
+    client: McpClient,
+    remote: String,
+}
+
+impl pi_rs_agent::AgentTool for McpAgentTool {
+    fn declaration(&self) -> &pi_rs_ai::Tool {
+        &self.declaration
+    }
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        args: &'a Value,
+        signal: &'a pi_rs_agent::CancellationToken,
+        _update: pi_rs_agent::AgentToolUpdateCallback,
+    ) -> futures_util::future::BoxFuture<'a, pi_rs_agent::Result<pi_rs_agent::AgentToolResult>>
+    {
+        Box::pin(async move {
+            use pi_rs_agent::AgentError;
+            let controller = pi_rs_mcp::AbortController::new();
+            let options = pi_rs_mcp::McpRequestOptions {
+                signal: Some(controller.signal()),
+                ..Default::default()
+            };
+            let call = self
+                .client
+                .call_tool(&self.remote, Some(args.clone()), &options);
+            tokio::pin!(call);
+            let reply = tokio::select! {
+                reply = &mut call => reply,
+                () = signal.cancelled() => {controller.abort(None); call.await}
+            }
+            .map_err(|e| AgentError::Callback(e.to_string()))?;
+            let blocks =
+                pi_rs_mcp::to_mcp_model_content(&self.declaration.name, &reply, Default::default())
+                    .await;
+            let content = blocks
+                .into_iter()
+                .map(|block| match block {
+                    pi_rs_mcp::LlmContent::Text { text } => {
+                        pi_rs_ai::InputContent::Text(text.into())
+                    }
+                    pi_rs_mcp::LlmContent::Image { data, mime_type } => {
+                        pi_rs_ai::InputContent::Image(pi_rs_ai::ImageContent {
+                            kind: Default::default(),
+                            data,
+                            mime_type,
+                        })
+                    }
+                })
+                .collect();
+            Ok(pi_rs_agent::AgentToolResult {
+                content,
+                structured_content: reply.structured_content,
+                is_error: reply.is_error,
+                ..Default::default()
+            })
+        })
+    }
+}
+
 struct HeadlessExtension {
+    tools: IndexMap<String, (McpClient, String)>,
+    clients: Vec<McpClient>,
     command: Command,
     registration: ExtensionRegistration,
 }
 
 #[async_trait]
 impl Extension for HeadlessExtension {
+    fn agent_tools(&self) -> Vec<Arc<dyn pi_rs_agent::AgentTool>> {
+        self.registration
+            .tools
+            .values()
+            .filter(|def| matches!(def.exposure, ToolExposure::Direct | ToolExposure::ModelOnly))
+            .filter_map(|def| {
+                let (client, remote) = self.tools.get(&def.name)?;
+                Some(Arc::new(McpAgentTool {
+                    declaration: pi_rs_ai::Tool {
+                        name: def.name.clone(),
+                        description: def.description.clone(),
+                        parameters: def.parameters.clone(),
+                        constrained_sampling: None,
+                    },
+                    label: def.label.clone(),
+                    client: client.clone(),
+                    remote: remote.clone(),
+                }) as Arc<dyn pi_rs_agent::AgentTool>)
+            })
+            .collect()
+    }
+
     fn name(&self) -> &str {
         self.command.path()
     }
     fn replaceable(&self) -> bool {
         matches!(self.command, Command::Mcp { .. })
     }
+    fn invalidate(&self) {
+        for client in &self.clients {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client.close().await;
+            });
+        }
+    }
+
+    async fn execute_tool(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &ExtensionToolContext,
+    ) -> Result<ToolOutcome, String> {
+        let (client, remote) = self
+            .tools
+            .get(name)
+            .ok_or_else(|| format!("Unknown MCP tool {name}"))?;
+        let reply = client
+            .call_tool(remote, Some(args.clone()), &Default::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        let failed = reply.is_error.unwrap_or(false);
+        let mut outcome = ToolOutcome::success(
+            serde_json::json!({"type":"toolCall","id":ctx.tool_call_id,"name":name,"arguments":args}),
+            serde_json::to_value(reply).map_err(|e| e.to_string())?,
+        );
+        outcome.is_error = failed;
+        Ok(outcome)
+    }
+
     fn hidden(&self) -> bool {
         self.replaceable()
     }
@@ -86,6 +204,47 @@ impl Extension for HeadlessExtension {
     }
 
     async fn init(&mut self, context: &mut ExtensionInitContext<'_>) -> Result<(), String> {
+        if let Command::Mcp {
+            agent_dir,
+            project_trusted,
+        } = &self.command
+        {
+            let cwd = Path::new(context.cwd);
+            let loaded = crate::cli::mcp::load_config(agent_dir, cwd, *project_trusted);
+            for (name, config) in loaded.servers {
+                if config["enabled"] == false {
+                    continue;
+                }
+                let Ok((client, tools)) =
+                    crate::cli::mcp::discover(agent_dir, &name, &config, cwd).await
+                else {
+                    continue;
+                };
+                for tool in tools {
+                    let local = pi_rs_mcp::create_mcp_tool_name(&name, &tool.name, |key| {
+                        self.tools.contains_key(key)
+                    });
+                    let schema = pi_rs_mcp::normalize_mcp_input_schema(&tool.input_schema)
+                        .map_err(|e| e.to_string())?;
+                    let mut definition = ToolDefinition::new(local.clone(), schema);
+                    definition.description = tool.description().unwrap_or_default().to_owned();
+                    definition.label = tool.title().unwrap_or(&tool.name).to_owned();
+                    definition.exposure = match config["toolExposure"]
+                        .get(&tool.name)
+                        .or_else(|| config.get("exposure"))
+                        .and_then(Value::as_str)
+                    {
+                        Some("direct") => ToolExposure::Direct,
+                        Some("deferred") => ToolExposure::Deferred,
+                        Some("hidden") => ToolExposure::Hidden,
+                        _ => ToolExposure::Codemode,
+                    };
+                    context.register_tool(definition)?;
+                    self.tools.insert(local, (client.clone(), tool.name));
+                }
+                self.clients.push(client);
+            }
+        }
         let (name, description) = match self.command {
             Command::Llama => ("llama", "Manage llama.cpp router models"),
             Command::Mcp { .. } => (
@@ -111,7 +270,8 @@ impl Extension for HeadlessExtension {
                         } => {
                             let cwd = PathBuf::from(&context.base.cwd);
                             let (message, kind) =
-                                mcp_command(&agent_dir, &cwd, project_trusted, &args).await;
+                                mcp_command(&agent_dir, &cwd, project_trusted, &args, &context)
+                                    .await;
                             context.base.ui.notify(message, kind);
                         }
                     }
@@ -127,6 +287,7 @@ async fn mcp_command(
     cwd: &Path,
     project_trusted: bool,
     args: &str,
+    context: &crate::core::extensions::types::ExtensionCommandContext,
 ) -> (String, &'static str) {
     const USAGE: &str =
         "Usage: /mcp, /mcp login [server], /mcp logout [server], /mcp reconnect [server]";
@@ -137,65 +298,68 @@ async fn mcp_command(
     ) {
         return (USAGE.to_owned(), "warning");
     }
-    let mut servers = IndexMap::<String, Value>::new();
-    let mut diagnostics = Vec::new();
+    let loaded = crate::cli::mcp::load_config(agent_dir, cwd, project_trusted);
+    let servers = loaded.servers;
+    let diagnostics = loaded.errors;
     let global = agent_dir.join("mcp.json");
-    let project = cwd.join(".pi/mcp.json");
-    for path in std::iter::once(&global).chain(project_trusted.then_some(&project)) {
-        match tokio::fs::read(path).await {
-            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                Ok(config) => {
-                    if let Some(entries) = config["mcpServers"].as_object() {
-                        for (name, value) in entries {
-                            if pi_rs_mcp::is_mcp_server_override(value) {
-                                if let Some(base) = servers.get_mut(name) {
-                                    for key in ["enabled", "exposure", "toolExposure"] {
-                                        if let Some(value) = value.get(key) {
-                                            base[key] = value.clone();
-                                        }
-                                    }
-                                }
-                            } else {
-                                servers.insert(name.clone(), value.clone());
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    diagnostics.push(format!("config error: {}: {error}", path.display()))
-                }
+    if let [action @ ("login" | "logout"), rest @ ..] = args.as_slice() {
+        let names: Vec<_> = servers
+            .iter()
+            .filter(|(_, entry)| crate::cli::mcp::oauth_url(entry).is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        let name = match rest {
+            [name] => (*name).to_owned(),
+            [] if names.is_empty() => {
+                return ("No MCP server uses OAuth sign-in.".into(), "warning");
+            }
+            [] if names.len() == 1 => names[0].clone(),
+            _ => match context
+                .base
+                .ui
+                .select_with_options("MCP server", names, Default::default())
+                .await
+            {
+                Some(name) => name,
+                None => return ("Sign-in cancelled.".into(), "info"),
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => diagnostics.push(format!("config error: {}: {error}", path.display())),
-        }
-    }
-    match args.as_slice() {
-        ["login" | "logout", ..] if servers.is_empty() => {
-            return ("No MCP server uses OAuth sign-in.".to_owned(), "warning");
-        }
-        ["login" | "logout", ..] => {
+        };
+        let Some(entry) = servers.get(&name) else {
+            return (format!("No MCP server named \"{name}\"."), "warning");
+        };
+        let Some(url) = crate::cli::mcp::oauth_url(entry) else {
             return (
-                "MCP OAuth is managed by the MCP transport's configured credential provider."
-                    .to_owned(),
+                format!("MCP server \"{name}\" does not use OAuth."),
                 "warning",
             );
+        };
+        let result = if *action == "login" {
+            crate::core::mcp_oauth::login(agent_dir, &name, url, &entry["oauth"], 300, None)
+                .await
+                .map(|()| format!("Signed in to MCP server \"{name}\"."))
+        } else {
+            crate::core::mcp_oauth::Store::new(agent_dir, &name, url)
+                .and_then(|s| s.remove())
+                .map(|_| format!("Signed out of MCP server \"{name}\"."))
+        };
+        return match result {
+            Ok(message) => (message, "info"),
+            Err(message) => (message, "error"),
+        };
+    }
+    if let ["reconnect", rest @ ..] = args.as_slice() {
+        if let [name] = rest
+            && !servers.contains_key(*name)
+        {
+            return (format!("No MCP server named \"{name}\"."), "warning");
         }
-        ["reconnect", name] => {
-            let Some(server) = servers.get(*name) else {
-                return (format!("No MCP server named \"{name}\"."), "warning");
-            };
-            return match inspect(name, server, cwd).await {
-                Ok(tools) => (
-                    format!("Reconnected to MCP server \"{name}\" (connected, {tools} tools)."),
-                    "info",
-                ),
-                Err(error) => (error, "error"),
-            };
+        if servers.values().all(|entry| entry["enabled"] == false) {
+            return ("No enabled MCP server to reconnect.".into(), "warning");
         }
-        ["reconnect"] if servers.values().all(|server| server["enabled"] == false) => {
-            return ("No enabled MCP server to reconnect.".to_owned(), "warning");
-        }
-        _ => {}
+        return match (context.reload)().await {
+            Ok(()) => ("Reloaded MCP connections and tools.".into(), "info"),
+            Err(error) => (error, "error"),
+        };
     }
     if servers.is_empty() && diagnostics.is_empty() {
         return (
@@ -212,8 +376,8 @@ async fn mcp_command(
             if server["enabled"] == false {
                 return format!("{name}: disabled ({exposure})");
             }
-            match inspect(name, server, cwd).await {
-                Ok(tools) => format!("{name}: connected, {tools} tools ({exposure})"),
+            match crate::cli::mcp::inspect(agent_dir, name, server, cwd).await {
+                Ok(tools) => format!("{name}: connected, {} tools ({exposure})", tools.len()),
                 Err(error) => format!(
                     "{name}: failed ({exposure})\n    {}",
                     error.replace('\n', "\n    ")
@@ -223,64 +387,4 @@ async fn mcp_command(
         .await;
     lines.extend(diagnostics);
     (lines.join("\n"), "info")
-}
-
-async fn inspect(name: &str, server: &Value, cwd: &Path) -> Result<usize, String> {
-    let transport: Arc<dyn McpTransport> =
-        match validate_mcp_server_config(name, server, &McpServerConfigOptions::default()) {
-            McpServerConfigResult::Stdio(server) => StdioTransport::new(StdioTransportOptions {
-                command: server["command"]
-                    .as_str()
-                    .ok_or("Missing command")?
-                    .to_owned(),
-                args: server["args"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect(),
-                cwd: Some(server["cwd"].as_str().map_or_else(
-                    || cwd.to_string_lossy().into_owned(),
-                    |path| cwd.join(path).to_string_lossy().into_owned(),
-                )),
-                env: string_map(&server["env"]),
-                ..StdioTransportOptions::default()
-            }),
-            McpServerConfigResult::Http(server) => {
-                StreamableHttpTransport::new(StreamableHttpTransportOptions {
-                    url: server["url"].as_str().ok_or("Missing URL")?.to_owned(),
-                    headers: string_map(&server["headers"]),
-                    open_get_stream: Some(false),
-                    ..StreamableHttpTransportOptions::default()
-                })
-                .map_err(|error| error.to_string())?
-            }
-            McpServerConfigResult::Invalid(message) => return Err(message),
-        };
-    let client = McpClient::new(McpClientOptions {
-        name: "pi".to_owned(),
-        version: VERSION.to_owned(),
-        ..McpClientOptions::default()
-    });
-    let result = async {
-        let initialized = client.connect(transport).await?;
-        if initialized.capabilities.tools.is_none() {
-            return Ok(0);
-        }
-        Ok::<_, pi_rs_mcp::McpClientError>(client.list_tools(&Default::default()).await?.len())
-    }
-    .await;
-    client.close().await;
-    result.map_err(|error| error.to_string())
-}
-
-fn string_map(value: &Value) -> Option<IndexMap<String, String>> {
-    Some(
-        value
-            .as_object()?
-            .iter()
-            .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
-            .collect(),
-    )
 }

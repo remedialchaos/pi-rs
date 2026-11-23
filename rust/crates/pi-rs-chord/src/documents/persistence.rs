@@ -93,18 +93,74 @@ impl DocumentStore {
         key: String,
         load: bool,
     ) -> SqliteFuture<Option<Loaded>> {
-        let owner = self.owner.clone();
-        self.database.call(move|c|{
-   let row=c.query_row("SELECT id,revision,version,fingerprint,host FROM chord_documents WHERE owner=? AND namespace='chord' AND kind=? AND key=? AND retired_at IS NULL",params![&*owner,name,key],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?))).optional()?;
-   let Some((id,revision,version,fingerprint,host))=row else{return Ok(None)};let version=u64::try_from(version).map_err(|_|Error::Invalid("negative document version".into()))?;
-   let(mut value,mut deltas)=(JsonValue::Null,0);
-   if load{let mut statement=c.prepare_cached("SELECT kind,version,content FROM chord_revisions WHERE document_id=? AND seq >= (SELECT MAX(seq) FROM chord_revisions WHERE document_id=? AND kind='base') ORDER BY seq")?;
-    let rows=statement.query_map([id,id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))?;let mut found_base=false;
-    for row in rows{let(kind,v,text)=row?;if u64::try_from(v).ok()!=Some(version){return Err(Error::Invalid("document revision version mismatch".into()))}let data:JsonValue=serde_json::from_str(&text)?;
-     if kind=="base"{value=data;found_base=true;deltas=0;}else{if !found_base{return Err(Error::Invalid("document has no base".into()))}let JsonValue::Array(wire)=data else{return Err(Error::Invalid("invalid stored delta".into()))};let ops=wire.iter().map(Op::from_json).collect::<std::result::Result<Vec<_>,_>>()?;value=apply(value,&ops)?;deltas+=1;}
-    }if !found_base{return Err(Error::Invalid("document has no base".into()))}
-   }Ok(Some(Loaded{stored:Stored{id,revision,version,deltas_since_base:deltas},value,fingerprint,host}))
-  })
+        let store = self.clone();
+        self.database
+            .call(move |c| store.read_in(c, &name, &key, load))
+    }
+    pub(super) fn read_in(
+        &self,
+        c: &Connection,
+        name: &str,
+        key: &str,
+        load: bool,
+    ) -> Result<Option<Loaded>> {
+        let row=c.query_row("SELECT id,revision,version,fingerprint,host FROM chord_documents WHERE owner=? AND namespace='chord' AND kind=? AND key=? AND retired_at IS NULL",params![&*self.owner,name,key],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?))).optional()?;
+        let Some((id, revision, version, fingerprint, host)) = row else {
+            return Ok(None);
+        };
+        let version = u64::try_from(version)
+            .map_err(|_| Error::Invalid("negative document version".into()))?;
+        let (mut value, mut deltas) = (JsonValue::Null, 0);
+        if load {
+            let mut statement=c.prepare_cached("SELECT kind,version,content FROM chord_revisions WHERE document_id=? AND seq >= (SELECT MAX(seq) FROM chord_revisions WHERE document_id=? AND kind='base') ORDER BY seq")?;
+            let rows = statement.query_map([id, id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut found_base = false;
+            for row in rows {
+                let (kind, v, text) = row?;
+                if u64::try_from(v).ok() != Some(version) {
+                    return Err(Error::Invalid("document revision version mismatch".into()));
+                }
+                let data: JsonValue = serde_json::from_str(&text)?;
+                if kind == "base" {
+                    value = data;
+                    found_base = true;
+                    deltas = 0;
+                } else {
+                    if !found_base {
+                        return Err(Error::Invalid("document has no base".into()));
+                    }
+                    let JsonValue::Array(wire) = data else {
+                        return Err(Error::Invalid("invalid stored delta".into()));
+                    };
+                    let ops = wire
+                        .iter()
+                        .map(Op::from_json)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    value = apply(value, &ops)?;
+                    deltas += 1;
+                }
+            }
+            if !found_base {
+                return Err(Error::Invalid("document has no base".into()));
+            }
+        }
+        Ok(Some(Loaded {
+            stored: Stored {
+                id,
+                revision,
+                version,
+                deltas_since_base: deltas,
+            },
+            value,
+            fingerprint,
+            host,
+        }))
     }
     pub(super) fn keys(&self, name: String, after: Option<String>) -> SqliteFuture<Vec<String>> {
         let owner = self.owner.clone();

@@ -45,7 +45,7 @@ pub struct RemoteError {
     pub code: String,
     pub message: String,
     pub path: Option<String>,
-    pub fields: Map<String, Value>,
+    pub fields: Box<Map<String, Value>>,
 }
 
 impl RemoteError {
@@ -69,7 +69,7 @@ impl RemoteError {
             code,
             message,
             path,
-            fields,
+            fields: Box::new(fields),
         }
     }
 

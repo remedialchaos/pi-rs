@@ -413,7 +413,7 @@ fn build_model(
     let base_url = fields
         .base_url
         .as_deref()
-        .filter(|url| !url.is_empty())
+        .filter(|url| !url.is_empty() || api_text == "pi-virtual")
         .ok_or_else(|| {
             format!("Provider {provider_id}: \"baseUrl\" is required when defining custom models.")
         })?;
@@ -707,6 +707,89 @@ impl ModelRegistry {
         self.error = error;
     }
 
+    pub(crate) fn apply_extensions(
+        &mut self,
+        runner: &super::extensions::runner::ExtensionRunner,
+    ) -> Result<Vec<String>, String> {
+        let mut virtual_only = Vec::new();
+        for extension in runner.extensions() {
+            let registration = extension.registration();
+            for provider in &registration.providers {
+                let config = serde_json::from_value(provider.config.clone())
+                    .map_err(|error| format!("Provider {}: {error}", provider.name))?;
+                let overlay = ModelsConfig {
+                    schema: None,
+                    providers: IndexMap::from([(provider.name.clone(), config)]),
+                };
+                self.applied
+                    .extend(apply_config(&self.models, &overlay, &self.env)?);
+                self.config.providers.extend(overlay.providers);
+            }
+            for entry in &registration.virtual_models {
+                if entry.provider.trim().is_empty() || entry.id.trim().is_empty() {
+                    return Err("Virtual model provider and id must not be empty.".to_owned());
+                }
+                let mut provider = self
+                    .models
+                    .get_provider(&entry.provider)
+                    .unwrap_or_else(|| {
+                        virtual_only.push(entry.provider.clone());
+                        Provider::new(entry.provider.clone(), entry.provider.clone())
+                    });
+                if let Some(existing) = self.get(&entry.provider, &entry.id)
+                    && existing.api != Api::from("pi-virtual")
+                {
+                    return Err(format!(
+                        "Virtual model {}/{} conflicts with a physical model.",
+                        entry.provider, entry.id
+                    ));
+                }
+                let mut fields: ModelConfigFields =
+                    serde_json::from_value(entry.definition.clone())
+                        .map_err(|error| error.to_string())?;
+                fields.id = Some(entry.id.clone());
+                let levels: Vec<ThinkingLevel> = entry
+                    .definition
+                    .get("thinkingLevels")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_else(|| vec![ThinkingLevel::Off]);
+                fields.thinking_level_map = Some(
+                    ThinkingLevel::ALL
+                        .into_iter()
+                        .map(|level| {
+                            (
+                                level,
+                                levels.contains(&level).then(|| level.as_str().to_owned()),
+                            )
+                        })
+                        .collect(),
+                );
+                fields.reasoning = Some(levels.iter().any(|level| *level != ThinkingLevel::Off));
+                fields.api = Some("pi-virtual".to_owned());
+                fields.base_url = Some(String::new());
+                fields.input.get_or_insert_with(|| {
+                    vec![ModelInputModality::Text, ModelInputModality::Image]
+                });
+                fields.context_window.get_or_insert(0.0);
+                fields.max_tokens.get_or_insert(0.0);
+                let mut model = build_model(&entry.provider, &fields, &self.env)?;
+                model.context_window = numeric_u64(fields.context_window).unwrap_or(0);
+                model.max_tokens = numeric_u64(fields.max_tokens).unwrap_or(0);
+                let mut models = provider.models.to_vec();
+                models.retain(|existing| !matches!(existing, pi_rs_ai::AnyModel::Chat(existing) if existing.id == entry.id));
+                models.push(pi_rs_ai::AnyModel::Chat(model));
+                provider.models = models.into();
+                self.models.set_provider(provider);
+            }
+        }
+        runner.bind_provider_registrations();
+        runner.bind_virtual_models();
+        Ok(virtual_only)
+    }
+
     /// Reload `models.json` from disk and reapply all overrides.
     pub fn refresh(&mut self) -> Result<(), String> {
         self.reload();
@@ -762,6 +845,38 @@ impl ModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_models_follow_each_session_generation() -> Result<(), String> {
+        use crate::core::{
+            event_bus::EventBus,
+            extensions::{runner::ExtensionRunner, types::*},
+        };
+        use std::sync::Arc;
+        for id in ["first", "reloaded"] {
+            let bus = Arc::new(EventBus::new());
+            let host = Arc::new(ExtensionHost::new(bus.clone()));
+            let mut ext = SimpleExtension::new("test");
+            let mut reg = ExtensionRegistration::new("test");
+            reg.providers.push(ProviderRegistration {name:"custom".into(), extension_path:"test".into(),config:serde_json::json!({"api":"openai-completions","baseUrl":"http://localhost","models":[{"id":id}]})});
+            reg.virtual_models.push(VirtualModelRegistration {
+                provider: "custom".into(),
+                id: "router".into(),
+                extension_path: "test".into(),
+                definition: serde_json::json!({"name":"Router"}),
+            });
+            ext.set_registration(reg);
+            let runner = ExtensionRunner::new(vec![Arc::new(ext)], host, bus, ".");
+            let mut registry = ModelRegistry::new(Models::default(), None);
+            registry.apply_extensions(&runner)?;
+            assert!(registry.get("custom", id).is_some());
+            assert_eq!(
+                registry.get("custom", "router").map(|m| m.api.clone()),
+                Some(Api::from("pi-virtual"))
+            );
+        }
+        Ok(())
+    }
 
     fn write_config(dir: &std::path::Path, text: &str) -> PathBuf {
         let path = dir.join(MODELS_JSON_FILE);

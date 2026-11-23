@@ -20,6 +20,7 @@ use std::{
 };
 use tokio::sync::watch;
 mod declarations;
+mod host_data;
 mod lifecycle;
 mod reload_cycle;
 mod staging;
@@ -182,6 +183,7 @@ impl Served {
 #[derive(Clone)]
 struct Plugin {
     facet: Facet,
+    http: Option<crate::node::http::RegisteredHttp>,
     types: IndexMap<String, Arc<Served>>,
     registries: IndexMap<String, RegistryDeclaration>,
     contributions: IndexMap<String, (crate::registries::Registry<JsonValue, JsonValue>, JsonValue)>,
@@ -200,8 +202,10 @@ struct HostState {
 struct HostInner {
     options: HostOptions,
     batch: Batch,
+    http: crate::node::http::HttpRegistry,
     state: Mutex<HostState>,
     reload: tokio::sync::Mutex<()>,
+    host_data: Arc<tokio::sync::RwLock<()>>,
     activity: NativeSource<ActivityCounts>,
     cycles: ReloadCycles,
     incarnation: String,
@@ -238,10 +242,12 @@ pub fn create_host(options: HostOptions) -> Result<Host> {
             })
         });
     let activity = NativeSource::new(batch.clone(), ActivityCounts::default(), |a, b| a == b);
+    let http = crate::node::http::new_registry(batch.clone(), options.on_error.clone())?;
     let (context, cancel) = Context::background().with_cancel();
     Ok(Host(Arc::new(HostInner {
         options,
         batch,
+        http,
         state: Mutex::new(HostState {
             loaded: false,
             closed: false,
@@ -254,6 +260,7 @@ pub fn create_host(options: HostOptions) -> Result<Host> {
             links: Vec::new(),
         }),
         reload: tokio::sync::Mutex::new(()),
+        host_data: Arc::new(tokio::sync::RwLock::new(())),
         activity,
         cycles: ReloadCycles::default(),
         incarnation: uuid_v7()?,
@@ -643,6 +650,12 @@ impl Host {
                 crate::registries::RegistryRecord::new(token, self.0.batch.clone(), |_| {})
             })
             .clone()
+    }
+    pub(crate) fn http_table(&self) -> Option<crate::node::http::HttpTable> {
+        if lock(&self.0.state).closed {
+            return None;
+        }
+        self.0.http.last_good()
     }
 }
 impl Object {

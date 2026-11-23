@@ -207,12 +207,25 @@ impl Surface {
         Ok(failures)
     }
     pub fn facet(&self) -> Result<Facet> {
+        self.build_facet(None)
+    }
+    /// Serve both the scripts contract and the artifacts through the host HTTP registry.
+    pub fn http_facet(&self, public: bool) -> Result<Facet> {
+        self.build_facet(Some(
+            self.contribution(public)
+                .map_err(|e| Error::Invalid(e.to_string()))?,
+        ))
+    }
+    fn build_facet(&self, http: Option<HttpContribution>) -> Result<Facet> {
         let contract = Arc::new(crate::surfaces::scripts_contract(&format!(
             "chord.{}.scripts",
             self.name
         ))?);
         let surface = self.clone();
         Ok(define_facet(move |host| {
+            if let Some(http) = &http {
+                host.contribute_http(http.clone())?;
+            }
             let surface = surface.clone();
             host.serve(
                 contract.clone(),

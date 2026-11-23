@@ -225,3 +225,31 @@ suite was 23.62 s → 21.75 s. This was not a controlled benchmark.
 - Live OAuth, session-share uploads, bug-report delivery, and terminal image
   protocols were not exercised end to end. Missing configured packages are not
   auto-installed at startup.
+
+## Milestone 1.8c — Coding-agent parity polish
+
+The standalone `pi mcp` command manages server configuration, reports connection
+status, and starts OAuth sign-in or removes stored credentials. Agent sessions
+discover tools over stdio and streamable HTTP and execute model-visible tools
+through the MCP client. The loopback test exercises a stored OAuth bearer token
+and a faux-model tool call. Interactive reconnect rebuilds the session's MCP
+connections, including when a single server is named.
+
+The WIT host exposes select, confirm, input, notify, status, and widget callbacks
+and accepts guest registrations for commands, tools, flags, providers, and
+virtual models. Session startup and reload apply extension registrations to the
+model registry. Live browser sign-in against an external provider was not tested.
+
+| Gate | Result |
+| --- | --- |
+| Scoped Cargo formatting check | Passed |
+| Offline Clippy, all targets, warnings denied | Passed |
+| Full offline crate suite | 879 passed, 0 failed, 0 ignored |
+| Mutation checks | All 14 new tests failed under mutation and passed after restoration |
+
+Added 14 tests and removed none. Eight exercise the compiled CLI, three cover
+its parser, and three cover live tool execution, guest UI, and registry updates.
+Mutations interrupted MCP dispatch and parsing, hid direct tools, inverted the
+guest confirmation answer, and suppressed provider registration. Aggregate
+test-binary runtime changed from 26.81 s to 40.15 s, excluding compilation.
+The host was under load during verification.

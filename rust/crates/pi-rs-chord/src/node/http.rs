@@ -17,9 +17,14 @@ use std::{
 };
 mod cookies;
 mod file;
+mod registry;
 mod websocket;
 pub use cookies::*;
 pub use file::*;
+pub(crate) use registry::{
+    HttpRegistry, HttpTable, RegisteredHttp, new_registry, registry_provider,
+};
+use tokio::sync::watch;
 pub use websocket::connect_websocket;
 
 pub type HttpResponse = Response<Body>;
@@ -229,6 +234,10 @@ pub struct HttpContribution {
     pub scripts: Vec<String>,
 }
 impl HttpContribution {
+    /// Declare this contribution under the owning `PluginFacet` name.
+    pub fn facet(self) -> crate::host::Facet {
+        crate::host::define_facet(move |host| host.contribute_http(self.clone()))
+    }
     pub fn new(plugin: impl Into<String>) -> Self {
         Self {
             plugin: plugin.into(),
@@ -259,6 +268,30 @@ impl HttpContribution {
         self.routes.push((method, path.into(), options));
         Ok(())
     }
+    fn validate(&self) -> HttpResult<()> {
+        for (directive, sources) in &self.csp {
+            if directive.is_empty()
+                || !directive
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'-')
+                || sources.iter().any(|s| {
+                    s.is_empty()
+                        || s.bytes().any(|b| {
+                            b.is_ascii_whitespace() || b == b';' || !(32..127).contains(&b)
+                        })
+                })
+            {
+                return Err(HttpError::new(500, "invalid CSP contribution"));
+            }
+        }
+        for (pattern, socket) in &self.sockets {
+            validate_pattern(pattern)?;
+            if socket.max_payload == 0 {
+                return Err(HttpError::new(500, "invalid socket payload limit"));
+            }
+        }
+        Ok(())
+    }
 }
 pub type OpenedLink = Arc<dyn Fn(&HttpRequest) -> Option<Box<dyn FnOnce() + Send>> + Send + Sync>;
 struct OpenLease(Option<Box<dyn FnOnce() + Send>>);
@@ -273,6 +306,8 @@ impl Drop for OpenLease {
 pub struct HttpOptions {
     pub links_path: Option<String>,
     pub opened: OpenedLink,
+    /// Build Chord link options from the principal admitted by HTTP authentication.
+    pub remote: Arc<dyn Fn(serde_json::Value) -> RemoteOptions + Send + Sync>,
     pub max_payload: usize,
     pub max_buffered: usize,
     pub close_timeout: Duration,
@@ -283,6 +318,7 @@ impl Default for HttpOptions {
         Self {
             links_path: Some("/_chord/link".into()),
             opened: Arc::new(|_| None),
+            remote: Arc::new(RemoteOptions::new),
             max_payload: 1024 * 1024,
             max_buffered: 8 * 1024 * 1024,
             close_timeout: Duration::from_secs(30),
@@ -293,7 +329,7 @@ impl Default for HttpOptions {
 struct Inner {
     host: Host,
     options: HttpOptions,
-    contributions: Mutex<Vec<HttpContribution>>,
+    contributions: Mutex<Vec<RegisteredHttp>>,
     links: Mutex<Vec<Weak<dyn Link>>>,
 }
 #[derive(Clone)]
@@ -309,30 +345,19 @@ impl Http {
     }
     pub fn contribute(&self, contribution: HttpContribution) -> HttpResult<()> {
         crate::contracts::check_name(&contribution.plugin, "HTTP plugin")?;
-        for (directive, sources) in &contribution.csp {
-            if directive.is_empty()
-                || !directive
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b == b'-')
-                || sources.iter().any(|s| {
-                    s.is_empty()
-                        || s.bytes().any(|b| {
-                            b.is_ascii_whitespace() || b == b';' || !(32..127).contains(&b)
-                        })
-                })
-            {
-                return Err(HttpError::new(500, "invalid CSP contribution"));
-            }
-        }
-        for pattern in contribution.sockets.keys() {
-            validate_pattern(pattern)?;
-        }
+        let name = contribution.plugin.clone();
+        let contribution = contribution.registered(&name)?;
         let mut contributions = self
             .0
             .contributions
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        contributions.retain(|c| c.plugin != contribution.plugin);
+        contributions.retain(|c| {
+            if c.plugin == name {
+                c.retire();
+            }
+            c.plugin != name
+        });
         contributions.push(contribution);
         contributions.sort_by(|a, b| a.plugin.cmp(&b.plugin));
         // Closing all upgraded links on a router replacement is conservative and prevents stale grants.
@@ -344,7 +369,12 @@ impl Http {
             .contributions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|c| c.plugin != plugin);
+            .retain(|c| {
+                if c.plugin == plugin {
+                    c.retire();
+                }
+                c.plugin != plugin
+            });
         self.close_links();
     }
     pub fn close_links(&self) {
@@ -363,7 +393,8 @@ impl Http {
         let listener = tokio::net::TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let state = (self.clone(), address);
+        let (sockets, socket_stop) = watch::channel(false);
+        let state = (self.clone(), address, socket_stop);
         let app = Router::new().fallback(dispatch).with_state(state);
         let task = tokio::spawn(async move {
             axum::serve(
@@ -378,6 +409,7 @@ impl Http {
         Ok(HttpServer {
             address,
             http: self.clone(),
+            sockets,
             stop: Some(stop),
             task: Some(task),
         })
@@ -387,17 +419,22 @@ impl Http {
         mut request: Request<Body>,
         local: SocketAddr,
         remote: SocketAddr,
+        mut socket_stop: watch::Receiver<bool>,
     ) -> HttpResponse {
         let nonce = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             rand::random::<[u8; 16]>(),
         );
-        let contributions = self
+        let mut contributions = self
             .0
             .contributions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        if let Some(registry) = self.0.host.http_table() {
+            contributions.splice(0..0, registry.0);
+            contributions.sort_by(|a, b| a.plugin.cmp(&b.plugin));
+        }
         let admitted = admit(request.headers(), local, &contributions);
         let mut origin = None;
         let mut framer = None;
@@ -414,16 +451,16 @@ impl Http {
             let is_link = self.0.options.links_path.as_deref() == Some(path.as_str());
             let socket = contributions
                 .iter()
-                .flat_map(|c| c.sockets.iter())
-                .filter_map(|(p, s)| {
+                .flat_map(|c| c.sockets.iter().map(move |(p, s)| (c, p, s)))
+                .filter_map(|(c, p, s)| {
                     match_path(p, &path)
                         .transpose()
-                        .map(|m| m.map(|params| (p.clone(), s.clone(), params)))
+                        .map(|m| m.map(|params| (p.clone(), s.clone(), params, c.retirement())))
                 })
                 .collect::<HttpResult<Vec<_>>>()?
                 .into_iter()
                 .rev()
-                .max_by_key(|(p, _, _)| specificity(p));
+                .max_by_key(|(p, _, _, _)| specificity(p));
             let is_upgrade = request
                 .headers()
                 .get("upgrade")
@@ -434,24 +471,27 @@ impl Http {
                 .flat_map(|c| {
                     c.routes
                         .iter()
-                        .filter(|(m, _, _)| m == request.method())
+                        .filter(|(m, _, _)| {
+                            m == request.method()
+                                || request.method() == Method::HEAD && *m == Method::GET
+                        })
                         .map(move |(m, p, r)| (c, m, p, r))
                 })
-                .filter_map(|(c, _, p, r)| {
+                .filter_map(|(c, m, p, r)| {
                     match_path(p, &path)
                         .transpose()
-                        .map(|m| m.map(|params| (c.clone(), p.clone(), r.clone(), params)))
+                        .map(|found| found.map(|params| (c, m, p, r.clone(), params)))
                 })
                 .collect::<HttpResult<Vec<_>>>()?
                 .into_iter()
                 .rev()
-                .max_by_key(|(_, p, _, _)| specificity(p));
+                .max_by_key(|(_, m, p, _, _)| (*m == request.method(), specificity(p)));
             let (route_plugin, pattern, route, params) =
                 if is_upgrade && (is_link || socket.is_some()) {
                     let params = socket.as_ref().map(|s| s.2.clone()).unwrap_or_default();
                     (String::new(), path.clone(), None, params)
-                } else if let Some((c, p, r, params)) = matched {
-                    (c.plugin, p, Some(r), params)
+                } else if let Some((c, method, p, r, params)) = matched {
+                    (c.plugin.clone(), format!("{method} {p}"), Some(r), params)
                 } else {
                     return Err(HttpError::new(404, "Not Found"));
                 };
@@ -534,7 +574,7 @@ impl Http {
                             match this
                                 .0
                                 .host
-                                .accept(link.clone(), RemoteOptions::new(principal))
+                                .accept(link.clone(), (this.0.options.remote)(principal))
                             {
                                 Ok(peer) => {
                                     let _lease = OpenLease((this.0.options.opened)(&req));
@@ -549,16 +589,21 @@ impl Http {
                         })
                         .into_response());
                 }
-                if let Some((_, options, _)) = socket {
+                if let Some((_, options, _, mut retired)) = socket {
                     if !options.public && req.principal.is_none() {
                         return Err(HttpError::new(401, "Unauthorized"));
                     }
                     let report = self.0.options.on_error.clone();
                     return Ok(upgrade
                         .max_message_size(options.max_payload)
+                        .max_frame_size(options.max_payload)
                         .on_upgrade(move |socket| async move {
-                            if let Err(e) = (options.handler)(socket, req).await {
-                                report(e.to_string());
+                            tokio::select! { biased;
+                                _ = retired.wait_for(|retired| *retired) => {},
+                                _ = socket_stop.wait_for(|closed| *closed) => {},
+                                result = async { (options.handler)(socket, req).await } => {
+                                    if let Err(e) = result { report(e.to_string()); }
+                                }
                             }
                         })
                         .into_response());
@@ -579,9 +624,7 @@ impl Http {
                         .iter()
                         .filter(|w| {
                             (w.all || c.plugin == route_plugin)
-                                && w.route
-                                    .as_ref()
-                                    .is_none_or(|r| r == &format!("{} {pattern}", req.method))
+                                && w.route.as_ref().is_none_or(|r| r == &pattern)
                         })
                         .cloned()
                 })
@@ -620,21 +663,23 @@ impl Http {
     }
 }
 async fn dispatch(
-    State((http, local)): State<(Http, SocketAddr)>,
+    State((http, local, socket_stop)): State<(Http, SocketAddr, watch::Receiver<bool>)>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> HttpResponse {
-    http.answer(request, local, remote).await
+    http.answer(request, local, remote, socket_stop).await
 }
 
 pub struct HttpServer {
     pub address: SocketAddr,
     http: Http,
+    sockets: watch::Sender<bool>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 impl HttpServer {
     pub async fn close(mut self) -> HttpResult<()> {
+        self.sockets.send_replace(true);
         self.http.close_links();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -654,6 +699,7 @@ impl HttpServer {
 }
 impl Drop for HttpServer {
     fn drop(&mut self) {
+        self.sockets.send_replace(true);
         self.http.close_links();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -713,7 +759,7 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 fn admit(
     headers: &HeaderMap,
     local: SocketAddr,
-    contributions: &[HttpContribution],
+    contributions: &[RegisteredHttp],
 ) -> HttpResult<(Provenance, String, Option<String>)> {
     if headers.get_all("host").iter().count() != 1 {
         return Err(HttpError::new(403, "Forbidden"));
@@ -791,7 +837,7 @@ fn origin_accepted(method: &Method, headers: &HeaderMap, origin: &str) -> bool {
 }
 fn defaults(
     headers: &mut HeaderMap,
-    contributions: &[HttpContribution],
+    contributions: &[RegisteredHttp],
     origin: Option<&str>,
     framer: Option<&str>,
     nonce: &str,
@@ -891,6 +937,7 @@ fn specificity(path: &str) -> Vec<u8> {
                 2
             }
         })
+        .chain(std::iter::once(3))
         .collect()
 }
 fn match_path(pattern: &str, path: &str) -> HttpResult<Option<IndexMap<String, String>>> {

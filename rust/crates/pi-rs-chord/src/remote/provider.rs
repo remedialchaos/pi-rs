@@ -10,9 +10,13 @@ impl RemotePeer {
                 params,
                 principal,
                 incarnation,
+                address_kind,
+                address_params,
                 ..
             } => {
-                if lock(&self.0.serving).contains_key(&hold) {
+                if lock(&self.0.pending_routes).contains_key(&hold)
+                    || lock(&self.0.serving).contains_key(&hold)
+                {
                     return Err(Error::Invalid("hold id already in use".into()));
                 }
                 if matches!(params, Part::Deflated(_)) {
@@ -26,7 +30,10 @@ impl RemotePeer {
                 else {
                     return Err(Error::Invalid("peer does not serve objects".into()));
                 };
-                let Some(contract) = host.served_contract(&type_name) else {
+                let Some(contract) = host
+                    .served_contract(&type_name)
+                    .or_else(|| self.0.options.route_contracts.get(&type_name).cloned())
+                else {
                     return self.send(Body::Failed {
                         hold,
                         cause: 2,
@@ -63,7 +70,7 @@ impl RemotePeer {
                     .peer()
                     .map(|(id, _)| uuid::Uuid::from_bytes(id).to_string())
                     .unwrap_or_default();
-                let caller = if self.0.options.role == LinkRole::Parent {
+                let caller = if self.0.options.role == LinkRole::Parent && self.0.options.trusted {
                     Caller {
                         principal: Some(
                             principal
@@ -83,42 +90,92 @@ impl RemotePeer {
                 };
                 let (context, cancel) = Context::background().with_cancel();
                 let parsed = params.parse(Limits::for_link(self.0.options.trusted))?;
-                let held = match host.hold_as(contract, parsed, caller, &context) {
-                    Ok(held) => held,
-                    Err(error) => {
-                        return self.send(Body::Failed {
-                            hold,
-                            cause: 1,
-                            error: wire_error(&error)?,
-                            retry_in: None,
-                        });
+                if let Err(error) =
+                    crate::contracts::check_params(contract.params(), &parsed, "params")
+                {
+                    return self.fail_hold(hold, &error);
+                }
+                let local = {
+                    let contract = contract.clone();
+                    let parsed = parsed.clone();
+                    let caller = caller.clone();
+                    let context = context.clone();
+                    move || {
+                        host.hold_as(contract, parsed, caller, &context)
+                            .map(Provided::Local)
                     }
                 };
-                let peer = self.clone();
-                let observation = held.state().observe(
-                    &context,
-                    move |call, _| {
-                        if let NativeWatchCall::Value { value } = call {
-                            peer.provider_state(hold, value)?;
+                if let Some(route) = self.0.options.route.clone() {
+                    crate::data::principal_key(caller.principal.as_ref().ok_or(Error::Closed)?)?;
+                    let key = Arc::new(());
+                    let mut pending = lock(&self.0.pending_routes);
+                    self.send(Body::Loading { hold })?;
+                    pending.insert(
+                        hold,
+                        PendingRoute {
+                            key: key.clone(),
+                            cancel: cancel.clone(),
+                        },
+                    );
+                    drop(pending);
+                    let peer = self.clone();
+                    let request = RouteHold {
+                        address_kind,
+                        address_params: *address_params,
+                        contract: contract.clone(),
+                        params: parsed,
+                        caller,
+                        context: context.clone(),
+                    };
+                    // Don't await demand on the channel dispatcher: Release (or a drop)
+                    // must be able to cancel it while the destination is starting.
+                    tokio::spawn(async move {
+                        let Ok(routed) = context
+                            .await_with(async move { route(request).await })
+                            .await
+                        else {
+                            return;
+                        };
+                        let mut pending = lock(&peer.0.pending_routes);
+                        if !pending
+                            .get(&hold)
+                            .is_some_and(|route| Arc::ptr_eq(&route.key, &key))
+                        {
+                            return;
                         }
-                        Ok(())
-                    },
-                    |_| {},
-                )?;
-                let state = held.state().value();
-                lock(&self.0.serving).insert(
-                    hold,
-                    Serving {
-                        held,
-                        cancel,
-                        _observation: Some(observation),
-                        subscriptions: Vec::new(),
-                        methods: Vec::new(),
-                    },
-                );
-                self.provider_state(hold, state)?;
+                        let held = match routed {
+                            Ok(Some(remote))
+                                if remote.0.contract.name() == contract.name()
+                                    && remote.0.contract.version() == contract.version()
+                                    && remote.0.contract.fingerprint()
+                                        == contract.fingerprint() =>
+                            {
+                                Ok(Provided::Routed(remote))
+                            }
+                            Ok(Some(_)) => Err(ChordError::new(
+                                "contract_mismatch",
+                                "router returned a different contract",
+                            )
+                            .into()),
+                            Ok(None) => local(),
+                            Err(error) => Err(error),
+                        };
+                        let result = peer.finish_hold(hold, held, &context, cancel);
+                        pending.remove(&hold);
+                        drop(pending);
+                        if let Err(error) = result {
+                            (peer.0.options.report)(error.to_string());
+                        }
+                    });
+                } else {
+                    self.finish_hold(hold, local(), &context, cancel)?;
+                }
             }
             Body::Release { hold } => {
+                let pending = lock(&self.0.pending_routes).remove(&hold);
+                if let Some(route) = pending {
+                    route.cancel.cancel("released");
+                }
                 let entry = lock(&self.0.serving).remove(&hold);
                 if let Some(entry) = entry {
                     entry.cancel.cancel("released");
@@ -147,6 +204,14 @@ impl RemotePeer {
                     && lock(&self.0.incoming).len() >= self.0.options.call_window
                 {
                     return Err(Error::Invalid("peer exceeded its call window".into()));
+                }
+                if lock(&self.0.pending_routes).contains_key(&hold) {
+                    return self.send(Body::Error {
+                        call,
+                        error: wire_error(
+                            &ChordError::new("not_ready", "hold has not bound").into(),
+                        )?,
+                    });
                 }
                 let held = {
                     let serving = lock(&self.0.serving);
@@ -193,14 +258,18 @@ impl RemotePeer {
                     JsonValue::Null
                 };
                 let (context, cancel) = Context::background().with_cancel();
-                lock(&self.0.incoming).insert(call, Incoming { hold, cancel });
+                let key = Arc::new(());
+                lock(&self.0.incoming).insert(
+                    call,
+                    Incoming {
+                        key: key.clone(),
+                        hold,
+                        cancel,
+                    },
+                );
                 let peer = self.clone();
                 tokio::spawn(async move {
                     let result = held.0.call(&held.1, args, &context).await;
-                    let active = lock(&peer.0.incoming).remove(&call).is_some();
-                    if !active {
-                        return;
-                    }
                     let reply = result
                         .and_then(|value| {
                             if value == JsonValue::Null {
@@ -221,6 +290,14 @@ impl RemotePeer {
                                 error: wire_error(&error)?,
                             })
                         });
+                    let mut incoming = lock(&peer.0.incoming);
+                    if !incoming
+                        .get(&call)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.key, &key))
+                    {
+                        return;
+                    }
+                    incoming.remove(&call);
                     match reply {
                         Ok(reply) => {
                             let _ = peer.send(reply);
@@ -234,25 +311,84 @@ impl RemotePeer {
                     entry.cancel.cancel("aborted by caller");
                 }
             }
-            Body::Retry { hold, .. } => {
+            Body::Retry { hold, hops } => {
                 let held = lock(&self.0.serving).get(&hold).map(|s| s.held.clone());
                 if let Some(held) = held {
-                    held.retry()?;
+                    match held {
+                        Provided::Local(held) => held.retry()?,
+                        Provided::Routed(held) if hops > 0 => held.retry_with_hops(hops - 1)?,
+                        Provided::Routed(_) => {}
+                    }
                 }
             }
             _ => {}
         }
         Ok(())
     }
-    fn provider_state(&self, id: u64, state: RefState) -> Result<()> {
-        let held = {
-            let mut serving = lock(&self.0.serving);
-            let Some(entry) = serving.get_mut(&id) else {
-                return Ok(());
-            };
-            entry.subscriptions.clear();
-            entry.held.clone()
+    fn fail_hold(&self, hold: u64, error: &Error) -> Result<()> {
+        self.send(Body::Failed {
+            hold,
+            cause: 1,
+            error: wire_error(error)?,
+            retry_in: None,
+        })
+    }
+    fn finish_hold(
+        &self,
+        hold: u64,
+        held: Result<Provided>,
+        context: &Context,
+        cancel: Cancel,
+    ) -> Result<()> {
+        let held = match held {
+            Ok(held) => held,
+            Err(error) => {
+                cancel.cancel("hold failed");
+                return self.fail_hold(hold, &error);
+            }
         };
+        let peer = self.clone();
+        let key = Arc::new(());
+        let observed = key.clone();
+        let initial = Arc::new(Mutex::new(()));
+        let subscribed = initial.clone();
+        let _initial = lock(&initial);
+        let observation = held.state().observe(
+            context,
+            move |call, _| {
+                let _initial = lock(&subscribed);
+                if let NativeWatchCall::Value { value } = call {
+                    peer.provider_state(hold, &observed, value)?;
+                }
+                Ok(())
+            },
+            |_| {},
+        )?;
+        let state = observation.value.clone();
+        lock(&self.0.serving).insert(
+            hold,
+            Serving {
+                key: key.clone(),
+                held,
+                cancel,
+                _observation: Some(observation),
+                subscriptions: Vec::new(),
+                methods: Vec::new(),
+            },
+        );
+        self.provider_state(hold, &key, state)
+    }
+    fn provider_state(&self, id: u64, key: &Arc<()>, state: RefState) -> Result<()> {
+        let mut serving = lock(&self.0.serving);
+        let Some(entry) = serving
+            .get_mut(&id)
+            .filter(|entry| Arc::ptr_eq(&entry.key, key))
+        else {
+            return Ok(());
+        };
+        entry.subscriptions.clear();
+        entry.methods.clear();
+        let held = &entry.held;
         match state {
             RefState::Loading => self.send(Body::Loading { hold: id }),
             RefState::Failed { cause, retry_at } => self.send(Body::Failed {
@@ -326,10 +462,8 @@ impl RemotePeer {
                     );
                     subscriptions.push(subscription);
                 }
-                if let Some(entry) = lock(&self.0.serving).get_mut(&id) {
-                    entry.methods = names.methods;
-                    entry.subscriptions = subscriptions;
-                }
+                entry.methods = names.methods;
+                entry.subscriptions = subscriptions;
                 self.send_replica(Body::Bound(vec![BoundEntry {
                     hold: id,
                     variant: variant as u64,
@@ -337,6 +471,46 @@ impl RemotePeer {
                     failed,
                 }]))
             }
+        }
+    }
+}
+impl Provided {
+    fn state(&self) -> NativeSource<RefState> {
+        match self {
+            Self::Local(held) => held.state(),
+            Self::Routed(held) => held.state(),
+        }
+    }
+    fn variant(&self) -> Result<String> {
+        match self {
+            Self::Local(held) => held.variant(),
+            Self::Routed(held) => held
+                .variant()
+                .ok_or_else(|| ChordError::new("not_ready", "reference is not bound").into()),
+        }
+    }
+    fn contract(&self) -> Arc<Contract> {
+        match self {
+            Self::Local(held) => held.contract(),
+            Self::Routed(held) => held.0.contract.clone(),
+        }
+    }
+    fn member(&self, name: &str) -> Result<Source> {
+        match self {
+            Self::Local(held) => held.member(name),
+            Self::Routed(held) => held.member(name),
+        }
+    }
+    async fn call(&self, method: &str, args: JsonValue, context: &Context) -> Result<JsonValue> {
+        match self {
+            Self::Local(held) => held.call(method, args, context).await,
+            Self::Routed(held) => held.call(method, args, context).await,
+        }
+    }
+    pub(super) fn release(&self) {
+        match self {
+            Self::Local(held) => held.release(),
+            Self::Routed(held) => held.release(),
         }
     }
 }

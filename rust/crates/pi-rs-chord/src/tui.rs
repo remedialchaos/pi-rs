@@ -56,6 +56,9 @@ impl TerminalTheme {
 }
 pub const BRIDGE: &str = "chordBridge";
 pub const FRAME_UNITS: usize = 16 * 1024;
+pub(crate) const SOCKET_PAYLOAD: usize = 1024 * 1024;
+const SOCKET_BUFFER: usize = 8 * SOCKET_PAYLOAD;
+const SOCKET_FRAMES: usize = 128;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeStart {
     pub base: String,
@@ -229,6 +232,12 @@ impl SandboxChannel {
     pub fn start(&self) -> &BridgeStart {
         &self.0.start
     }
+    pub fn exit(&self, code: i32) -> Result<()> {
+        if lock(&self.0.state).closed {
+            return Err(Error::Closed);
+        }
+        (self.0.send)(SandboxMessage::Exit { code })
+    }
     pub fn write(&self, data: &str) -> Result<()> {
         if lock(&self.0.state).closed {
             return Err(Error::Closed);
@@ -291,9 +300,9 @@ impl SandboxChannel {
                     .get(&socket)
                     .and_then(Weak::upgrade);
                 if let Some(socket) = socket {
-                    let queued = lock(&socket.queued).take().unwrap_or_default();
-                    for bytes in queued {
-                        socket.send(bytes)?;
+                    let mut queue = lock(&socket.queued);
+                    for bytes in queue.take().unwrap_or_default() {
+                        socket.forward(bytes)?;
                     }
                 }
             }
@@ -303,6 +312,16 @@ impl SandboxChannel {
                     .get(&socket)
                     .and_then(Weak::upgrade);
                 if let Some(socket) = socket {
+                    {
+                        let mut pending = lock(&socket.inbound);
+                        if let Some((size, frames)) = pending.as_mut() {
+                            if *size + bytes.len() > SOCKET_BUFFER || *frames >= SOCKET_FRAMES {
+                                return Err(Error::Invalid("terminal input buffer full".into()));
+                            }
+                            *size += bytes.len();
+                            *frames += 1;
+                        }
+                    }
                     socket.end.deliver(bytes);
                 }
             }
@@ -324,6 +343,7 @@ impl SandboxChannel {
             id,
             channel: Arc::downgrade(&self.0),
             queued: Mutex::new(Some(Vec::new())),
+            inbound: Mutex::new(Some((0, 0))),
             end: LinkEnd::default(),
         });
         {
@@ -365,24 +385,41 @@ struct BridgeSocket {
     id: u64,
     channel: Weak<Inner>,
     queued: Mutex<Option<Vec<Vec<u8>>>>,
+    inbound: Mutex<Option<(usize, usize)>>,
     end: LinkEnd,
+}
+impl BridgeSocket {
+    fn forward(&self, bytes: Vec<u8>) -> Result<()> {
+        if self.end.closed() {
+            return Ok(());
+        }
+        let channel = self.channel.upgrade().ok_or(Error::Closed)?;
+        (channel.send)(SandboxMessage::SocketSend {
+            socket: self.id,
+            bytes,
+        })
+    }
 }
 impl Link for BridgeSocket {
     fn send(&self, bytes: Vec<u8>) -> Result<()> {
         if self.end.closed() {
             return Ok(());
         }
+        if bytes.len() > SOCKET_PAYLOAD {
+            return Err(Error::Invalid("terminal socket frame too large".into()));
+        }
         let mut queued = lock(&self.queued);
         if let Some(queued) = queued.as_mut() {
+            if queued.len() >= SOCKET_FRAMES
+                || queued.iter().map(Vec::len).sum::<usize>() + bytes.len() > SOCKET_BUFFER
+            {
+                return Err(Error::Invalid("terminal output buffer full".into()));
+            }
             queued.push(bytes);
             return Ok(());
         }
         drop(queued);
-        let channel = self.channel.upgrade().ok_or(Error::Closed)?;
-        (channel.send)(SandboxMessage::SocketSend {
-            socket: self.id,
-            bytes,
-        })
+        self.forward(bytes)
     }
     fn close(&self) {
         if self.end.closed() {
@@ -395,7 +432,8 @@ impl Link for BridgeSocket {
         }
     }
     fn on_message(&self, listener: Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
-        self.end.on_message(listener)
+        self.end.on_message(listener);
+        *lock(&self.inbound) = None;
     }
     fn on_close(&self, listener: Arc<dyn Fn() + Send + Sync>) {
         self.end.on_close(listener)

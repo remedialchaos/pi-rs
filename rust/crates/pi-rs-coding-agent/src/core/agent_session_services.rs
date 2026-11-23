@@ -800,7 +800,7 @@ async fn create_services(
         )
     });
 
-    let mut model_runtime = ModelRuntime::create(&agent_dir, &mut diagnostics).await?;
+    let mut model_runtime = ModelRuntime::create(&agent_dir, &runner, &mut diagnostics).await?;
     if args.list_models.is_some()
         && let Some(load_error) = model_runtime.registry().get_error()
     {
@@ -820,7 +820,21 @@ async fn create_services(
         &mut model_runtime,
         &mut diagnostics,
     );
-    let tools = selected_tools(&cwd, args, &settings);
+    let mut tools = selected_tools(&cwd, args, &settings);
+    if !args.no_tools {
+        for extension in runner.extensions() {
+            tools.extend(extension.agent_tools().into_iter().filter(|tool| {
+                let name = &tool.declaration().name;
+                args.tools
+                    .as_ref()
+                    .is_none_or(|patterns| patterns.iter().any(|p| tool_name_matches(p, name)))
+                    && args
+                        .exclude_tools
+                        .as_ref()
+                        .is_none_or(|patterns| !patterns.iter().any(|p| tool_name_matches(p, name)))
+            }));
+        }
+    }
     let system_prompt = build_system_prompt_sections(&SystemPromptOptions {
         cwd: cwd.clone(),
         custom_prompt: resources.system_prompt.clone(),

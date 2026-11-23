@@ -254,6 +254,25 @@ pub struct Workers {
     closed: Mutex<bool>,
 }
 impl Workers {
+    fn lock_path_for_key(&self, key: &str) -> PathBuf {
+        self.options
+            .lock_dir
+            .join(format!("{}.lock", super::plugins::digest(key.as_bytes())))
+    }
+    pub(crate) fn lock_path(&self, address: &serde_json::Value) -> Result<PathBuf> {
+        Ok(self.lock_path_for_key(&crate::json::JsonValue::from_serde(address.clone()).to_json()?))
+    }
+    /// Stop and forget only the worker owning this address. AppServer serializes
+    /// this with demand and holds the process lock during address mutations.
+    pub(crate) async fn retire(&self, address: &serde_json::Value) -> Result<()> {
+        let key = crate::json::JsonValue::from_serde(address.clone()).to_json()?;
+        let handle = self.handles.lock().await.remove(&key);
+        if let Some(handle) = handle {
+            handle.shutdown().await?;
+            handle.wait_exit().await;
+        }
+        Ok(())
+    }
     pub fn new(options: WorkerOptions) -> Result<Self> {
         super::app::private_directory(&options.lock_dir)?;
         Ok(Self {
@@ -309,9 +328,7 @@ impl Workers {
             end: LinkEnd::default(),
             outgoing: sender.clone(),
         });
-        let lock = options
-            .lock_dir
-            .join(format!("{}.lock", super::plugins::digest(key.as_bytes())));
+        let lock = self.lock_path_for_key(&key);
         sender
             .send(Frame::Control(Control::Start {
                 address,

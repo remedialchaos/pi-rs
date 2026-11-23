@@ -83,6 +83,31 @@ impl StoreEngine {
         self.inner.changed.subscribe()
     }
     pub fn commit(&self, writes: Vec<StoreWrite>) -> SqliteFuture<OutboxCommit> {
+        self.commit_step(
+            move |step| {
+                for write in writes {
+                    step.apply(write)?;
+                }
+                Ok(())
+            },
+            |(), commit| commit,
+            None,
+        )
+    }
+    pub(super) fn change_host_data(
+        &self,
+        address: crate::contracts::Address,
+        owners: super::HostDataOwners,
+        apply: impl FnOnce(&mut super::Step<'_>) -> Result<super::HostDataCounts> + Send + 'static,
+    ) -> SqliteFuture<super::HostDataCounts> {
+        self.commit_step(apply, |counts, _| counts, Some((address, owners)))
+    }
+    fn commit_step<T: Send + 'static, R: Send + 'static>(
+        &self,
+        apply: impl FnOnce(&mut super::Step<'_>) -> Result<T> + Send + 'static,
+        finish: impl FnOnce(T, OutboxCommit) -> R + Send + 'static,
+        ownership: Option<(crate::contracts::Address, super::HostDataOwners)>,
+    ) -> SqliteFuture<R> {
         let engine = self.clone();
         let inner = self.inner.clone();
         self.inner.db.call(move |c| {
@@ -91,18 +116,30 @@ impl StoreEngine {
             }
             let result = atomic(c, || {
                 let mut step = super::Step::new(c)?;
-                for write in writes {
-                    step.apply(write)?;
-                }
+                let value = apply(&mut step)?;
                 let commit = step.finish()?;
                 let runs = engine.prepare_live(c);
-                Ok((commit, runs))
+                let mut changes = Vec::new();
+                if let Some((address, owners)) = &ownership {
+                    for (documents, _) in &owners.documents {
+                        changes.extend(documents.prepare_host_data(c, address)?);
+                    }
+                }
+                Ok((value, commit, runs, changes))
             });
             match result {
-                Ok((commit, runs)) => {
-                    engine.adopt_live(runs)?;
+                Ok((value, commit, runs, changes)) => {
+                    let _runtime = inner.runtime.enter();
+                    let context = crate::context::Context::background();
+                    inner.batch.within(&context.clone(), move || {
+                        let _ownership = ownership;
+                        for change in changes {
+                            change(&context)?;
+                        }
+                        super::live_query::adopt(runs)
+                    })?;
                     inner.changed.send_replace(commit.seq);
-                    Ok(commit)
+                    Ok(finish(value, commit))
                 }
                 Err(error) => {
                     if matches!(error, Error::Diverged(_)) {

@@ -21,6 +21,7 @@ pub struct ModelRuntime {
 impl ModelRuntime {
     pub async fn create(
         agent_dir: &Path,
+        runner: &super::extensions::runner::ExtensionRunner,
         diagnostics: &mut Vec<super::agent_session_runtime::RuntimeDiagnostic>,
     ) -> Result<Self, String> {
         let auth_path = agent_dir.join("auth.json");
@@ -37,7 +38,8 @@ impl ModelRuntime {
                 error,
             ));
         }
-        let registry = ModelRegistry::new(models, Some(agent_dir.join("models.json")));
+        let mut registry = ModelRegistry::new(models, Some(agent_dir.join("models.json")));
+        let virtual_only = registry.apply_extensions(runner)?;
         let models = registry.models();
         models
             .refresh(RefreshOptions {
@@ -70,7 +72,7 @@ impl ModelRuntime {
             keys,
             scoped: Vec::new(),
         };
-        for provider in runtime.keys.keys() {
+        for provider in runtime.keys.keys().chain(virtual_only.iter()) {
             if runtime.authorized.insert(provider.clone()) {
                 runtime
                     .available

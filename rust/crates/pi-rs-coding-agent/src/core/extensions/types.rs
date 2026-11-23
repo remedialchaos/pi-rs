@@ -1047,6 +1047,10 @@ pub struct ExtensionCommandContext {
 /// WASM adapter.
 #[async_trait]
 pub trait Extension: Send + Sync {
+    fn agent_tools(&self) -> Vec<Arc<dyn pi_rs_agent::AgentTool>> {
+        Vec::new()
+    }
+
     fn name(&self) -> &str;
     fn path(&self) -> &str {
         self.name()

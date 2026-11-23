@@ -348,3 +348,47 @@ control readiness preceded the binary link hello. Readiness tests now have deadl
 Next: finish the FAIL gate, starting with HostData address ownership operations and
 worker routing, then registry-facing Files/HTTP and real launcher/build/bootstrap
 wiring. Do not mark Milestone 2.1 complete from this bounded checkpoint.
+
+## Milestone 2.1b-3: platform orchestration
+
+- `AppServer` routes authenticated holds to address-scoped workers on demand.
+  `HostData` exports running workers without stopping them. Import stages the
+  format-2 archive before retiring and replacing the target; delete retires only
+  the selected owner. Tar entries stream to and from disk, including the worker
+  store and finished blobs. The server store separately imports or deletes only
+  rows and documents that belong to that address.
+- The Host HTTP registry publishes routes, wraps and sockets on the running
+  listener and retires links owned by a removed contribution. Host-bound
+  `Files`, `FilesFolder` and `Users` expose paged views, persisted profiles and
+  idle upload expiry. Surface bootstrap and artifacts use the same HTTP registry.
+- Checked-in Rust-compiled WASM components exercise the production WIT setup,
+  method and state publication path. The rollout test proves successful
+  replacement and retention of the last healthy guest when setup is rejected.
+- The TUI launcher fetches authenticated bootstrap and content-addressed assets,
+  constrains fetches to its surface, and connects and closes its Chord client
+  link through the launcher channel.
+
+### Verification
+
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| Formatting | PASS | Crate `cargo fmt --check` |
+| Offline strict Clippy | PASS | All targets, `-D warnings` |
+| Offline Cargo suite | PASS | 178 passed, 0 failed, 0 ignored after restoration |
+| Mutation sensitivity | PASS | All 15 new tests failed under combined behavioral faults; all 10 mutated source files restored and verified by SHA-256 |
+
+Added 15 offline integration tests and removed none. Summed test execution grew
+from 9.32s (163 tests) to 30.41s (178 tests), including real worker child processes
+and guest component execution. Cargo test wall time including rebuild was 433s
+on the final run, versus 325.52s on the prior checkpoint.
+
+### Remaining limits
+
+This verifies the Rust orchestration paths, not full upstream or Phase 3 parity.
+Files transports bytes and cursor pages through JSON contract methods. The TUI
+launcher supplies a native client session rather than starting an arbitrary
+artifact as a subprocess or owning the operating system TTY. Scoped server
+store replacement is transactional and ordinary swap failures restore the old
+directory, but the filesystem and SQLite do not share a crash-atomic commit.
+WASM reload holdback is per host, not a distributed commit. Upstream replay,
+WSS client support, and non-Linux verification are not covered by this run.

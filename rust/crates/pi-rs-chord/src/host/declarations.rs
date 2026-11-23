@@ -59,12 +59,25 @@ pub(super) struct RegistryDeclaration {
 }
 pub struct FacetHost {
     pub(super) plugin: String,
+    pub(super) http: Option<crate::node::http::RegisteredHttp>,
     pub(super) host: Host,
     pub(super) types: IndexMap<String, Arc<Served>>,
     pub(super) registries: IndexMap<String, RegistryDeclaration>,
     pub(super) contributions: IndexMap<String, (Registry<JsonValue, JsonValue>, JsonValue)>,
 }
 impl FacetHost {
+    /// Contribute native handlers to the host's `chord.http` v1 registry.
+    pub fn contribute_http(&mut self, value: crate::node::http::HttpContribution) -> Result<()> {
+        if self.http.is_some() {
+            return Err(Error::Invalid("duplicate chord.http contribution".into()));
+        }
+        self.http = Some(
+            value
+                .registered(&self.plugin)
+                .map_err(|e| Error::Invalid(e.to_string()))?,
+        );
+        Ok(())
+    }
     pub fn serve(
         &mut self,
         contract: Arc<Contract>,
@@ -293,13 +306,14 @@ impl ObjectSelf {
                 definition.name()
             )));
         }
+        let singleton = definition.is_singleton();
         self.recorded.documents.push(definition.clone());
         let handle = self
             .attempt
             .as_ref()
             .map(|a| a.declare(definition))
             .transpose()?;
-        let source = if let Some(handle) = handle.clone() {
+        let source = if let Some(handle) = handle.clone().filter(|_| singleton) {
             self.follow(move |target, ctx| {
                 Box::pin(async move {
                     let source = handle.source()?;
@@ -501,6 +515,12 @@ pub struct ObjectDocument {
     source: Source,
 }
 impl ObjectDocument {
+    /// Access the document by key once the object is active.
+    pub fn keyed_handle(&self) -> Result<Handle> {
+        self.handle
+            .clone()
+            .ok_or_else(|| ChordError::new("not_ready", "recording document is inert").into())
+    }
     pub fn source(&self) -> Result<Source> {
         Ok(self.source.clone())
     }
@@ -517,6 +537,14 @@ impl ObjectDocument {
         context: &Context,
         change: impl FnOnce(crate::documents::Draft) -> SyncFuture<T> + Send,
     ) -> Result<T> {
+        self.change_at(None, context, change).await
+    }
+    pub async fn change_at<T: Send>(
+        &self,
+        key: Option<crate::documents::DocumentKey>,
+        context: &Context,
+        change: impl FnOnce(crate::documents::Draft) -> SyncFuture<T> + Send,
+    ) -> Result<T> {
         let object = self.object.upgrade().ok_or(Error::Closed)?;
         let handle = self
             .handle
@@ -526,7 +554,7 @@ impl ObjectDocument {
         object
             .documents
             .transaction(&token, context, move |tx| async move {
-                let draft = tx.draft(&handle, None).await?;
+                let draft = tx.draft(&handle, key).await?;
                 change(draft).await
             })
             .await

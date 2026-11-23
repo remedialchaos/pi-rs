@@ -1,6 +1,17 @@
 package pi:extension@0.1.0;
 
 interface host {
+    register-provider: func(name: string, config-json: string) -> result<_, string>;
+    register-virtual-model: func(provider: string, id: string, definition-json: string) -> result<_, string>;
+    register-tool: func(name: string, description: string, schema-json: string) -> result<_, string>;
+    register-command: func(name: string, description: option<string>) -> result<_, string>;
+    register-flag: func(name: string, description: option<string>, boolean: bool, default-value: option<string>) -> result<_, string>;
+    ui-select: func(title: string, items: list<string>) -> option<string>;
+    ui-confirm: func(title: string, message: string) -> bool;
+    ui-input: func(title: string, placeholder: option<string>) -> option<string>;
+    ui-notify: func(message: string, kind: option<string>);
+    ui-set-status: func(key: string, text: option<string>);
+    ui-set-widget: func(key: string, lines: option<list<string>>);
     notify: func(level: string, message: string);
     get-flag: func(name: string) -> option<string>;
     execute-tool: func(name: string, args-json: string) -> result<string, string>;

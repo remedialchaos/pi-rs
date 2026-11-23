@@ -1,0 +1,31 @@
+[package]
+name = "pi-rs-p3"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "p3: one Pi per person server, supervisor, CLI, and v1 plugin API (Rust port of apps/p3)"
+
+[[bin]]
+name = "p3"
+path = "src/main.rs"
+
+[dependencies]
+pi-rs-chord = { path = "../pi-rs-chord" }
+pi-rs-schema = { path = "../pi-rs-schema" }
+pi-rs-telemetry = { path = "../pi-rs-telemetry" }
+pi-rs-ai = { path = "../pi-rs-ai" }
+
+axum = { version = "0.8", features = ["ws"] }
+chrono = { version = "0.4", features = ["clock", "serde"] }
+http = "1"
+indexmap = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
