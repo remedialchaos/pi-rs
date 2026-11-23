@@ -22,6 +22,7 @@ indexmap = { version = "2", features = ["serde"] }
 percent-encoding = "2"
 regex = "1"
 url = "2"
+vt100 = "0.16"
 sha2 = "0.10"
 pi-rs-ai = { path = "../pi-rs-ai" }
 pi-rs-chord = { path = "../pi-rs-chord" }
