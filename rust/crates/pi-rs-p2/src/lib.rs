@@ -2,5 +2,6 @@
 
 pub mod api;
 pub mod hosts;
+pub mod plugins;
 pub mod runtime;
 pub mod upstream;
