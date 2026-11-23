@@ -303,8 +303,19 @@ impl Drop for OpenLease {
     }
 }
 #[derive(Clone)]
+pub enum LinkAdmission {
+    Attach,
+    Reject(StatusCode),
+    Close(axum::extract::ws::CloseFrame),
+}
+
+#[derive(Clone)]
 pub struct HttpOptions {
     pub links_path: Option<String>,
+    /// Inspect the authenticated request before attaching a WebSocket to Chord.
+    pub admit_link: fn(&HttpRequest) -> LinkAdmission,
+    /// Stop at this principal; otherwise keep the first match while checking later authenticators.
+    pub prefer_principal: fn(&serde_json::Value) -> bool,
     pub opened: OpenedLink,
     /// Build Chord link options from the principal admitted by HTTP authentication.
     pub remote: Arc<dyn Fn(serde_json::Value) -> RemoteOptions + Send + Sync>,
@@ -317,6 +328,8 @@ impl Default for HttpOptions {
     fn default() -> Self {
         Self {
             links_path: Some("/_chord/link".into()),
+            admit_link: |_| LinkAdmission::Attach,
+            prefer_principal: |_| true,
             opened: Arc::new(|_| None),
             remote: Arc::new(RemoteOptions::new),
             max_payload: 1024 * 1024,
@@ -534,12 +547,16 @@ impl Http {
                 body: Arc::new(tokio::sync::Mutex::new(Some(body))),
             };
             if !cross_site && (!foreign || navigation && route.as_ref().is_some_and(|r| r.page)) {
+                let mut first = None;
                 'auth: for contribution in &contributions {
                     for authenticate in &contribution.authenticators {
                         match authenticate(req.clone()).await {
                             Ok(Some(principal)) => {
-                                req.principal = Some(principal);
-                                break 'auth;
+                                if (self.0.options.prefer_principal)(&principal) {
+                                    first = Some(principal);
+                                    break 'auth;
+                                }
+                                first.get_or_insert(principal);
                             }
                             Ok(None) => {}
                             Err(e) => (self.0.options.on_error)(format!(
@@ -549,13 +566,27 @@ impl Http {
                         }
                     }
                 }
+                req.principal = first;
             }
             if let Some(upgrade) = upgrade {
                 if is_link {
+                    let admission = (self.0.options.admit_link)(&req);
+                    if let LinkAdmission::Reject(status) = admission {
+                        return Ok((status, [(http::header::CONNECTION, "close")]).into_response());
+                    }
                     let principal = req
                         .principal
                         .clone()
                         .ok_or_else(|| HttpError::new(401, "Unauthorized"))?;
+                    if let LinkAdmission::Close(frame) = admission {
+                        return Ok(upgrade
+                            .on_upgrade(move |mut socket| async move {
+                                let _ = socket
+                                    .send(axum::extract::ws::Message::Close(Some(frame)))
+                                    .await;
+                            })
+                            .into_response());
+                    }
                     let this = self.clone();
                     return Ok(upgrade
                         .max_message_size(self.0.options.max_payload)

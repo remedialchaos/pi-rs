@@ -1,6 +1,6 @@
 # `pi-rs` Handoff
 
-- **Previous checkpoint**: `6302ffe8b` (durable observation and telemetry) on local `main`.
+- **Previous checkpoint**: `bb908bd1c` (durable cancellation and restart) on local `main`.
 - **Stage**: Wave 1 in progress. The previous checkpoint recorded 17 workspace crates, 21 leaf gates and 2,236 native tests.
 - **Fallback rate**: `pi`, `pi-ai`, `pi-env`, `pi-evals`, `p3`, `pi-mac`, and `pi-voice-server` binaries run 100% natively; `packages/` and `apps/` untouched.
 - **Next action**: Verify and integrate the Wave 1 claims in [MAP.md](MAP.md) before assigning the 49 built-in plugins. Isolated worktrees under `.worktrees/` contain unmerged work.
@@ -29,7 +29,7 @@
 | **3.1** `pi-rs-p3` (`p3` bin; `old/` skipped) | **PASS** | **79/79** tests (69 lib + 6 live `p3` binary CLI + 4 live child-worker runner, 5/5 mutation checks), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
 | **3.2-web** Browser | PARTIAL | 135 native tests. Chromium exchanged chat with upstream and loaded the packaged native application's JS, WASM, CSS and fonts under production CSP. Owner and guest admission used fixture credentials on a native server. Native session creation and chat still need their providers. |
 | **3.2-tui** Mounted client | PARTIAL | 20 tests, including five new mutation-verified terminal cases for transcript, keyboard paging, tree layout, native shortcut dispatch and theme reload. Dynamic guests, mouse scroll and whole-screen replay remain open. |
-| **3.2** `pi-rs-p2` standalone server | PARTIAL | Six upstream HTTP cases passed at the core checkpoint. Two subsequent tests verified 106 shared contracts across 130 versions. The existing worker timing check failed under load before and after the declaration change. Authenticated native chat, remaining hosts and 49 built-in plugins are open. |
+| **3.2** `pi-rs-p2` standalone server | PARTIAL | Ten native tests passed with the packaged browser, including owner access, a stale-browser reload and 106 shared contracts across 130 versions. Six HTTP replay cases passed at the core checkpoint. Worker supervision, native chat and 49 built-in plugins are in progress. |
 | **3.3** `pi-rs-p2-mac` (`pi-mac` bin) | **PASS** | 16/16 Linux tests + `aarch64-apple-darwin` check + real upstream `p2` smoke PASS |
 | **3.4** `pi-rs-voice-server` (`pi-voice-server` bin) | **PASS** | 17/17 offline tests + real Supertonic/Kokoro/Silero/Parakeet verified |
 

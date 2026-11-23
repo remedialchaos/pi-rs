@@ -144,7 +144,6 @@ async fn worker_opens_matching_session_and_refuses_mismatched_address() -> TestR
         directory.path().join("locks"),
     );
     options.args.push("--worker".into());
-    options.start_timeout = Duration::from_secs(5);
     let workers = Workers::new(options.clone())?;
     let start = json!({
         "app": "",

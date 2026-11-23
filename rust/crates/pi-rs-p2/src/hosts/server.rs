@@ -203,6 +203,10 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         host.clone(),
         HttpOptions {
             links_path: Some("/chord".into()),
+            prefer_principal: |principal| principal["kind"] == "owner",
+            admit_link: |request| {
+                crate::runtime::http::admit_link(request, super::web::browser_base())
+            },
             max_payload: 1024 * 1024,
             max_buffered: 4 * 1024 * 1024,
             close_timeout: Duration::from_secs(8),

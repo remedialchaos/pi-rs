@@ -20,9 +20,13 @@ async fn server(directory: &tempfile::TempDir) -> TestResult<P2Server> {
         Box::pin(async move {
             Ok(match request.header("cookie") {
                 Some("fixture=owner") => Some(json!({"kind":"owner","access":"local"})),
-                Some("fixture=guest") => Some(json!({
+                Some("fixture=guest" | "fixture=both") => Some(json!({
                     "kind":"guest","id":"guest","name":"Guest","home":"aa-11",
                     "sessions":{"aa-11":"view"},"revision":1
+                })),
+                Some("fixture=shared") => Some(json!({
+                    "kind":"guest","id":"share","name":"Invited","home":"second","email":"user@example.test",
+                    "sessions":{"second":"full","first":"view"},"revision":2
                 })),
                 Some("fixture=worker") => {
                     Some(json!({"kind":"worker","session":"aa-11","generation":1}))
@@ -32,12 +36,87 @@ async fn server(directory: &tempfile::TempDir) -> TestResult<P2Server> {
             })
         })
     }));
+    auth.authenticators.push(std::sync::Arc::new(|request| {
+        Box::pin(async move {
+            Ok((request.header("cookie") == Some("fixture=both"))
+                .then(|| json!({"kind":"owner","access":"local"})))
+        })
+    }));
     let mut options = ServerOptions::new(directory.path().to_owned());
     options.port = 0;
     options
         .registry
         .register("browser-fixture", FacetKind::Server, auth.facet())?;
     Ok(start_server(options).await?)
+}
+
+#[tokio::test]
+async fn access_over_chord_exposes_only_the_authenticated_browsers_own_grant() -> TestResult {
+    use pi_rs_chord::{
+        context::Context,
+        json::JsonValue,
+        node::http::connect_websocket,
+        remote::{RemoteOptions, RemotePeer},
+        state::Batch,
+    };
+    use pi_rs_p2::api::v1::p2_contracts::lookup;
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir()?;
+    let server = server(&directory).await?;
+    let contract = Arc::new(lookup("p2.access")?);
+    let ctx = Context::background();
+    for (cookie, variant, grant) in [
+        ("fixture=owner", "owner", None),
+        ("fixture=both", "owner", None),
+        (
+            "fixture=guest",
+            "guest",
+            Some(
+                json!({"id":"guest","name":"Guest","session":"aa-11","mode":"view","sessions":{"aa-11":"view"}}),
+            ),
+        ),
+        (
+            "fixture=shared",
+            "guest",
+            Some(
+                json!({"id":"share","name":"Invited","session":"second","mode":"full","sessions":{"second":"full","first":"view"},"email":"user@example.test"}),
+            ),
+        ),
+        ("fixture=worker", "forbidden", None),
+    ] {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::COOKIE, cookie.parse()?);
+        let link = connect_websocket(
+            &format!("ws://{}/chord?client=script", server.address),
+            headers,
+            1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .await?;
+        let client = RemotePeer::connect(
+            link,
+            RemoteOptions::new(json!({"kind":"server"})),
+            Batch::new(|_| {}),
+        )?;
+        let held = client.hold(contract.clone(), JsonValue::from_serde(json!({})), &ctx)?;
+        let ready = tokio::time::timeout(Duration::from_secs(5), held.wait(&ctx)).await?;
+        if variant == "forbidden" {
+            assert!(matches!(ready, Err(pi_rs_chord::Error::Chord(e)) if e.code == "forbidden"));
+        } else {
+            ready?;
+            assert_eq!(held.variant().as_deref(), Some(variant));
+            if let Some(grant) = grant {
+                assert_eq!(held.member("grant")?.value()?.to_json().to_serde()?, grant);
+            } else {
+                assert!(held.member("grant").is_err());
+            }
+        }
+        held.release();
+        client.close();
+    }
+    server.close().await?;
+    Ok(())
 }
 
 async fn request(

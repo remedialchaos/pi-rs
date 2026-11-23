@@ -1,6 +1,36 @@
 use http::{HeaderMap, Method, header};
+use pi_rs_chord::node::http::{HttpRequest, LinkAdmission};
+
+#[cfg(test)]
+mod tests;
 
 pub const PROXY_MARKER_HEADER: &str = "x-p2-proxy-secret";
+
+pub(crate) fn admit_link(request: &HttpRequest, base: Option<&str>) -> LinkAdmission {
+    if request.principal.is_none() {
+        return LinkAdmission::Reject(http::StatusCode::FORBIDDEN);
+    }
+    stale_page(&request.query, base).map_or(LinkAdmission::Attach, LinkAdmission::Close)
+}
+
+/// An old browser reloads on this close frame. Named non-browser clients may omit the base.
+fn stale_page(query: &str, base: Option<&str>) -> Option<axum::extract::ws::CloseFrame> {
+    let params = form_urlencoded::parse(query.as_bytes());
+    let first = |key: &str| {
+        params
+            .clone()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    };
+    let is_current = match first("web") {
+        Some(sent) => base.is_none_or(|base| sent == base),
+        None => matches!(first("client").as_deref(), Some("tui" | "cloud" | "script")),
+    };
+    (!is_current).then(|| axum::extract::ws::CloseFrame {
+        code: 4001,
+        reason: "p2: stale page, reload".into(),
+    })
+}
 
 pub fn parse_allowed_hosts(value: &str) -> Vec<String> {
     value

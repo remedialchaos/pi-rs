@@ -25,60 +25,40 @@ use std::{
     time::Duration,
 };
 
-// Build the actual native child as part of the integration test without changing Cargo targets.
-fn executable(dir: &Path) -> PathBuf {
-    let deps = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_owned();
-    let chord = std::fs::read_dir(&deps)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("libpi_rs_chord-")
-                && path.extension().is_some_and(|ext| ext == "rlib")
-        })
-        .max_by_key(|path| path.metadata().unwrap().modified().unwrap())
-        .unwrap();
-    let exec = dir.join("worker");
-    // Rustc resolves the exact transitive Tokio instance used by the selected Chord rlib.
-    let tokio = std::fs::read_dir(&deps)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("libtokio-")
-                && path.extension().is_some_and(|ext| ext == "rlib")
-        })
-        .max_by_key(|path| path.metadata().unwrap().modified().unwrap())
-        .unwrap();
-    let result = std::process::Command::new("rustc")
-        .args(["--edition=2024", "-C", "debuginfo=0", "-L"])
-        .arg(format!("dependency={}", deps.display()))
-        .arg("--extern")
-        .arg(format!("pi_rs_chord={}", chord.display()))
-        .arg("--extern")
-        .arg(format!("tokio={}", tokio.display()))
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/b3_worker.rs"
-        ))
-        .arg("-o")
-        .arg(&exec)
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    exec
+// Ask Cargo for the executable so this also works with a filtered test run.
+fn worker_executable() -> std::io::Result<PathBuf> {
+    let output = std::process::Command::new(env!("CARGO"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "build",
+            "--offline",
+            "-j",
+            "1",
+            "--example",
+            "b3-worker",
+            "--message-format=json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    for line in output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let message: serde_json::Value = serde_json::from_slice(line)?;
+        if message["target"]["name"] == "b3-worker"
+            && let Some(path) = message["executable"].as_str()
+        {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    Err(std::io::Error::other(
+        "Cargo did not report the worker fixture executable",
+    ))
 }
 fn params(id: &str) -> JsonValue {
     JsonValue::from_serde(json!({"id":id}))
@@ -86,8 +66,8 @@ fn params(id: &str) -> JsonValue {
 fn address(id: &str) -> Address {
     worker::kind().address(params(id)).unwrap()
 }
-async fn app(dir: &Path) -> (AppServer, Arc<AtomicUsize>) {
-    let child = executable(dir);
+async fn app(dir: &Path) -> pi_rs_chord::Result<(AppServer, Arc<AtomicUsize>)> {
+    let child = worker_executable()?;
     let count = Arc::new(AtomicUsize::new(0));
     let starts = count.clone();
     let mut process = WorkerOptions::new(child, dir.join("unused"));
@@ -110,7 +90,7 @@ async fn app(dir: &Path) -> (AppServer, Arc<AtomicUsize>) {
         json!({"kind":"server"}),
     );
     options.workers.push(kind);
-    (start_server(options).await.unwrap(), count)
+    Ok((start_server(options).await?, count))
 }
 async fn who(reference: &RemoteReference) -> serde_json::Value {
     let context = Context::background();
@@ -127,9 +107,10 @@ async fn who(reference: &RemoteReference) -> serde_json::Value {
     .unwrap()
 }
 #[tokio::test]
-async fn worker_kind_routes_two_addresses_and_stamps_the_authenticated_caller() {
+async fn worker_kind_routes_two_addresses_and_stamps_the_authenticated_caller()
+-> pi_rs_chord::Result<()> {
     let dir = tempfile::tempdir().unwrap();
-    let (app, starts) = app(dir.path()).await;
+    let (app, starts) = app(dir.path()).await?;
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     let mut headers = http::HeaderMap::new();
     let issued = app
@@ -192,11 +173,13 @@ async fn worker_kind_routes_two_addresses_and_stamps_the_authenticated_caller() 
     })
     .await
     .unwrap();
+    Ok(())
 }
 #[tokio::test]
-async fn live_export_replace_and_delete_transfer_only_the_selected_address() {
+async fn live_export_replace_and_delete_transfer_only_the_selected_address()
+-> pi_rs_chord::Result<()> {
     let dir = tempfile::tempdir().unwrap();
-    let (app, starts) = app(dir.path()).await;
+    let (app, starts) = app(dir.path()).await?;
     let context = Context::background();
     let one = app
         .hold_worker(worker::contract(), params("one"), &context)
@@ -270,5 +253,5 @@ async fn live_export_replace_and_delete_transfer_only_the_selected_address() {
             .is_err()
     );
     assert_eq!(who(&one).await["id"], "one");
-    app.close().await.unwrap();
+    app.close().await
 }

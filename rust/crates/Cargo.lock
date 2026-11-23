@@ -4017,6 +4017,8 @@ name = "pi-rs-p2"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "form_urlencoded",
+ "futures-util",
  "hmac 0.12.1",
  "http",
  "indexmap 2.14.2",
@@ -4027,6 +4029,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "uuid",
 ]
 

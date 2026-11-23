@@ -168,3 +168,18 @@ reload to verify persistence. Exercise access rejection for a guest without a se
 The browser milestone's upstream test used injected assets and CSP bypass. The native
 browser checks for this slice exercise asset delivery. Native chat and persistence still
 require the production providers and worker wiring.
+
+### Browser identity and stale pages
+
+The HTTP host prefers the owner when multiple credentials match. Over Chord,
+the browser can read its own access grant. An authenticated client presenting
+an outdated browser bundle receives the reload close frame before Chord sends
+its hello. The unchanged upstream device-authentication and stale-page cases
+each passed. Changing the owner classification and accepting the stale link
+each failed the corresponding Rust test.
+
+Two tests were added and zero removed. The previous eight-test revision had a
+worker-startup timeout under load, so a passing time for that run is unavailable.
+The fixture now uses the production startup deadline. All ten tests passed in
+23.22 s of test execution with production browser assets. Workspace formatting
+and strict all-target Clippy for p2 and Chord passed.

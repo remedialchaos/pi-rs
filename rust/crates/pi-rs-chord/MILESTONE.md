@@ -392,3 +392,14 @@ store replacement is transactional and ordinary swap failures restore the old
 directory, but the filesystem and SQLite do not share a crash-atomic commit.
 WASM reload holdback is per host, not a distributed commit. Upstream replay,
 WSS client support, and non-Linux verification are not covered by this run.
+
+### HTTP admission and native owner fixture
+
+The HTTP host accepts an application preference among authenticated principals
+and an application close frame before attaching a WebSocket peer. The p2 browser
+tests cover owner preference, grant publication and stale-client reload.
+The owner integration tests build their child fixture as a Cargo example.
+Selecting crate archives by modification time previously paired incompatible
+Tokio types and failed before either child could run. Both existing owner tests
+passed in 126.18 s including the fixture build. Zero Chord tests were added or
+removed. The earlier failed run has no passing suite time for comparison.

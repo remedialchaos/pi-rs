@@ -5,6 +5,10 @@ edition = "2024"
 publish = false
 license = "MIT"
 
+[[example]]
+name = "b3-worker"
+path = "tests/fixtures/b3_worker.rs"
+
 [dependencies]
 pi-rs-schema = { path = "../pi-rs-schema" }
 pi-rs-telemetry = { path = "../pi-rs-telemetry" }

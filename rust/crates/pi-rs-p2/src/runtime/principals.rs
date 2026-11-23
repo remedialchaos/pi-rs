@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,7 +14,7 @@ pub enum Principal {
         #[serde(skip_serializing_if = "Option::is_none")]
         email: Option<String>,
         home: String,
-        sessions: BTreeMap<String, GrantMode>,
+        sessions: IndexMap<String, GrantMode>,
         revision: u64,
     },
     Worker {
