@@ -14,6 +14,7 @@ members = [
     "pi-rs-env",
     "pi-rs-evals",
     "pi-rs-p3",
+    "pi-rs-p2",
     "pi-rs-p2-web",
     "pi-rs-p2-tui",
     "pi-rs-p2-mac",

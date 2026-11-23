@@ -1,6 +1,6 @@
 # `pi-rs` Handoff
 
-- **Base commit**: `1e6e4aa16` on local `main`, three commits ahead of `origin/main`.
+- **Previous checkpoint**: `b4a61f54e` (mounted TUI) on local `main`.
 - **Stage**: Wave 1 in progress. The previous checkpoint recorded 17 workspace crates, 21 leaf gates and 2,236 native tests.
 - **Fallback rate**: `pi`, `pi-ai`, `pi-env`, `pi-evals`, `p3`, `pi-mac`, and `pi-voice-server` binaries run 100% natively; `packages/` and `apps/` untouched.
 - **Next action**: Verify and integrate the Wave 1 claims in [MAP.md](MAP.md) before assigning the 49 built-in plugins. Isolated worktrees under `.worktrees/` contain unmerged work.
@@ -33,7 +33,7 @@
 | **3.3** `pi-rs-p2-mac` (`pi-mac` bin) | **PASS** | 16/16 Linux tests + `aarch64-apple-darwin` check + real upstream `p2` smoke PASS |
 | **3.4** `pi-rs-voice-server` (`pi-voice-server` bin) | **PASS** | 17/17 offline tests + real Supertonic/Kokoro/Silero/Parakeet verified |
 
-The upstream server and the standalone Rust Wave 1 binary (SHA-256 `4f186820268344cec5bfd99229649d9228730fe9002d1cce0f7af129064d1b49`) each passed the six [HTTP cases](app-cases/http/). Run with `P2_FAKE=1` and a disposable `P2_DATA_DIR`. The upstream WebSocket session creation, retry and chat case passed in `apps/p2/test/p2/session-operations.test.ts`. Native authenticated session/chat flow and plugin integration are pending.
+The upstream server and the standalone Rust Wave 1 binary (SHA-256 `16763aeedfdaefa2c7b732af551cee77f9c2080c4d5ead2a3b369b0defc5d129`) each passed the six [HTTP cases](app-cases/http/). Run with `P2_FAKE=1` and a disposable `P2_DATA_DIR`. The upstream WebSocket session creation, retry and chat case passed in `apps/p2/test/p2/session-operations.test.ts`. Native authenticated session/chat flow and plugin integration are pending.
 
 ## Key Links
 

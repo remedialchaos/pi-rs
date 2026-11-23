@@ -4007,6 +4007,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-rs-p2"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hmac 0.12.1",
+ "http",
+ "indexmap 2.14.2",
+ "pi-rs-chord",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pi-rs-p2-mac"
 version = "0.1.0"
 dependencies = [
