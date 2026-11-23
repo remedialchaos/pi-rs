@@ -374,7 +374,18 @@ impl<'a> Transaction<'a> {
         &mut self,
         task: &Task<R, H>,
         input: Value,
+        options: TaskOptions,
+    ) -> Result<TaskId> {
+        self.create_task_initialized(task, input, options, None)
+            .await
+    }
+
+    pub(crate) async fn create_task_initialized<R: ?Sized, H>(
+        &mut self,
+        task: &Task<R, H>,
+        input: Value,
         mut options: TaskOptions,
+        checkpoint: Option<Value>,
     ) -> Result<TaskId> {
         self.write()?;
         if let Some(ids) = options.submission_ids.take() {
@@ -422,7 +433,10 @@ impl<'a> Transaction<'a> {
         let conversation_id = conversation_id
             .ok_or_else(|| Error::invalid("Tx.createTask() requires options.conversationId"))?;
         self.require_conversation(conversation_id).await?;
-        let checkpoint = task.initial(&input).map_err(Error::Callback)?;
+        let checkpoint = match checkpoint {
+            Some(checkpoint) => checkpoint,
+            None => task.initial(&input).map_err(Error::Callback)?,
+        };
         let id = self.session.mint_id()?;
         let trace = match options.trace {
             TaskTrace::Root => None,

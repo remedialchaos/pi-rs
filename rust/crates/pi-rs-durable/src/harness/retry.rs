@@ -88,12 +88,15 @@ static TRANSIENT: LazyLock<RegexSet> = LazyLock::new(|| {
     ]).expect("valid provider error expressions")
 });
 pub(super) fn delay(settings: &serde_json::Value, error: &str, attempt: u64) -> Option<u64> {
+    if LIMIT.is_match(error) || !TRANSIENT.is_match(error) {
+        return None;
+    }
+    backoff(settings, attempt)
+}
+
+pub(super) fn backoff(settings: &serde_json::Value, attempt: u64) -> Option<u64> {
     let policy = &settings["retry"];
-    if policy["enabled"] == false
-        || attempt > policy["maxRetries"].as_u64().unwrap_or(3)
-        || LIMIT.is_match(error)
-        || !TRANSIENT.is_match(error)
-    {
+    if policy["enabled"] == false || attempt > policy["maxRetries"].as_u64().unwrap_or(3) {
         return None;
     }
     let base = policy["baseDelayMs"].as_u64().unwrap_or(2000);

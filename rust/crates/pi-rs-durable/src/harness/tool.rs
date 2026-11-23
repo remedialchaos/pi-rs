@@ -177,6 +177,13 @@ impl Invocation {
         let TaskState::Running { checkpoint, wake } = &self.record.state else {
             return Err(Error::invalid("Tool must be running"));
         };
+        let cutoff = self.restart_cutoff();
+        let cutoff_error = cutoff.as_ref().map(|(frequency, _)| {
+            format!(
+                "Tool {} was interrupted {frequency}; it is not run again",
+                call.name
+            )
+        });
         let result = if self.record.abort_requested {
             if (checkpoint["phase"] == "parked" || checkpoint.get("wake").is_some())
                 && let Some(cancel) = tool.and_then(|t| t.cancel.as_ref())
@@ -220,6 +227,8 @@ impl Invocation {
                 }
             };
             harness_error(code, &message)
+        } else if let Some(message) = &cutoff_error {
+            harness_error("restart_limit", message)
         } else if let Some(tool) = tool {
             if checkpoint["phase"] == "call" {
                 let mut checked_call = call.clone();
@@ -355,9 +364,30 @@ impl Invocation {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .finish(&mut result);
-        for hook in agent.hooks("pi.tool", "afterTool") {
-            if let Some(next) = hook(json!({"call":call,"result":result}), self, ctx).await? {
-                result = serde_json::from_value(next)?;
+        if cutoff
+            .as_ref()
+            .is_none_or(|(_, salvage)| *salvage && !self.record.abort_requested)
+        {
+            for hook in agent.hooks("pi.tool", "afterTool") {
+                let change = hook(json!({"call":call,"result":result}), self, ctx)
+                    .await
+                    .and_then(|value| {
+                        value
+                            .map(serde_json::from_value)
+                            .transpose()
+                            .map_err(Error::from)
+                    });
+                match change {
+                    Ok(Some(next)) => result = next,
+                    Ok(None) => {}
+                    Err(error) => {
+                        ctx.check()?;
+                        self.harness.session.harness_report(
+                            crate::session::ReportKind::Extension,
+                            &error.to_string(),
+                        );
+                    }
+                }
             }
         }
         if let Some(tool) = tool {
@@ -556,6 +586,14 @@ impl Invocation {
                 outcome: if self.record.abort_requested {
                     TaskOutcome::Aborted {
                         reason: None,
+                        result: Some(value),
+                    }
+                } else if let Some(message) = cutoff_error {
+                    TaskOutcome::Failed {
+                        error: crate::TaskOutcomeError {
+                            message,
+                            detail: Some(json!({"reason":"restart_limit"})),
+                        },
                         result: Some(value),
                     }
                 } else {

@@ -65,3 +65,16 @@ The integrated native suite passed all 87 tests in 32.99 s of test execution,
 up from 82 tests in 37.78 s on the preceding checkpoint. Five tests were added,
 one extended, and zero removed. Offline all-target Clippy passed with warnings
 denied. Cancellation, restart cutoffs and hook failure handling remain in progress.
+
+### Cancellation and restart
+
+Closing a harness returns its in-flight work to pending. Reopening resends the
+request without charging a retry. After an interrupted request, disabling retries
+prevents a further provider call. Explicit abort supersedes a descendant restart
+mark. An after-run hook reports a rejected task request while preserving the answer.
+
+Four tests were added and zero removed. Each failed under a corresponding
+mutation and passed after restoration. The integrated suite passed 91 tests in
+69.69 s of test execution, compared with 87 in 32.99 s on the previous revision.
+Offline all-target Clippy passed with warnings denied. Cancellation while a commit
+is blocked, interrupted provider polling and additional cutoff cases are pending.

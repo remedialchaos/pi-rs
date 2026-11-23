@@ -9,57 +9,132 @@ use crate::{
 use pi_rs_chord::{context::Context, delta::Segment};
 use serde_json::{Value, json};
 
+#[derive(Default)]
+pub(super) struct HookDecision {
+    pub(super) continuation: Option<Value>,
+    pub(super) tasks: Vec<PreparedTask>,
+}
+
+pub(super) struct PreparedTask {
+    task: std::sync::Arc<crate::tasks::Task<Invocation>>,
+    input: Value,
+    checkpoint: Value,
+}
+
 impl Invocation {
+    pub(super) fn restart_cutoff(&self) -> Option<(String, bool)> {
+        let count = self.record.restarts?;
+        let limit = (self.harness.settings)()["restartLimit"]
+            .as_u64()
+            .unwrap_or(super::DEFAULT_RESTART_LIMIT);
+        (count >= limit).then(|| {
+            let frequency = if count == 1 {
+                "once".into()
+            } else {
+                format!("{count} times in a row")
+            };
+            (frequency, count == limit)
+        })
+    }
+
+    pub(super) async fn invoke_hook(
+        &self,
+        hook: &super::HookHandler,
+        input: Value,
+        ctx: &Context,
+    ) -> Result<Option<Value>> {
+        match hook(input, self, ctx).await {
+            Ok(decision) => Ok(decision),
+            Err(error) => {
+                ctx.check()?;
+                self.harness
+                    .session
+                    .harness_report(crate::session::ReportKind::Extension, &error.to_string());
+                Ok(None)
+            }
+        }
+    }
+
     pub(super) async fn hook_decisions(
         &self,
         agent: &Agent,
         event: &str,
         input: Value,
         ctx: &Context,
-    ) -> Result<Vec<Value>> {
-        let mut decisions = Vec::new();
+    ) -> Result<HookDecision> {
+        let registry = self.harness.registry.snapshot();
+        let mut result = HookDecision::default();
         for hook in agent.hooks("pi.generation", event) {
-            match hook(input.clone(), self, ctx).await {
-                Ok(Some(decision)) => {
-                    decisions.push(decision);
-                    if event == "onYield" {
-                        break;
+            let Some(decision) = self.invoke_hook(&hook, input.clone(), ctx).await? else {
+                continue;
+            };
+            if let Some(requests) = decision.get("tasks") {
+                let mut errors = Vec::new();
+                if let Some(requests) = requests.as_array() {
+                    for request in requests {
+                        let name = request["task"].as_str().unwrap_or("");
+                        if name.starts_with("pi.") {
+                            errors.push(format!("A hook cannot start the built-in task {name}"));
+                            continue;
+                        }
+                        let Some(task) = registry.task(name) else {
+                            errors.push(format!("Task {name} is not installed"));
+                            continue;
+                        };
+                        let input = request["input"].clone();
+                        match task.initial(&input) {
+                            Ok(checkpoint) => {
+                                let phase = checkpoint["phase"].as_str().unwrap_or("undefined");
+                                if task.definition.phases.contains_key(phase) {
+                                    result.tasks.push(PreparedTask {
+                                        task: task.clone(),
+                                        input,
+                                        checkpoint,
+                                    });
+                                } else {
+                                    errors.push(format!(
+                                        "Task {name} starts at the unknown phase {phase}"
+                                    ));
+                                }
+                            }
+                            Err(error) => errors.push(error.to_string()),
+                        }
                     }
+                } else {
+                    errors.push("Hook tasks must be an array".into());
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    ctx.check()?;
+                if !errors.is_empty() {
                     self.harness
                         .session
-                        .harness_report(crate::session::ReportKind::Extension, &error.to_string());
+                        .harness_report(crate::session::ReportKind::Extension, &errors.join("\n"));
                 }
             }
+            if event == "onYield" {
+                result.continuation = decision.get("continue").cloned();
+                break;
+            }
         }
-        Ok(decisions)
+        Ok(result)
     }
+
     pub(super) async fn hook_children(
         &self,
         tx: &mut Transaction<'_>,
-        decisions: &[Value],
+        decisions: &HookDecision,
     ) -> Result<Vec<TaskId>> {
-        let registry = self.harness.registry.snapshot();
-        let mut children = Vec::new();
-        for request in decisions
-            .iter()
-            .flat_map(|v| v["tasks"].as_array().into_iter().flatten())
-        {
-            let Some(name) = request["task"].as_str() else {
-                continue;
-            };
-            let Some(task) = registry.task(name).filter(|_| !name.starts_with("pi.")) else {
-                continue;
-            };
+        let mut children = Vec::with_capacity(decisions.tasks.len());
+        for prepared in &decisions.tasks {
             let options = TaskOptions::new(TaskOwnership::Task {
                 task_id: self.record.id,
             });
             children.push(
-                tx.create_task(task, request["input"].clone(), options)
-                    .await?,
+                tx.create_task_initialized(
+                    &prepared.task,
+                    prepared.input.clone(),
+                    options,
+                    Some(prepared.checkpoint.clone()),
+                )
+                .await?,
             );
         }
         Ok(children)
@@ -162,7 +237,7 @@ impl Invocation {
             self.hook_decisions(agent, "afterRun", checkpoint["run"].clone(), ctx)
                 .await?
         } else {
-            vec![]
+            Default::default()
         };
         self.commit(ctx, async |tx, _| {
             let boundary = super::prepare_boundary(

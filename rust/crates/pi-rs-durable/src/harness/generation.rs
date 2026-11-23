@@ -204,29 +204,7 @@ pub fn generation_task() -> Arc<Task<Invocation>> {
                     return Err(Error::invalid("Generation abort requires running state").into());
                 };
                 let phase = checkpoint["phase"].as_str();
-                let poll = if phase == Some("poll") {
-                    Some(checkpoint)
-                } else {
-                    checkpoint.get("poll")
-                };
-                if let Some(poll) = poll
-                    && let Some((provider, model)) = poll["model"]["provider"]
-                        .as_str()
-                        .zip(poll["model"]["modelId"].as_str())
-                    && let Some(model) = inv.harness.models.get_model(provider, model)
-                    && let Ok(handle) = serde_json::from_value(poll["handle"].clone())
-                {
-                    let options = StreamOptions {
-                        telemetry: super::telemetry::active_context(ctx),
-                        ..Default::default()
-                    };
-                    let _ = inv
-                        .harness
-                        .models
-                        .cancel_deferred(model, handle, options)
-                        .await;
-                    ctx.check().map_err(Error::from)?;
-                }
+                inv.cancel_deferred_checkpoint(checkpoint, ctx).await?;
                 inv.commit(ctx, async |tx, record| {
                     let address = resolve_address(&LIVE_DOC, Some(record.conversation_id), None)?;
                     let live = serde_json::to_value(
@@ -342,6 +320,62 @@ async fn start_run_with_failure(
 }
 
 impl Invocation {
+    async fn cancel_deferred_checkpoint(&self, checkpoint: &Value, ctx: &Context) -> Result<()> {
+        let poll = if checkpoint["phase"] == "poll" {
+            Some(checkpoint)
+        } else {
+            checkpoint.get("poll")
+        };
+        if let Some(poll) = poll
+            && let Some((provider, model)) = poll["model"]["provider"]
+                .as_str()
+                .zip(poll["model"]["modelId"].as_str())
+            && let Some(model) = self.harness.models.get_model(provider, model)
+            && let Ok(handle) = serde_json::from_value(poll["handle"].clone())
+        {
+            let options = StreamOptions {
+                telemetry: super::telemetry::active_context(ctx),
+                ..Default::default()
+            };
+            let _ = self
+                .harness
+                .models
+                .cancel_deferred(model, handle, options)
+                .await;
+            ctx.check().map_err(Error::from)?;
+        }
+        Ok(())
+    }
+
+    async fn interrupted_failure(
+        &self,
+        tx: &mut Transaction<'_>,
+        settings: &Value,
+        reason: &str,
+        text: &str,
+        salvage: bool,
+    ) -> Result<TaskState> {
+        let conversation = self.record.conversation_id;
+        let boundary = if settings["afterFailedRun"] == "continue" {
+            Some(
+                prepare_boundary(
+                    tx,
+                    conversation,
+                    settings["steeringMode"] == "all",
+                    settings["followUpMode"] == "all",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        if salvage {
+            convert_partial(tx, conversation).await?;
+        }
+        self.generation_failure(tx, conversation, boundary, settings, reason, text)
+            .await
+    }
+
     async fn generation_failure(
         &self,
         tx: &mut Transaction<'_>,
@@ -416,11 +450,117 @@ impl Invocation {
         let phase = checkpoint["phase"].as_str().unwrap_or("");
         let now = || (self.harness.now)();
         let settings = (self.harness.settings)();
-        if phase == "retry" {
+        if let Some((frequency, salvage)) = self.restart_cutoff() {
+            if salvage {
+                self.cancel_deferred_checkpoint(checkpoint, ctx).await?;
+            }
+            let text = format!("The generation was interrupted {frequency} in its {phase} phase");
+            return self
+                .commit(ctx, async |tx, _| {
+                    if matches!(phase, "finish" | "drain" | "yield")
+                        && let Some(answer) = checkpoint["answer"]
+                            .as_u64()
+                            .or_else(|| checkpoint["run"]["answer"].as_u64())
+                    {
+                        end_run(tx, conversation.id, id, RunEnd::Done { answer }).await?;
+                        return Ok(TaskState::Terminal {
+                            outcome: TaskOutcome::Completed {
+                                result: json!({"entryId":answer}),
+                            },
+                        });
+                    }
+                    self.interrupted_failure(tx, &settings, "restart_limit", &text, salvage)
+                        .await
+                })
+                .await;
+        }
+        if matches!(phase, "request" | "poll") && self.record.restarts.is_some() {
+            let backoff = super::retry::backoff(&settings, attempt);
+            if backoff.is_none() {
+                self.cancel_deferred_checkpoint(checkpoint, ctx).await?;
+            }
+            let stopped = if phase == "poll" {
+                "the deferred answer was fetched"
+            } else {
+                "the model was answering"
+            };
+
+            return self
+                .commit(ctx, async |tx, _| {
+                    let text = format!("The host stopped while {stopped}, on attempt {attempt}");
+                    let Some(delay) = backoff else {
+                        return self
+                            .interrupted_failure(tx, &settings, "interrupted", &text, true)
+                            .await;
+                    };
+                    convert_partial(tx, conversation.id).await?;
+                    let until = now().saturating_add(delay);
+                    let address = resolve_address(&LIVE_DOC, Some(conversation.id), None)?;
+                    tx.doc(&LIVE_DOC, &address, None).await?.set(
+                        &[Segment::Key("generation".into())],
+                        json!({"attempt":attempt,"retry":{"at":until,"error":text}}).into(),
+                    )?;
+                    let mut next = json!({"phase":"retry","attempt":attempt,"until":until});
+                    if let Some(compacted) = checkpoint.get("compacted") {
+                        next["compacted"] = compacted.clone();
+                    }
+                    if phase == "poll" {
+                        let mut poll = json!({});
+                        for field in ["model", "thinkingLevel", "cutoff", "handle"] {
+                            if let Some(value) = checkpoint.get(field) {
+                                poll[field] = value.clone();
+                            }
+                        }
+                        next["poll"] = poll;
+                    }
+                    Ok(TaskState::Sleeping {
+                        checkpoint: next,
+                        until: Some(until),
+                        signals: None,
+                    })
+                })
+                .await;
+        }
+        if let Some(until) = match phase {
+            "retry" => checkpoint["until"].as_u64(),
+            "poll" => checkpoint["pollAt"].as_u64(),
+            _ => None,
+        }
+        .filter(|until| *until > now())
+        {
             return self
                 .commit(ctx, async |_, _| {
+                    Ok(TaskState::Sleeping {
+                        checkpoint: checkpoint.clone(),
+                        until: Some(until),
+                        signals: None,
+                    })
+                })
+                .await;
+        }
+        if phase == "retry" {
+            return self
+                .commit(ctx, async |tx, _| {
+                    let mut next = checkpoint.get("poll").cloned().unwrap_or_else(|| json!({}));
+                    let mut progress = json!({"attempt":attempt+1});
+                    if checkpoint.get("poll").is_some() {
+                        let at = now();
+                        next["phase"] = json!("poll");
+                        next["pollAt"] = json!(at);
+                        progress["deferred"] = json!({"pollAt":at});
+                    } else {
+                        next["phase"] = json!("prepare");
+                    }
+                    next["attempt"] = json!(attempt + 1);
+                    let address = resolve_address(&LIVE_DOC, Some(conversation.id), None)?;
+                    tx.doc(&LIVE_DOC, &address, None)
+                        .await?
+                        .set(&[Segment::Key("generation".into())], progress.into())?;
+                    if let Some(compacted) = checkpoint.get("compacted") {
+                        next["compacted"] = compacted.clone();
+                    }
                     Ok(TaskState::Running {
-                        checkpoint: json!({"phase":"prepare","attempt":attempt+1}),
+                        checkpoint: next,
                         wake: None,
                     })
                 })
@@ -519,10 +659,7 @@ impl Invocation {
                         ctx,
                     )
                     .await?;
-                if decisions
-                    .iter()
-                    .any(|d| d["tasks"].as_array().is_some_and(|v| !v.is_empty()))
-                {
+                if !decisions.tasks.is_empty() {
                     return self
                         .commit(ctx, async |tx, _| {
                             let tasks = self.hook_children(tx, &decisions).await?;
@@ -873,19 +1010,6 @@ impl Invocation {
                 })
             }).await;
         }
-        if phase == "request" && self.record.restarts.is_some() {
-            return self
-                .commit(ctx, async |tx, _| {
-                    convert_partial(tx, conversation.id).await?;
-                    let until = now().saturating_add(2000);
-                    Ok(TaskState::Sleeping {
-                        checkpoint: json!({"phase":"retry","attempt":attempt,"until":until}),
-                        until: Some(until),
-                        signals: None,
-                    })
-                })
-                .await;
-        }
         let session_id =
             super::ensure_provider_session_id(&self.harness.session, conversation.id, ctx).await?;
         let mut opts = stream_options(checkpoint, session_id, ctx)?;
@@ -900,7 +1024,8 @@ impl Invocation {
                 Box::pin(async move {
                     for hook in hooks.iter() {
                         let input = json!({"model":model,"payload":payload});
-                        if let Some(replacement) = hook(input, &invocation, &context)
+                        if let Some(replacement) = invocation
+                            .invoke_hook(hook, input, &context)
                             .await
                             .map_err(|e| pi_rs_ai::Error::Protocol(e.to_string()))?
                         {
@@ -928,7 +1053,10 @@ impl Invocation {
         } else {
             let mut provider_messages = json!({"messages":view.messages});
             for hook in agent.hooks("pi.generation", "beforeRequest") {
-                if let Some(next) = hook(provider_messages.clone(), self, ctx).await? {
+                if let Some(next) = self
+                    .invoke_hook(&hook, provider_messages.clone(), ctx)
+                    .await?
+                {
                     provider_messages = next;
                 }
             }
@@ -989,7 +1117,8 @@ impl Invocation {
                 .await;
         }
         for hook in agent.hooks("pi.generation", "afterResponse") {
-            hook(serde_json::to_value(&*message)?, self, ctx).await?;
+            self.invoke_hook(&hook, serde_json::to_value(&*message)?, ctx)
+                .await?;
         }
         if message.stop_reason == StopReason::Error
             && pi_rs_ai::utils::is_context_overflow(&message, None)
@@ -1028,7 +1157,7 @@ impl Invocation {
             self.hook_decisions(&agent, "onYield", serde_json::to_value(&*message)?, ctx)
                 .await?
         } else {
-            vec![]
+            Default::default()
         };
         self.commit(ctx, async |tx, _| {
             let boundary = prepare_boundary(
@@ -1156,7 +1285,7 @@ impl Invocation {
                     policy: crate::JoinPolicy::AllSettled,
                 });
             }
-            let continuation = decisions.first().and_then(|d| d.get("continue")).cloned();
+            let continuation = decisions.continuation.clone();
             self.conclude_answer(
                 tx,
                 boundary,

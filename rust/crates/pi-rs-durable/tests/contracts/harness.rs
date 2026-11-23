@@ -598,3 +598,326 @@ async fn failed_run_policy_settles_or_preserves_the_queued_follow_up()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn explicit_abort_upgrades_descendant_restart_mark_without_reading_restart_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_durable::{HarnessOptions, TaskOutcome, TaskState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use pi_rs_durable::{
+        TaskOwnership,
+        session::TaskOptions,
+        tasks::{TaskDefinition, TaskRuntime, define_task},
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("restart.sqlite");
+    let ctx = Context::background();
+    let seed = Harness::open(
+        Arc::new(SqliteStorage::open(&path)?),
+        Default::default(),
+        &ctx,
+    )
+    .await?;
+    let root = seed.root(&ctx).await?;
+    let missing = define_task(TaskDefinition::<dyn TaskRuntime> {
+        name: "test.missing".into(),
+        version: 1,
+        initial: Arc::new(|_| Ok(json!({"phase":"work"}))),
+        phases: Default::default(),
+        abort: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
+        migrate: None,
+        hooks: (),
+    });
+    let (parent, child) = root
+        .commit(
+            async |tx| {
+                let parent = tx
+                    .create_task(
+                        &missing,
+                        json!(null),
+                        TaskOptions::new(TaskOwnership::Conversation),
+                    )
+                    .await?;
+                let mut options = TaskOptions::new(TaskOwnership::Task { task_id: parent });
+                options.abandon_on_restart = true;
+                let child = tx.create_task(&missing, json!(null), options).await?;
+                Ok((parent, child))
+            },
+            &ctx,
+            Default::default(),
+        )
+        .await?;
+    seed.close(&ctx).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let harness = Harness::open_with(
+        Arc::new(SqliteStorage::open(&path)?),
+        HarnessOptions {
+            settings: Arc::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                json!({})
+            }),
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .await?;
+    assert_eq!(
+        harness
+            .get_task(child, &ctx)
+            .await?
+            .ok_or("missing child")?
+            .abort_reason,
+        Some(pi_rs_durable::TaskAbortReason::Restart)
+    );
+    harness.abort_task(parent, &ctx).await?;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        harness.wait_for_task(child, &ctx),
+    )
+    .await;
+    harness.close(&ctx).await?;
+    let leaf = result??;
+    assert!(
+        matches!(&leaf.state, TaskState::Terminal { outcome: TaskOutcome::Orphaned { reason } } if reason == "missing_task")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn after_run_reports_rejected_task_requests_and_preserves_answer()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_ai::faux::{faux_assistant_message, faux_provider, faux_text};
+    use pi_rs_durable::{
+        Extension, HarnessOptions, HarnessRegistry, HookHandler, HookRegistration, MemoryStorage,
+        SubmissionStatus, create_registry,
+    };
+    let registry = create_registry();
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = starts.clone();
+    let phase: pi_rs_durable::tasks::PhaseHandler<pi_rs_durable::Invocation> =
+        Arc::new(move |_, runtime, ctx| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                runtime
+                    .commit(ctx, async |_, _| {
+                        Ok(pi_rs_durable::TaskState::Terminal {
+                            outcome: pi_rs_durable::TaskOutcome::Completed {
+                                result: json!(null),
+                            },
+                        })
+                    })
+                    .await?;
+                Ok(())
+            })
+        });
+    let child = pi_rs_durable::define_task(pi_rs_durable::tasks::TaskDefinition {
+        name: "test.child".into(),
+        version: 1,
+        initial: Arc::new(|input| Ok(json!({"phase":input}))),
+        phases: [("work".into(), phase.clone())].into_iter().collect(),
+        abort: phase,
+        migrate: None,
+        hooks: (),
+    });
+    let handler: HookHandler = Arc::new(|_, _, _| {
+        Box::pin(async {
+            Ok(Some(
+                json!({"tasks":[{"task":"test.missing","input":null},{"task":"pi.generation","input":{}},{"task":"test.child","input":"unknown"},{"task":"test.child","input":"work"}]}),
+            ))
+        })
+    });
+    let broken: HookHandler =
+        Arc::new(|_, _, _| Box::pin(async { Err(Error::invalid("response hook failed")) }));
+    registry.install(Extension {
+        name: "after-run".into(),
+        tasks: vec![Arc::new(child)],
+        hooks: vec![HookRegistration {
+            task: "pi.generation".into(),
+            handlers: [
+                ("afterRun".into(), handler),
+                ("afterResponse".into(), broken),
+            ]
+            .into_iter()
+            .collect(),
+        }],
+        ..Default::default()
+    })?;
+    let (send, mut reports) = tokio::sync::mpsc::unbounded_channel();
+    let ctx = Context::background();
+    let harness = Harness::open_with(
+        Arc::new(MemoryStorage::new()),
+        HarnessOptions {
+            registry: Arc::new(HarnessRegistry::Local(registry)),
+            session: SessionOptions {
+                report: Some(Arc::new(move |_, text| {
+                    let _ = send.send(text.to_owned());
+                })),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .await?;
+    let fake = faux_provider(Default::default());
+    fake.set_responses([faux_assistant_message(vec![faux_text("answer")]).into()]);
+    let model = &fake.models[0];
+    harness.models.set_provider(fake.provider.clone());
+    let root = harness.root(&ctx).await?;
+    root.configure(
+        &[(
+            "model".into(),
+            json!({"provider":model.provider,"modelId":model.id}),
+        )]
+        .into_iter()
+        .collect(),
+        &ctx,
+    )
+    .await?;
+    let item = root
+        .submit(
+            serde_json::from_value(json!({"type":"input","content":"go"}))?,
+            &ctx,
+        )
+        .await?;
+    let settled =
+        tokio::time::timeout(std::time::Duration::from_secs(10), item.wait(&ctx)).await??;
+    assert_eq!(settled.status, SubmissionStatus::Done);
+    tokio::time::timeout(std::time::Duration::from_secs(10), root.wait_for_idle(&ctx)).await??;
+    harness.close(&ctx).await?;
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(reports.try_recv()?.as_str(), "response hook failed");
+    assert_eq!(
+        reports.try_recv()?.as_str(),
+        "Task test.missing is not installed\nA hook cannot start the built-in task pi.generation\nTask test.child starts at the unknown phase unknown"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reopening_interrupted_request_with_retries_disabled_ends_without_a_provider()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_durable::{
+        HarnessOptions, TaskOutcome, TaskOwnership, TaskState, generation_task,
+        session::TaskOptions,
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("crashed.sqlite");
+    let ctx = Context::background();
+    let seed = Harness::open(
+        Arc::new(SqliteStorage::open(&path)?),
+        Default::default(),
+        &ctx,
+    )
+    .await?;
+    let root = seed.root(&ctx).await?;
+    let id = root
+        .commit(
+            async |tx| {
+                let id = tx
+                    .create_task(
+                        &*generation_task(),
+                        json!({}),
+                        TaskOptions::new(TaskOwnership::Conversation),
+                    )
+                    .await?;
+                let mut record = tx
+                    .staged_tasks()
+                    .find(|record| record.id == id)
+                    .ok_or_else(|| Error::invalid("missing generation"))?
+                    .clone();
+                record.state = TaskState::Running {
+                    checkpoint: json!({"phase":"request","attempt":1}),
+                    wake: None,
+                };
+                tx.set_task(record)?;
+                Ok(id)
+            },
+            &ctx,
+            Default::default(),
+        )
+        .await?;
+    // The scheduler never ran on the seeding host. The running checkpoint is the crash boundary.
+    drop(root);
+    drop(seed);
+    let recovered = Harness::open_with(
+        Arc::new(SqliteStorage::open(&path)?),
+        HarnessOptions {
+            settings: Arc::new(|| json!({"retry":{"enabled":false}})),
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .await?;
+    let task = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recovered.wait_for_task(id, &ctx),
+    )
+    .await??;
+    recovered.close(&ctx).await?;
+    assert!(
+        matches!(&task.state,TaskState::Terminal {outcome:TaskOutcome::Failed {error,..}} if error.detail==Some(json!({"reason":"interrupted"})) && error.message=="The host stopped while the model was answering, on attempt 1")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn clean_close_resends_the_inflight_request_without_charging_a_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_ai::faux::{FauxStep, faux_assistant_message, faux_provider, faux_text};
+    use pi_rs_durable::{HarnessOptions, SubmissionStatus};
+    let ctx = Context::background();
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("resend.sqlite");
+    let options = || HarnessOptions {
+        settings: Arc::new(|| json!({"retry":{"enabled":false}})),
+        ..Default::default()
+    };
+    let first = Harness::open_with(Arc::new(SqliteStorage::open(&path)?), options(), &ctx).await?;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let entered = started.clone();
+    let fake = faux_provider(Default::default());
+    fake.set_responses([FauxStep::Factory(Arc::new(move |_, _, _, _| {
+        entered.notify_one();
+        Box::pin(std::future::pending())
+    }))]);
+    first.models.set_provider(fake.provider.clone());
+    let model = &fake.models[0];
+    let root = first.root(&ctx).await?;
+    root.configure(
+        &[(
+            "model".into(),
+            json!({"provider":model.provider,"modelId":model.id}),
+        )]
+        .into_iter()
+        .collect(),
+        &ctx,
+    )
+    .await?;
+    let id = root
+        .submit(
+            serde_json::from_value(json!({"type":"input","content":"resume"}))?,
+            &ctx,
+        )
+        .await?
+        .id;
+    let timeout = std::time::Duration::from_secs(10);
+    tokio::time::timeout(timeout, started.notified()).await?;
+    tokio::time::timeout(timeout, first.close(&ctx)).await??;
+    let next = Harness::open_with(Arc::new(SqliteStorage::open(&path)?), options(), &ctx).await?;
+    fake.set_responses([faux_assistant_message(vec![faux_text("answer")]).into()]);
+    next.models.set_provider(fake.provider.clone());
+    next.resume()?;
+    let submission = next
+        .submission(id, &ctx)
+        .await?
+        .ok_or("missing submission")?;
+    let settled = tokio::time::timeout(timeout, submission.wait(&ctx)).await??;
+    next.close(&ctx).await?;
+    assert_eq!(settled.status, SubmissionStatus::Done);
+    assert_eq!(fake.state.call_count(), 2);
+    Ok(())
+}

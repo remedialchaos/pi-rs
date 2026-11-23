@@ -490,15 +490,43 @@ impl Harness {
     }
 
     async fn run_driver(&self, ctx: Context) -> Result<()> {
+        let mut active = std::collections::HashSet::new();
         let mut running = tokio::task::JoinSet::new();
-        let result = self.drive(&ctx, &mut running).await;
+        let result = self.drive(&ctx, &mut active, &mut running).await;
         running.shutdown().await;
+        if ctx.check().is_err() && !active.is_empty() {
+            self.session
+                .commit(
+                    async |tx| {
+                        let mut stopped = Vec::new();
+                        for id in active {
+                            if let Some(record) = tx.task(id).await?
+                                && let TaskState::Running { checkpoint, wake } = &record.state
+                            {
+                                let mut pending = record.as_ref().clone();
+                                pending.state = TaskState::Pending {
+                                    checkpoint: checkpoint.clone(),
+                                    wake: wake.clone(),
+                                };
+                                stopped.push(pending);
+                            }
+                        }
+                        for record in stopped {
+                            tx.set_task(record)?;
+                        }
+                        Ok(())
+                    },
+                    &Context::background(),
+                )
+                .await?;
+        }
         result
     }
 
     async fn drive(
         &self,
         ctx: &Context,
+        active: &mut std::collections::HashSet<TaskId>,
         running: &mut tokio::task::JoinSet<(TaskId, Result<bool>)>,
     ) -> Result<()> {
         let changed = self.driver.notify.clone();
@@ -514,7 +542,6 @@ impl Harness {
             Ok(())
         })?;
         let mut registry = self.registry.subscribe();
-        let mut active = std::collections::HashSet::new();
         loop {
             ctx.check()?;
             self.reconcile(ctx).await?;
@@ -629,12 +656,15 @@ impl Harness {
                 if cancelling {
                     for child in graph.tasks.values().filter(|child| {
                         child.id != record.id
-                            && !child.abort_requested
+                            && (!child.abort_requested || (child.abort_reason.is_some() && record.abort_reason.is_none()))
                             && graph.reaches(Some(Scope::Task(record.id)), Scope::Task(child.id), false)
                     }) {
                         let update = changes.entry(child.id).or_insert_with(|| child.clone());
-                        update.abort_requested = true;
-                        update.abort_reason = record.abort_reason;
+                        // Explicit cancellation takes precedence over restart abandonment.
+                        if !update.abort_requested || record.abort_reason.is_none() {
+                            update.abort_requested = true;
+                            update.abort_reason = record.abort_reason;
+                        }
                     }
                 }
                 if let TaskState::Waiting {
@@ -660,7 +690,7 @@ impl Harness {
                         for child in on
                             .iter()
                             .filter_map(|id| graph.tasks.get(id))
-                            .filter(|c| !c.abort_requested)
+                            .filter(|c| !c.abort_requested || c.abort_reason.is_some())
                         {
                             let update = changes.entry(child.id).or_insert_with(|| child.clone());
                             update.abort_requested = true;
@@ -681,9 +711,6 @@ impl Harness {
                     record.state,
                     TaskState::Completing { .. } | TaskState::Running { .. }
                 ) {
-                    let limit = (self.settings)()["restartLimit"]
-                        .as_u64()
-                        .unwrap_or(super::DEFAULT_RESTART_LIMIT);
                     let blocked = match registry.task(&record.kind) {
                         None => Some("missing_task"),
                         Some(t) if t.version() < record.version => Some("task_too_old"),
@@ -692,7 +719,12 @@ impl Harness {
                         }
                         _ => None,
                     };
-                    let outcome = if let Some(n) = record.restarts.filter(|n| *n >= limit)
+                    let outcome = if let Some(n) = record.restarts.filter(|n| {
+                        let limit = (self.settings)()["restartLimit"]
+                            .as_u64()
+                            .unwrap_or(super::DEFAULT_RESTART_LIMIT);
+                        *n >= limit
+                    })
                         && (record.abort_requested
                             || !matches!(
                                 record.kind.as_str(),

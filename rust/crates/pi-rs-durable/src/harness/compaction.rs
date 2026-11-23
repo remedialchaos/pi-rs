@@ -294,7 +294,8 @@ impl Invocation {
         let TaskState::Running { checkpoint, .. } = &self.record.state else {
             return Err(Error::invalid("Compaction must be running"));
         };
-        if checkpoint["phase"] == "retry" && !self.record.abort_requested {
+        let cutoff = self.restart_cutoff();
+        if checkpoint["phase"] == "retry" && !self.record.abort_requested && cutoff.is_none() {
             let until = checkpoint["until"].as_u64().unwrap_or(0);
             return self
                 .commit(ctx, async |tx, _| {
@@ -358,6 +359,14 @@ impl Invocation {
                 result: None,
                 reason: None,
             };
+        } else if let Some((frequency, _)) = cutoff {
+            outcome = TaskOutcome::Failed {
+                error: TaskOutcomeError {
+                    message: format!("Compaction was interrupted {frequency}"),
+                    detail: Some(json!({"reason":"restart_limit"})),
+                },
+                result: None,
+            };
         } else if let Some(model) = model {
             let view = conv.context(checkpoint["tail"].as_u64(), ctx).await?;
             if selecting {
@@ -380,7 +389,7 @@ impl Invocation {
                     }
                     let mut decision = None;
                     for hook in agent.hooks("pi.compaction", "beforeCompact") {
-                        if let Some(value) = hook(input.clone(), self, ctx).await? {
+                        if let Some(value) = self.invoke_hook(&hook, input.clone(), ctx).await? {
                             decision = Some(value);
                             break;
                         }
