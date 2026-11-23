@@ -8,11 +8,12 @@ use pi_rs_mcp::{
     McpServerConfigOptions, McpServerConfigResult, mcp_namespace, validate_mcp_server_config,
 };
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::LazyLock;
 
 /// Where a stdio server runs: where the conversation works, on the p2 host, or on an environment of `envs.json`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunOn {
     Location,
     Host,
@@ -20,7 +21,7 @@ pub enum RunOn {
 }
 
 /// One server of the owner's configuration, validated.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum OwnerServer {
     Stdio {
         name: String,
@@ -40,7 +41,7 @@ pub enum OwnerServer {
 }
 
 /// The owner's servers and why entries were skipped.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct OwnerConfig {
     pub servers: Vec<OwnerServer>,
     pub errors: Vec<String>,

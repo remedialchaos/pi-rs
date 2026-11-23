@@ -2,7 +2,7 @@
 
 use crate::{
     api::v1::PluginRegistry,
-    plugins::{artifacts, search},
+    plugins::{artifacts, mcp, search},
 };
 use pi_rs_chord::Result;
 
@@ -10,5 +10,5 @@ use pi_rs_chord::Result;
 pub fn register(registry: &mut PluginRegistry) -> Result<()> {
     artifacts::register(registry)?;
     search::register(registry)?;
-    Ok(())
+    mcp::register(registry)
 }
