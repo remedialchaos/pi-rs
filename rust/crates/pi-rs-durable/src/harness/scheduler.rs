@@ -6,6 +6,7 @@ use crate::{
     tasks::Task,
 };
 use pi_rs_chord::context::Context;
+use pi_rs_telemetry::TelemetrySpan;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -34,7 +35,8 @@ impl Invocation {
         change: impl for<'a, 'tx> AsyncFnOnce(&'a mut Transaction<'tx>, TaskRecord) -> Result<TaskState>,
     ) -> Result<()> {
         let id = self.record.id;
-        self.harness
+        let checkpoint = self
+            .harness
             .session
             .commit_with(
                 async |tx| {
@@ -107,8 +109,21 @@ impl Invocation {
                     ) {
                         current.memos = None;
                     }
+                    let advanced = match (&current.state, &state) {
+                        (
+                            TaskState::Running {
+                                checkpoint: previous,
+                                ..
+                            },
+                            TaskState::Running { checkpoint, .. },
+                        ) if previous["phase"] != checkpoint["phase"] => {
+                            checkpoint["phase"].as_str().map(str::to_owned)
+                        }
+                        _ => None,
+                    };
                     current.state = state;
-                    tx.set_task(current)
+                    tx.set_task(current)?;
+                    Ok(advanced)
                 },
                 ctx,
                 TransactionScope {
@@ -117,7 +132,14 @@ impl Invocation {
                 },
                 Default::default(),
             )
-            .await
+            .await?;
+        if let Some(phase) = checkpoint {
+            ctx.telemetry().add_event(
+                "pi.durable.checkpoint",
+                [("phase".into(), phase.into())].into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -196,17 +218,19 @@ impl Harness {
                             checkpoint = migrated.checkpoint;
                             record.version = task.version();
                         }
+                        let first = record.started_at.is_none();
                         record.started_at.get_or_insert(now);
                         record.state = TaskState::Running { checkpoint, wake };
                         tx.set_task(record.clone())?;
-                        Ok(Some(record))
+                        Ok(Some((record, first)))
                     },
                     ctx,
                 )
                 .await?;
-        let Some(mut record) = reserved else {
+        let Some((mut record, mut first)) = reserved else {
             return Ok(false);
         };
+        let mut continued = None;
         while let TaskState::Running { checkpoint, .. } = &record.state {
             let phase = checkpoint
                 .get("phase")
@@ -224,7 +248,12 @@ impl Harness {
                 harness: self.clone(),
                 record: record.clone(),
             };
-            let (phase_context, cancel) = ctx.with_cancel();
+            let mut trace = continued
+                .take()
+                .unwrap_or_else(|| self.telemetry.phase(&record, checkpoint, phase, first));
+            first = false;
+            let decision_context = ctx.with_telemetry(trace.span.context.clone());
+            let (phase_context, cancel) = decision_context.with_cancel();
             let mark = record.abort_requested;
             let _observe=self.session.follow_commits(move |publication,_|{
                 if !mark
@@ -252,17 +281,17 @@ impl Harness {
                     None => Some(format!("Unknown phase {phase} of task {}", record.kind)),
                 }
             };
-            let next = self
+            let (next, fault) = self
                 .session
                 .commit(
                     async |tx| {
                         let Some(current) = tx.task(id).await? else {
-                            return Ok(None);
+                            return Ok((None, None));
                         };
                         if current.state != record.state
                             || current.abort_requested != record.abort_requested
                         {
-                            return Ok(Some(current.as_ref().clone()));
+                            return Ok((Some(current.as_ref().clone()), None));
                         }
                         let message = failure.unwrap_or_else(|| {
                             format!(
@@ -274,7 +303,7 @@ impl Harness {
                         current.state = TaskState::Terminal {
                             outcome: TaskOutcome::Faulted {
                                 error: TaskOutcomeError {
-                                    message,
+                                    message: message.clone(),
                                     detail: None,
                                 },
                             },
@@ -285,13 +314,26 @@ impl Harness {
                         current.ended_at = Some(now);
                         current.memos = None;
                         current.restarts = None;
-                        tx.set_task(current)?;
-                        Ok(None)
+                        tx.set_task(current.clone())?;
+                        Ok((Some(current), Some(message)))
                     },
-                    ctx,
+                    &decision_context,
                 )
                 .await?;
+            if let Some(message) = fault {
+                self.session
+                    .report_task_fault(id, &message, &decision_context);
+            }
             let Some(updated) = next else { break };
+            if record.kind == "pi.tool"
+                && phase == "call"
+                && updated.abort_requested == record.abort_requested
+                && matches!(&updated.state, TaskState::Running { checkpoint, .. } if checkpoint["phase"] == "execute")
+            {
+                continued = Some(trace);
+            } else {
+                trace.finish(&record, &updated);
+            }
             record = updated;
         }
         Ok(true)
@@ -299,6 +341,36 @@ impl Harness {
 }
 
 impl Harness {
+    pub(super) async fn load_telemetry_tasks(&self, ctx: &Context) -> Result<()> {
+        for status in [
+            crate::TaskStatus::Pending,
+            crate::TaskStatus::Running,
+            crate::TaskStatus::Waiting,
+            crate::TaskStatus::Sleeping,
+            crate::TaskStatus::Completing,
+        ] {
+            let query = crate::TaskQuery {
+                status: Some(status),
+                ..Default::default()
+            };
+            let mut cursor = None;
+            loop {
+                let page = self
+                    .session
+                    .scan_tasks(&query, 256, cursor.as_ref(), ctx)
+                    .await?;
+                for task in page.items {
+                    self.telemetry.track(&task, true);
+                }
+                cursor = page.next;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn recover_running(&self, ctx: &Context) -> Result<()> {
         self.session
             .commit(
@@ -418,6 +490,17 @@ impl Harness {
     }
 
     async fn run_driver(&self, ctx: Context) -> Result<()> {
+        let mut running = tokio::task::JoinSet::new();
+        let result = self.drive(&ctx, &mut running).await;
+        running.shutdown().await;
+        result
+    }
+
+    async fn drive(
+        &self,
+        ctx: &Context,
+        running: &mut tokio::task::JoinSet<(TaskId, Result<bool>)>,
+    ) -> Result<()> {
         let changed = self.driver.notify.clone();
         let _commits = self.session.follow_commits(move |publication, _| {
             if let crate::session::ObservedCommit::Stored(commit) = publication
@@ -432,10 +515,9 @@ impl Harness {
         })?;
         let mut registry = self.registry.subscribe();
         let mut active = std::collections::HashSet::new();
-        let mut running = tokio::task::JoinSet::new();
         loop {
             ctx.check()?;
-            self.reconcile(&ctx).await?;
+            self.reconcile(ctx).await?;
             let snapshot = self.registry.snapshot();
             let now = (self.now)();
             let mut next_wake = None;
@@ -455,7 +537,7 @@ impl Harness {
                             },
                             256,
                             cursor.as_ref(),
-                            &ctx,
+                            ctx,
                         )
                         .await?;
                     for record in page.items {
@@ -492,7 +574,7 @@ impl Harness {
             }
             let mut alarm = None;
             if let Some(callback) = &self.on_wake {
-                let value = self.wake(&ctx).await?;
+                let value = self.wake(ctx).await?;
                 self.publish_wake(callback, value);
             } else if let Some(at) = next_wake {
                 let wake = self.driver.notify.clone();

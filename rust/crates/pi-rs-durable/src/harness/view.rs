@@ -1,3 +1,12 @@
+pub(super) mod delta;
+use delta::key;
+use pi_rs_chord::{
+    delta::Op,
+    json::JsonValue,
+    watch::{Watch, WatchCall},
+};
+use std::collections::HashMap;
+type Incarnations = HashMap<String, (crate::DocumentId, u64)>;
 use super::{
     AGENT_DOC, Conversation, ConversationView, ConversationWindow, INBOX_DOC, LIVE_DOC,
     PROVIDER_DOC, USAGE_DOC,
@@ -10,6 +19,25 @@ use crate::{
 use pi_rs_chord::context::Context;
 use serde_json::Value;
 use std::sync::Arc;
+
+fn wire(view: &ConversationView) -> Result<JsonValue> {
+    let mut object = JsonObject::new();
+    object.insert(
+        "conversation".into(),
+        serde_json::to_value(view.conversation.as_ref())?,
+    );
+    let entries = view
+        .entries
+        .iter()
+        .map(|entry| serde_json::to_value(entry.as_ref()))
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    object.insert("entries".into(), Value::Array(entries));
+    if let Some(before) = view.before {
+        object.insert("before".into(), before.into());
+    }
+    object.insert("docs".into(), Value::Object((*view.docs).clone()));
+    Ok(Value::Object(object).into())
+}
 
 async fn scan_window(
     tx: &Transaction<'_>,
@@ -36,6 +64,15 @@ impl Conversation {
         window: &ConversationWindow,
         ctx: &Context,
     ) -> Result<ConversationView> {
+        self.attach_view(window, ctx, |view, _| Ok(view)).await
+    }
+
+    async fn attach_view<T>(
+        &self,
+        window: &ConversationWindow,
+        ctx: &Context,
+        attach: impl FnOnce(ConversationView, Incarnations) -> Result<T>,
+    ) -> Result<T> {
         let min = window.min.unwrap_or(50);
         let max = window.max.unwrap_or_else(|| min.saturating_mul(2));
         if min == 0 || min as u64 > crate::MAX_SAFE_ID {
@@ -57,6 +94,7 @@ impl Conversation {
                     let conversation = tx.conversation(self.id).await?.ok_or_else(|| {
                         Error::invalid(format!("Conversation {} does not exist", self.id))
                     })?;
+                    let mut incarnations = Incarnations::new();
                     let mut docs = JsonObject::new();
                     for token in [
                         &*AGENT_DOC,
@@ -66,7 +104,10 @@ impl Conversation {
                         &*USAGE_DOC,
                     ] {
                         let address = resolve_address(token, Some(self.id), None)?;
-                        if let Some(value) = tx.document_snapshot(token, &address).await? {
+                        if let Some((id, version, value)) =
+                            tx.document_snapshot(token, &address).await?
+                        {
+                            incarnations.insert(token.kind.clone(), (id, version));
                             docs.insert(token.kind.clone(), Value::Object((*value).clone()));
                         }
                     }
@@ -104,12 +145,15 @@ impl Conversation {
                             } else {
                                 None
                             };
-                            return Ok(ConversationView {
-                                conversation,
-                                docs,
-                                entries,
-                                before,
-                            });
+                            return attach(
+                                ConversationView {
+                                    conversation,
+                                    docs,
+                                    entries,
+                                    before,
+                                },
+                                incarnations,
+                            );
                         }
                     }
                     let mut entries = scan_window(
@@ -127,12 +171,15 @@ impl Conversation {
                         None
                     };
                     entries.reverse();
-                    Ok(ConversationView {
-                        conversation,
-                        docs,
-                        entries,
-                        before,
-                    })
+                    attach(
+                        ConversationView {
+                            conversation,
+                            docs,
+                            entries,
+                            before,
+                        },
+                        incarnations,
+                    )
                 },
                 ctx,
             )
@@ -140,130 +187,216 @@ impl Conversation {
     }
 }
 
-use futures_util::future::BoxFuture;
-use pi_rs_chord::watch::{NativeWatch, WatchEnd};
-use tokio::sync::watch;
-
-async fn observe<T: Clone + Send + Sync + 'static>(
-    session: &crate::Session,
-    ctx: &Context,
-    mut registry: Option<watch::Receiver<Arc<super::RegistrySnapshot>>>,
-    read: impl Fn(Context) -> BoxFuture<'static, Result<T>> + Send + 'static,
-) -> Result<NativeWatch<T>> {
-    let (changes, mut changed) = watch::channel(());
-    let commit = session.follow_commits(move |_, _| {
-        changes.send_replace(());
-        Ok(())
-    })?;
-    let (closed, mut closing) = tokio::sync::oneshot::channel();
-    let closer = std::sync::Mutex::new(Some(closed));
-    let close = session.subscribe_close(move || {
-        if let Some(tx) = closer.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = tx.send(());
+use crate::session::{Observation, Observer, Subscription};
+use pi_rs_chord::watch::WatchEnd;
+use std::sync::atomic::Ordering;
+impl Conversation {
+    pub async fn watch(&self, window: ConversationWindow, ctx: &Context) -> Result<Watch> {
+        let watch = self
+            .attach_view(&window, ctx, |initial, incarnations| {
+                let holder = Arc::new(std::sync::Mutex::new(None));
+                let release = holder.clone();
+                let watch = Watch::new(
+                    wire(&initial)?,
+                    move || {
+                        release.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    },
+                    |_| {},
+                );
+                let output = watch.clone();
+                let ending = watch.clone();
+                let observer = Observer::new(
+                    move |call: &WatchCall<ConversationView>, context| {
+                        if let WatchCall::Value {
+                            value,
+                            ops,
+                            retired,
+                        } = call
+                        {
+                            output.advance(
+                                WatchCall::Value {
+                                    value: wire(value)?,
+                                    ops: ops.clone(),
+                                    retired: *retired,
+                                },
+                                context.clone(),
+                            );
+                        }
+                        Ok(())
+                    },
+                    move |end| {
+                        ending.end(end);
+                    },
+                );
+                *holder.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(self.listen_view(initial, incarnations, &window, observer)?);
+                if let Some(signal) = ctx.abort_signal()
+                    && let Err(error) = watch.observe_abort(signal)
+                {
+                    watch.stop();
+                    return Err(Error::invalid(error.to_string()));
+                }
+                Ok(watch)
+            })
+            .await?;
+        if let Err(error) = ctx.check() {
+            watch.stop();
+            return Err(error.into());
         }
-    })?;
-    let initial = read(ctx.clone()).await?;
-    let (context, cancel) = ctx.with_cancel();
-    let view = NativeWatch::new(
-        initial,
-        move || {
-            cancel.cancel("Observation ended");
-        },
-        |_| {},
-    );
-    let output = view.clone();
-    tokio::spawn(async move {
-        let _subscriptions = (commit, close);
-        loop {
-            let refresh=context.await_with(async{
-                tokio::select!{
-                    _=&mut closing=>false,
-                    changed=changed.changed()=>changed.is_ok(),
-                    changed=async {match &mut registry{Some(r)=>r.changed().await.is_ok(),None=>std::future::pending().await}}=>changed
-                }
-            }).await;
-            match refresh {
-                Ok(true) => match read(context.clone()).await {
-                    Ok(value) => output.advance(value, context.clone()),
-                    Err(error) => {
-                        output.end(WatchEnd::Failed(error.to_string()));
-                        break;
+        Ok(watch)
+    }
+
+    fn listen_view(
+        &self,
+        initial: ConversationView,
+        incarnations: Incarnations,
+        window: &ConversationWindow,
+        observer: Observer<WatchCall<ConversationView>>,
+    ) -> Result<Subscription> {
+        let state = std::sync::Mutex::new((initial, incarnations));
+        let observer = Arc::new(observer);
+        let listener = observer.clone();
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let enabled = active.clone();
+        let min = window.min.unwrap_or(50);
+        let max = window.max.unwrap_or(2 * min);
+        let id = self.id;
+        let commits = self.session.follow_commits(move |publication, context| {
+            use crate::CommitChange;
+            use crate::session::ObservedCommit;
+            let changes = match publication {
+                ObservedCommit::Stored(commit) => &commit.changes,
+                ObservedCommit::Memory(changes) => changes,
+            };
+            if !enabled.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            let (previous, incarnations) = &mut *state;
+            let mut view = previous.clone();
+            let mut ops = Vec::new();
+            let mut inserted = Vec::new();
+            for change in changes {
+                match change {
+                    CommitChange::Entry { value } if value.conversation_id == id => {
+                        view.entries.push(Arc::new(value.clone()));
+                        inserted.push(JsonValue::from_serde(serde_json::to_value(value)?));
                     }
-                },
-                Ok(false) => {
-                    output.end(WatchEnd::Ended);
-                    break;
-                }
-                Err(_) => {
-                    output.end(WatchEnd::Aborted);
-                    break;
+                    CommitChange::Document(doc) => {
+                        delta::advance_document(id, doc, incarnations, &mut view.docs, &mut ops);
+                    }
+                    _ => {}
                 }
             }
-        }
-    });
-    Ok(view)
-}
-
-impl Conversation {
-    pub async fn watch(
-        &self,
-        window: ConversationWindow,
-        ctx: &Context,
-    ) -> Result<NativeWatch<ConversationView>> {
-        let conv = self.clone();
-        let window = Arc::new(std::sync::Mutex::new(window));
-        observe(&self.session, ctx, None, move |ctx| {
-            let conv = conv.clone();
-            let window = window.clone();
-            Box::pin(async move {
-                let prior = window.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let value = conv.view(&prior, &ctx).await?;
-                window.lock().unwrap_or_else(|e| e.into_inner()).from =
-                    value.entries.first().map(|e| e.id);
-                Ok(value)
-            })
-        })
-        .await
+            if !inserted.is_empty() {
+                ops.push(Op::Splice(
+                    vec![key("entries")],
+                    previous.entries.len(),
+                    0,
+                    inserted,
+                ));
+            }
+            if !ops.is_empty() {
+                if view.entries.len() > max {
+                    let drop_count = view.entries.len() - min;
+                    let before = view.entries[drop_count - 1].id;
+                    view.before = Some(before);
+                    ops.push(Op::Splice(vec![key("entries")], 0, drop_count, vec![]));
+                    ops.push(Op::Set(
+                        vec![key("before")],
+                        JsonValue::Number(before as f64),
+                    ));
+                    view.entries.drain(..drop_count);
+                }
+                *previous = view.clone();
+                drop(state);
+                (listener.advance)(
+                    &WatchCall::Value {
+                        value: view,
+                        ops,
+                        retired: false,
+                    },
+                    &context.without_abort_signal(),
+                )
+                .map_err(|e| Error::invalid(e.to_string()))?;
+            }
+            Ok(())
+        })?;
+        let session = self.session.clone();
+        let closing = active.clone();
+        let close = self.session.subscribe_close(move || {
+            if closing.swap(false, Ordering::AcqRel) {
+                (observer.end)(session.failure().map_or(WatchEnd::Ended, WatchEnd::Failed));
+            }
+        })?;
+        Ok(Subscription::new(move || {
+            active.store(false, Ordering::Release);
+            drop((commits, close));
+        }))
     }
 }
 impl super::Harness {
-    pub async fn watch_task_graph(
-        &self,
-        ctx: &Context,
-    ) -> Result<NativeWatch<Arc<super::TaskGraph>>> {
-        let harness = self.clone();
-        observe(
-            &self.session,
-            ctx,
-            Some(self.registry.subscribe()),
-            move |ctx| {
-                let harness = harness.clone();
-                Box::pin(async move {
-                    let registry = harness.registry.snapshot();
-                    let graph = harness
-                        .task_graph(
-                            |r| match registry.task(&r.kind) {
-                                None => Some(super::BlockedReason::MissingTask),
-                                Some(t) if t.version() < r.version => {
-                                    Some(super::BlockedReason::TaskTooOld)
-                                }
-                                _ => None,
-                            },
-                            &ctx,
-                        )
-                        .await?;
-                    Ok(Arc::new(graph))
-                })
-            },
-        )
-        .await
-    }
     pub async fn observe_conversation(
         &self,
         id: crate::ConversationId,
         window: ConversationWindow,
+        observer: Observer<WatchCall<ConversationView>>,
         ctx: &Context,
-    ) -> Result<NativeWatch<ConversationView>> {
-        self.handle(id).watch(window, ctx).await
+    ) -> Result<Observation<ConversationView>> {
+        let conversation = self.handle(id);
+        let observation = conversation
+            .attach_view(&window, ctx, |value, incarnations| {
+                ctx.check()?;
+                let subscription = conversation.listen_view(
+                    value.clone(),
+                    incarnations,
+                    &window,
+                    host_observer(observer),
+                )?;
+                Ok(Observation {
+                    value,
+                    subscription,
+                })
+            })
+            .await?;
+        ctx.check()?;
+        Ok(observation)
     }
+}
+
+/// Adapters reopen a closed session. App watches instead finish normally.
+pub(super) fn host_observer<T: 'static>(observer: Observer<T>) -> Observer<T> {
+    let current = Arc::new(std::sync::Mutex::new(Some(Arc::new(observer))));
+    let advancing = current.clone();
+    Observer::new(
+        move |value, ctx| {
+            let target = advancing.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(target) = target {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (target.advance)(value, ctx)
+                }));
+                let error = match result {
+                    Ok(Ok(())) => return Ok(()),
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "observer panicked".to_owned(),
+                };
+                let failed = advancing.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(failed) = failed {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (failed.end)(WatchEnd::ListenerError(error))
+                    }));
+                }
+            }
+            Ok(())
+        },
+        move |end| {
+            let target = current.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(target) = target {
+                (target.end)(match end {
+                    WatchEnd::Ended => WatchEnd::Failed("session closed".into()),
+                    other => other,
+                });
+            }
+        },
+    )
 }

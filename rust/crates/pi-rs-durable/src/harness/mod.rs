@@ -10,6 +10,8 @@ pub use usage::{UsageBucket, UsageState, add_usage, record_usage};
 mod transcript;
 pub use transcript::*;
 
+pub(crate) mod telemetry;
+
 /// Content-free span, event, and metric definitions for the durable runtime.
 pub const DURABLE_TELEMETRY_SCHEMA: &str = include_str!("telemetry.json");
 mod runtime;

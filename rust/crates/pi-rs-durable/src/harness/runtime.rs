@@ -30,6 +30,7 @@ pub struct HarnessOptions {
     pub env: Option<BuildEnv>,
     pub on_wake: Option<Arc<dyn Fn(super::Wake) + Send + Sync>>,
     pub session: SessionOptions,
+    pub telemetry: pi_rs_telemetry::Context,
     pub models: pi_rs_ai::registry::Models,
     pub identity: pi_rs_ai::request::ClientIdentity,
     pub registry: Arc<super::HarnessRegistry>,
@@ -41,6 +42,7 @@ impl Default for HarnessOptions {
             env: None,
             on_wake: None,
             session: Default::default(),
+            telemetry: pi_rs_telemetry::Context::noop(),
             models: Default::default(),
             identity: Default::default(),
             registry: Arc::default(),
@@ -50,6 +52,7 @@ impl Default for HarnessOptions {
 }
 #[derive(Clone)]
 pub struct Harness {
+    pub(super) telemetry: Arc<super::telemetry::HarnessTelemetry>,
     pub(super) env: Option<BuildEnv>,
     pub(super) on_wake: Option<Arc<dyn Fn(super::Wake) + Send + Sync>>,
     pub(super) driver: Arc<super::scheduler::Driver>,
@@ -117,6 +120,9 @@ impl Harness {
             })
         }));
         let read_only = options.read_only;
+        let telemetry = Arc::new(super::telemetry::HarnessTelemetry::new(
+            host_options.telemetry,
+        ));
         let harness = Self {
             env: host_options.env,
             on_wake: host_options.on_wake,
@@ -131,8 +137,12 @@ impl Harness {
             registry: host_options.registry,
             settings: Arc::new(move || super::resolve_settings(&(host_options.settings)())),
             now: options.now.clone(),
-            session: Session::new(storage, options),
+            session: Session::new_tracked(storage, options, Some(telemetry.clone())),
+            telemetry,
         };
+        if harness.telemetry.enabled() {
+            harness.load_telemetry_tasks(context).await?;
+        }
         if !read_only {
             harness.recover_running(context).await?;
             if let Some(callback) = &harness.on_wake {
@@ -211,8 +221,9 @@ impl Harness {
         Ok(self.handle(record.id))
     }
     pub async fn close(&self, ctx: &Context) -> Result<()> {
-        self.stop_driver().await?;
-        self.session.close(ctx).await
+        let driver = self.stop_driver().await;
+        let session = self.session.close(ctx).await;
+        driver.and(session)
     }
 }
 impl Conversation {

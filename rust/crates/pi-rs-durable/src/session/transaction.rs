@@ -156,13 +156,13 @@ impl<'a> Transaction<'a> {
         &self,
         definition: &DocToken,
         address: &DocumentAddress,
-    ) -> Result<Option<Arc<JsonObject>>> {
+    ) -> Result<Option<(DocumentId, u64, Arc<JsonObject>)>> {
         self.read("Tx.snapshot()")?;
         Ok(self
             .session
             .load_document(definition, address)
             .await?
-            .map(|loaded| loaded.value.clone()))
+            .map(|loaded| (loaded.record.id, loaded.version, loaded.value.clone())))
     }
 
     pub async fn typed_entry<D>(

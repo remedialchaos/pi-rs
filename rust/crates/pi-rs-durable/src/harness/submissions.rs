@@ -1,4 +1,7 @@
-use super::{Harness, INBOX_DOC};
+use super::{
+    Harness, INBOX_DOC,
+    telemetry::{OpenSpan, link},
+};
 use crate::{
     CommitChange, ConversationId, Session, SubmissionId, SubmissionRecord, SubmissionSettlement,
     SubmissionStatus,
@@ -7,6 +10,7 @@ use crate::{
     signals::is_settled,
 };
 use pi_rs_chord::{context::Context, delta::Segment};
+use pi_rs_telemetry::{Context as TraceContext, SpanOptions, SpanStatus, TelemetrySpan};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -168,10 +172,16 @@ pub struct SubmissionDraft {
 impl Conversation {
     pub async fn submit(&self, draft: SubmissionDraft, ctx: &Context) -> Result<Submission> {
         self.harness.resume()?;
-        let id = self
+        let span = self.submission_span(&draft, ctx);
+        let context = ctx.with_telemetry(span.context.clone());
+        let result = self
             .session
-            .commit(async |tx| self.admit(tx, draft).await, ctx)
-            .await?;
+            .commit(
+                async |tx| self.admit_record(tx, draft, Some(&span.context)).await,
+                &context,
+            )
+            .await;
+        let id = finish_admission(&span.context, result)?;
         Ok(Submission {
             id,
             harness: self.harness.clone(),
@@ -189,6 +199,55 @@ impl Conversation {
             return Err(SessionError::ReadAfterWrite("submit(tx, draft)").into());
         }
         self.harness.resume()?;
+        let span = self.submission_span(&draft, tx.context());
+        let result = self.admit_record(tx, draft, Some(&span.context)).await;
+        finish_admission(&span.context, result)
+    }
+
+    fn submission_span(&self, draft: &SubmissionDraft, ctx: &Context) -> OpenSpan {
+        let kind = match &draft.body {
+            SubmissionBody::Write { .. } => "write",
+            SubmissionBody::Input { .. } => "input",
+            SubmissionBody::Continue => "continue",
+        };
+        let (parent, links) = if kind == "write" {
+            (ctx.telemetry(), Vec::new())
+        } else {
+            (
+                &self.harness.telemetry.root,
+                vec![link(ctx.telemetry().clone())],
+            )
+        };
+        let span = OpenSpan::new(
+            parent,
+            SpanOptions {
+                name: "pi.durable.submit".into(),
+                attributes: [
+                    ("submission.type".into(), kind.into()),
+                    ("conversation.id".into(), (self.id as f64).into()),
+                ]
+                .into(),
+                links,
+            },
+        );
+        span.context.set_status(SpanStatus::Error { error: None });
+        span
+    }
+
+    pub(super) async fn admit_internal(
+        &self,
+        tx: &mut Transaction<'_>,
+        draft: SubmissionDraft,
+    ) -> Result<SubmissionId> {
+        self.admit_record(tx, draft, None).await.map(|(id, _)| id)
+    }
+
+    async fn admit_record(
+        &self,
+        tx: &mut Transaction<'_>,
+        draft: SubmissionDraft,
+        span: Option<&TraceContext>,
+    ) -> Result<(SubmissionId, SubmissionStatus)> {
         let kind = match &draft.body {
             SubmissionBody::Write { .. } => SubmissionKind::Write,
             SubmissionBody::Input { entry, .. } => {
@@ -216,10 +275,10 @@ impl Conversation {
                     }
                 )));
             }
-            return Ok(existing.id);
+            return Ok((existing.id, existing.status));
         }
         let mut create = SubmissionCreate {
-            trace: None,
+            trace: span.and_then(|span| span.inject(span)),
             conversation_id: self.id,
             request_id: draft.request_id,
             notify: draft.notify,
@@ -246,11 +305,23 @@ impl Conversation {
         {
             create.entry = Some(tx.append_entry(self.id, entry.clone()).await?.id);
             create.status = SubmissionStatus::Done;
-            return Ok(tx.create_submission(create).await?.id);
+            return Ok((
+                tx.create_submission(create).await?.id,
+                SubmissionStatus::Done,
+            ));
         }
         let live = resolve_address(&LIVE_DOC, Some(self.id), None)?;
         let state = serde_json::to_value(tx.doc(&LIVE_DOC, &live, None).await?.value()?.to_json())?;
         let busy = state.get("run").is_some();
+        if matches!(&draft.body, SubmissionBody::Input { when_busy, .. } if when_busy.as_deref() == Some("steer"))
+            && let Some(span) = span
+            && create.trace.is_some()
+            && let Some(id) = state["run"]["taskId"].as_u64()
+            && let Some(task) = tx.task(id).await?
+            && let Some(carrier) = &task.trace
+        {
+            span.add_link(link(span.extract(Some(carrier))));
+        }
         let now = (self.harness.now)();
         if let SubmissionBody::Input {
             when_busy,
@@ -292,7 +363,7 @@ impl Conversation {
                 state["runFailure"]["first"].as_u64().or(placed.first),
             )
             .await?;
-            return Ok(id);
+            return Ok((id, SubmissionStatus::Placed));
         }
         if busy || !items.is_empty() {
             let id = tx.create_submission(create).await?.id;
@@ -324,13 +395,21 @@ impl Conversation {
                 0,
                 vec![item.into()],
             )?;
-            if let Some(boundary) = boundary {
-                let placed = apply_boundary(tx, boundary, true, now).await?;
-                if !placed.users.is_empty() {
-                    start_run(tx, self.id, placed.users, placed.first).await?;
-                }
+            let Some(boundary) = boundary else {
+                return Ok((id, SubmissionStatus::Queued));
+            };
+            let placed = apply_boundary(tx, boundary, true, now).await?;
+            let status = if kind == SubmissionKind::Write {
+                SubmissionStatus::Done
+            } else if placed.users.last() == Some(&id) {
+                SubmissionStatus::Placed
+            } else {
+                SubmissionStatus::Queued
+            };
+            if !placed.users.is_empty() {
+                start_run(tx, self.id, placed.users, placed.first).await?;
             }
-            return Ok(id);
+            return Ok((id, status));
         }
         match draft.body {
             SubmissionBody::Write { entry } => {
@@ -342,7 +421,8 @@ impl Conversation {
                     create.entry = Some(tx.append_entry(self.id, entry).await?.id);
                     create.status = SubmissionStatus::Done;
                 }
-                Ok(tx.create_submission(create).await?.id)
+                let record = tx.create_submission(create).await?;
+                Ok((record.id, record.status))
             }
             SubmissionBody::Input { content, entry, .. } => {
                 let first = append_input(tx, self.id, content, entry, now).await?.id;
@@ -350,9 +430,30 @@ impl Conversation {
                 create.status = SubmissionStatus::Placed;
                 let id = tx.create_submission(create).await?.id;
                 start_run(tx, self.id, vec![id], Some(first)).await?;
-                Ok(id)
+                Ok((id, SubmissionStatus::Placed))
             }
             SubmissionBody::Continue => Err(Error::invalid("Continue already admitted")),
         }
     }
+}
+
+fn finish_admission(
+    span: &TraceContext,
+    result: Result<(SubmissionId, SubmissionStatus)>,
+) -> Result<SubmissionId> {
+    let (id, status) = result?;
+    let status = if status == SubmissionStatus::Unanswered {
+        "done"
+    } else {
+        status.as_str()
+    };
+    span.set_attributes(
+        [
+            ("submission.id".into(), (id as f64).into()),
+            ("result".into(), status.into()),
+        ]
+        .into(),
+    );
+    span.set_status(SpanStatus::Ok);
+    Ok(id)
 }

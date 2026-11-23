@@ -105,6 +105,7 @@ use crate::{
 };
 use pi_rs_ai::types::ToolCall;
 use pi_rs_chord::context::Context;
+use pi_rs_telemetry::TelemetrySpan;
 
 pub fn tool_task() -> Arc<Task<Invocation>> {
     let handler: PhaseHandler<Invocation> = Arc::new(|_, inv, ctx| {
@@ -158,6 +159,13 @@ impl Invocation {
                     .clone(),
             )?
         };
+        ctx.telemetry().set_attributes(
+            [
+                ("tool.name".into(), call.name.clone().into()),
+                ("tool.call_id".into(), call.id.clone().into()),
+            ]
+            .into(),
+        );
         let agent = conversation.agent(ctx).await?;
         let tool = (if nested {
             &agent.callable
@@ -583,7 +591,7 @@ impl Invocation {
         let parent = self.record.id;
         let address =
             crate::documents::resolve_address(&NESTED_CALL_DOC, Some(parent), Some(key.into()))?;
-        let id=self.harness.session.commit(async |tx|{
+        let (id, replayed) = self.harness.session.commit(async |tx| {
             let current = tx
                 .task(parent)
                 .await?
@@ -609,7 +617,7 @@ impl Invocation {
                         call["id"]
                     )));
                 }
-                return Ok(id);
+                return Ok((id, prior.get("result").is_some()));
             }
             let mut input =
                 json!({
@@ -660,8 +668,14 @@ impl Invocation {
                 &[pi_rs_chord::delta::Segment::Key("nestedTools".into())],
                 json!(slots).into(),
             )?;
-            Ok(id)
-        },ctx).await?;
+            Ok((id, false))
+        }, ctx).await?;
+        if replayed {
+            ctx.telemetry().add_event(
+                "pi.durable.replay",
+                [("tool.name".into(), name.into())].into(),
+            );
+        }
         let task = self.harness.wait_for_task(id, ctx).await?;
         if let Some(result) = self
             .harness

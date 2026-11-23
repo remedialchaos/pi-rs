@@ -105,7 +105,7 @@ impl<T> Listener<T> {
             Ok(Err(error)) => error.to_string(),
             Err(error) => super::panic_message(&*error),
         };
-        session.report(ReportKind::Listener, &error);
+        session.report_in(ReportKind::Listener, &error, Some(context));
         self.end(session, WatchEnd::ListenerError(error));
         false
     }

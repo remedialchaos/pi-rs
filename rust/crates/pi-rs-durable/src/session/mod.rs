@@ -194,6 +194,14 @@ impl Session {
     }
 
     pub fn new(storage: Arc<dyn Storage>, options: SessionOptions) -> Self {
+        Self::new_tracked(storage, options, None)
+    }
+
+    pub(crate) fn new_tracked(
+        storage: Arc<dyn Storage>,
+        options: SessionOptions,
+        telemetry: Option<Arc<crate::harness::telemetry::HarnessTelemetry>>,
+    ) -> Self {
         Self(Arc::new_cyclic(|weak: &Weak<Inner>| {
             let report = weak.clone();
             let timers = host_timers(
@@ -207,6 +215,7 @@ impl Session {
             Inner {
                 storage,
                 options,
+                telemetry,
                 timers,
                 weak: weak.clone(),
                 line: AsyncMutex::new(()),
@@ -220,6 +229,17 @@ impl Session {
                 closed: watch::channel(None).0,
             }
         }))
+    }
+
+    pub(crate) fn report_task_fault(&self, id: crate::TaskId, message: &str, context: &Context) {
+        if let Some(report) = &self.0.options.report {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                report(ReportKind::TaskFaulted, message)
+            }));
+        }
+        if let Some(telemetry) = &self.0.telemetry {
+            telemetry.report("task_faulted", Some(id), Some(context.telemetry()));
+        }
     }
 
     /// Stage one transaction. Its callback may run while unrelated earlier writes reach Storage;
@@ -397,6 +417,7 @@ struct State {
 struct Inner {
     storage: Arc<dyn Storage>,
     options: SessionOptions,
+    telemetry: Option<Arc<crate::harness::telemetry::HarnessTelemetry>>,
     timers: Timers,
     weak: Weak<Self>,
     writer: Writer,
@@ -444,6 +465,10 @@ impl Inner {
         }
     }
     fn fail(&self, cause: String) {
+        self.fail_in(cause, None);
+    }
+
+    fn fail_in(&self, cause: String, context: Option<&Context>) {
         let mut failure = lock(&self.failed);
         if failure.is_some() {
             return;
@@ -451,11 +476,25 @@ impl Inner {
         *failure = Some(cause.clone());
         drop(failure);
         self.begin_close();
-        self.report(ReportKind::StorageFailed, &cause);
+        self.report_in(ReportKind::StorageFailed, &cause, context);
     }
     fn report(&self, kind: ReportKind, message: &str) {
+        self.report_in(kind, message, None);
+    }
+
+    fn report_in(&self, kind: ReportKind, message: &str, context: Option<&Context>) {
         if let Some(report) = &self.options.report {
             let _ = catch_unwind(AssertUnwindSafe(|| report(kind, message)));
+        }
+        if let Some(telemetry) = &self.telemetry {
+            let name = match kind {
+                ReportKind::StorageFailed => "storage_failed",
+                ReportKind::TaskFaulted => "task_faulted",
+                ReportKind::Extension => "extension_error",
+                ReportKind::Listener => "listener_error",
+                ReportKind::Host | ReportKind::Timer | ReportKind::Telemetry => "host_error",
+            };
+            telemetry.report(name, None, context.map(Context::telemetry));
         }
     }
 
@@ -520,7 +559,7 @@ impl Inner {
         };
         if let Err(error) = catch_unwind(AssertUnwindSafe(|| self.storage.publishing(&mut publish)))
         {
-            self.report(ReportKind::Listener, &panic_message(&*error));
+            self.report_in(ReportKind::Listener, &panic_message(&*error), Some(context));
         }
         publish();
         adopted.ok_or_else(|| Error::invalid("Storage publication did not run"))?
@@ -556,6 +595,12 @@ impl Inner {
             Vec::new()
         };
         for write in std::mem::take(&mut batch.writes) {
+            if seq.is_some()
+                && let StorageWrite::Task { value } = &write
+                && let Some(telemetry) = &self.telemetry
+            {
+                telemetry.track(value, false);
+            }
             self.telemetry(&write, context);
             if !describe {
                 continue;
@@ -694,7 +739,11 @@ impl Inner {
             _ => {}
         }));
         if let Err(error) = emitted {
-            self.report(ReportKind::Telemetry, &panic_message(&*error));
+            self.report_in(
+                ReportKind::Telemetry,
+                &panic_message(&*error),
+                Some(context),
+            );
         }
     }
 
@@ -795,6 +844,9 @@ impl Inner {
         if let Some(cause) = closing {
             self.fail(cause.clone());
             error = Some(cause);
+        }
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.close();
         }
         self.closed.send_replace(Some((
             self.failure()

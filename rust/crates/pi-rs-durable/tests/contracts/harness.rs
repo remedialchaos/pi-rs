@@ -80,39 +80,76 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
         tools::ToolResult,
     };
     use pi_rs_durable::{SubmissionStatus, storage::memory::MemoryStorage};
+    use pi_rs_telemetry::{AttributeValue, Context as Recorder, SpanOptions, TelemetryContext};
     for available in [false, true] {
+        let telemetry = Recorder::new();
         let registry = create_registry();
         if available {
+            let parameters = json!({
+                "type":"object", "properties":{"text":{"type":"string"}}, "required":["text"]
+            });
             registry.install(Extension {
                 name: "tool:echo".into(),
-                tools: vec![ToolRegistration {
-                    sequential: false,
-                    prepare_arguments: None,
-                    cancel: None,
-                    structured_output_schema: None,
-                    output_limits: None,
-                    declaration: pi_rs_ai::types::Tool {
-                        name: "echo".into(),
-                        description: "Returns the input text".into(),
-                        parameters: json!({
-                            "type": "object",
-                            "properties": {"text":{"type":"string"}},
-                            "required": ["text"]
+                tools: vec![
+                    ToolRegistration {
+                        sequential: false,
+                        prepare_arguments: None,
+                        cancel: None,
+                        structured_output_schema: None,
+                        output_limits: None,
+                        declaration: pi_rs_ai::types::Tool {
+                            name: "echo".into(),
+                            description: "Returns the input text".into(),
+                            parameters: parameters.clone(),
+                            constrained_sampling: None,
+                        },
+                        execute: Arc::new(|args, task, ctx| {
+                            Box::pin(async move {
+                                let args: pi_rs_durable::JsonObject = serde_json::from_value(args)?;
+                                let output = task
+                                    .execute_tool("echo", "inner", args.clone(), false, false, ctx)
+                                    .await?;
+                                let replay = task
+                                    .execute_tool("echo", "inner", args, false, false, ctx)
+                                    .await?;
+                                if output != replay {
+                                    return Err(Error::invalid("Keyed call changed on replay"));
+                                }
+                                let result: ToolResult = serde_json::from_value(json!({
+                                    "output":[{"type":"text","text":output["structuredOutput"]}]
+                                }))?;
+                                Ok(result.into())
+                            })
                         }),
-                        constrained_sampling: None,
+                        deferred: false,
+                        callers: None,
+                        replay_safe: false,
                     },
-                    execute: Arc::new(|args, _, _| {
-                        Box::pin(async move {
-                            let result: ToolResult = serde_json::from_value(
-                                json!({"output":[{"type":"text","text":args["text"]}]}),
-                            )?;
-                            Ok(result.into())
-                        })
-                    }),
-                    deferred: false,
-                    callers: None,
-                    replay_safe: false,
-                }],
+                    ToolRegistration {
+                        sequential: false,
+                        prepare_arguments: None,
+                        cancel: None,
+                        structured_output_schema: None,
+                        output_limits: None,
+                        declaration: pi_rs_ai::types::Tool {
+                            name: "inner".into(),
+                            description: "Echo implementation".into(),
+                            parameters,
+                            constrained_sampling: None,
+                        },
+                        execute: Arc::new(|args, _, _| {
+                            Box::pin(async move {
+                                let result: ToolResult = serde_json::from_value(json!({
+                                    "output":[{"type":"text","text":args["text"]}]
+                                }))?;
+                                Ok(result.into())
+                            })
+                        }),
+                        deferred: false,
+                        callers: Some(vec!["tools".into()]),
+                        replay_safe: false,
+                    },
+                ],
                 ..Default::default()
             })?;
         }
@@ -121,6 +158,7 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
             Arc::new(MemoryStorage::new()),
             HarnessOptions {
                 registry: Arc::new(HarnessRegistry::Local(registry)),
+                telemetry: telemetry.clone(),
                 ..Default::default()
             },
             &ctx,
@@ -154,11 +192,14 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
             &ctx,
         )
         .await?;
-        let submission = root
-            .submit(
-                serde_json::from_value(json!({"type":"input","content":"question"}))?,
-                &ctx,
-            )
+        let submission = telemetry
+            .start_span(SpanOptions::new("caller"), |caller| async {
+                root.submit(
+                    serde_json::from_value(json!({"type":"input","content":"private-question"}))?,
+                    &ctx.with_telemetry(caller),
+                )
+                .await
+            })
             .await?;
         let record =
             match tokio::time::timeout(std::time::Duration::from_secs(10), submission.wait(&ctx))
@@ -212,7 +253,96 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
             json!([{"type":"text","text":if available { "hello" } else { "<harness>\n[error] Tool unavailable is not available\n</harness>" }}])
         );
         assert_eq!(fake.state.call_count(), 2);
+        harness.wait_for_idle(&ctx).await?;
         harness.close(&ctx).await?;
+
+        let spans = telemetry.get_spans();
+        assert!(spans.iter().all(|span| span.settled));
+        let caller = &spans[0];
+        let submit = &spans[1];
+        assert_eq!(submit.name, "pi.durable.submit");
+        assert_eq!(submit.parent_context, None);
+        assert_eq!(submit.links.len(), 1);
+        assert_eq!(submit.links[0].context, caller.context);
+        assert_eq!(submit.attributes["result"], AttributeValue::from("placed"));
+        assert_eq!(record.trace.as_ref(), Some(&submit.context));
+        let phases: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "pi.durable.phase")
+            .collect();
+        assert_eq!(phases[0].parent_context.as_ref(), Some(&submit.context));
+        let tool = phases
+            .iter()
+            .find(|span| {
+                span.attributes.get("tool.call_id") == Some(&AttributeValue::from("call-1"))
+            })
+            .ok_or("missing tool span")?;
+        if available {
+            assert!(
+                tool.events
+                    .iter()
+                    .any(|event| event.name == "pi.durable.checkpoint"
+                        && event.attributes["phase"] == AttributeValue::from("execute"))
+            );
+            let children: Vec<_> = phases
+                .iter()
+                .filter(|span| {
+                    span.attributes.get("tool.name") == Some(&AttributeValue::from("inner"))
+                })
+                .collect();
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].parent_context.as_ref(), Some(&tool.context));
+            assert_eq!(
+                tool.events
+                    .iter()
+                    .filter(|event| event.name == "pi.durable.replay"
+                        && event.attributes["tool.name"] == AttributeValue::from("inner"))
+                    .count(),
+                1
+            );
+        }
+        let requests: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "pi.ai.request")
+            .collect();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(phases.iter().any(|phase| request.parent_context.as_ref()
+                == Some(&phase.context)
+                && phase.attributes["phase"] == AttributeValue::from("request")));
+        }
+        assert!(
+            submit
+                .events
+                .iter()
+                .any(|event| event.name == "pi.durable.entry"
+                    && event.attributes["entry.kind"] == AttributeValue::from("pi.user"))
+        );
+        assert!(phases.iter().flat_map(|span| &span.events).any(|event| {
+            event.name == "pi.durable.submission"
+                && event.attributes["status"] == AttributeValue::from("done")
+                && Some(&event.attributes["answer.entry_id"])
+                    == record
+                        .answer
+                        .map(|id| AttributeValue::from(id as f64))
+                        .as_ref()
+        }));
+        let recorded = format!("{spans:?}");
+        for private in ["private-question", "\"hello\"", "\"answer\""] {
+            assert!(!recorded.contains(private));
+        }
+        let metrics = telemetry.get_metrics();
+        let durations = metrics
+            .iter()
+            .filter(|metric| metric.name == "pi.durable.phase.duration")
+            .count();
+        assert_eq!(durations, phases.len());
+        let active: Vec<_> = metrics
+            .iter()
+            .filter(|metric| metric.name == "pi.durable.tasks.active")
+            .collect();
+        assert!(!active.is_empty());
+        assert_eq!(active.iter().map(|metric| metric.value).sum::<f64>(), 0.0);
     }
     Ok(())
 }

@@ -58,7 +58,7 @@ pub(super) fn stream_options(
     let value = &checkpoint["streamOptions"];
     let mut opts = StreamOptions {
         session_id: Some(session_id),
-        telemetry: Some(ctx.telemetry().clone()),
+        telemetry: super::telemetry::active_context(ctx),
         transport: serde_json::from_value(value["transport"].clone())?,
         cache_retention: serde_json::from_value(value["cacheRetention"].clone())?,
         websocket_connect_timeout_ms: value["websocketConnectTimeoutMs"].as_u64(),
@@ -217,7 +217,7 @@ pub fn generation_task() -> Arc<Task<Invocation>> {
                     && let Ok(handle) = serde_json::from_value(poll["handle"].clone())
                 {
                     let options = StreamOptions {
-                        telemetry: Some(ctx.telemetry().clone()),
+                        telemetry: super::telemetry::active_context(ctx),
                         ..Default::default()
                     };
                     let _ = inv

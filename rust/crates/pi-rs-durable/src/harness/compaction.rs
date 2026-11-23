@@ -587,7 +587,7 @@ impl Invocation {
                         notify: None,
                         body: SubmissionBody::Write { entry },
                     };
-                    let submission = conv.admit(tx, draft).await?;
+                    let submission = conv.admit_internal(tx, draft).await?;
                     json!({"submissionId": submission})
                 };
                 outcome = TaskOutcome::Completed { result };

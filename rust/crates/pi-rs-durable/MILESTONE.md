@@ -47,4 +47,21 @@ The native Harness runs on Session storage. It opens and forks SQLite-backed con
 | Queued submission after a failed run | With a second submission waiting, keep left it queued, withdraw settled it unanswered with reason `run_failed`, and continue answered it. Changing the withdrawal reason failed the new test. After restoring it, all 82 tests passed serially in 72.60 s. After the scheduler and tool readability edits, the same 82 passed in 37.78 s. One test added, zero removed. Formatting and strict all-target Clippy passed for both revisions. |
 | Formal differential replay | The native crate has no leaf bridge or recorded corpus. The checked comparisons above use the upstream transcript and tool-round implementations. |
 
-The scheduler also implements lifecycle hook dispatch, sequential tools, bounded tool progress, nested task execution and restart reconciliation. Lifecycle failure, cancellation and restart edge cases need additional verification. Conversation observation, task-graph watches and telemetry publication are under separate verification.
+### Conversation observation and telemetry
+
+Window and task-graph observers report committed changes before the writer returns.
+Document watches identify replacements from the ID and version read in the same
+snapshot. Three mutations verified eviction splices, the terminal session-close
+signal and replacement safety.
+
+The upstream telemetry suite passed 27 cases. The native recorder observed four
+write spans, six task phases including a resumed phase, balanced active counts,
+and both storage and task failures. The model/tool test observed nested keyed
+replay. Changing the storage-failure classification, phase histogram outcome
+and replay event name failed the three corresponding contracts. External sink
+delivery remains unverified.
+
+The integrated native suite passed all 87 tests in 32.99 s of test execution,
+up from 82 tests in 37.78 s on the preceding checkpoint. Five tests were added,
+one extended, and zero removed. Offline all-target Clippy passed with warnings
+denied. Cancellation, restart cutoffs and hook failure handling remain in progress.

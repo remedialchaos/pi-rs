@@ -222,16 +222,17 @@ impl Writer {
                     Ok(listener_failure) => {
                         if let Some(error) = &backend_error {
                             if let Some(listener_failure) = listener_failure {
-                                session.report(
+                                session.report_in(
                                     super::ReportKind::Listener,
                                     &listener_failure.to_string(),
+                                    Some(&part.context),
                                 );
                             }
                             delayed.push((part, Err(Error::Storage(error.clone()))));
                         } else {
                             if let Some(listener_failure) = listener_failure {
                                 let cause = listener_failure.to_string();
-                                session.fail(cause.clone());
+                                session.fail_in(cause.clone(), Some(&part.context));
                                 stopped = Some(cause);
                             }
                             self.finish(part, Ok(()));
@@ -246,7 +247,7 @@ impl Writer {
                 .or(stopped)
                 .or_else(|| refusal.map(|error| error.to_string()))
             {
-                session.fail(cause);
+                session.fail_in(cause, delayed.first().map(|(part, _)| &part.context));
             }
             for (part, outcome) in delayed {
                 self.finish(part, outcome);
