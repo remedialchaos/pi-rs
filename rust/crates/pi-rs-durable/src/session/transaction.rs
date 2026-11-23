@@ -116,6 +116,10 @@ impl<'a> Transaction<'a> {
     pub fn context(&self) -> &Context {
         self.context
     }
+    pub(crate) fn belongs_to(&self, session: &super::Session) -> bool {
+        Arc::ptr_eq(self.session, &session.0)
+    }
+
     pub fn has_table_write(&self) -> bool {
         self.has_table_write
     }
@@ -146,6 +150,19 @@ impl<'a> Transaction<'a> {
     pub async fn entry(&self, id: EntryId) -> Result<Option<EntryRecord>> {
         self.read("Tx.entry()")?;
         Ok(self.session.entry(id).await?.map(|stored| stored.entry))
+    }
+
+    pub(crate) async fn document_snapshot(
+        &self,
+        definition: &DocToken,
+        address: &DocumentAddress,
+    ) -> Result<Option<Arc<JsonObject>>> {
+        self.read("Tx.snapshot()")?;
+        Ok(self
+            .session
+            .load_document(definition, address)
+            .await?
+            .map(|loaded| loaded.value.clone()))
     }
 
     pub async fn typed_entry<D>(
@@ -198,6 +215,18 @@ impl<'a> Transaction<'a> {
     ) -> Result<Page<EntryRecord>> {
         self.read("Tx.scanEntries()")?;
         self.session.scan_entries(query, limit, cursor).await
+    }
+
+    pub async fn scan_submissions(
+        &self,
+        query: &SubmissionQuery,
+        limit: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<SubmissionRecord>> {
+        self.read("Tx.scanSubmissions()")?;
+        self.session.touch(&super::Key::All).await?;
+        self.session
+            .read_storage(|storage| storage.scan_submissions(query, limit, cursor))
     }
 
     pub async fn scan_tasks(
@@ -557,7 +586,7 @@ impl<'a> Transaction<'a> {
         Ok(value)
     }
 
-    async fn current_task(&mut self, id: TaskId) -> Result<Option<&TaskRecord>> {
+    pub(crate) async fn current_task(&mut self, id: TaskId) -> Result<Option<&TaskRecord>> {
         if self
             .tasks
             .get(&id)

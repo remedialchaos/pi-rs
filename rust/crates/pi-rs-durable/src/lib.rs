@@ -6,6 +6,7 @@ pub mod documents;
 pub mod entries;
 pub mod env;
 pub mod errors;
+pub mod harness;
 pub mod ids;
 pub mod images;
 pub mod search;
@@ -27,6 +28,7 @@ pub use entries::{
     define_entry,
 };
 pub use errors::SessionError;
+pub use harness::*;
 pub use ids::*;
 pub use session::{Session, create_session};
 pub use signals::{

@@ -130,6 +130,9 @@ pub enum ObservedCommit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReportKind {
     StorageFailed,
+    Extension,
+    Host,
+    TaskFaulted,
     Listener,
     Timer,
     Telemetry,
@@ -183,6 +186,13 @@ pub fn create_session(storage: Arc<dyn Storage>, options: SessionOptions) -> Ses
 }
 
 impl Session {
+    pub(crate) fn harness_report(&self, kind: ReportKind, text: &str) {
+        self.0.report(kind, text);
+    }
+    pub(crate) fn timers(&self) -> &Timers {
+        &self.0.timers
+    }
+
     pub fn new(storage: Arc<dyn Storage>, options: SessionOptions) -> Self {
         Self(Arc::new_cyclic(|weak: &Weak<Inner>| {
             let report = weak.clone();

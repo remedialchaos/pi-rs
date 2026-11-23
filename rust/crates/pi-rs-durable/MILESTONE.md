@@ -31,3 +31,19 @@ The upstream Chord Vitest entry points also import the 2.2b harness, which faile
 - Standard Rust strings and `serde_json::Value` cannot represent lone UTF-16 surrogates. The native storage suite does not claim that part of the upstream lossless indexed-string test. It does exercise embedded NUL, supplementary Unicode, and prototype-like keys.
 - The sibling Chord store does not expose live-query publication for custom transaction series, and it rejects explicit document creation at `MAX_SAFE_ID`. Durable publication and table IDs have separate test coverage.
 - Image re-encoding is native, not byte-for-byte Photon; image contract tests check geometry, orientation, budgets, and unchanged bytes when no conversion is needed. Exact jsdiff hunk placement for ambiguous repeated lines and exact JavaScript event-loop scheduling are not established.
+
+## 2.2b durable harness
+
+The native Harness runs on Session storage. It opens and forks SQLite-backed conversations, drives model and tool tasks, settles submissions and compacts transcripts.
+
+| Check | Result and scope |
+| --- | --- |
+| SQLite reopen and fork | Passed. Changing fork inheritance from as-of to current returned /second instead of /first. |
+| Model and tool scheduling | The two-request test caught a scheduler deadlock. Independent Tokio dispatch tasks fixed it. Requiring more than one child to process a tool round made the contract fail. |
+| Transcript | The two-window result matched the upstream TypeScript module, including the gap after entry 3, the next entry 7 and resume at 9. Adding one to the gap endpoint failed the contract. |
+| Automatic compaction | The threshold case made two model requests. Overflow required three. Both wrote one summary between the first and second answers. Relabelling the summary entry failed the test. |
+| Tool-round oracle | Both settled done with call-1 and two provider calls. Missing tool produced user, assistant, tool-result, assistant and exactly `<harness>\n[error] Tool unavailable is not available\n</harness>` (isError true). Registered echo inserted system between user and assistant and returned exactly `hello` (isError false). All listed entry kinds use the pi. prefix. |
+| Native suite, format and lint | All 81 tests passed serially in 36.11 s, with a wall time of 374.88 s including compilation. Formatting and offline all-target Clippy passed. The 77-test foundation run took 19.96 s under different load. Four tests were added and zero removed. |
+| Formal differential replay | The native crate has no leaf bridge or recorded corpus. The checked comparisons above use the upstream transcript and tool-round implementations. |
+
+The scheduler also implements lifecycle hook dispatch, sequential tools, bounded tool progress, nested task execution and restart reconciliation. Lifecycle failure, cancellation and restart edge cases need additional verification. Conversation observation, task-graph watches and telemetry publication are under separate verification.

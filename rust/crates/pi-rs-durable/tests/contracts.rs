@@ -21,3 +21,6 @@ mod storage_benchmark;
 mod storage_conformance;
 #[path = "contracts/tools.rs"]
 mod tools;
+
+#[path = "contracts/harness.rs"]
+mod harness;
