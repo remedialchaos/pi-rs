@@ -152,6 +152,7 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     let mut routes = HttpContribution::new("p2.core-http");
     routes.hosts.clone_from(&options.allowed_hosts);
     let nonce = uuid::Uuid::new_v4().to_string();
+    super::web::add_routes(&mut routes, nonce.clone())?;
     let mut headers = HttpWrap::new(
         "p2.response-headers",
         WrapPhase::Headers,
@@ -198,7 +199,6 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     });
     health.cross_site = true;
     routes.route("GET /health", health)?;
-    super::web::add_routes(&mut routes)?;
     let http = Http::new(
         host.clone(),
         HttpOptions {

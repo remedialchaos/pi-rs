@@ -1,6 +1,6 @@
 # `pi-rs` Handoff
 
-- **Previous checkpoint**: `9cf6a5023` (native durable environment bridge) on local `main`.
+- **Previous checkpoint**: `d704bb724` (106 shared Chord declarations) on local `main`.
 - **Stage**: Wave 1 in progress. The previous checkpoint recorded 17 workspace crates, 21 leaf gates and 2,236 native tests.
 - **Fallback rate**: `pi`, `pi-ai`, `pi-env`, `pi-evals`, `p3`, `pi-mac`, and `pi-voice-server` binaries run 100% natively; `packages/` and `apps/` untouched.
 - **Next action**: Verify and integrate the Wave 1 claims in [MAP.md](MAP.md) before assigning the 49 built-in plugins. Isolated worktrees under `.worktrees/` contain unmerged work.
@@ -27,7 +27,7 @@
 | **2.3b** `pi-rs-env` durable `ExecutionEnv` bridge | Native gates passed | 46 tests, 5 new mutation checks. Rust and upstream agreed on the exercised daemon, shell and error cases. Formal listing replay pending. |
 | **2.4** `pi-rs-evals` (`pi-evals` bin) | **PASS** | **44/44** tests (5/5 mutation checks, golden report/SHA parity, TTY-deterministic styling), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
 | **3.1** `pi-rs-p3` (`p3` bin; `old/` skipped) | **PASS** | **79/79** tests (69 lib + 6 live `p3` binary CLI + 4 live child-worker runner, 5/5 mutation checks), `#![forbid(unsafe_code)]`, 0 `#[allow]` |
-| **3.2-web** Browser | PARTIAL | 135 native tests. Compiled WASM created a session and exchanged chat messages with the upstream server in Chromium. The fixture injected assets with CSP bypass. Production browser routing, CSP and plugin integration remain open. |
+| **3.2-web** Browser | PARTIAL | 135 native tests. Chromium exchanged chat with upstream and loaded the packaged native application's JS, WASM, CSS and fonts under production CSP. Owner and guest admission used fixture credentials on a native server. Native session creation and chat still need their providers. |
 | **3.2-tui** Mounted client | PARTIAL | 20 tests, including five new mutation-verified terminal cases for transcript, keyboard paging, tree layout, native shortcut dispatch and theme reload. Dynamic guests, mouse scroll and whole-screen replay remain open. |
 | **3.2** `pi-rs-p2` standalone server | PARTIAL | Six upstream HTTP cases passed at the core checkpoint. Two subsequent tests verified 106 shared contracts across 130 versions. The existing worker timing check failed under load before and after the declaration change. Authenticated native chat, remaining hosts and 49 built-in plugins are open. |
 | **3.3** `pi-rs-p2-mac` (`pi-mac` bin) | **PASS** | 16/16 Linux tests + `aarch64-apple-darwin` check + real upstream `p2` smoke PASS |

@@ -72,11 +72,23 @@ fn endpoint(root: &HtmlElement) -> Result<(String, bool)> {
         url.search_params().set("client", "cloud");
         return Ok((url.href(), true));
     }
-    let base = js_sys::Reflect::get(&window(), &"chordPage".into())
+    let existing_base = js_sys::Reflect::get(&window(), &"chordPage".into())
         .ok()
-        .and_then(|p| js_sys::Reflect::get(&p, &"base".into()).ok())
-        .and_then(|p| p.as_string())
-        .unwrap_or_default();
+        .and_then(|page| js_sys::Reflect::get(&page, &"base".into()).ok())
+        .and_then(|base| base.as_string());
+    let base = if let Some(base) = existing_base {
+        base
+    } else if let Some(base) = document()
+        .document_element()
+        .and_then(|html| html.get_attribute("data-web-version"))
+    {
+        let page = js_sys::Object::new();
+        js_sys::Reflect::set(&page, &"base".into(), &JsValue::from_str(&base)).map_err(js_error)?;
+        js_sys::Reflect::set(&window(), &"chordPage".into(), &page).map_err(js_error)?;
+        base
+    } else {
+        String::new()
+    };
     let scheme = if loc.protocol().map_err(js_error)? == "https:" {
         "wss"
     } else {

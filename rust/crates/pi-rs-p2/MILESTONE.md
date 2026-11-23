@@ -3,7 +3,8 @@
 The native `p2` binary starts a Chord server on loopback. It locks the data directory, checks
 the storage layout, opens the private store and files, publishes its bound port, loads server
 facets, and shuts down HTTP, Chord, and SQLite. The binary embeds the public installable-app
-files and browser sign-in page.
+files and browser sign-in page. A packaged build also embeds the authenticated browser shell
+and its WASM, module, stylesheet and fonts.
 
 ## Plugin and session host interfaces
 
@@ -64,33 +65,106 @@ and Durable Harness backend still need production wiring. The port of the Durabl
 is open as milestone 2.2b. Explicit session demand is available to native plugins. Automatic
 routing from the HTTP Chord connection, catalog-coordinated pause and relocation, crash restart
 policy and worker activity from Durable tasks still need integration. Owner claim, credential
-and session flows require their plugins. Browser WASM and authenticated TUI bundle delivery are
-separate integration work. Telemetry and dev supervision remain open. HTTP responses outside
+and session flows require their plugins. Authenticated TUI bundle delivery, Radius framing,
+telemetry and dev supervision remain open. HTTP responses outside
 the six recorded cases, including errors before route dispatch, have limited parity evidence.
 
 ## Browser asset and production handoff
 
-Browser client source is on local main at `f49b10824`. The browser owner supplies
-`app.js`, `app_bg.wasm`, `p2.css` and the five WOFF2 fonts. The coordinator reported the live
-test bundle at `rust/crates/target/p2-browser-assets` in the main checkout. Treat it as a
-build input for live testing. Production packaging should supply the same files without a
-runtime dependency on that checkout.
+### Build a standalone p2 with the browser bundle
+
+Run from the repository root with the Rust `wasm32-unknown-unknown` target, the
+`wasm-bindgen` CLI version matching `Cargo.lock` (0.2.130), and npm dependencies
+installed from `package-lock.json` with `npm ci --ignore-scripts`. esbuild and the
+Elanor asset packages are build inputs.
+
+```sh
+export TMPDIR=/var/tmp/pi-rs-tmp-p2-assets
+export CARGO_TARGET_DIR=/var/tmp/pi-rs-target-p2-assets
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+assets="$PWD/rust/crates/target/p2-browser-assets"
+mkdir -p "$TMPDIR" "$CARGO_TARGET_DIR" "$assets"
+cargo build --manifest-path rust/crates/Cargo.toml -p pi-rs-p2-web \
+  --target wasm32-unknown-unknown --offline --locked -j 1
+wasm-bindgen --target web --no-typescript --out-name app --out-dir "$assets" \
+  "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/pi_rs_p2_web.wasm"
+node_modules/.bin/esbuild rust/crates/pi-rs-p2-web/assets/browser.css \
+  --bundle --loader:.woff2=file --outfile="$assets/p2.css"
+P2_BROWSER_ASSETS="$assets" cargo build --manifest-path rust/crates/Cargo.toml \
+  -p pi-rs-p2 --bin p2 --offline --locked -j 1
+
+package="$PWD/rust/crates/target/p2-standalone"
+vendor="$PWD/node_modules/@earendil-works"
+mkdir -p "$package/licenses"
+cp "$CARGO_TARGET_DIR/debug/p2" "$package/"
+cp LICENSE "$package/LICENSE"
+cp "$vendor/elanor-fonts/licenses/commit-mono.txt" "$package/licenses/"
+cp "$vendor/elanor-fonts/licenses/mallos-serif.txt" "$package/licenses/"
+cp "$vendor/design-tokens/LICENSE" "$package/licenses/design-tokens.txt"
+cp "$vendor/elanor-react/LICENSE" "$package/licenses/elanor-react.txt"
+```
+
+Distribute `p2-standalone/` with its browser asset notices. The build script validates the asset set,
+embeds the files in the binary and computes the SHA-256-based version. At runtime,
+p2 serves the version at `/_chord/web/base` and the authenticated bundle at
+`/_chord/web/<version>/`. CSS font URLs stay relative to the stylesheet. The
+shell publishes the version as metadata. Rust/WASM reads it to set
+`chordPage.base` and open `/chord?web=<version>`. Authenticated HTML and its CSP
+share the core server's nonce. The policy allows same-origin assets and the
+Chord socket. Authenticated pages and bundle files use `Cache-Control: no-store`.
+
+Core builds with `P2_BROWSER_ASSETS` unset still serve sign-in and public
+installable-app files. An authorized app page on that build returns HTTP 503.
+The variable is a compile-time input. Start the packaged binary with the usual
+`PORT` and `P2_DATA_DIR` settings.
+
+The public base route reads `hosts::web::browser_base()`. That function also
+exposes the packaged version to the server for the planned stale-page check.
 
 | Ownership boundary | Files and remaining work |
 | --- | --- |
 | Browser bundle | `pi-rs-p2-web` owns the WASM client, JS loader, CSS, fonts and binary Chord client. The main commit's milestone records its loopback Chromium test against upstream p2. |
-| Asset and page integration | `pi-rs-p2/src/hosts/web.rs` owns HTTP delivery of the bundle and the authenticated app page. Today it serves public files and the sign-in fallback. Authenticated requests reaching the fallback get 404. Provide `#root`, load the stylesheet and JS module, initialize WASM once, and set the local `chordPage.base` used by `/chord?web=<base>`. Serve WASM as `application/wasm` and preserve the stylesheet's relative font URLs. Coordinate CSP and bundle configuration through `hosts/server.rs` and `main.rs`. |
+| Asset and page integration | `pi-rs-p2/src/hosts/web.rs` serves the authenticated shell to owners and to guests on root and their granted session pages. The app's code assets require an owner or guest principal. Chord resolves credentials and enforces origin and Fetch Metadata admission before dispatch. |
 | Production server and plugin composition | `main.rs` owns the production registry selected at boot. `hosts/server.rs` owns authenticated HTTP and WebSocket admission and Chord routing. Register the providers for `p2.access` v1 and `p2.sessions` v7 on the server and preserve session identity through the WebSocket upgrade. The browser also expects `p2.chat` v6 on the session address. Match the upstream contract fingerprints and member indexes. |
 | Production session worker | `hosts/session_workers.rs` owns on-demand child routing and caller propagation. Wire the session catalog callback and Chord route into it. `hosts/worker.rs` owns child boot and worker facets. Install Chat and the Durable Harness backend there, using `runtime/session_worker.rs` for lifecycle coordination. |
 | Native client host | `hosts/client.rs` owns native web and TUI facet loading over a caller-supplied Chord link. The compiled browser connects directly. TUI delivery remains a separate integration. |
 
-For asset acceptance, fetch the HTML, JS, WASM, CSS and fonts from p2 itself. Confirm the
-anonymous sign-in flow still works and load the authenticated page in Chromium with production
-CSP enabled. Asset delivery can be checked before the production providers land.
+### Live asset verification
+
+- Rebuilt the browser bundle from source using the existing lockfile-installed
+  npm dependencies. A second wasm-bindgen and esbuild run produced identical
+  asset bytes. Started the copied package outside the checkout with no runtime
+  asset path. Health, the base version, installable manifest, anonymous sign-in
+  and asset refusal passed. The process shut down cleanly on TERM.
+- Chromium 157 used separate disposable owner and guest profiles against the
+  native server with a credential fixture. The owner sign-in form rejected
+  invalid and reused tokens. The guest received 403 for an ungranted session
+  and 200 for its granted conversation. Both profiles mounted the app under
+  production CSP, fetched the JS, WASM, CSS and five WOFF2 files from p2, and
+  received a Chord upgrade and binary frame using the packaged base. The HTML
+  contained the bootstrap and no identity or session data.
+- The embedded `sw.js` matches upstream byte-for-byte. In a separate check
+  after the owner run, the active worker returned cached WASM with HTTP 200
+  after cookie removal. A direct server request returned 401. The worker also
+  stored the metadata-only HTML shell. This is inherited offline behavior.
+- The recorded HTTP replay passed 6/6 on the copied package. An earlier run
+  received a transient 404 on `/__p2_dev`. That case passed in isolation and
+  in the subsequent full replay.
+
+### Browser asset gates
+
+| Check | Evidence |
+| --- | --- |
+| Build input validation | The offline WASM and native builds passed. A bundle missing `app_bg.wasm` failed at compile time. |
+| Owner and guest admission | Fresh Chromium profiles mounted under CSP using real HTTP responses. The guest's ungranted session returned 403. |
+| Shared page nonce | The HTTP test compares two authenticated HTML responses from one server and matches each script nonce to its CSP. Replacing the server nonce with the Chord request nonce failed that assertion. |
+| Mutation checks | Two tests added, zero removed. Removing the guest grant check and changing the WASM MIME type each failed the corresponding test. The original code was restored for the final suite. |
+| Native tests | Before the change, p2 passed 4 tests in 1.17 s. After the change, p2 passed 6 tests in 4.12 s without the bundle and 6 tests in 3.17 s with it. p2-web passed 135 native tests. Times sum test harness execution and exclude build and lock waits. |
+| Formatting and lint | Formatting passed for both crates. Offline all-target Clippy passed with warnings denied for core-only and packaged p2, native p2-web and the WASM target. |
 
 For production acceptance, use the native server and worker with a disposable catalog and fake
 model. Sign in, create a session, send a message, observe the user and assistant rows, and
 reload to verify persistence. Exercise access rejection for a guest without a session grant.
-The browser milestone's upstream test used injected assets and CSP bypass. The coordinator's
-6/6 native HTTP replay covers the existing front door. Production browser delivery and native
-chat require their own live result.
+The browser milestone's upstream test used injected assets and CSP bypass. The native
+browser checks for this slice exercise asset delivery. Native chat and persistence still
+require the production providers and worker wiring.

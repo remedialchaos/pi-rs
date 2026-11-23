@@ -1,16 +1,22 @@
-//! Embedded public assets and the unauthenticated browser entrance.
+//! Embedded browser assets, sign-in and the authenticated application shell.
+
+use std::sync::Arc;
 
 use axum::body::Body;
 use http::{HeaderValue, StatusCode, header};
 use pi_rs_chord::node::{
     app::new_token,
     http::{
-        HttpContribution, HttpRequest, HttpResponse, HttpResult, RouteOptions, html_response,
-        text_response,
+        HttpContribution, HttpError, HttpRequest, HttpResponse, HttpResult, RouteOptions,
+        html_response, json_response, text_response,
     },
 };
+use serde::Deserialize;
 
-use crate::runtime::http::foreign_browser_request;
+use crate::runtime::{
+    http::{content_security_policy, foreign_browser_request},
+    principals::Principal,
+};
 
 const MANIFEST: &[u8] = include_bytes!("../../assets/public/manifest.webmanifest");
 const TOUCH_ICON: &[u8] = include_bytes!("../../assets/public/icons/apple-touch-icon.png");
@@ -46,6 +52,100 @@ const PUBLIC_FILES: &[(&str, &str, &[u8])] = &[
 ];
 
 const SIGN_IN: &str = include_str!("../../assets/sign-in.html");
+const APP: &str = include_str!("../../assets/app.html");
+const WEB_PREFIX: &str = "/_chord/web/";
+
+struct BrowserBundle {
+    base: &'static str,
+    files: &'static [(&'static str, &'static str, &'static [u8])],
+}
+
+include!(concat!(env!("OUT_DIR"), "/browser_bundle.rs"));
+
+pub(crate) fn browser_base() -> Option<&'static str> {
+    BROWSER_BUNDLE.map(|bundle| bundle.base)
+}
+
+fn viewer(request: &HttpRequest) -> HttpResult<Option<Principal>> {
+    request
+        .principal
+        .as_ref()
+        .map(|value| match Principal::deserialize(value) {
+            Ok(principal @ (Principal::Owner { .. } | Principal::Guest { .. })) => Ok(principal),
+            _ => Err(HttpError::new(403, "Forbidden")),
+        })
+        .transpose()
+}
+
+fn session_page(path: &str) -> Option<&str> {
+    let path = path.strip_prefix("/s/")?;
+    let session = if let Some((session, conversation)) = path.split_once("/c/") {
+        if !matches!(conversation.as_bytes().first(), Some(b'1'..=b'9'))
+            || !conversation.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        session
+    } else {
+        path
+    };
+    (!session.is_empty()
+        && session
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'-')))
+    .then_some(session)
+}
+
+fn app_page(request: &HttpRequest, nonce: &str) -> HttpResult<HttpResponse> {
+    let Some(viewer) = viewer(request)? else {
+        return sign_in(request);
+    };
+    let path = request.path.as_str();
+    let session = session_page(path);
+    if viewer.is_owner() {
+        let list = path
+            .strip_prefix("/list/")
+            .is_some_and(|key| !key.is_empty() && !key.contains('/'));
+        if !matches!(path, "/" | "/new") && !list && session.is_none() {
+            return text_response(404, "Not found");
+        }
+    } else if path != "/" && !session.is_some_and(|id| viewer.can_view(id)) {
+        return text_response(403, "Forbidden");
+    }
+    let Some(bundle) = BROWSER_BUNDLE else {
+        return text_response(503, "Could not load the UI");
+    };
+    let mut response = html_response(
+        APP.replace("{{base}}", bundle.base)
+            .replace("{{nonce}}", nonce),
+    )?;
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_str(&content_security_policy(nonce, &request.origin))?,
+    );
+    Ok(response)
+}
+
+fn browser_asset(request: &HttpRequest) -> HttpResult<HttpResponse> {
+    if viewer(request)?.is_none() {
+        return text_response(401, "Unauthorized");
+    }
+    if let Some(bundle) = BROWSER_BUNDLE
+        && let Some((base, file)) = request
+            .path
+            .strip_prefix(WEB_PREFIX)
+            .and_then(|p| p.split_once('/'))
+        && base == bundle.base
+        && let Some(&(_, mime, bytes)) = bundle.files.iter().find(|(name, _, _)| *name == file)
+    {
+        let mut response = HttpResponse::new(Body::from(bytes));
+        let headers = response.headers_mut();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+        return Ok(response);
+    }
+    text_response(404, "Not found")
+}
 
 fn sign_in(request: &HttpRequest) -> HttpResult<HttpResponse> {
     let nonce = new_token(18);
@@ -72,7 +172,7 @@ fn sign_in(request: &HttpRequest) -> HttpResult<HttpResponse> {
     Ok(response)
 }
 
-pub(crate) fn add_routes(routes: &mut HttpContribution) -> HttpResult<()> {
+pub(crate) fn add_routes(routes: &mut HttpContribution, nonce: String) -> HttpResult<()> {
     for &(path, mime, bytes) in PUBLIC_FILES {
         routes.route(
             &format!("GET {path}"),
@@ -96,16 +196,37 @@ pub(crate) fn add_routes(routes: &mut HttpContribution) -> HttpResult<()> {
         )?;
     }
 
+    routes.route(
+        "GET /_chord/web/base",
+        RouteOptions::public(|_| {
+            Box::pin(async {
+                match browser_base() {
+                    Some(base) => json_response(&base.into()),
+                    None => text_response(503, "Could not load the UI"),
+                }
+            })
+        }),
+    )?;
+    routes.route(
+        "GET /_chord/web/*",
+        RouteOptions::new(|request| Box::pin(async move { browser_asset(&request) })),
+    )?;
+
     let fallback = RouteOptions::public(|request| {
         Box::pin(async move {
-            if request.principal.is_some() {
-                return text_response(404, "Not found");
+            match viewer(&request)? {
+                Some(Principal::Guest { .. }) => text_response(403, "Forbidden"),
+                Some(_) => text_response(404, "Not found"),
+                None => sign_in(&request),
             }
-            sign_in(&request)
         })
     });
-    let mut app_page = fallback.clone();
-    app_page.page = true;
+    let nonce = Arc::<str>::from(nonce);
+    let mut page = RouteOptions::public(move |request| {
+        let nonce = nonce.clone();
+        Box::pin(async move { app_page(&request, &nonce) })
+    });
+    page.page = true;
     for pattern in [
         "GET /",
         "GET /new",
@@ -114,7 +235,7 @@ pub(crate) fn add_routes(routes: &mut HttpContribution) -> HttpResult<()> {
         "GET /list/*",
         "GET /join/*",
     ] {
-        routes.route(pattern, app_page.clone())?;
+        routes.route(pattern, page.clone())?;
     }
     routes.route("GET /*", fallback)?;
     for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] {

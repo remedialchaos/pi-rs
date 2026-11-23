@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en" data-web-version="{{base}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fbfaf8">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#151413">
+  <meta name="apple-mobile-web-app-title" content="Pi">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Pi</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="/_chord/web/{{base}}/p2.css">
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" nonce="{{nonce}}">
+    import init from "/_chord/web/{{base}}/app.js";
+    await init();
+  </script>
+</body>
+</html>

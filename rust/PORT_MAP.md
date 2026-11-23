@@ -1,6 +1,6 @@
 # Port map: pi-rs
 
-21 of 641 units have a Rust port; no original changed since it was recorded.
+21 of 642 units have a Rust port; no original changed since it was recorded.
 
 ## Ports
 
@@ -272,6 +272,7 @@ In the order `analyze` suggests.
 | `packages/mcp/src/config.ts` | 225 | 2 | 93 |
 | `packages/schema/src/builders.ts` | 208 | 20 | 90 |
 | `packages/schema/src/compiler.ts` | 580 | 1 | 67 |
+| `rust/crates/pi-rs-p2/assets/public/` | 103 | 0 | 82 |
 | `apps/p2/plugins/devices/owner-access.ts` | 182 | 2 | 72 |
 | `apps/p2/plugins/scope-prompt/scopes.ts` | 105 | 2 | 86 |
 | `apps/p2/plugins/terminals/service.ts` | 394 | 3 | 69 |
