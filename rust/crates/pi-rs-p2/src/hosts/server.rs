@@ -85,13 +85,19 @@ impl ServerOptions {
     }
 }
 
+struct RunningPlugins {
+    sources: super::plugins::PluginSources,
+    runtime: pi_rs_chord::node::plugins::PluginRuntime,
+    registry: PluginRegistry,
+}
+
 pub struct P2Server {
     pub host: Host,
     pub address: SocketAddr,
     pub data_dir: PathBuf,
     pub plugins: Vec<String>,
     pub workers: SessionWorkers,
-    core: Vec<PluginFacet>,
+    loading: Option<Arc<tokio::sync::Mutex<RunningPlugins>>>,
     http: HttpServer,
     store: StoreEngine,
     _lock: ProcessLock,
@@ -102,10 +108,8 @@ pub struct P2Server {
 #[cfg(unix)]
 struct StandaloneDev {
     control: DevControl,
-    host: Host,
     workers: SessionWorkers,
-    core: Vec<PluginFacet>,
-    selection: tokio::sync::Mutex<(PluginRegistry, Vec<String>)>,
+    loading: Arc<tokio::sync::Mutex<RunningPlugins>>,
 }
 
 #[cfg(unix)]
@@ -126,23 +130,22 @@ impl StandaloneDev {
                 plugins,
                 Default::default(),
                 |names| async move {
-                    let selection = self.selection.lock().await;
-                    let (registry, selected) = &*selection;
-                    registry
-                        .select(Some(&names))
-                        .map_err(|err| err.to_string())?;
-                    if let Some(name) = names.iter().find(|name| !selected.contains(name)) {
-                        return Err(format!("Cannot reload unloaded p2 plugin: {name}"));
-                    }
-                    let mut facets = self.core.clone();
-                    facets.extend(registry.facets(FacetKind::Server, selected));
-                    let report = self
-                        .host
-                        .reload(facets, &Context::background())
+                    let mut loading = self.loading.lock().await;
+                    let RunningPlugins {
+                        sources,
+                        runtime,
+                        registry,
+                    } = &mut *loading;
+                    let update = sources
+                        .reload_named(runtime, &names, &Context::background())
                         .await
-                        .map_err(|err| err.to_string())?;
-                    self.workers
-                        .update_authorizers(registry.session_authorizers(selected), &report.failed);
+                        .map_err(|error| error.to_string())?;
+                    update.log_problems();
+                    let report = update.report;
+                    self.workers.update_authorizers(
+                        registry.session_authorizers(&update.selected),
+                        &report.failed,
+                    );
                     if let Some(failure) = report.failed.first() {
                         return Err(format!("{} (server): {}", failure.plugin, failure.error));
                     }
@@ -184,31 +187,26 @@ impl P2Server {
         registry: &PluginRegistry,
         requested: Option<&[String]>,
     ) -> Result<ReloadReport> {
-        let selected = registry.select(requested)?;
-        #[cfg(unix)]
-        let mut dev_selection = match &self.dev {
-            Some((dev, _)) => Some(dev.selection.lock().await),
-            None => None,
-        };
-        let mut facets = self.core.clone();
-        facets.extend(registry.facets(FacetKind::Server, &selected));
-        let report = self.host.reload(facets, &Context::background()).await?;
+        let mut loading = self
+            .loading
+            .as_ref()
+            .ok_or(pi_rs_chord::Error::Closed)?
+            .lock()
+            .await;
+        let RunningPlugins {
+            sources,
+            runtime,
+            registry: active,
+        } = &mut *loading;
+        sources.replace_registry(registry, requested)?;
+        let update = sources.reload(runtime, &Context::background()).await?;
+        update.log_problems();
+        self.plugins = update.selected;
+        let report = update.report;
+        *active = registry.clone();
+        self.workers.set_builtin_names(registry.select(None)?);
         self.workers
-            .update_authorizers(registry.session_authorizers(&selected), &report.failed);
-        self.plugins.retain(|name| {
-            selected.contains(name) || report.failed.iter().any(|f| &f.plugin == name)
-        });
-        self.plugins.extend(
-            selected
-                .into_iter()
-                .filter(|name| !report.failed.iter().any(|f| &f.plugin == name)),
-        );
-        self.plugins.sort();
-        self.plugins.dedup();
-        #[cfg(unix)]
-        if let Some(selection) = &mut dev_selection {
-            **selection = (registry.clone(), self.plugins.clone());
-        }
+            .update_authorizers(registry.session_authorizers(&self.plugins), &report.failed);
         Ok(report)
     }
 
@@ -395,7 +393,7 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         data_dir: options.data_dir,
         plugins: selected,
         workers,
-        core: Vec::new(),
+        loading: None,
         http,
         store,
         _lock: lock,
@@ -413,20 +411,42 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
             allowed_hosts: options.allowed_hosts,
             port: server.address.port(),
         };
-        server.core = vec![
+        let core = vec![
             PluginFacet::new("@p2/core", info_facet(info, server.host.downgrade())?),
             PluginFacet::new("p2.core-http", routes.facet()),
             PluginFacet::new("chord.app.files", files.facet()?),
         ];
-        let mut facets = server.core.clone();
-        facets.extend(options.registry.facets(FacetKind::Server, &server.plugins));
-        let report = server.host.load(facets, &Context::background()).await?;
-        if let Some(failure) = report.failed.into_iter().next() {
+        let mut sources = super::plugins::PluginSources::new(
+            &options.registry,
+            options.plugins.as_deref(),
+            &host_dirs::user_plugins_directory(&server.data_dir),
+            FacetKind::Server,
+        )?;
+        let (runtime, update) = sources
+            .load(server.host.clone(), core, &Context::background())
+            .await?;
+        update.log_problems();
+        if let Some(failure) = update.report.failed.iter().find(|f| {
+            matches!(
+                f.plugin.as_str(),
+                "@p2/core" | "p2.core-http" | "chord.app.files"
+            )
+        }) {
             return Err(Error::Activation {
-                plugin: failure.plugin,
-                reason: failure.error,
+                plugin: failure.plugin.clone(),
+                reason: failure.error.clone(),
             });
         }
+        server.plugins = update.selected;
+        let loading = Arc::new(tokio::sync::Mutex::new(RunningPlugins {
+            sources,
+            runtime,
+            registry: options.registry.clone(),
+        }));
+        server.loading = Some(loading.clone());
+        server
+            .workers
+            .set_builtin_names(options.registry.select(None)?);
         server
             .workers
             .update_authorizers(options.registry.session_authorizers(&server.plugins), &[]);
@@ -435,10 +455,8 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
             {
                 let dev = Arc::new(StandaloneDev {
                     control: DevControl::default(),
-                    host: server.host.clone(),
                     workers: server.workers.clone(),
-                    core: server.core.clone(),
-                    selection: tokio::sync::Mutex::new((options.registry, server.plugins.clone())),
+                    loading,
                 });
                 let handler = dev.clone();
                 let channel = channel::serve(&server.data_dir, move |cmd| {

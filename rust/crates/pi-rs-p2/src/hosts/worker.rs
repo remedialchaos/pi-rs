@@ -52,7 +52,7 @@ pub async fn start_session_worker(
 /// Assemble the native session runtime after validating the parent handshake.
 /// The factory can share its boundary with the plugin facets that admit work.
 pub async fn start_session_worker_with(
-    worker: WorkerSession,
+    mut worker: WorkerSession,
     registry: &PluginRegistry,
     requested: Option<&[String]>,
     boundary: impl FnOnce(&WorkerInit, &SessionInit) -> Result<Option<Arc<WorkerBoundary>>>,
@@ -65,13 +65,28 @@ pub async fn start_session_worker_with(
             "Session parameters do not match worker address".into(),
         ));
     }
+    let reserved = registry.select(None)?;
+    worker.scripts.retain(|script| {
+        if reserved.contains(&script.name) {
+            eprintln!("p2 plugins: plugin {} is already discovered", script.name);
+            false
+        } else {
+            true
+        }
+    });
     let selected = registry.select(requested)?;
+
     let directory = session_directory(&init.data_dir, id)?;
     let mut core = registry.facets(FacetKind::Worker, &selected);
     if let Some(boundary) = boundary(&init, &session)? {
         core.push(PluginFacet::new("@p2/core", boundary.facet(id.clone())?));
     }
-    start_worker_with_host(
+    let delivered: Vec<_> = worker
+        .scripts
+        .iter()
+        .map(|s| (s.name.clone(), s.digest.clone()))
+        .collect();
+    let app = start_worker_with_host(
         worker,
         WorkerAppOptions {
             directory,
@@ -85,5 +100,11 @@ pub async fn start_session_worker_with(
             ..Default::default()
         },
     )
-    .await
+    .await?;
+    for (name, digest) in delivered {
+        if app.plugins.digest(&name).as_ref() != Some(&digest) {
+            eprintln!("p2 worker: optional component {name} was not registered");
+        }
+    }
+    Ok(app)
 }

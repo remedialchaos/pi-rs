@@ -1,7 +1,7 @@
 //! Route a session hold to one native worker, retaining the hold across restarts.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
@@ -50,6 +50,7 @@ pub struct SessionWorkers(Arc<Supervisor>);
 struct Supervisor {
     host: Host,
     processes: Workers,
+    reserved: Mutex<BTreeSet<String>>,
     start: Box<Start>,
     generation: AtomicU64,
     sessions: Mutex<BTreeMap<String, Arc<Slot>>>,
@@ -68,6 +69,7 @@ impl SessionWorkers {
         Ok(Self(Arc::new(Supervisor {
             host: host.clone(),
             processes: Workers::new(process)?,
+            reserved: Mutex::default(),
             start: Box::new(start),
             generation: AtomicU64::new(0),
             sessions: Mutex::default(),
@@ -163,6 +165,10 @@ impl SessionWorkers {
             self.supervise(session, &slot, &mut state);
         }
         Ok(held)
+    }
+
+    pub(crate) fn set_builtin_names(&self, names: Vec<String>) {
+        *self.0.reserved.lock().unwrap_or_else(|e| e.into_inner()) = names.into_iter().collect();
     }
 
     pub(crate) fn update_authorizers(
@@ -359,11 +365,13 @@ impl SessionWorkers {
         }
         let wire = session_address(session);
         self.0.processes.retry(&wire).await?;
-        let handle = self
+        let reserved = self
             .0
-            .processes
-            .demand(wire, serde_json::to_value(init)?, vec![])
-            .await?;
+            .reserved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let handle = demand_session(&self.0.processes, init, &reserved).await?;
         if let Err(error) = peer.connect_child(
             handle.link.clone(),
             serde_json::to_value(Principal::Worker {
@@ -459,4 +467,22 @@ pub(crate) async fn catalog_session(
         "thinkingLevel": row["thinkingLevel"],
     });
     Ok(result)
+}
+
+/// Send the initial worker facet set in the Start frame, before Chord publishes Ready.
+pub async fn demand_session(
+    processes: &Workers,
+    init: WorkerInit,
+    reserved: &BTreeSet<String>,
+) -> Result<Arc<WorkerHandle>> {
+    let session = init.session()?;
+    crate::runtime::host_dirs::session_directory(&init.data_dir, &session.id)?;
+    let scripts = super::plugins::worker_scripts(&init.data_dir, reserved)?;
+    processes
+        .demand(
+            session_address(&session.id),
+            serde_json::to_value(init)?,
+            scripts,
+        )
+        .await
 }
