@@ -5,12 +5,58 @@ use crate::{
     registries::{Registry, RegistryProvider},
     watch::{NativeWatchCall, WatchCall},
 };
+use std::sync::atomic::AtomicU64;
 type Method = Arc<dyn Fn(JsonValue, Ctx) -> SyncFuture<JsonValue> + Send + Sync>;
+type EventListener = Arc<dyn Fn(JsonValue) + Send + Sync>;
+
+/// Native event broadcaster for contract `event` members.
+#[derive(Clone, Default)]
+pub struct EventChannel {
+    listeners: Arc<Mutex<IndexMap<u64, EventListener>>>,
+    next: Arc<AtomicU64>,
+}
+impl EventChannel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn emit(&self, payload: JsonValue) {
+        let listeners: Vec<_> = lock(&self.listeners).values().cloned().collect();
+        for listener in listeners {
+            listener(payload.clone());
+        }
+    }
+    pub fn subscribe(
+        &self,
+        listener: impl Fn(JsonValue) + Send + Sync + 'static,
+    ) -> EventSubscription {
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        lock(&self.listeners).insert(id, Arc::new(listener));
+        EventSubscription {
+            listeners: Arc::downgrade(&self.listeners),
+            id,
+        }
+    }
+}
+
+/// Drops the listener from its `EventChannel`.
+pub struct EventSubscription {
+    listeners: Weak<Mutex<IndexMap<u64, EventListener>>>,
+    id: u64,
+}
+impl Drop for EventSubscription {
+    fn drop(&mut self) {
+        if let Some(listeners) = self.listeners.upgrade() {
+            lock(&listeners).shift_remove(&self.id);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Members {
     pub variant: String,
     pub state: IndexMap<String, Source>,
     pub methods: IndexMap<String, Method>,
+    pub events: IndexMap<String, EventChannel>,
 }
 impl Default for Members {
     fn default() -> Self {
@@ -23,6 +69,7 @@ impl Members {
             variant: crate::contracts::LOCAL.into(),
             state: IndexMap::new(),
             methods: IndexMap::new(),
+            events: IndexMap::new(),
         }
     }
     pub fn variant(name: impl Into<String>) -> Self {
@@ -31,9 +78,14 @@ impl Members {
             ..Self::new()
         }
     }
+    fn has_member(&self, name: &str) -> bool {
+        self.state.contains_key(name)
+            || self.methods.contains_key(name)
+            || self.events.contains_key(name)
+    }
     pub fn state(&mut self, name: impl Into<String>, source: Source) -> Result<()> {
         let name = name.into();
-        if self.state.contains_key(&name) || self.methods.contains_key(&name) {
+        if self.has_member(&name) {
             return Err(Error::Invalid(format!("duplicate member {name}")));
         }
         self.state.insert(name, source);
@@ -45,10 +97,18 @@ impl Members {
         method: impl Fn(JsonValue, Ctx) -> SyncFuture<JsonValue> + Send + Sync + 'static,
     ) -> Result<()> {
         let name = name.into();
-        if self.state.contains_key(&name) || self.methods.contains_key(&name) {
+        if self.has_member(&name) {
             return Err(Error::Invalid(format!("duplicate member {name}")));
         }
         self.methods.insert(name, Arc::new(method));
+        Ok(())
+    }
+    pub fn event(&mut self, name: impl Into<String>, channel: EventChannel) -> Result<()> {
+        let name = name.into();
+        if self.has_member(&name) {
+            return Err(Error::Invalid(format!("duplicate member {name}")));
+        }
+        self.events.insert(name, channel);
         Ok(())
     }
 }
@@ -144,6 +204,9 @@ impl FacetHost {
     pub fn principal(&self) -> Option<&serde_json::Value> {
         self.host.0.options.principal.as_ref()
     }
+    pub fn host(&self) -> Host {
+        self.host.clone()
+    }
 }
 #[derive(Clone)]
 pub(super) enum Request {
@@ -220,6 +283,12 @@ impl ObjectSelf {
     }
     pub fn batch(&self) -> Batch {
         self.host.batch()
+    }
+    pub fn host(&self) -> Host {
+        self.host.clone()
+    }
+    pub fn store(&self) -> Option<&crate::store::StoreEngine> {
+        self.host.store()
     }
     pub fn writable(&self, value: JsonValue) -> Result<Source> {
         Source::new(self.host.batch(), value)

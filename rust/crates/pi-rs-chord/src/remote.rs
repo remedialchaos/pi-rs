@@ -971,9 +971,10 @@ impl Reference {
         if self.released.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.state.set(state, &Context::background())?;
-        self.changed.send_modify(|n| *n = n.wrapping_add(1));
-        Ok(())
+        let changed = self.changed.clone();
+        self.state.set_with(state, &Context::background(), move || {
+            changed.send_modify(|n| *n = n.wrapping_add(1));
+        })
     }
 }
 impl RemoteReference {
@@ -1098,13 +1099,14 @@ impl RemoteReference {
     fn end(&self, error: ChordError) {
         if !self.0.released.swap(true, Ordering::AcqRel) {
             lock(&self.0.abort).take();
-            let _ = self.0.state.set(
+            let changed = self.0.changed.clone();
+            let _ = self.0.state.set_with(
                 RefState::Ended {
                     error: error.clone(),
                 },
                 &Context::background(),
+                move || changed.send_modify(|n| *n = n.wrapping_add(1)),
             );
-            self.0.changed.send_modify(|n| *n = n.wrapping_add(1));
             for source in lock(&self.0.members).values() {
                 source.detach("released");
             }

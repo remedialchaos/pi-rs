@@ -762,11 +762,16 @@ fn validate_members(contract: &Contract, members: &Members) -> Result<()> {
         })?;
     if variant.state.len() != members.state.len()
         || variant.methods.len() != members.methods.len()
+        || variant.events.len() != members.events.len()
         || variant.state.keys().any(|n| !members.state.contains_key(n))
         || variant
             .methods
             .keys()
             .any(|n| !members.methods.contains_key(n))
+        || variant
+            .events
+            .keys()
+            .any(|n| !members.events.contains_key(n))
     {
         return Err(ChordError::new(
             "invalid",

@@ -437,6 +437,9 @@ impl Host {
     pub fn batch(&self) -> Batch {
         self.0.batch.clone()
     }
+    pub fn store(&self) -> Option<&StoreEngine> {
+        self.0.options.store.as_ref()
+    }
     pub fn page_state<T: Clone + PartialEq + Send + 'static>(
         &self,
         key: &str,
@@ -887,6 +890,22 @@ impl Held {
             .members
             .variant
             .clone())
+    }
+    pub fn subscribe_event(
+        &self,
+        name: &str,
+        listener: impl Fn(JsonValue) + Send + Sync + 'static,
+    ) -> Result<EventSubscription> {
+        let object = self.object()?;
+        let state = lock(&object.state);
+        let instance = state
+            .attempt
+            .as_ref()
+            .ok_or_else(|| ChordError::new("not_ready", "object is not live"))?;
+        let channel = instance.members.events.get(name).ok_or_else(|| {
+            ChordError::invalid("event", format!("unknown event member {name}"), None)
+        })?;
+        Ok(channel.subscribe(listener))
     }
     pub fn retry(&self) -> Result<()> {
         let object = self.object()?;

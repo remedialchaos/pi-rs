@@ -215,7 +215,7 @@ async fn standalone_hosts_publish_before_exit_and_keep_worker_stdout_framed()
     let mut stdin = worker.stdin.take().ok_or("missing stdin")?;
     let mut stdout = worker.stdout.take().ok_or("missing stdout")?;
     tokio::time::timeout(std::time::Duration::from_secs(30),async{
- let start=json!({"app":dir.path(),"dataDir":dir.path(),"fake":true,"telemetry":false,"generation":1,"values":{"session":{"id":"active","cwd":dir.path(),"model":{"provider":"faux","modelId":"model"},"thinkingLevel":"off"}}});
+ let start=json!({"app":dir.path(),"dataDir":dir.path(),"fake":true,"telemetry":false,"generation":1,"values":{"session":{"id":"active","cwd":dir.path(),"model":{"provider":"faux","modelId":"faux-1"},"thinkingLevel":"off"}}});
  write_frame(&mut stdin,&Frame::Control(Control::Start{address:pi_rs_p2::api::v1::session_address("active"),start,scripts:vec![],lock:dir.path().join("lock")})).await?;
  assert!(matches!(read_frame(&mut stdout).await?,Frame::Control(Control::Started)));
  loop {if matches!(read_frame(&mut stdout).await?,Frame::Control(Control::Ready{..})){break}}
