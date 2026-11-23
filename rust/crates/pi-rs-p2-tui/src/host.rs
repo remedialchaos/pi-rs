@@ -1,3 +1,4 @@
+use crate::components::PanelFrame;
 use crate::core_commands::CoreAction;
 use crate::theme::{TerminalState, Theme, ThemeFileError, ThemeRef, watch_theme_file};
 use pi_rs_tui::{ComponentRef, Terminal, Tui, TuiAltScreen, TuiMainScreen};
@@ -15,6 +16,12 @@ pub struct TuiClient<S = TuiMainScreen> {
     pub screen: S,
     contributions: indexmap::IndexMap<String, Rc<dyn TuiContribution>>,
     theme_watch: Option<ThemeWatch>,
+    panel_layout: Option<PanelLayout>,
+}
+struct PanelLayout {
+    split: Rc<RefCell<pi_rs_tui::HStack>>,
+    editor: ComponentRef,
+    active: Option<(Rc<RefCell<PanelFrame>>, ComponentRef)>,
 }
 struct ThemeWatch {
     _watcher: notify::RecommendedWatcher,
@@ -34,6 +41,7 @@ impl TuiClient {
             screen,
             contributions: Default::default(),
             theme_watch: None,
+            panel_layout: None,
         }
     }
     pub fn step(&mut self, timeout: Duration) -> io::Result<()> {
@@ -44,7 +52,95 @@ impl TuiClient {
 impl TuiClient<TuiAltScreen> {
     pub fn step(&mut self, timeout: Duration) -> io::Result<()> {
         self.apply_theme_changes();
+        if let Some(layout) = &mut self.panel_layout
+            && let Some((frame, _)) = &layout.active
+        {
+            frame
+                .borrow_mut()
+                .set_height(self.screen.base.terminal.height().saturating_sub(2));
+            if self.screen.base.terminal.width() < 100 && frame.borrow().focused {
+                self.screen.base.set_focus(Some(layout.editor.clone()));
+            }
+        }
         self.screen.step(timeout)
+    }
+
+    pub fn open_side_panel(&mut self, panel: PanelFrame) {
+        if let Some((frame, _)) = self
+            .panel_layout
+            .as_ref()
+            .and_then(|layout| layout.active.as_ref())
+            && frame.borrow().id == panel.id
+        {
+            frame.borrow_mut().update(panel);
+            self.screen.base.request_render(false);
+            return;
+        }
+        self.close_side_panel();
+        let Some(layout) = &mut self.panel_layout else {
+            return;
+        };
+        let frame = Rc::new(RefCell::new(panel));
+        frame
+            .borrow_mut()
+            .set_height(self.screen.base.terminal.height().saturating_sub(2));
+        let child = ComponentRef::from_shared(frame.clone());
+        layout.split.borrow_mut().add_child(
+            child.clone(),
+            pi_rs_tui::StackEntryOptions {
+                basis: pi_rs_tui::layout_node::StackBasis::Cells(0),
+                grow: 2.,
+                min_size: Some(40),
+                visible: Some(Rc::new(|viewport| viewport.width >= 100)),
+                ..Default::default()
+            },
+        );
+        layout.active = Some((frame, child));
+        self.screen.base.request_render(false);
+    }
+
+    pub fn focus_side_panel(&mut self, focused: bool) -> bool {
+        let Some(layout) = &self.panel_layout else {
+            return false;
+        };
+        let Some((_, child)) = &layout.active else {
+            return false;
+        };
+        let visible = self.screen.base.terminal.width() >= 100;
+        self.screen.base.set_focus(Some(if focused && visible {
+            child.clone()
+        } else {
+            layout.editor.clone()
+        }));
+        self.screen.base.request_render(false);
+        visible
+    }
+
+    pub fn side_panel_shown(&self) -> bool {
+        self.screen.base.terminal.width() >= 100
+            && self
+                .panel_layout
+                .as_ref()
+                .is_some_and(|layout| layout.active.is_some())
+    }
+    pub fn side_panel_focused(&self) -> bool {
+        self.panel_layout
+            .as_ref()
+            .and_then(|layout| layout.active.as_ref())
+            .is_some_and(|(frame, _)| frame.borrow().focused)
+    }
+
+    pub fn close_side_panel(&mut self) -> bool {
+        let Some(layout) = &mut self.panel_layout else {
+            return false;
+        };
+        let Some((_, child)) = layout.active.take() else {
+            return false;
+        };
+        layout.split.borrow_mut().remove_child(&child);
+        self.screen.base.set_focus(Some(layout.editor.clone()));
+        self.screen.base.request_render(false);
+        true
     }
     pub fn mount_panel(
         terminal: impl Terminal + 'static,
@@ -74,6 +170,21 @@ impl TuiClient<TuiAltScreen> {
                 ..Default::default()
             },
         );
+        let split = Rc::new(RefCell::new(pi_rs_tui::HStack::new(
+            [(
+                ComponentRef::new(body),
+                StackEntryOptions {
+                    basis: StackBasis::Cells(0),
+                    grow: 3.,
+                    min_size: Some(1),
+                    ..Default::default()
+                },
+            )],
+            pi_rs_tui::StackOptions {
+                gap: 1,
+                ..Default::default()
+            },
+        )));
         let mut panel = VStack::default();
         panel.add_child(
             header,
@@ -84,7 +195,7 @@ impl TuiClient<TuiAltScreen> {
             },
         );
         panel.add_child(
-            ComponentRef::new(body),
+            ComponentRef::from_shared(split.clone()),
             StackEntryOptions {
                 basis: StackBasis::Cells(0),
                 grow: 1.,
@@ -99,11 +210,16 @@ impl TuiClient<TuiAltScreen> {
             },
         );
         screen.set_layout_root(Some(ComponentRef::new(panel)));
-        screen.base.set_focus(Some(field));
+        screen.base.set_focus(Some(field.clone()));
         Self {
             screen,
             contributions: Default::default(),
             theme_watch: None,
+            panel_layout: Some(PanelLayout {
+                split,
+                editor: field,
+                active: None,
+            }),
         }
     }
 }

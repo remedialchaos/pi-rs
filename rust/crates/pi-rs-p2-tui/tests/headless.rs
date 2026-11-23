@@ -428,3 +428,110 @@ fn terminal_wheel_scrolls_panel_body_and_keeps_heading_and_editor() -> io::Resul
     assert!(frame.last().is_some_and(|line| line.contains("editor")));
     Ok(())
 }
+
+#[test]
+fn mounted_side_panel_keeps_focus_and_scroll_on_update_and_releases_on_close() -> io::Result<()> {
+    use pi_rs_p2_tui::components::{PanelContent, PanelFrame};
+    use pi_rs_tui::{Component, Text, Tui};
+    use std::cell::Cell;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Wide(Arc<AtomicUsize>);
+    impl Terminal for Wide {
+        fn width(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+        fn height(&self) -> usize {
+            10
+        }
+        fn write(&mut self, _: &str) {}
+        fn is_tty(&self) -> bool {
+            true
+        }
+        fn read_available(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
+    }
+    struct Notes(Rc<Cell<usize>>);
+    impl Component for Notes {
+        fn render(&self, _: usize) -> Vec<String> {
+            (1..=30).map(|i| format!("note {i:02}")).collect()
+        }
+    }
+    impl PanelContent for Notes {
+        fn dispose(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    let width = Arc::new(AtomicUsize::new(100));
+    let disposed = Rc::new(Cell::new(0));
+    let panel = |title: &'static str| {
+        PanelFrame::new(
+            Box::new(Context(ThemeRef::new(Theme::default()))),
+            "notes".into(),
+            Box::new(Notes(disposed.clone())),
+            move || title.into(),
+        )
+    };
+    let text = |s| ComponentRef::new(Text::new(s, 0, 0, None));
+    let mut client = TuiClient::mount_panel(
+        Wide(width.clone()),
+        text("chat"),
+        text("transcript"),
+        text("editor"),
+        true,
+    );
+    client.screen.start()?;
+    client.open_side_panel(panel("first version"));
+    client.screen.render_now(true)?;
+    assert!(
+        client
+            .screen
+            .screen_lines()
+            .iter()
+            .any(|line| line.contains("transcript") && line.contains("first version"))
+    );
+    assert!(client.focus_side_panel(true));
+    client.screen.handle_input("\x1b[6~");
+    client.open_side_panel(panel("second version"));
+    client.screen.render_now(false)?;
+    let frame = client.screen.screen_lines().join("\n");
+    assert!(
+        client.side_panel_focused()
+            && frame.contains("second version")
+            && !frame.contains("note 01")
+    );
+    assert_eq!(disposed.get(), 1);
+    width.store(99, Ordering::Relaxed);
+    client.step(Duration::ZERO)?;
+    client.screen.render_now(true)?;
+    assert!(!client.side_panel_focused());
+    assert!(
+        !client
+            .screen
+            .screen_lines()
+            .join("\n")
+            .contains("second version")
+    );
+    width.store(100, Ordering::Relaxed);
+    client.screen.render_now(true)?;
+    assert!(
+        client
+            .screen
+            .screen_lines()
+            .join("\n")
+            .contains("second version")
+    );
+    assert!(client.close_side_panel());
+    client.screen.render_now(true)?;
+    assert_eq!(disposed.get(), 2);
+    assert!(
+        !client
+            .screen
+            .screen_lines()
+            .join("\n")
+            .contains("second version")
+    );
+    Ok(())
+}

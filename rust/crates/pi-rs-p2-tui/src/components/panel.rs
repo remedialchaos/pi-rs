@@ -31,6 +31,10 @@ impl PanelFrame {
             top: Cell::default(),
         }
     }
+    pub(crate) fn update(&mut self, mut next: Self) {
+        std::mem::swap(&mut self.content, &mut next.content);
+        std::mem::swap(&mut self.title, &mut next.title);
+    }
     pub fn set_height(&mut self, rows: usize) {
         self.height = Some(rows);
     }
@@ -68,13 +72,23 @@ impl Component for PanelFrame {
             let keys = pi_rs_tui::get_keybindings();
             let page = self.height.unwrap_or(2).saturating_sub(1).max(1);
             let top = self.top.get();
-            let next = if keys.matches(data, "tui.select.pageDown") {
+            let matches = |id| keys.matches(data, id);
+            let half = (self.height.unwrap_or(2).saturating_sub(1) / 2).max(1);
+            let next = if matches("tui.altScreen.top") {
+                0
+            } else if matches("tui.altScreen.bottom") {
+                usize::MAX
+            } else if matches("tui.altScreen.halfPageDown") {
+                top.saturating_add(half)
+            } else if matches("tui.altScreen.halfPageUp") {
+                top.saturating_sub(half)
+            } else if matches("tui.select.pageDown") || matches("tui.altScreen.pageDown") {
                 top.saturating_add(page)
-            } else if keys.matches(data, "tui.select.pageUp") {
+            } else if matches("tui.select.pageUp") || matches("tui.altScreen.pageUp") {
                 top.saturating_sub(page)
-            } else if keys.matches(data, "tui.select.down") {
+            } else if matches("tui.select.down") || matches("tui.altScreen.lineDown") {
                 top.saturating_add(1)
-            } else if keys.matches(data, "tui.select.up") {
+            } else if matches("tui.select.up") || matches("tui.altScreen.lineUp") {
                 top.saturating_sub(1)
             } else {
                 self.content.handle_input(data);
@@ -83,6 +97,22 @@ impl Component for PanelFrame {
             self.top.set(next);
             self.ctx.request_render();
         }
+    }
+    fn captures_viewport_input(&self) -> bool {
+        self.focused
+    }
+    fn handle_mouse(
+        &mut self,
+        event: &pi_rs_tui::TuiMouseEvent,
+    ) -> Option<pi_rs_tui::TuiMouseEventResult> {
+        let delta = event.wheel_delta?;
+        self.top
+            .set(self.top.get().saturating_add_signed(delta as isize));
+        Some(pi_rs_tui::TuiMouseEventResult {
+            handled: true,
+            render: Some(true),
+            ..Default::default()
+        })
     }
     fn invalidate(&mut self) {
         self.content.invalidate();

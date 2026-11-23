@@ -1,7 +1,11 @@
 mod admission;
 mod grants;
+mod plugins;
 mod preferences;
+#[cfg(test)]
+mod pty;
 mod view;
+mod when;
 use crate::runtime::local_owner::*;
 use pi_rs_chord::node::http::connect_websocket;
 use pi_rs_p2_tui::host::TuiClient;
@@ -218,7 +222,20 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                     theme.clone(),
                     no_themes,
                 );
-                mount(view::View::connect(link, preferred.clone())?, prefs)
+                let plugins = if local && !guest {
+                    let data = env::var_os("P2_DATA_DIR")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| home.join(".pi/p2"));
+                    plugins::Plugins::load(data.join("plugins")).await?
+                } else {
+                    None
+                };
+                mount(
+                    view::View::connect(link, preferred.clone())?,
+                    prefs,
+                    plugins,
+                )
+                .await
             }
             Err(error) => Err(error.into()),
         };
@@ -316,7 +333,11 @@ fn response_cookie(response: &reqwest::Response) -> Result<String, Box<dyn Error
     Ok(cookie)
 }
 
-fn mount(mut view: view::View, prefs: preferences::Preferences) -> Result<(), Box<dyn Error>> {
+async fn mount(
+    mut view: view::View,
+    prefs: preferences::Preferences,
+    mut plugins: Option<plugins::Plugins>,
+) -> Result<(), Box<dyn Error>> {
     let mode = prefs.theme.color_mode;
     let terminal = prefs.theme.terminal.clone();
     let theme = pi_rs_p2_tui::ThemeRef::new(prefs.theme);
@@ -349,7 +370,7 @@ fn mount(mut view: view::View, prefs: preferences::Preferences) -> Result<(), Bo
         prefs.mouse,
     );
     if let Some(path) = prefs.theme_path
-        && let Err(error) = client.watch_theme(&path, theme, mode, terminal)
+        && let Err(error) = client.watch_theme(&path, theme.clone(), mode, terminal)
     {
         eprintln!("Live theme reload unavailable: {error}");
     }
@@ -363,6 +384,21 @@ fn mount(mut view: view::View, prefs: preferences::Preferences) -> Result<(), Bo
     let picking = visible.clone();
     let mut drafts = std::collections::HashMap::new();
     let mut destination = None;
+    let shortcuts = plugins
+        .as_ref()
+        .map(|p| p.shortcuts(&prefs.keys))
+        .unwrap_or_default();
+    let command = Rc::new(std::cell::RefCell::new(None));
+    let shortcut_command = command.clone();
+    let panel_open = Rc::new(Cell::new(false));
+    let panel_focus = Rc::new(Cell::new(false));
+    let open = panel_open.clone();
+    let focused = panel_focus.clone();
+    let focus_change = Rc::new(Cell::new(None));
+    let change = focus_change.clone();
+    let chat = Rc::new(Cell::new(false));
+    let session = chat.clone();
+    let input = editor.clone();
     client.screen.base.add_input_listener(Box::new(move |data| {
         let quit_key = pi_rs_tui::keys::matches_key_data(data, "ctrl+c");
         let matches = |key| pi_rs_tui::keys::matches_key_data(data, key);
@@ -378,7 +414,25 @@ fn mount(mut view: view::View, prefs: preferences::Preferences) -> Result<(), Bo
         if let Some(key) = pick {
             selection.set(Some(key));
         }
-        let consume = quit_key || pick.is_some() || picking.get() || copy_key(data);
+        let mut consume = quit_key || pick.is_some() || picking.get() || copy_key(data);
+        if !consume && open.get() && (matches("f2") || (focused.get() && matches("escape"))) {
+            change.set(Some(!focused.get()));
+            consume = true;
+        }
+        if !consume
+            && let Some((_, id, _)) = shortcuts.iter().find(|(key, _, when)| {
+                matches(key)
+                    && when.matches(&command_context(
+                        session.get(),
+                        open.get(),
+                        focused.get(),
+                        input.borrow().value().is_empty(),
+                    ))
+            })
+        {
+            *shortcut_command.borrow_mut() = Some((id.clone(), String::new()));
+            consume = true;
+        }
         if quit_key {
             quit.set(true);
         }
@@ -395,11 +449,67 @@ fn mount(mut view: view::View, prefs: preferences::Preferences) -> Result<(), Bo
         if done.get() {
             break Ok(());
         }
-        if let Some(text) = submit.borrow_mut().take()
-            && let Err(error) = view.submit(&text)
-        {
-            break Err(error.into());
+        if let Some(focus) = focus_change.take() {
+            client.focus_side_panel(focus);
         }
+        if let Some(text) = submit.borrow_mut().take() {
+            let slash = text.trim().strip_prefix('/').map(|s| {
+                s.split_once(char::is_whitespace)
+                    .map_or((s, ""), |(name, args)| (name, args.trim()))
+            });
+            if slash == Some(("close-panel", "")) && client.close_side_panel() {
+                if let Some(p) = &mut plugins {
+                    p.detach();
+                }
+                editor.borrow_mut().set_value(String::new());
+                panel_open.set(false);
+            } else if let Some((id, args)) = slash.and_then(|(name, args)| {
+                Some((
+                    plugins.as_ref()?.slash(
+                        name,
+                        &command_context(
+                            view.destination().is_some(),
+                            panel_open.get(),
+                            panel_focus.get(),
+                            false,
+                        ),
+                    )?,
+                    args,
+                ))
+            }) {
+                *command.borrow_mut() = Some((id.to_owned(), args.to_owned()));
+                editor.borrow_mut().set_value(String::new());
+            } else if let Err(error) = view.submit(&text) {
+                break Err(error.into());
+            }
+        }
+        let requested = command.borrow_mut().take();
+        if let Some(p) = &mut plugins {
+            if let Some((id, args)) = requested
+                && let Err(error) = p.run(&id, &args).await
+            {
+                client
+                    .screen
+                    .flash(pi_rs_p2_tui::line_text(&error.to_string()), None);
+            }
+            match p.panel(&theme) {
+                Ok(plugins::PanelUpdate::Show(frame)) => {
+                    client.open_side_panel(frame);
+                    panel_open.set(true);
+                }
+                Ok(plugins::PanelUpdate::Close) => {
+                    client.close_side_panel();
+                    panel_open.set(false);
+                }
+                Ok(plugins::PanelUpdate::Unchanged) => {}
+                Err(error) => client
+                    .screen
+                    .flash(pi_rs_p2_tui::line_text(&error.to_string()), None),
+            }
+        }
+        panel_focus.set(client.side_panel_focused());
+        panel_open.set(client.side_panel_shown());
+        chat.set(view.destination().is_some());
         let mut selection_changed = false;
         if let Some(key) = picker_key.take() {
             if let Err(error) = view.choose(key) {
@@ -411,6 +521,11 @@ fn mount(mut view: view::View, prefs: preferences::Preferences) -> Result<(), Bo
         match view.step() {
             Ok(changed) if changed || selection_changed => {
                 if destination.as_ref() != view.destination() {
+                    if let Some(p) = &mut plugins {
+                        p.detach();
+                    }
+                    client.close_side_panel();
+                    panel_open.set(false);
                     if let Some(old) = destination.take() {
                         drafts.insert(old, editor.borrow().value().to_owned());
                     }
@@ -440,7 +555,24 @@ fn mount(mut view: view::View, prefs: preferences::Preferences) -> Result<(), Bo
         }
     };
     client.screen.stop(Default::default())?;
+    if let Some(p) = plugins {
+        p.close().await?;
+    }
     result
+}
+
+fn command_context(chat: bool, panel: bool, focused: bool, empty: bool) -> Vec<&'static str> {
+    let mut active = vec!["connected", "owner", if chat { "chat" } else { "sessions" }];
+    if panel {
+        active.push("panel");
+    }
+    if focused {
+        active.push("panelFocused");
+    }
+    if empty {
+        active.push("editorEmpty");
+    }
+    active
 }
 
 async fn local_sign_in(

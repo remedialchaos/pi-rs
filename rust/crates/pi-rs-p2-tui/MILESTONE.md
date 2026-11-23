@@ -31,3 +31,21 @@ The upstream panel places its header outside the body scroll view in `apps/p2/sr
 One regression test was added and zero removed. Disabling mouse handling made its viewport-offset assertion fail. The existing nine headless tests took 0.04 s on the candidate with the new test filtered out. With mouse handling enabled, all ten took 0.06 s, and all three launcher admission tests took 0.09 s. These timings exclude compilation. The upstream custom-theme hot-reload test command also passed.
 
 After restoration, both complete crate suites passed all 30 tests (9 in p2, 21 in p2-tui). Cargo reported 8m09s for the build. The headless binary took 0.20 s and the launcher admission binary took 0.41 s in that run.
+
+## External TUI commands and side panels
+
+A standalone local owner launcher discovers installed TUI components in the server data directory’s `plugins` root with Chord’s existing discovery and `PluginRuntime`. The launcher reads commands from each guest’s local Chord object, invokes the guest with the command ID and slash arguments, and renders its published panel. Component execution uses the existing fuel-limited WIT host. The projection below is specific to the Rust launcher. Upstream serves JavaScript facet bundles to its terminal worker.
+
+| Local WIT object member | Terminal interaction |
+| --- | --- |
+| `commands` state | Keyed command records on the local object named for the discovered plugin. Records can declare `keys`, `when`, and `slash.name`. Local key overrides and reserved launcher bindings take precedence. |
+| `run` method | The launcher sends `{"id":"notes.show","args":"first"}` for `/notes first`. Shortcut invocation sends an empty argument string. |
+| `panel` state | A published `{id,title,lines}` shows a panel alongside the transcript. A further publication with the same ID updates its contents while retaining focus and scroll position. Publishing null closes it. |
+
+The upstream dispatcher is in `apps/p2/src/runtime/tui-commands.ts`. The mounted layout follows `besidePanel` in `apps/p2/src/runtime/tui.ts`. At 100 columns and above the body and side panel share width in a 3:2 ratio. The editor initially retains focus. F2 moves focus, Page Down scrolls the side panel, Escape returns to the editor, and `/close-panel` dismisses it. Navigation closes the previous conversation’s panel. Below 100 columns the side panel hides.
+
+The regression fixture in `tests/fixtures/panel` is a compiled Rust guest for `chord:plugin@0.1.0`. Its source uses the same build and component-encoding procedure as the Chord B3 fixtures, with `serde_json` added to the guest dependencies. It publishes 50 labeled rows and changes the panel title to include the actual command argument. The standalone terminal test uses this installed component against an authenticated upstream session. Remote delivery of TUI components and live replacement of the component binary are outside this adapter.
+
+The installed guest passed on the standalone launcher in a 120×14 tmux PTY in 3.576 s. The run exercised slash arguments, F4 dispatch, guest publications, wheel scrolling in both directions at column 100 and row 5, F2/Page Down/Escape, retained scroll after a guest update, resizing to 80 and 100 columns, and dismissal. Both new regression tests failed with their targeted mutations (discarding command arguments and replacing the mounted frame on update) and passed after restoration. The two crate suites went from 30 to 32 passing tests, with zero removed. The final test build took 1m07s, the guest test 2.53 s, and the headless suite 0.12 s.
+
+All six recorded application cases replayed successfully. The full upstream TUI oracle ran 133 cases in 401.073 s with 130 passing, two failing and one cancelled. On focused retry, the real-worker external-editor case and changed-bundle case passed. The launcher clipboard case timed out at tui-actions.test.ts line 378. The three-case retry took 38.994 s.
