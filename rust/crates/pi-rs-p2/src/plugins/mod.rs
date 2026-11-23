@@ -1,5 +1,6 @@
 //! Built-in native `p2` plugins (Wave 2).
 
+pub mod familiar;
 pub mod history;
 pub mod shard_d2;
 

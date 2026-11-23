@@ -7,5 +7,6 @@ use crate::api::v1::PluginRegistry;
 /// Registers the Shard D2 built-in plugins into `registry`.
 pub fn register(registry: &mut PluginRegistry) -> Result<()> {
     super::history::register(registry)?;
+    super::familiar::register(registry)?;
     Ok(())
 }
