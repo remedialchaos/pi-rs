@@ -32,6 +32,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 tempfile = "3"
+unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 # Remote TUI connections use TLS through Chord's WebSocket transport.
