@@ -21,18 +21,32 @@ use pi_rs_p2::{
         server::service_of, session_address,
     },
     hosts::worker::{SessionWorker, start_session_worker},
-    plugins::chat_mode::{
-        SEND_ROUTERS_SERVICE, SendRouterInput, SendRoutersService,
-        contract::{
-            Attachment, AttachmentRef, Author, CHAT_ENTRY, DEFAULT_AGENT_NAME, MENTION_ENTRY,
-            ReplyTo, chat_message, is_valid_agent_name, mention, mention_token, mentions_agent,
-            spoken_mention,
+    plugins::{
+        chat_mode::{
+            SEND_ROUTERS_SERVICE, SendRouterInput, SendRoutersService,
+            contract::{
+                Attachment, AttachmentRef, Author, CHAT_ENTRY, DEFAULT_AGENT_NAME, MENTION_ENTRY,
+                ReplyTo, chat_message, is_valid_agent_name, mention, mention_token, mentions_agent,
+                spoken_mention,
+            },
+            digest::{
+                ComposeMentionInput, EXCERPT_LENGTH, compose_mention, digest, digest_files,
+                excerpt, quote_of, read_enough, unmentioned,
+            },
+            display::chat_entry_display,
         },
-        digest::{
-            ComposeMentionInput, EXCERPT_LENGTH, compose_mention, digest, digest_files, excerpt,
-            quote_of, read_enough, unmentioned,
+        views::{
+            contract::{
+                AnnotationInput, MESSAGE_CONTEXTS_SERVICE, MessageContext, MessageContextsService,
+                SelectInlineInput, Selection, TRANSCRIPT, View, ViewsState, is_valid_view_id,
+                is_valid_view_kind, live_views,
+            },
+            doc::{
+                ViewSpec, add_annotation, describe_annotation, free_view_id, mark_sent, open_view,
+                remove_view, select_inline, view_context,
+            },
+            layout::{CHAT, adopt, arranged_tree, arrangement_error, initial_layout, reconcile},
         },
-        display::chat_entry_display,
     },
 };
 use serde_json::{Value, json};
@@ -747,6 +761,396 @@ async fn chat_mode_worker_permissions_settings_and_routing() -> TestResult {
             .len(),
         1
     );
+
+    worker.close().await?;
+    Ok(())
+}
+
+// ============================================================================
+// views pure unit tests
+// ============================================================================
+
+#[test]
+fn views_doc_and_context_helpers() -> TestResult {
+    assert!(is_valid_view_id("notes-1_a"));
+    assert!(!is_valid_view_id("Notes"));
+    assert!(is_valid_view_kind("pi.artifact"));
+    assert!(!is_valid_view_kind(""));
+
+    let mut state = ViewsState::default();
+    let id1 = free_view_id(&state, "Notes & Plans!", "markdown");
+    assert_eq!(id1, "notes-plans");
+    let v1 = open_view(
+        &mut state,
+        ViewSpec {
+            id: id1.clone(),
+            kind: "markdown".into(),
+            title: "Notes & Plans!".into(),
+            item: Some("docs/notes.md".into()),
+        },
+        1000,
+    )?;
+    assert_eq!(v1.id, "notes-plans");
+    assert_eq!(
+        free_view_id(&state, "Notes & Plans!", "markdown"),
+        "notes-plans-2"
+    );
+
+    // Reopening with same id updates focus and preserves created.
+    let v1_again = open_view(
+        &mut state,
+        ViewSpec {
+            id: id1.clone(),
+            kind: "markdown".into(),
+            title: "Notes Updated".into(),
+            item: None,
+        },
+        2000,
+    )?;
+    assert_eq!(v1_again.created, 1000);
+    assert_eq!(v1_again.focus, 2000);
+    assert_eq!(v1_again.item.as_deref(), Some("docs/notes.md"));
+
+    // Custom views are filtered out by live_views.
+    state.views.push(View {
+        id: "old-custom".into(),
+        kind: "custom".into(),
+        item: None,
+        title: "Old".into(),
+        selection: None,
+        focus: 100,
+        created: 100,
+    });
+    assert_eq!(live_views(&state).len(), 1);
+
+    // Selection + inline selection + annotations -> view_context + mark_sent.
+    state.views[0].selection = Some(Selection {
+        summary: "lines 1-5".into(),
+        data: None,
+        sent: None,
+    });
+    select_inline(
+        &mut state,
+        SelectInlineInput {
+            kind: "md".into(),
+            item: "art-1".into(),
+            title: "Spec".into(),
+            selection: Some(Selection {
+                summary: "heading 2".into(),
+                data: None,
+                sent: None,
+            }),
+        },
+    );
+    let ann_id = add_annotation(
+        &mut state,
+        AnnotationInput::Comment {
+            view: id1.clone(),
+            quote: "hello   world".into(),
+            note: "fix typo".into(),
+        },
+        "Owner",
+        3000,
+    )?;
+    let _ink_id = add_annotation(
+        &mut state,
+        AnnotationInput::Ink {
+            view: TRANSCRIPT.into(),
+            strokes: vec![vec![0.1, 0.2, 0.8, 0.9]],
+            aspect: 1.5,
+            under: Some("target".into()),
+            note: Some("circle".into()),
+        },
+        "Alice",
+        3001,
+    )?;
+    assert!(describe_annotation(&state.views, &state.annotations[1]).contains("10–80% across"));
+
+    let carried = view_context(&state).expect("carried context");
+    assert!(carried.text.contains("<views>"));
+    assert!(carried.text.contains("Selected in view \"notes-plans\""));
+    assert!(carried.text.contains("Selected in md \"art-1\""));
+    assert!(carried.text.contains("fix typo"));
+    assert_eq!(carried.annotations.len(), 2);
+
+    mark_sent(&mut state, &carried);
+    assert!(view_context(&state).is_none());
+
+    assert!(remove_view(&mut state, &id1));
+    assert!(!remove_view(&mut state, &id1));
+    // Only transcript annotation remains after view removal.
+    assert_eq!(state.annotations.len(), 1);
+    assert!(state.annotations[0].id != ann_id);
+    Ok(())
+}
+
+#[test]
+fn views_layout_reconcile_and_arrangement() {
+    let mut known: std::collections::HashSet<String> =
+        ["transcript".into(), "notes".into(), "diff".into()]
+            .into_iter()
+            .collect();
+    let valid = json!({
+        "row": ["transcript", { "tabs": ["notes", "diff"], "active": "diff" }],
+        "sizes": [0.4, 0.6]
+    });
+    assert!(arrangement_error(&valid, &known).is_none());
+    assert!(arrangement_error(&json!({ "tabs": [] }), &known).is_some());
+    assert!(arrangement_error(&json!({ "row": ["transcript", "transcript"] }), &known).is_some());
+    assert!(arrangement_error(&json!("unknown"), &known).is_some());
+
+    let layout = initial_layout();
+    let reconciled = reconcile(
+        layout,
+        &[("notes".into(), 50_000), ("diff".into(), 55_000)],
+        60_000,
+    );
+    assert_eq!(reconciled.phone, "diff");
+    let adopted = adopt(reconciled, &valid, 70_000, &["notes".into(), "diff".into()]);
+    assert_eq!(adopted.arranged, 70_000);
+    assert!(adopted.hidden.is_empty());
+
+    known.remove("diff");
+    let tree = arranged_tree(&valid, &known).expect("tree without closed diff");
+    assert!(!pi_rs_p2::plugins::views::layout::views_in(&tree).contains(&"diff".to_string()));
+    assert!(pi_rs_p2::plugins::views::layout::views_in(&tree).contains(&CHAT.to_string()));
+}
+
+// ============================================================================
+// views worker facet integration tests
+// ============================================================================
+
+#[tokio::test]
+async fn views_worker_permissions_methods_and_send_router() -> TestResult {
+    let fixture = TempDir::new()?;
+    let context = Context::background();
+    let calls = Arc::new(Mutex::new(MockChatCalls::default()));
+
+    let mut registry = PluginRegistry::new();
+    register_chat_mode_test_mocks(&mut registry, calls.clone())?;
+    pi_rs_p2::plugins::views::register(&mut registry)?;
+
+    let route_contract = Arc::new(pi_rs_chord::contracts::Contract::local(
+        "test.views-route",
+        1,
+        vec![],
+        indexmap::IndexMap::from([(
+            "dispatch".into(),
+            pi_rs_chord::contracts::Member::Method {
+                args: pi_rs_chord::contracts::schema::unknown(),
+                result: pi_rs_chord::contracts::schema::unknown(),
+            },
+        )]),
+    )?);
+    let rc = route_contract.clone();
+    registry.register(
+        "test-views-route",
+        FacetKind::Worker,
+        define_facet(move |h| {
+            let hh = h.host();
+            h.serve(
+                rc.clone(),
+                move |_, _, _| {
+                    let mut members = Members::new();
+                    let hh2 = hh.clone();
+                    members.method("dispatch", move |args, ctx| {
+                        let hh2 = hh2.clone();
+                        Box::pin(async move {
+                            let input: SendRouterInput = serde_json::from_value(args.to_serde()?)?;
+                            let routers =
+                                service_of::<SendRoutersService>(&hh2, SEND_ROUTERS_SERVICE)?;
+                            let router = routers.get("views").ok_or_else(|| {
+                                pi_rs_chord::Error::Invalid("missing views router".into())
+                            })?;
+                            let res = router(input, ctx).await?;
+                            Ok(res.unwrap_or(JsonValue::Null))
+                        })
+                    })?;
+                    Ok(members)
+                },
+                ServeOptions::default(),
+            )
+        }),
+    )?;
+
+    let (worker, _parent) = spawn_worker(fixture.path(), "sess-vw", &registry).await?;
+    let host = worker.host.clone();
+
+    // Extension p2-views is installed.
+    assert!(
+        worker
+            .process
+            .registries
+            .extensions
+            .snapshot()
+            .extension("p2-views")
+            .is_some()
+    );
+
+    let views_c = Arc::new(lookup("p2.views")?);
+    let params = JsonValue::from_serde(json!({ "session": "sess-vw" }));
+
+    // Unauthorized guest is forbidden.
+    let denied = host.hold_as(
+        views_c.clone(),
+        params.clone(),
+        Caller {
+            principal: Some(serde_json::to_value(guest(
+                "guest-wrong",
+                "other-sess",
+                GrantMode::Full,
+            ))?),
+            incarnation: "inc-1".into(),
+        },
+        &context,
+    )?;
+    assert!(denied.wait(&context).await.is_err());
+
+    // View-only guest gets reader variant.
+    let reader = host.hold_as(
+        views_c.clone(),
+        params.clone(),
+        Caller {
+            principal: Some(serde_json::to_value(guest(
+                "guest-view",
+                "sess-vw",
+                GrantMode::View,
+            ))?),
+            incarnation: "inc-1".into(),
+        },
+        &context,
+    )?;
+    reader.wait(&context).await?;
+    assert_eq!(reader.variant()?, "reader");
+    assert!(
+        reader
+            .call(
+                "open",
+                JsonValue::from_serde(json!({ "kind": "markdown", "item": "README.md" })),
+                &context
+            )
+            .await
+            .is_err()
+    );
+
+    // Owner gets editor variant.
+    let owner_caller = Caller {
+        principal: Some(serde_json::to_value(owner())?),
+        incarnation: "inc-1".into(),
+    };
+    let editor = host.hold_as(views_c, params, owner_caller.clone(), &context)?;
+    editor.wait(&context).await?;
+    assert_eq!(editor.variant()?, "editor");
+
+    let opened = editor
+        .call(
+            "open",
+            JsonValue::from_serde(json!({ "kind": "markdown", "item": "README.md" })),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    let view_id = opened["id"].as_str().expect("view id").to_string();
+
+    editor
+        .call(
+            "select",
+            JsonValue::from_serde(json!({
+                "id": view_id,
+                "selection": { "summary": "Intro paragraph" }
+            })),
+            &context,
+        )
+        .await?;
+    let ann = editor
+        .call(
+            "annotate",
+            JsonValue::from_serde(json!({
+                "kind": "comment",
+                "view": view_id,
+                "quote": "Intro",
+                "note": "Clarify"
+            })),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    assert!(ann["id"].as_str().is_some());
+
+    // Register a MessageContextsService provider and verify send router combines both.
+    let carried_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let carried_flag2 = carried_flag.clone();
+    let msg_contexts = service_of::<MessageContextsService>(&host, MESSAGE_CONTEXTS_SERVICE)?;
+    msg_contexts.contribute(
+        "test-extra",
+        Arc::new(move |_input, _ctx| {
+            let cf = carried_flag2.clone();
+            Box::pin(async move {
+                Ok(Some(MessageContext {
+                    text: "<extra>Extra context</extra>".into(),
+                    note: "extra note".into(),
+                    carried: Box::new(move |_| {
+                        Box::pin(async move {
+                            cf.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(())
+                        })
+                    }),
+                }))
+            })
+        }),
+    );
+
+    let route_held = host.hold_as(
+        route_contract,
+        JsonValue::Object(Default::default()),
+        owner_caller,
+        &context,
+    )?;
+    route_held.wait(&context).await?;
+    let res = route_held
+        .call(
+            "dispatch",
+            JsonValue::from_serde(serde_json::to_value(SendRouterInput {
+                conversation: 1,
+                author: author("owner", "o1", "Owner"),
+                text: "Please review".into(),
+                request_id: "vr-1".into(),
+                when_busy: None,
+                attachments: vec![],
+                reply_to: None,
+            })?),
+            &context,
+        )
+        .await?;
+    assert!(!matches!(res, JsonValue::Null));
+    assert!(carried_flag.load(std::sync::atomic::Ordering::SeqCst));
+    let submits = calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .submits
+        .clone();
+    assert_eq!(submits.len(), 1);
+    assert!(
+        submits[0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("<views>")
+    );
+    assert!(
+        submits[0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("<extra>Extra context</extra>")
+    );
+
+    // Close view cleans up.
+    editor
+        .call(
+            "close",
+            JsonValue::from_serde(json!({ "id": view_id })),
+            &context,
+        )
+        .await?;
 
     worker.close().await?;
     Ok(())

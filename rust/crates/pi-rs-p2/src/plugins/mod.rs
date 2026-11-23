@@ -2,6 +2,7 @@
 
 pub mod chat_mode;
 pub mod shard_d3;
+pub mod views;
 
 use crate::api::v1::PluginRegistry;
 
