@@ -78,3 +78,35 @@ mutation and passed after restoration. The integrated suite passed 91 tests in
 69.69 s of test execution, compared with 87 in 32.99 s on the previous revision.
 Offline all-target Clippy passed with warnings denied. Cancellation while a commit
 is blocked, interrupted provider polling and additional cutoff cases are pending.
+
+### Host-input contracts
+
+Closing the three audited upstream harness host contracts
+(`harness-structured-output`, `harness-storage-failure`, `harness-host-inputs`):
+
+- Invalid structured tool output of a model-issued call stands as a result, and
+  the host report names the extension that owns the tool: the last selected one
+  that provides or wraps it. Nested callers keep their error result with the
+  `invalid_structured_output` diagnostic and produce no report. A failed
+  `cancel` reports the same way.
+- The host clock is wrapped once at open, so every harness and Session read goes
+  through it. A panicking clock falls back to the system clock, the first failure
+  is reported once, and a report handler that reads the clock again
+  reentrantly cannot report again. A panicking reporter is dropped, and tasks
+  still start, commit and abort with fallback timestamps.
+- `HarnessOptions.models` takes a plain registry, wrapped with the harness
+  identity once, or a selector read at each use. Generation resolves and streams
+  through the current registry at each request, tools read the current registry
+  at each access, and generation reads the current settings selector at each
+  request preparation. Eight existing tests moved from mutating
+  `harness.models` after open to passing the registry in options.
+
+Seven tests were added and zero removed, each mutation-verified (break, fail,
+restore, pass): never resolving the owning extension; setting the clock report
+flag after reporting; unwrapping the host clock; snapshotting the models
+selector at open; dropping a plain registry; ignoring the tool's models read;
+and resolving settings once at open. The integrated suite passed 101 contract
+tests in 27.65 s (the pre-change suite measured 48.80 s and 97.63 s under
+differing machine load, with one unrelated env-process flake that passes in
+isolation and on re-run). Formatting and offline all-target Clippy passed with
+warnings denied.

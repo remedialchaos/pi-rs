@@ -350,7 +350,7 @@ impl Invocation {
         let model = reference["provider"]
             .as_str()
             .zip(reference["modelId"].as_str())
-            .and_then(|(p, m)| self.harness.models.get_model(p, m));
+            .and_then(|(p, m)| self.harness.models().get_model(p, m));
         let mut outcome = TaskOutcome::Completed { result: json!({}) };
         let mut entry = None;
         let mut usage = None;
@@ -472,7 +472,7 @@ impl Invocation {
                     .abort_signal()
                     .map(|s| s.subscribe(move |_| signal.cancel()));
                 let msg = ctx
-                    .await_with(self.harness.models.complete_simple(
+                    .await_with(self.harness.models().complete_simple(
                         model,
                         pi_rs_ai::types::Context {
                             messages,
