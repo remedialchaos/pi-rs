@@ -19,6 +19,7 @@ pub mod scope_prompt;
 pub mod send_file;
 pub mod settings;
 pub mod shard_a;
+pub mod shard_b3;
 pub mod shard_c2;
 pub mod shard_d;
 pub mod status;
@@ -27,12 +28,14 @@ pub mod sync;
 pub mod telemetry;
 pub mod voice;
 pub mod web_shell;
+pub mod workspace;
 
 use crate::api::v1::PluginRegistry;
 
 /// Registers all built-in native `p2` plugins into `registry`.
 pub fn register_builtins(registry: &mut PluginRegistry) -> pi_rs_chord::Result<()> {
     shard_a::register(registry)?;
+    shard_b3::register(registry)?;
     shard_c2::register(registry)?;
     shard_d::register(registry)?;
     Ok(())
