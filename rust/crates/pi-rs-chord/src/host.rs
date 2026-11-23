@@ -233,9 +233,11 @@ impl WeakHost {
 }
 pub fn create_host(options: HostOptions) -> Result<Host> {
     if let Some(principal) = &options.principal {
-        options
-            .principal_policy
-            .map_or(crate::data::principal_key, |policy| policy.key)(principal)?;
+        if let Some(policy) = options.principal_policy {
+            (policy.key)(principal)?;
+        } else {
+            crate::data::principal_key(principal)?;
+        }
     }
     let report = options.on_error.clone();
     let batch = options
