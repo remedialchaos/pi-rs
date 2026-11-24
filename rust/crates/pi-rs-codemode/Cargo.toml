@@ -3,6 +3,8 @@ name = "pi-rs-codemode"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT"
+description = "Sandboxed async JS execution runtime via wasmtime and quickjs.wasm (Rust port of packages/codemode)"
 
 [dependencies]
 wasmtime = { version = "=50.0.2", default-features = false, features = ["std", "runtime", "cranelift"] }

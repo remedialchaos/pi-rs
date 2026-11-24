@@ -17,10 +17,12 @@ Maps upstream TypeScript/Swift/Python domain terms to canonical Rust names so ev
 | `@earendil-works/chord` | `pi-rs-chord` | `pi_rs_chord` | - |
 | `@earendil-works/pi-durable` | `pi-rs-durable` | `pi_rs_durable` | - |
 | `@earendil-works/pi-env` (+ `daemon/`) | `pi-rs-env` | `pi_rs_env` | `pi-env` |
-| `@earendil-works/pi-evals` | `pi-rs-evals` | `pi_rs_evals` | - |
+| `@earendil-works/pi-evals` | `pi-rs-evals` | `pi_rs_evals` | `pi-evals` |
 | `@earendil-works/p3` | `pi-rs-p3` | `pi_rs_p3` | `p3` |
 | `apps/p2` | `pi-rs-p2` | `pi_rs_p2` | `p2` |
-| `apps/p2-mac` | `pi-rs-p2-mac` | `pi_rs_p2_mac` | `p2-mac` |
+| `apps/p2/src/web` | `pi-rs-p2-web` | `pi_rs_p2_web` | - |
+| `apps/p2/src/tui` | `pi-rs-p2-tui` | `pi_rs_p2_tui` | - |
+| `apps/p2-mac` | `pi-rs-p2-mac` | `pi_rs_p2_mac` | `pi-mac` |
 | `apps/p2/voice-server` | `pi-rs-voice-server` | `pi_rs_voice_server` | `pi-voice-server` |
 
 ## Core Domain Terms

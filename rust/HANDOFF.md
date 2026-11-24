@@ -1,9 +1,9 @@
 # `pi-rs` Handoff
 
-- **Checkpoint**: Full 18-crate port + all 49 `p2` plugins + interactive UI polish (Items 2, 3, 1: remote TUI plugin delivery/hot-swap, built-in native TUI views, whole-screen TUI PTY visual parity against upstream, browser plugin UI wiring, Chord sorted wire-order fix, and packaged real-Chromium E2E) complete on local `main` (**not pushed**).
+- **Checkpoint**: Full 18-crate port + all 49 `p2` plugins + interactive UI polish (remote TUI plugin delivery/hot-swap, built-in native TUI views, whole-screen TUI PTY visual parity against upstream, browser plugin UI wiring, Chord sorted wire-order fix, and packaged real-Chromium E2E) published on `main`.
 - **Stage**: All 18 workspace crates, all 8 binaries (`pi`, `pi-ai`, `pi-env`, `pi-evals`, `p3`, `p2`, `pi-mac`, `pi-voice-server`), all 49 built-in `p2` plugins, `p2 tui`, and the packaged Leptos WASM browser UI are ported, integrated, and passing offline & live E2E gates.
 - **Fallback rate**: 0% fallback; `packages/` and `apps/` remain untouched (`git diff 780bf31fc -- packages/ apps/` is empty).
-- **Next action**: User review/push decision on local `main`, plus optional host-specific polish (macOS native AppKit/`WKWebView`, external live OAuth/SSH/Docker, Pocket TTS ONNX adapter, or retiring upstream reference trees).
+- **Next action**: Optional CI/release automation, host-specific polish (macOS native AppKit/`WKWebView`, external live OAuth/SSH/Docker, Pocket TTS ONNX adapter), closing documented fidelity limits, or retiring upstream reference trees.
 
 ## Gate Table
 
@@ -29,7 +29,7 @@
 ## Known Hazards & Notes
 
 1. **Workspace layout**: Cargo workspace root MUST stay at `rust/crates/Cargo.toml` so local `rust/pi-rs-*` proof crates stay outside Cargo discovery and ignored via `/pi-rs-*/` in `rust/.gitignore`.
-2. **Build cache & temp disk**: `/tmp` is a 4 GiB tmpfs. For large builds, set `CARGO_TARGET_DIR=/var/tmp/pi-rs-target-...` with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`. Avoid long `TMPDIR` or deep worktree paths when running `pi-rs-p2-mac` Unix-socket tests (`SUN_LEN` 108-byte limit).
+2. **Build cache & temp disk**: If `/tmp` is a small tmpfs, point `CARGO_TARGET_DIR` and `TMPDIR` to disk-backed storage (e.g., under `/var/tmp`) with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`. Avoid long `TMPDIR` or deep worktree paths when running `pi-rs-p2-mac` Unix-socket tests (`SUN_LEN` 108-byte limit).
 3. **Browser asset packaging**: Build `pi-rs-p2` with `P2_BROWSER_ASSETS=<dir>` (produced by `cargo build -p pi-rs-p2-web --target wasm32-unknown-unknown`, `wasm-bindgen --target web --no-typescript --out-name app`, and `esbuild`) to embed the live WASM browser UI.
 4. **Chord wire indexing**: Remote Chord links MUST index state/method/event members using `Contract::variant_member_names` (sorted by UTF-16 per upstream `contract.ts:296`), NOT declaration-order `member_names`.
 5. **Documented fidelity limits** (recorded per crate `MILESTONE.md`):
@@ -38,4 +38,4 @@
    - `pi-rs-env`: `packaged_daemon()` assumes npm `bin/` layout (`local_daemon()` is the native path); live `sshd`/Windows/macOS runtime untested on Linux host.
    - `pi-rs-evals`: offline Docker verification via injectable runner; no live Docker daemon run.
    - `pi-rs-p2-mac` & `pi-rs-voice-server`: macOS UI/signing deferred per ADR-005; Pocket TTS is a discovery/streaming hook.
-6. **Git & privacy safety**: `packages/` and `apps/` untouched; zero personal real-name metadata or home paths; local `main` held unpushed until user directs.
+6. **Git & privacy safety**: `packages/` and `apps/` untouched; zero personal real-name metadata or home paths in working tree or published history.

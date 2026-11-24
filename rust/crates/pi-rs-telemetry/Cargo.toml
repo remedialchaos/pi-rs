@@ -3,6 +3,8 @@ name = "pi-rs-telemetry"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT"
+description = "Vendor-neutral spans, metrics, propagation, and trace rendering (Rust port of packages/telemetry)"
 
 [dependencies]
 indexmap = { version = "2", features = ["serde"] }

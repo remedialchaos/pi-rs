@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"
+description = "Self-hosted Pi server, worker runtime, and built-in plugins (Rust port of apps/p2)"
 
 [[bin]]
 name = "p2"

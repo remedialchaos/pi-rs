@@ -4,7 +4,7 @@
 
 ## Before You Start
 
-1. Read [rust/DECISIONS.md](rust/DECISIONS.md) for settled architectural decisions (ADR-001 through ADR-009).
+1. Read [rust/DECISIONS.md](rust/DECISIONS.md) for settled architectural decisions (ADR-001 through ADR-011).
 2. Read [rust/MAP.md](rust/MAP.md) to see what is planned, claimed, or already ported.
 3. Read [AGENTS.md](AGENTS.md) for coding standards, error handling, and workflow rules.
 
@@ -19,9 +19,9 @@
 Before opening a pull request, ensure the relevant checks pass:
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --manifest-path rust/crates/Cargo.toml --all -- --check
+cargo clippy --manifest-path rust/crates/Cargo.toml --workspace --all-targets -- -D warnings
+cargo test --manifest-path rust/crates/Cargo.toml --workspace
 ```
 
 For ported units verified against the upstream oracle:

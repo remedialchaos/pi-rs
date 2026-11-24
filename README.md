@@ -6,14 +6,14 @@ AI agent toolkit: unified LLM API, agent loop, TUI, coding agent CLI, rewritten 
 
 ## Status
 
-Active rewrite in progress. Upstream TypeScript, Swift, and Python trees (`packages/`, `apps/`) remain in this repository untouched as the behavioral reference and test oracle until each target passes differential verification and is lifted to a standalone Rust crate or binary.
+All 18 Rust workspace crates, 8 binaries (`pi`, `pi-ai`, `pi-env`, `pi-evals`, `p3`, `p2`, `pi-mac`, `pi-voice-server`), all 49 built-in `p2` plugins, `p2 tui`, and the packaged Leptos WASM browser UI are ported and passing offline and live E2E verification. Upstream TypeScript, Swift, and Python trees (`packages/`, `apps/`) remain untouched in-tree as the behavioral reference and test oracle.
 
 Tracking and architecture documents live under [`rust/`](rust/):
 
 - [rust/MAP.md](rust/MAP.md) — phased port plan, crate/unit progress, and research queue
-- [rust/DECISIONS.md](rust/DECISIONS.md) — Architecture Decision Records (ADR-001 through ADR-009)
+- [rust/DECISIONS.md](rust/DECISIONS.md) — Architecture Decision Records (ADR-001 through ADR-011)
 - [rust/GLOSSARY.md](rust/GLOSSARY.md) — upstream-to-Rust crate, binary, and symbol map
-- [rust/HANDOFF.md](rust/HANDOFF.md) — current checkpoint state and gates
+- [rust/HANDOFF.md](rust/HANDOFF.md) — current checkpoint state, gates, and known fidelity limits
 
 ## Architecture & Roadmap
 
@@ -39,15 +39,17 @@ The port proceeds bottom-up in three phases using Rust edition 2024:
 | `pi-rs-chord` | — | `packages/chord` | Multi-process reactive object runtime, SQLite store, links, HTTP, workers, and WASM/WIT hot-reloading plugins |
 | `pi-rs-durable` | — | `packages/durable` | Durable conversation, task, and document runtime |
 | `pi-rs-env` | `pi-env` | `packages/env` | Remote SSH execution environment client integrating the existing Rust `pi-env` daemon |
-| `pi-rs-evals` | — | `packages/evals` | Evaluation harness |
+| `pi-rs-evals` | `pi-evals` | `packages/evals` | Evaluation harness |
 
 ### Phase 3 — Applications
 
 | Crate | Binary | Replaces | Role |
 | --- | --- | --- | --- |
 | `pi-rs-p3` | `p3` | `apps/p3` | Single-user Pi server and CLI on Chord |
-| `pi-rs-p2` | `p2` | `apps/p2` | Self-hosted server, TUI, and Rust-to-WASM web UI |
-| `pi-rs-p2-mac` | `p2-mac` | `apps/p2-mac` | Rust macOS desktop shell |
+| `pi-rs-p2` | `p2` | `apps/p2` | Self-hosted server, worker runtime, and all 49 built-in plugins |
+| `pi-rs-p2-web` | — | `apps/p2/src/web` | Leptos CSR WASM browser frontend for `p2` (ADR-011) |
+| `pi-rs-p2-tui` | — | `apps/p2/src/tui` | Terminal UI client library powering `p2 tui` |
+| `pi-rs-p2-mac` | `pi-mac` | `apps/p2-mac` | Rust macOS companion shell and portable `p2` supervisor |
 | `pi-rs-voice-server` | `pi-voice-server` | `apps/p2/voice-server` | Rust WebSocket speech-to-text and text-to-speech service |
 
 ### Runtime Boundaries
@@ -64,20 +66,20 @@ The port proceeds bottom-up in three phases using Rust edition 2024:
 
 ## Development
 
-Prerequisites: stable Rust (edition 2024), `cargo`, and (while the upstream TS oracle is active) Node.js >= 22.19 and `rust-anything`.
+Prerequisites: stable Rust (edition 2024), `cargo`, `wasm32-unknown-unknown` target (for `pi-rs-p2-web`), and optionally Node.js >= 22.19 and `rust-anything` when running against the upstream TS oracle.
 
 ```bash
-# Hydrate upstream TS oracle (read-only reference for rust-anything record/diff)
+# Check formatting, lints, and run the 18-crate Rust workspace tests
+cargo fmt --manifest-path rust/crates/Cargo.toml --all -- --check
+cargo clippy --manifest-path rust/crates/Cargo.toml --workspace --all-targets -- -D warnings
+cargo clippy --manifest-path rust/crates/Cargo.toml --target wasm32-unknown-unknown -p pi-rs-p2-web --lib -- -D warnings
+cargo test --manifest-path rust/crates/Cargo.toml --workspace
+
+# Optional: hydrate upstream TS oracle (read-only reference for parity checks)
 npm install --ignore-scripts
-
-# Verify porting toolchain
-rust-anything doctor
-
-# Once Rust crates are scaffolded under rust/
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
 ```
+
+To build `p2` with the embedded Leptos WASM browser UI, compile `pi-rs-p2-web` for `wasm32-unknown-unknown`, run `wasm-bindgen --target web --no-typescript --out-name app` and `esbuild` on its stylesheet, and pass the output directory via `P2_BROWSER_ASSETS=<dir>` when building `pi-rs-p2`.
 
 ## Security & Permissions
 

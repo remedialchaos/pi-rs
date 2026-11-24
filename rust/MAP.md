@@ -12,7 +12,7 @@
 
 All workers stopped on 2026-11-23. The following table records their last assignments. Local checkpoint commits, verification results, and the resume sequence are in [HANDOFF.md](HANDOFF.md).
 
-All Wave 1 and Wave 2 claims are complete and merged locally onto `main` (unpushed).
+All Wave 1 and Wave 2 claims are complete and merged onto `main`.
 
 | Milestone | State | Summary |
 | --- | --- | --- |
