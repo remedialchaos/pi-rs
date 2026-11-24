@@ -703,7 +703,7 @@ async fn familiar_server_creates_once_restores_archived_and_forbids_guests() -> 
 
     let mut options = ServerOptions::new(dir.path().to_path_buf());
     options.port = 0;
-    shard_d2::register(&mut options.registry)?;
+    pi_rs_p2::plugins::familiar::register(&mut options.registry)?;
     options
         .registry
         .register("mock-catalog", FacetKind::Server, mock_catalog)?;
@@ -908,5 +908,349 @@ async fn familiar_worker_inert_for_normal_session_and_configures_tools_for_famil
     );
     write_frame(&mut parent2, &Frame::Control(Control::Shutdown)).await?;
     tokio::time::timeout(TIMEOUT, run2).await???;
+    Ok(())
+}
+
+#[test]
+fn rollups_input_of_and_fingerprint_of_track_reads_and_exclude_familiar() {
+    use pi_rs_p2::plugins::rollups::runner::{
+        RollupFacts, fingerprint_of, input_of, mention_of, mention_read,
+    };
+    use std::collections::HashMap;
+
+    let facts = RollupFacts {
+        familiar: Some("fam".into()),
+        sessions: vec![
+            json!({
+                "id": "fam", "title": "Ask Pi", "cwd": "/", "env": null,
+                "createdAt": 1, "updatedAt": 10, "archivedAt": null, "pinned": false,
+                "model": { "provider": "p", "modelId": "m" }
+            }),
+            json!({
+                "id": "b", "title": "Beta", "cwd": "/b", "env": null,
+                "createdAt": 20, "updatedAt": 30, "archivedAt": null, "pinned": true,
+                "model": { "provider": "p", "modelId": "m" }
+            }),
+            json!({
+                "id": "a", "title": "Alpha", "cwd": "/a", "env": "dev",
+                "createdAt": 10, "updatedAt": 20, "archivedAt": null, "pinned": false,
+                "model": { "provider": "p", "modelId": "m" }
+            }),
+        ],
+        statuses: json!({
+            "a": { "running": true, "busy": ["turn"], "error": null },
+            "b": { "running": false, "busy": [], "error": "boom" }
+        }),
+        answers: json!({ "a": 5, "b": 2 }),
+        reads: json!({ "a": 3, "b": 2 }),
+        projects: vec![json!({ "name": "core", "cwd": "/a" })],
+        memberships: json!({ "a": "core" }),
+    };
+
+    let input = input_of(&facts, 1000);
+    assert_eq!(input.sessions.len(), 2);
+    assert_eq!(input.sessions[0].id, "a");
+    assert_eq!(input.sessions[0].state, "working");
+    assert!(input.sessions[0].unread);
+    assert_eq!(input.sessions[0].project.as_deref(), Some("core"));
+    assert_eq!(input.sessions[1].id, "b");
+    assert_eq!(input.sessions[1].state, "stopped");
+    assert!(!input.sessions[1].unread);
+    assert_eq!(input.sessions[1].error.as_deref(), Some("boom"));
+
+    let reads = vec!["sessions.title".to_owned()];
+    let fp1 = fingerprint_of(&input, &reads, &HashMap::new());
+    let mut input_same_title = input.clone();
+    input_same_title.sessions[0].unread = false;
+    assert_eq!(
+        fp1,
+        fingerprint_of(&input_same_title, &reads, &HashMap::new()),
+        "unread was not read so fingerprint stays identical"
+    );
+    input_same_title.sessions[0].title = "Changed".into();
+    assert_ne!(
+        fp1,
+        fingerprint_of(&input_same_title, &reads, &HashMap::new()),
+        "title was read so fingerprint changes"
+    );
+
+    let mpath = mention_read("bug", Some(500));
+    let parsed = mention_of(&mpath).expect("mention_of parses");
+    assert_eq!(parsed.query, "bug");
+    assert_eq!(parsed.since, Some(500));
+    assert!(mention_of("sessions.title").is_none());
+}
+
+#[tokio::test]
+async fn rollups_server_executes_scripts_and_enforces_owner_and_familiar_auth() -> TestResult {
+    use pi_rs_chord::host::Caller;
+    use pi_rs_p2::{
+        api::v1::{FacetKind, OwnerAccess, Principal},
+        hosts::server::{ServerOptions, start_server},
+        runtime::server::ServerServices,
+    };
+
+    let dir = TempDir::new()?;
+    let ctx = Context::background();
+    let catalog_contract = Arc::new(lookup("p2.catalog")?);
+    let status_contract = Arc::new(lookup("p2.status-store")?);
+    let search_contract = Arc::new(lookup("p2.search-index")?);
+    let project_contract = Arc::new(lookup("p2.project-service")?);
+    let ops_contract = Arc::new(lookup("p2.session-operations")?);
+
+    let mock_catalog = ServerServices::default().with_facet(move |host| {
+        host.serve(
+            catalog_contract.clone(),
+            move |_, _, object| {
+                let sessions = json!([{
+                    "id": "s1",
+                    "title": "Fix bug",
+                    "cwd": "/repo",
+                    "env": null,
+                    "createdAt": 100,
+                    "updatedAt": 200,
+                    "archivedAt": null,
+                    "pinned": false,
+                    "main": 1,
+                    "branches": [],
+                    "model": { "provider": "faux", "modelId": "faux-1" },
+                    "thinkingLevel": "off"
+                }]);
+                let mut members = Members::new();
+                members.state(
+                    "sessions",
+                    object.writable(JsonValue::from_serde(sessions))?,
+                )?;
+                for m in ["get", "create", "activity", "update"] {
+                    members.method(m, |_, _| Box::pin(async move { Ok(JsonValue::Null) }))?;
+                }
+                Ok(members)
+            },
+            ServeOptions::default(),
+        )
+    });
+
+    let mock_status = ServerServices::default().with_facet(move |host| {
+        host.serve(
+            status_contract.clone(),
+            move |_, _, object| {
+                let mut members = Members::new();
+                members.state(
+                    "statuses",
+                    object.writable(JsonValue::from_serde(json!({})))?,
+                )?;
+                members.method("report", |_, _| {
+                    Box::pin(async move { Ok(JsonValue::Null) })
+                })?;
+                Ok(members)
+            },
+            ServeOptions::default(),
+        )
+    });
+
+    let mock_search = ServerServices::default().with_facet(move |host| {
+        host.serve(
+            search_contract.clone(),
+            move |_, _, object| {
+                let mut members = Members::new();
+                members.state(
+                    "answers",
+                    object.writable(JsonValue::from_serde(json!({})))?,
+                )?;
+                members.state("reads", object.writable(JsonValue::from_serde(json!({})))?)?;
+                members.state(
+                    "rebuilds",
+                    object.writable(JsonValue::from_serde(json!([])))?,
+                )?;
+                members.method("mentions", |args, _| {
+                    Box::pin(async move {
+                        let v = args.to_serde()?;
+                        assert_eq!(v["query"], "bug");
+                        Ok(JsonValue::from_serde(json!({ "s1": 555 })))
+                    })
+                })?;
+                for m in [
+                    "cursor", "index", "reset", "markRead", "history", "messages", "rebuild",
+                ] {
+                    members.method(m, |_, _| Box::pin(async move { Ok(JsonValue::Null) }))?;
+                }
+                Ok(members)
+            },
+            ServeOptions::default(),
+        )
+    });
+
+    let mock_projects = ServerServices::default().with_facet(move |host| {
+        host.serve(
+            project_contract.clone(),
+            move |_, _, object| {
+                let mut members = Members::new();
+                members.state(
+                    "projects",
+                    object.writable(JsonValue::from_serde(json!([])))?,
+                )?;
+                members.state(
+                    "archived",
+                    object.writable(JsonValue::from_serde(json!([])))?,
+                )?;
+                members.state(
+                    "sessions",
+                    object.writable(JsonValue::from_serde(json!({})))?,
+                )?;
+                for m in [
+                    "assign", "copy", "create", "rename", "locate", "move", "archive", "restore",
+                    "remove",
+                ] {
+                    members.method(m, |_, _| Box::pin(async move { Ok(JsonValue::Null) }))?;
+                }
+                Ok(members)
+            },
+            ServeOptions::default(),
+        )
+    });
+
+    let mock_ops = ServerServices::default().with_facet(move |host| {
+        host.serve(
+            ops_contract.clone(),
+            move |_, _, object| {
+                let mut members = Members::new();
+                members.state(
+                    "operations",
+                    object.writable(JsonValue::from_serde(json!([])))?,
+                )?;
+                for m in [
+                    "create", "move", "relocate", "clone", "fork", "archive", "restore", "dismiss",
+                ] {
+                    members.method(m, |_, _| Box::pin(async move { Ok(JsonValue::Null) }))?;
+                }
+                Ok(members)
+            },
+            ServeOptions::default(),
+        )
+    });
+
+    let mut options = ServerOptions::new(dir.path().to_path_buf());
+    options.port = 0;
+    shard_d2::register(&mut options.registry)?;
+    options
+        .registry
+        .register("mock-catalog", FacetKind::Server, mock_catalog)?;
+    options
+        .registry
+        .register("mock-status", FacetKind::Server, mock_status)?;
+    options
+        .registry
+        .register("mock-search", FacetKind::Server, mock_search)?;
+    options
+        .registry
+        .register("mock-projects", FacetKind::Server, mock_projects)?;
+    options
+        .registry
+        .register("mock-ops", FacetKind::Server, mock_ops)?;
+
+    let server = start_server(options).await?;
+    let rollups_contract = Arc::new(lookup("p2.sidebar-rollups")?);
+
+    // Guest is forbidden.
+    let guest = Principal::Guest {
+        id: "g1".into(),
+        name: "Guest".into(),
+        email: None,
+        home: "s1".into(),
+        sessions: Default::default(),
+        revision: 1,
+    };
+    let guest_held = server.host.hold_as(
+        rollups_contract.clone(),
+        JsonValue::Object(Default::default()),
+        Caller {
+            principal: Some(serde_json::to_value(&guest)?),
+            incarnation: "test".into(),
+        },
+        &ctx,
+    )?;
+    assert!(guest_held.wait(&ctx).await.is_err());
+
+    // Non-Familiar worker is forbidden on `list`.
+    let non_fam_worker = Principal::Worker {
+        session: "not-familiar".into(),
+        generation: 1,
+    };
+    let worker_held = server.host.hold_as(
+        rollups_contract.clone(),
+        JsonValue::Object(Default::default()),
+        Caller {
+            principal: Some(serde_json::to_value(&non_fam_worker)?),
+            incarnation: "test".into(),
+        },
+        &ctx,
+    )?;
+    worker_held.wait(&ctx).await?;
+    assert!(
+        worker_held
+            .call("list", JsonValue::Null, &ctx)
+            .await
+            .is_err()
+    );
+
+    // Owner can preview, save, refresh, and remove.
+    let owner = Principal::Owner {
+        access: OwnerAccess::Local,
+    };
+    let owner_held = server.host.hold_as(
+        rollups_contract,
+        JsonValue::Object(Default::default()),
+        Caller {
+            principal: Some(serde_json::to_value(&owner)?),
+            incarnation: "test".into(),
+        },
+        &ctx,
+    )?;
+    owner_held.wait(&ctx).await?;
+
+    // Warm QuickJS WASM module once so the 5s script timeout doesn't include cold Wasmtime compile in debug mode.
+    let _ = pi_rs_codemode::load_quickjs_wasm(None);
+
+    let preview = owner_held
+        .call(
+            "preview",
+            JsonValue::from_serde(json!({
+                "code": "const m = await mentions('bug'); return { layout: 'sessions', members: sessions.filter(s => m[s.id]).map(s => ({ id: s.id, at: m[s.id] })) };"
+            })),
+            &ctx,
+        )
+        .await?
+        .to_serde()?;
+    assert_eq!(preview["ok"], true, "{preview}");
+    assert_eq!(preview["output"]["layout"], "sessions");
+    assert_eq!(preview["output"]["members"][0]["id"], "s1");
+    assert_eq!(preview["output"]["members"][0]["at"], 555);
+
+    let saved = owner_held
+        .call(
+            "save",
+            JsonValue::from_serde(json!({
+                "key": "bugs",
+                "name": "Bugs",
+                "window": "3d",
+                "refresh": { "kind": "auto" },
+                "code": "return { layout: 'sessions', members: sessions.map(s => s.id) };"
+            })),
+            &ctx,
+        )
+        .await?
+        .to_serde()?;
+    assert_eq!(saved["definition"]["key"], "bugs");
+    assert_eq!(saved["output"]["members"], json!(["s1"]));
+
+    owner_held
+        .call(
+            "remove",
+            JsonValue::from_serde(json!({ "key": "bugs" })),
+            &ctx,
+        )
+        .await?;
+
+    server.close().await?;
     Ok(())
 }

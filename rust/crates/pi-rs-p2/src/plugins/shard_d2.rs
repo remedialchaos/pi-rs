@@ -8,5 +8,6 @@ use crate::api::v1::PluginRegistry;
 pub fn register(registry: &mut PluginRegistry) -> Result<()> {
     super::history::register(registry)?;
     super::familiar::register(registry)?;
+    super::rollups::register(registry)?;
     Ok(())
 }

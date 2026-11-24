@@ -2,6 +2,7 @@
 
 pub mod familiar;
 pub mod history;
+pub mod rollups;
 pub mod shard_d2;
 
 use crate::api::v1::PluginRegistry;
