@@ -27,6 +27,12 @@ use pi_rs_p2::{
         server::install_service, server_address,
     },
     plugins::{
+        envs::{
+            config::{
+                EnvConfig, GondolinEnvConfig, SandboxMount, SshEnvConfig, parse_envs, validate_env,
+            },
+            server::server_facet as envs_server_facet,
+        },
         locations::{
             BoxedFuture, DirectoryListing, ENV_MANAGERS_SERVICE, EnvDirectoryManager, EnvInfo,
             EnvManagers, LocationMoveState, LocationServer, env_revision, location_move_doc,
@@ -136,8 +142,9 @@ fn shard_b2_registers_locations_plugin() -> TestResult {
     let selected = registry.select(None)?;
     assert!(selected.contains(&"locations".to_owned()));
     assert!(selected.contains(&"models".to_owned()));
-    assert_eq!(registry.facets(FacetKind::Server, &selected).len(), 2);
-    assert_eq!(registry.facets(FacetKind::Worker, &selected).len(), 2);
+    assert!(selected.contains(&"envs".to_owned()));
+    assert_eq!(registry.facets(FacetKind::Server, &selected).len(), 3);
+    assert_eq!(registry.facets(FacetKind::Worker, &selected).len(), 3);
     Ok(())
 }
 
@@ -910,6 +917,292 @@ async fn models_server_publishes_resources_enforces_owner_and_persists_settings(
     assert_eq!(scoped.as_array().map(Vec::len), Some(1));
 
     drop((denied, worker_peer, held, owner_peer));
+    tokio::time::timeout(TIMEOUT, host.close(&ctx)).await??;
+    Ok(())
+}
+
+#[test]
+fn envs_config_validation_rejects_reserved_sandbox_paths_and_dangling_hosts() {
+    let bad_reserved = EnvConfig::Gondolin(GondolinEnvConfig {
+        host: "gpu".into(),
+        image: None,
+        mounts: Some(vec![SandboxMount {
+            host: "~/work".into(),
+            guest: "/opt/pi-env/bin".into(),
+            readonly: Some(true),
+        }]),
+        allow_hosts: None,
+        cpus: None,
+        memory_mb: None,
+        disk_gb: None,
+    });
+    assert!(validate_env(&bad_reserved).is_err());
+
+    let bad_pi_write = EnvConfig::Gondolin(GondolinEnvConfig {
+        host: "gpu".into(),
+        image: None,
+        mounts: Some(vec![SandboxMount {
+            host: "~/.pi/agent".into(),
+            guest: "/workspace".into(),
+            readonly: Some(false),
+        }]),
+        allow_hosts: None,
+        cpus: None,
+        memory_mb: None,
+        disk_gb: None,
+    });
+    assert!(validate_env(&bad_pi_write).is_err());
+
+    let bad_ssh = EnvConfig::Ssh(SshEnvConfig {
+        host: "-oProxyCommand=bad".into(),
+        user: None,
+        port: None,
+        identity_file: None,
+        shell_path: None,
+        login_shell: None,
+        shell_env: None,
+    });
+    assert!(validate_env(&bad_ssh).is_err());
+
+    let dangling = serde_json::to_string(&json!({
+        "box1": { "type": "gondolin", "host": "missing" }
+    }))
+    .unwrap_or_default();
+    assert!(parse_envs(&dangling).is_err());
+
+    let valid = serde_json::to_string(&json!({
+        "gpu": { "type": "ssh", "host": "gpu.example", "user": "dev", "port": 22 },
+        "box1": { "type": "gondolin", "host": "gpu", "mounts": [{ "host": "~/repo", "guest": "/repo" }] }
+    }))
+    .unwrap_or_default();
+    let parsed = parse_envs(&valid);
+    assert!(parsed.is_ok());
+}
+
+#[tokio::test]
+async fn envs_server_enforces_owner_saves_lists_and_publishes_managers_service() -> TestResult {
+    let temp = TempDir::new()?;
+    let server_contract = Arc::new(lookup("p2.server")?);
+    let catalog_contract = Arc::new(lookup("p2.catalog")?);
+    let envs_contract = Arc::new(lookup("p2.envs")?);
+    let secrets_contract = Arc::new(lookup("p2.sandbox-secrets")?);
+    let data_dir = temp.path().to_path_buf();
+
+    let mock_peers = define_facet(move |facet_host| {
+        let data_dir = data_dir.clone();
+        facet_host.serve(
+            server_contract.clone(),
+            move |_, _, object| {
+                let mut m = Members::new();
+                m.state(
+                    "info",
+                    object.writable(JsonValue::from_serde(json!({
+                        "app": "",
+                        "dataDir": data_dir,
+                        "fake": false,
+                        "allowedHosts": [],
+                        "port": 0
+                    })))?,
+                )?;
+                m.method("revokeOwners", |_, _| {
+                    Box::pin(async { Ok(JsonValue::Null) })
+                })?;
+                m.method("revokeGuests", |_, _| {
+                    Box::pin(async { Ok(JsonValue::Null) })
+                })?;
+                Ok(m)
+            },
+            ServeOptions::default(),
+        )?;
+        facet_host.serve(
+            catalog_contract.clone(),
+            |_, _, object| {
+                let mut m = Members::new();
+                m.state(
+                    "sessions",
+                    object.writable(JsonValue::from_serde(json!([
+                        {
+                            "id": "s-gpu",
+                            "title": "GPU session",
+                            "createdAt": 1,
+                            "updatedAt": 1,
+                            "cwd": "/work",
+                            "env": "gpu",
+                            "model": { "provider": "faux", "modelId": "faux-1" },
+                            "pinned": false,
+                            "thinkingLevel": "off",
+                            "archivedAt": null,
+                            "branches": [],
+                            "main": 1
+                        }
+                    ])))?,
+                )?;
+                m.method("get", |_, _| Box::pin(async { Ok(JsonValue::Null) }))?;
+                m.method("create", |_, _| Box::pin(async { Ok(JsonValue::Null) }))?;
+                m.method("activity", |_, _| Box::pin(async { Ok(JsonValue::Null) }))?;
+                m.method("update", |_, _| Box::pin(async { Ok(JsonValue::Null) }))?;
+                Ok(m)
+            },
+            ServeOptions::default(),
+        )?;
+        Ok(())
+    });
+
+    let ctx = Context::background();
+    let host = create_host(HostOptions {
+        address: Some(JsonValue::from_serde(server_address())),
+        principal: Some(json!({ "kind": "server" })),
+        principal_policy: Some(Principal::POLICY),
+        ..Default::default()
+    })?;
+    let ready = host
+        .load(
+            vec![
+                PluginFacet::new("peers", mock_peers),
+                PluginFacet::new("envs", envs_server_facet()?),
+            ],
+            &ctx,
+        )
+        .await?;
+    assert!(ready.failed.is_empty(), "{:?}", ready.failed);
+
+    let worker_peer = connect_as(
+        &host,
+        &Principal::Worker {
+            session: "s-gpu".into(),
+            generation: 1,
+        },
+    )?;
+    let denied = worker_peer.hold(
+        envs_contract.clone(),
+        JsonValue::Object(Default::default()),
+        &ctx,
+    )?;
+    assert!(
+        tokio::time::timeout(TIMEOUT, denied.wait(&ctx))
+            .await?
+            .is_err(),
+        "non-owner must be rejected from p2.envs"
+    );
+
+    let owner_peer = connect_as(
+        &host,
+        &Principal::Owner {
+            access: OwnerAccess::Local,
+        },
+    )?;
+    let held = owner_peer.hold(
+        envs_contract.clone(),
+        JsonValue::Object(Default::default()),
+        &ctx,
+    )?;
+    tokio::time::timeout(TIMEOUT, held.wait(&ctx)).await??;
+
+    // ENV_MANAGERS_SERVICE is published once EnvService opens.
+    let _managers =
+        pi_rs_p2::api::v1::server::service_of::<EnvManagers>(&host, ENV_MANAGERS_SERVICE)?;
+
+    held.call(
+        "save",
+        JsonValue::from_serde(json!({
+            "name": "gpu",
+            "config": { "type": "ssh", "host": "gpu.example", "user": "dev", "port": 22 }
+        })),
+        &ctx,
+    )
+    .await?;
+
+    let list = held.call("list", JsonValue::Null, &ctx).await?.to_serde()?;
+    let rows = list.as_array().ok_or("expected array")?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "gpu");
+    assert_eq!(rows[0]["sessions"], 1);
+
+    // Deleting an in-use environment without force fails; force: true succeeds.
+    assert!(
+        held.call(
+            "delete",
+            JsonValue::from_serde(json!({ "name": "gpu" })),
+            &ctx,
+        )
+        .await
+        .is_err(),
+        "in-use env delete without force must fail"
+    );
+    held.call(
+        "delete",
+        JsonValue::from_serde(json!({ "name": "gpu", "force": true })),
+        &ctx,
+    )
+    .await?;
+    let after_del = held.call("list", JsonValue::Null, &ctx).await?.to_serde()?;
+    assert_eq!(after_del.as_array().map(Vec::len), Some(0));
+
+    // Sandbox secrets CRUD via p2.sandbox-secrets.
+    held.call(
+        "save",
+        JsonValue::from_serde(json!({
+            "name": "gpu",
+            "config": { "type": "ssh", "host": "gpu.example" }
+        })),
+        &ctx,
+    )
+    .await?;
+    held.call(
+        "save",
+        JsonValue::from_serde(json!({
+            "name": "box1",
+            "config": { "type": "gondolin", "host": "gpu" }
+        })),
+        &ctx,
+    )
+    .await?;
+    let sec_held = owner_peer.hold(
+        secrets_contract.clone(),
+        JsonValue::Object(Default::default()),
+        &ctx,
+    )?;
+    tokio::time::timeout(TIMEOUT, sec_held.wait(&ctx)).await??;
+    sec_held
+        .call(
+            "set",
+            JsonValue::from_serde(json!({
+                "sandbox": "box1",
+                "name": "OPENAI_API_KEY",
+                "hosts": ["api.openai.com"],
+                "value": "sk-test"
+            })),
+            &ctx,
+        )
+        .await?;
+    let sec_list = sec_held
+        .call(
+            "list",
+            JsonValue::from_serde(json!({ "name": "box1" })),
+            &ctx,
+        )
+        .await?
+        .to_serde()?;
+    assert_eq!(sec_list.as_array().map(Vec::len), Some(1));
+    assert_eq!(sec_list[0]["name"], "OPENAI_API_KEY");
+    sec_held
+        .call(
+            "delete",
+            JsonValue::from_serde(json!({ "sandbox": "box1", "name": "OPENAI_API_KEY" })),
+            &ctx,
+        )
+        .await?;
+    let sec_after = sec_held
+        .call(
+            "list",
+            JsonValue::from_serde(json!({ "name": "box1" })),
+            &ctx,
+        )
+        .await?
+        .to_serde()?;
+    assert_eq!(sec_after.as_array().map(Vec::len), Some(0));
+
+    drop((denied, worker_peer, sec_held, held, owner_peer));
     tokio::time::timeout(TIMEOUT, host.close(&ctx)).await??;
     Ok(())
 }

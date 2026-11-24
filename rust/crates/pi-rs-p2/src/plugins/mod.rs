@@ -1,5 +1,6 @@
 //! Built-in native `p2` plugins (Wave 2).
 
+pub mod envs;
 pub mod locations;
 pub mod models;
 pub mod shard_b2;

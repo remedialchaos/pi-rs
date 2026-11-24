@@ -8,5 +8,6 @@ use crate::api::v1::PluginRegistry;
 pub fn register_builtins(registry: &mut PluginRegistry) -> Result<()> {
     super::locations::register(registry)?;
     super::models::register(registry)?;
+    super::envs::register(registry)?;
     Ok(())
 }
