@@ -1,4 +1,5 @@
 mod admission;
+mod builtin_panels;
 mod grants;
 mod plugins;
 mod preferences;
@@ -384,6 +385,7 @@ async fn mount(
     let picking = visible.clone();
     let mut drafts = std::collections::HashMap::new();
     let mut destination = None;
+    let mut builtin_panels = builtin_panels::BuiltinPanels::default();
     let shortcuts = plugins
         .as_ref()
         .map(|p| p.shortcuts(&prefs.keys))
@@ -461,6 +463,7 @@ async fn mount(
                 if let Some(p) = &mut plugins {
                     p.detach();
                 }
+                builtin_panels.close();
                 editor.borrow_mut().set_value(String::new());
                 panel_open.set(false);
             } else if let Some((id, args)) = slash.and_then(|(name, args)| {
@@ -477,8 +480,25 @@ async fn mount(
                     args,
                 ))
             }) {
+                builtin_panels.close();
                 *command.borrow_mut() = Some((id.to_owned(), args.to_owned()));
                 editor.borrow_mut().set_value(String::new());
+            } else if let Some(outcome) = slash
+                .map(|(name, args)| builtin_panels.handle_slash(name, args, &mut view, &theme))
+                .filter(|outcome| outcome.handled)
+            {
+                if let Some(p) = &mut plugins {
+                    p.detach();
+                }
+                if let Some(msg) = outcome.flash {
+                    client.screen.flash(msg, None);
+                }
+                if let Some(frame) = outcome.panel {
+                    client.open_side_panel(frame);
+                    panel_open.set(client.side_panel_shown());
+                }
+                editor.borrow_mut().set_value(String::new());
+                client.screen.base.request_render(false);
             } else if let Err(error) = view.submit(&text) {
                 break Err(error.into());
             }
@@ -524,6 +544,7 @@ async fn mount(
                     if let Some(p) = &mut plugins {
                         p.detach();
                     }
+                    builtin_panels.on_session_change();
                     client.close_side_panel();
                     panel_open.set(false);
                     if let Some(old) = destination.take() {
@@ -541,10 +562,13 @@ async fn mount(
                 {
                     editor.borrow_mut().set_value(String::new());
                 }
+                if let Some(frame) = builtin_panels.refresh(&view, &theme) {
+                    client.open_side_panel(frame);
+                }
                 grants.borrow_mut().display(&view.last_message);
-                let (title, body) = view.text.split_once('\n').unwrap_or((&view.text, ""));
-                header.borrow_mut().set_text(title);
-                root.borrow_mut().set_text(body);
+                let (title, body) = view.render_themed(&theme);
+                header.borrow_mut().set_text(&title);
+                root.borrow_mut().set_text(&body);
                 client.screen.base.request_render(false);
             }
             Ok(_) => {}
