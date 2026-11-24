@@ -290,7 +290,6 @@ impl View {
         let args = json!({
             "cwd": cwd,
             "title": title.unwrap_or(""),
-            "model": Value::Null,
         });
         self.call_method(1, method, args, CallKind::SessionCreate)?;
         Ok(())
@@ -871,22 +870,30 @@ impl View {
         }
     }
 
-    /// Render the session header and transcript body with `ThemeRef` colors.
-    pub(super) fn render_themed(&self, theme_ref: &ThemeRef) -> (String, String) {
+    /// Render the transcript or session picker wrapped cleanly to `width`.
+    pub(super) fn render_transcript_lines(
+        &self,
+        theme_ref: &ThemeRef,
+        width: usize,
+    ) -> Vec<String> {
+        let width = width.max(1);
         let theme = theme_ref.current();
         if let Some(pos) = self.picker {
-            let header = theme.bold(&theme.fg("accent", "Sessions"));
-            let mut body = Vec::new();
+            let mut body = vec![pi_rs_tui::truncate_to_width(
+                &format!(" {}", theme.bold(&theme.fg("accent", "Sessions"))),
+                width,
+                true,
+            )];
             for (index, (_, _, title)) in self.rows.iter().enumerate() {
-                if index == pos {
-                    body.push(theme.fg("accent", &format!("> {title}")));
+                let line = if index == pos {
+                    theme.fg("accent", &format!(" > {title}"))
                 } else {
-                    body.push(theme.fg("text", &format!("  {title}")));
-                }
+                    theme.fg("text", &format!("   {title}"))
+                };
+                body.push(pi_rs_tui::truncate_to_width(&line, width, true));
             }
-            return (header, body.join("\n"));
+            return body;
         }
-        let header = theme.bold(&theme.fg("accent", &self.title));
         let mut lines = Vec::new();
         if let Some(v) = self
             .transcript
@@ -898,22 +905,26 @@ impl View {
                 if let Some(text) = entry["data"]["text"].as_str() {
                     let cleaned = clean(text);
                     if !cleaned.is_empty() {
-                        lines.push(theme.fg("userMessageText", &cleaned));
+                        render_user_block(&cleaned, &theme, width, &mut lines);
                     }
                 } else {
                     for m in entry["model"].as_array().into_iter().flatten() {
-                        render_model_message(m, &theme, &mut lines, false);
+                        render_model_message(m, theme_ref, &theme, width, &mut lines, false);
                     }
                 }
             }
             let live = &v["docs"]["pi.live"]["generation"]["message"];
             if !live.is_null() {
-                render_model_message(live, &theme, &mut lines, true);
+                render_model_message(live, theme_ref, &theme, width, &mut lines, true);
             }
         } else if let Some((_, body)) = self.text.split_once('\n') {
-            lines.push(theme.fg("muted", body));
+            for raw in body.lines() {
+                for wrapped in pi_rs_tui::wrap_text_with_ansi(raw, width.saturating_sub(2).max(1)) {
+                    lines.push(format!(" {}", theme.fg("muted", &wrapped)));
+                }
+            }
         }
-        (header, lines.join("\n"))
+        lines
     }
 
     fn model(&mut self, m: &Value) {
@@ -947,39 +958,119 @@ impl View {
     }
 }
 
+fn render_user_block(
+    text: &str,
+    theme: &pi_rs_p2_tui::theme::Theme,
+    width: usize,
+    lines: &mut Vec<String>,
+) {
+    let inner = width.saturating_sub(2).max(1);
+    let pad_line = theme.bg("userMessageBg", &" ".repeat(width));
+    lines.push(String::new());
+    lines.push(pad_line.clone());
+    for wrapped in pi_rs_tui::wrap_text_with_ansi(text, inner) {
+        let vis = pi_rs_tui::visible_width(&wrapped);
+        let right_pad = width.saturating_sub(1 + vis);
+        let row = format!(" {wrapped}{}", " ".repeat(right_pad));
+        lines.push(theme.bg("userMessageBg", &theme.fg("userMessageText", &row)));
+    }
+    lines.push(pad_line);
+}
+
+fn push_model_text(
+    s: &str,
+    role: &str,
+    theme_ref: &ThemeRef,
+    width: usize,
+    started: &mut bool,
+    lines: &mut Vec<String>,
+) {
+    let cleaned = clean(s);
+    if cleaned.is_empty() {
+        return;
+    }
+    if !*started {
+        lines.push(String::new());
+        *started = true;
+    }
+    if role == "assistant" {
+        let md = pi_rs_tui::Markdown::new(
+            cleaned,
+            1,
+            0,
+            theme_ref.markdown(),
+            Default::default(),
+            Default::default(),
+        );
+        lines.extend(pi_rs_tui::Component::render(&md, width));
+    } else {
+        let theme = theme_ref.current();
+        let color = if role == "toolResult" {
+            "muted"
+        } else {
+            "text"
+        };
+        for wrapped in pi_rs_tui::wrap_text_with_ansi(&cleaned, width.saturating_sub(2).max(1)) {
+            lines.push(format!(" {}", theme.fg(color, &wrapped)));
+        }
+    }
+}
+
 fn render_model_message(
     m: &Value,
+    theme_ref: &ThemeRef,
     theme: &pi_rs_p2_tui::theme::Theme,
+    width: usize,
     lines: &mut Vec<String>,
     streaming: bool,
 ) {
     let role = m["role"].as_str().unwrap_or("");
-    let color = match role {
-        "user" => "userMessageText",
-        "toolResult" => "muted",
-        _ => "text",
-    };
-    if let Some(s) = m["content"].as_str() {
-        let cleaned = clean(s);
-        if !cleaned.is_empty() {
-            lines.push(theme.fg(color, &cleaned));
+    if role == "user" {
+        if let Some(s) = m["content"].as_str() {
+            let cleaned = clean(s);
+            if !cleaned.is_empty() {
+                render_user_block(&cleaned, theme, width, lines);
+            }
         }
+        return;
+    }
+    let mut started = false;
+    if let Some(s) = m["content"].as_str() {
+        push_model_text(s, role, theme_ref, width, &mut started, lines);
         return;
     }
     for b in m["content"].as_array().into_iter().flatten() {
         match b["type"].as_str() {
+            Some("thinking") => {
+                if !started {
+                    lines.push(String::new());
+                    started = true;
+                }
+                lines.push(format!(
+                    " {}",
+                    theme.italic(&theme.fg("thinkingText", "Thinking..."))
+                ));
+            }
             Some("text") => {
                 if let Some(s) = b["text"].as_str() {
-                    let cleaned = clean(s);
-                    if !cleaned.is_empty() {
-                        lines.push(theme.fg(color, &cleaned));
-                    }
+                    push_model_text(s, role, theme_ref, width, &mut started, lines);
                 }
             }
             Some("toolCall") => {
+                if !started {
+                    lines.push(String::new());
+                    started = true;
+                }
                 let name = b["name"].as_str().unwrap_or("tool");
                 let suffix = if streaming { "…" } else { "" };
-                lines.push(theme.fg("toolTitle", &format!("[tool: {name}{suffix}]")));
+                lines.push(pi_rs_tui::truncate_to_width(
+                    &format!(
+                        " {}",
+                        theme.fg("toolTitle", &format!("[tool: {name}{suffix}]"))
+                    ),
+                    width,
+                    true,
+                ));
             }
             _ => {}
         }

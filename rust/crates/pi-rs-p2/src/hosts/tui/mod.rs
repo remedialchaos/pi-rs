@@ -9,11 +9,24 @@ mod view;
 mod when;
 use crate::runtime::local_owner::*;
 use pi_rs_chord::node::http::connect_websocket;
-use pi_rs_p2_tui::host::TuiClient;
-use pi_rs_tui::{ComponentRef, ProcessTerminal, Text, Tui, TuiInputListenerResult};
+use pi_rs_p2_tui::{
+    RenderContext,
+    components::{BuiltInHeader, HeaderSource, spread},
+    host::TuiClient,
+};
+use pi_rs_tui::{
+    Component, ComponentRef, Focusable, Input, ProcessTerminal, Tui, TuiInputListenerResult,
+};
 use reqwest::{Client, Url, header};
 use serde_json::{Value, json};
-use std::{cell::Cell, env, error::Error, path::PathBuf, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    env,
+    error::Error,
+    path::PathBuf,
+    rc::Rc,
+    time::Duration,
+};
 
 pub async fn run() -> Result<(), Box<dyn Error>> {
     let default_address = format!(
@@ -242,6 +255,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                     view::View::connect(link, preferred.clone())?,
                     prefs,
                     plugins,
+                    origin.clone(),
+                    if guest { "guest" } else { "owner" },
                 )
                 .await
             }
@@ -341,42 +356,158 @@ fn response_cookie(response: &reqwest::Response) -> Result<String, Box<dyn Error
     Ok(cookie)
 }
 
+struct HeaderRenderCtx(pi_rs_p2_tui::ThemeRef);
+
+impl RenderContext for HeaderRenderCtx {
+    fn theme(&self) -> &pi_rs_p2_tui::ThemeRef {
+        &self.0
+    }
+    fn key_text(&self, id: &str) -> String {
+        match id {
+            "app.tools.expand" => "ctrl+o".into(),
+            "app.interrupt" => "escape".into(),
+            "app.exit" => "ctrl+c".into(),
+            "p2.panel.focus" => "F2".into(),
+            "p2.sessions" => "ctrl+r".into(),
+            _ => String::new(),
+        }
+    }
+    fn request_render(&self) {}
+}
+
+struct TranscriptPane {
+    view: Rc<RefCell<view::View>>,
+    theme: pi_rs_p2_tui::ThemeRef,
+}
+
+impl Component for TranscriptPane {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.view
+            .borrow()
+            .render_transcript_lines(&self.theme, width)
+    }
+}
+
+struct EditorDock {
+    editor: Rc<RefCell<Input>>,
+    theme: pi_rs_p2_tui::ThemeRef,
+    footer_left: Rc<RefCell<String>>,
+    footer_right: Rc<RefCell<String>>,
+}
+
+impl Component for EditorDock {
+    fn render(&self, width: usize) -> Vec<String> {
+        let width = width.max(1);
+        let theme = self.theme.current();
+        let rule = theme.fg("borderMuted", &"─".repeat(width));
+        let mut lines = Vec::new();
+        lines.push(rule.clone());
+        for line in self.editor.borrow().render(width) {
+            lines.push(pi_rs_tui::truncate_to_width(&line, width, false));
+        }
+        lines.push(rule);
+        let left = theme.fg("dim", &self.footer_left.borrow());
+        let right = theme.fg("dim", &self.footer_right.borrow());
+        lines.push(spread(&left, &right, width, 2));
+        lines
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        self.editor.borrow_mut().handle_input(data);
+    }
+
+    fn invalidate(&mut self) {
+        self.editor.borrow_mut().invalidate();
+    }
+
+    fn as_focusable(&mut self) -> Option<&mut dyn Focusable> {
+        Some(self)
+    }
+}
+
+impl Focusable for EditorDock {
+    fn is_focused(&self) -> bool {
+        self.editor.borrow().is_focused()
+    }
+
+    fn set_focused(&mut self, focused: bool) {
+        self.editor.borrow_mut().set_focused(focused);
+    }
+}
+
 async fn mount(
-    mut view: view::View,
+    view: view::View,
     prefs: preferences::Preferences,
     mut plugins: Option<plugins::Plugins>,
+    origin: String,
+    role: &str,
 ) -> Result<(), Box<dyn Error>> {
     let mode = prefs.theme.color_mode;
     let terminal = prefs.theme.terminal.clone();
     let theme = pi_rs_p2_tui::ThemeRef::new(prefs.theme);
 
-    let header = Rc::new(std::cell::RefCell::new(Text::new(
-        &view.text,
-        1,
-        0,
-        Some(theme.fg("text")),
-    )));
-    let root = Rc::new(std::cell::RefCell::new(Text::new(
-        "",
-        1,
-        0,
-        Some(theme.fg("text")),
-    )));
-    let submit = Rc::new(std::cell::RefCell::new(None));
+    let hint_theme = theme.current();
+    let header_component = BuiltInHeader::new(HeaderSource {
+        ctx: Box::new(HeaderRenderCtx(theme.clone())),
+        origin: Some(origin),
+        role: Some(role.to_owned()),
+        connected: true,
+        expanded: false,
+        hints: Box::new(move || {
+            vec![
+                format!(
+                    "{} {}",
+                    hint_theme.fg("dim", "escape"),
+                    hint_theme.fg("muted", "interrupt")
+                ),
+                format!(
+                    "{} {}",
+                    hint_theme.fg("dim", "ctrl+c"),
+                    hint_theme.fg("muted", "quit")
+                ),
+                format!(
+                    "{} {}",
+                    hint_theme.fg("dim", "/"),
+                    hint_theme.fg("muted", "commands")
+                ),
+                format!(
+                    "{} {}",
+                    hint_theme.fg("dim", "F2"),
+                    hint_theme.fg("muted", "panel")
+                ),
+                format!(
+                    "{} {}",
+                    hint_theme.fg("dim", "ctrl+r"),
+                    hint_theme.fg("muted", "sessions")
+                ),
+            ]
+        }),
+        expanded_hints: Box::new(Vec::new),
+    });
+    let header = ComponentRef::new(header_component);
+
+    let view = Rc::new(RefCell::new(view));
+    let root = ComponentRef::new(TranscriptPane {
+        view: view.clone(),
+        theme: theme.clone(),
+    });
+    let submit = Rc::new(RefCell::new(None));
     let posted = submit.clone();
-    let mut editor = pi_rs_tui::Input::default();
+    let mut editor = Input::default();
     editor.on_submit = Some(Box::new(move |text| {
         *posted.borrow_mut() = Some(text.to_owned())
     }));
-    let editor = Rc::new(std::cell::RefCell::new(editor));
-    let field = ComponentRef::from_shared(editor.clone());
-    let mut client = TuiClient::mount_panel(
-        ProcessTerminal::new(),
-        ComponentRef::from_shared(header.clone()),
-        ComponentRef::from_shared(root.clone()),
-        field,
-        prefs.mouse,
-    );
+    let editor = Rc::new(RefCell::new(editor));
+    let footer_left = Rc::new(RefCell::new(view.borrow().title().to_owned()));
+    let footer_right = Rc::new(RefCell::new("p2 tui".to_owned()));
+    let field = ComponentRef::new(EditorDock {
+        editor: editor.clone(),
+        theme: theme.clone(),
+        footer_left: footer_left.clone(),
+        footer_right: footer_right.clone(),
+    });
+    let mut client =
+        TuiClient::mount_panel(ProcessTerminal::new(), header, root, field, prefs.mouse);
     if let Some(path) = prefs.theme_path
         && let Err(error) = client.watch_theme(&path, theme.clone(), mode, terminal)
     {
@@ -477,15 +608,11 @@ async fn mount(
                 editor.borrow_mut().set_value(String::new());
                 panel_open.set(false);
             } else if let Some((id, args)) = slash.and_then(|(name, args)| {
+                let has_dest = view.borrow().destination().is_some();
                 Some((
                     plugins.as_ref()?.slash(
                         name,
-                        &command_context(
-                            view.destination().is_some(),
-                            panel_open.get(),
-                            panel_focus.get(),
-                            false,
-                        ),
+                        &command_context(has_dest, panel_open.get(), panel_focus.get(), false),
                     )?,
                     args,
                 ))
@@ -493,24 +620,30 @@ async fn mount(
                 builtin_panels.close();
                 *command.borrow_mut() = Some((id.to_owned(), args.to_owned()));
                 editor.borrow_mut().set_value(String::new());
-            } else if let Some(outcome) = slash
-                .map(|(name, args)| builtin_panels.handle_slash(name, args, &mut view, &theme))
-                .filter(|outcome| outcome.handled)
-            {
-                if let Some(p) = &mut plugins {
-                    p.detach();
+            } else {
+                let outcome = slash.map(|(name, args)| {
+                    let mut v = view.borrow_mut();
+                    builtin_panels.handle_slash(name, args, &mut v, &theme)
+                });
+                if let Some(outcome) = outcome.filter(|o| o.handled) {
+                    if let Some(p) = &mut plugins {
+                        p.detach();
+                    }
+                    if let Some(msg) = outcome.flash {
+                        client.screen.flash(msg, None);
+                    }
+                    if let Some(frame) = outcome.panel {
+                        client.open_side_panel(frame);
+                        panel_open.set(client.side_panel_shown());
+                    }
+                    editor.borrow_mut().set_value(String::new());
+                    client.screen.base.request_render(false);
+                } else {
+                    let submitted = view.borrow_mut().submit(&text);
+                    if let Err(error) = submitted {
+                        break Err(error.into());
+                    }
                 }
-                if let Some(msg) = outcome.flash {
-                    client.screen.flash(msg, None);
-                }
-                if let Some(frame) = outcome.panel {
-                    client.open_side_panel(frame);
-                    panel_open.set(client.side_panel_shown());
-                }
-                editor.borrow_mut().set_value(String::new());
-                client.screen.base.request_render(false);
-            } else if let Err(error) = view.submit(&text) {
-                break Err(error.into());
             }
         }
         let requested = command.borrow_mut().take();
@@ -561,18 +694,21 @@ async fn mount(
         }
         panel_focus.set(client.side_panel_focused());
         panel_open.set(client.side_panel_shown());
-        chat.set(view.destination().is_some());
+        chat.set(view.borrow().destination().is_some());
         let mut selection_changed = false;
         if let Some(key) = picker_key.take() {
-            if let Err(error) = view.choose(key) {
+            let chosen = view.borrow_mut().choose(key);
+            if let Err(error) = chosen {
                 break Err(error.into());
             }
             selection_changed = true;
-            visible.set(view.choosing());
+            visible.set(view.borrow().choosing());
         }
-        match view.step() {
+        let stepped = view.borrow_mut().step();
+        match stepped {
             Ok(changed) if changed || selection_changed => {
-                if destination.as_ref() != view.destination() {
+                let mut v = view.borrow_mut();
+                if destination.as_ref() != v.destination() {
                     if let Some(p) = &mut plugins {
                         p.detach();
                     }
@@ -582,25 +718,29 @@ async fn mount(
                     if let Some(old) = destination.take() {
                         drafts.insert(old, editor.borrow().value().to_owned());
                     }
-                    destination = view.destination().cloned();
+                    destination = v.destination().cloned();
                     let restored = destination
                         .as_ref()
                         .and_then(|key| drafts.remove(key))
                         .unwrap_or_default();
                     editor.borrow_mut().set_value(restored);
                 }
-                if let Some(text) = view.accepted.take()
+                if let Some(text) = v.accepted.take()
                     && editor.borrow().value() == text
                 {
                     editor.borrow_mut().set_value(String::new());
                 }
-                if let Some(frame) = builtin_panels.refresh(&view, &theme) {
+                if let Some(frame) = builtin_panels.refresh(&v, &theme) {
                     client.open_side_panel(frame);
                 }
-                grants.borrow_mut().display(&view.last_message);
-                let (title, body) = view.render_themed(&theme);
-                header.borrow_mut().set_text(&title);
-                root.borrow_mut().set_text(&body);
+                grants.borrow_mut().display(&v.last_message);
+                *footer_left.borrow_mut() = v.title().to_owned();
+                if let (Some(prov), Some(mid)) = (
+                    v.default_model["provider"].as_str(),
+                    v.default_model["modelId"].as_str(),
+                ) {
+                    *footer_right.borrow_mut() = format!("({prov}) {mid}");
+                }
                 client.screen.base.request_render(false);
             }
             Ok(_) => {}

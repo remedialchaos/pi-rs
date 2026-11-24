@@ -20,6 +20,7 @@ pub struct TuiClient<S = TuiMainScreen> {
 }
 struct PanelLayout {
     split: Rc<RefCell<pi_rs_tui::HStack>>,
+    header: ComponentRef,
     editor: ComponentRef,
     active: Option<(Rc<RefCell<PanelFrame>>, ComponentRef)>,
 }
@@ -55,9 +56,12 @@ impl TuiClient<TuiAltScreen> {
         if let Some(layout) = &mut self.panel_layout
             && let Some((frame, _)) = &layout.active
         {
+            let width = self.screen.base.terminal.width().max(1);
+            let reserved = layout.header.borrow().render(width).len()
+                + layout.editor.borrow().render(width).len();
             frame
                 .borrow_mut()
-                .set_height(self.screen.base.terminal.height().saturating_sub(2));
+                .set_height(self.screen.base.terminal.height().saturating_sub(reserved));
             if self.screen.base.terminal.width() < 100 && frame.borrow().focused {
                 self.screen.base.set_focus(Some(layout.editor.clone()));
             }
@@ -81,9 +85,12 @@ impl TuiClient<TuiAltScreen> {
             return;
         };
         let frame = Rc::new(RefCell::new(panel));
+        let width = self.screen.base.terminal.width().max(1);
+        let reserved =
+            layout.header.borrow().render(width).len() + layout.editor.borrow().render(width).len();
         frame
             .borrow_mut()
-            .set_height(self.screen.base.terminal.height().saturating_sub(2));
+            .set_height(self.screen.base.terminal.height().saturating_sub(reserved));
         let child = ComponentRef::from_shared(frame.clone());
         layout.split.borrow_mut().add_child(
             child.clone(),
@@ -176,7 +183,7 @@ impl TuiClient<TuiAltScreen> {
                 StackEntryOptions {
                     basis: StackBasis::Cells(0),
                     grow: 3.,
-                    min_size: Some(1),
+                    min_size: Some(40),
                     ..Default::default()
                 },
             )],
@@ -187,9 +194,9 @@ impl TuiClient<TuiAltScreen> {
         )));
         let mut panel = VStack::default();
         panel.add_child(
-            header,
+            header.clone(),
             StackEntryOptions {
-                basis: StackBasis::Cells(1),
+                basis: StackBasis::Auto,
                 shrink: 0.,
                 ..Default::default()
             },
@@ -217,6 +224,7 @@ impl TuiClient<TuiAltScreen> {
             theme_watch: None,
             panel_layout: Some(PanelLayout {
                 split,
+                header,
                 editor: field,
                 active: None,
             }),
