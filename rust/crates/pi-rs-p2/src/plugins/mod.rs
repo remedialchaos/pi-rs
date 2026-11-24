@@ -25,6 +25,7 @@ mod search;
 pub mod send_file;
 pub mod settings;
 pub mod shard_a;
+pub mod shard_b;
 pub mod shard_c;
 pub mod shard_c2;
 pub mod shard_d;
@@ -43,6 +44,7 @@ use crate::api::v1::PluginRegistry;
 /// Registers all built-in native `p2` plugins into `registry`.
 pub fn register_builtins(registry: &mut PluginRegistry) -> pi_rs_chord::Result<()> {
     shard_a::register(registry)?;
+    shard_b::register(registry)?;
     shard_c::register(registry)?;
     shard_c2::register(registry)?;
     shard_d::register(registry)?;
