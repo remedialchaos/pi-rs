@@ -183,3 +183,311 @@ async fn agent_is_script_only_and_retries_invalid_answers_in_one_child() -> Test
     worker.close().await?;
     Ok(())
 }
+#[tokio::test]
+async fn backup_chunks_are_store_scoped_and_aborts_leave_no_slot() -> TestResult {
+    use pi_rs_chord::sync::{FileSystemSyncRemote, PutBatchResult};
+    use pi_rs_p2::plugins::backup::{Begun, CHUNK_BYTES, Uploads};
+
+    let fixture = tempfile::tempdir()?;
+    let remote = Arc::new(FileSystemSyncRemote::new(fixture.path()));
+    let uploads = Uploads::new(remote.clone(), "device".into());
+    let Begun::Upload(aborted) = uploads.begin("session-first", 0, 1, false).await? else {
+        return Err("expected a new upload".into());
+    };
+    assert!(
+        uploads
+            .append("session-second", &aborted, vec![9])
+            .await
+            .is_err()
+    );
+    assert!(uploads.finish("session-second", &aborted).await.is_err());
+    uploads.abort("session-second", &aborted).await;
+    assert!(
+        uploads
+            .append("session-first", &aborted, vec![0; CHUNK_BYTES + 1])
+            .await
+            .is_err()
+    );
+    uploads
+        .append("session-first", &aborted, vec![1, 2])
+        .await?;
+    uploads.abort("session-first", &aborted).await;
+    assert!(uploads.finish("session-first", &aborted).await.is_err());
+    assert!(remote.get_batch("session-first", 0)?.is_none());
+
+    let Begun::Upload(upload) = uploads.begin("session-first", 0, 1, true).await? else {
+        return Err("expected an upload after abort".into());
+    };
+    let payload = vec![0xa5; CHUNK_BYTES];
+    uploads
+        .append("session-first", &upload, payload.clone())
+        .await?;
+    uploads
+        .append("session-first", &upload, vec![0xf0, 0x0d])
+        .await?;
+    assert_eq!(
+        uploads.finish("session-first", &upload).await?,
+        PutBatchResult::Created
+    );
+    let mut restored = Vec::new();
+    std::io::Read::read_to_end(
+        &mut remote
+            .get_batch("session-first", 0)?
+            .ok_or("missing backup")?,
+        &mut restored,
+    )?;
+    assert_eq!(&restored[..CHUNK_BYTES], payload);
+    assert_eq!(&restored[CHUNK_BYTES..], &[0xf0, 0x0d]);
+    assert_eq!(remote.list("session-first")?.batches[0].archive, Some(true));
+    let Begun::Result(result) = uploads.begin("session-first", 0, 1, false).await? else {
+        return Err("a committed slot requested another body".into());
+    };
+    assert_eq!(
+        result,
+        PutBatchResult::Exists {
+            to: 1,
+            device: "device".into()
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn backup_bookmark_and_remote_restore_cover_updates_after_an_archive() -> TestResult {
+    use pi_rs_chord::{
+        sqlite::SqliteDatabase,
+        store::{ColumnRecord, ColumnType, Query, StoreEngine, TableDefinition},
+        sync::FileSystemSyncRemote,
+    };
+    use pi_rs_p2::plugins::backup::BackupStore;
+
+    let fixture = tempfile::tempdir()?;
+    let source = fixture.path().join("source");
+    let destination = fixture.path().join("destination");
+    let remote = Arc::new(FileSystemSyncRemote::new(fixture.path().join("remote")));
+    let origin =
+        StoreEngine::open(SqliteDatabase::open(":memory:", Default::default()).await?).await?;
+    let table = TableDefinition::new(
+        "backup_fixture",
+        1,
+        indexmap::IndexMap::from([("id".into(), ColumnRecord::new(ColumnType::Str))]),
+        vec!["id".into()],
+        indexmap::IndexMap::new(),
+    )?;
+    origin.commit(table.declaration("fixture")?).await?;
+    let backup = BackupStore::open(
+        origin.clone(),
+        "server".into(),
+        &source,
+        "target",
+        remote.clone(),
+        "device".into(),
+    )
+    .await?;
+    backup.run(|_| {}).await?;
+    origin
+        .commit(vec![table.put("fixture", json!({"id": "expected"}))?])
+        .await?;
+    drop(backup);
+    let reopened = BackupStore::open(
+        origin,
+        "server".into(),
+        &source,
+        "target",
+        remote.clone(),
+        "device".into(),
+    )
+    .await?;
+    reopened.run(|_| {}).await?;
+    let history = remote.list("server")?;
+    assert_eq!(history.batches.len(), 2);
+    assert!(
+        history
+            .batches
+            .iter()
+            .any(|batch| batch.after == 0 && batch.archive == Some(true))
+    );
+    let empty = SqliteDatabase::open(":memory:", Default::default()).await?;
+    let restored = BackupStore::restore(
+        remote,
+        "device".into(),
+        "server",
+        &destination,
+        "target",
+        empty,
+    )
+    .await?;
+    assert_eq!(restored.meta().await?.last_seq, 2);
+    assert_eq!(restored.count(Query::new("fixture", table)?).await?, 1);
+    Ok(())
+}
+#[tokio::test]
+async fn backup_worker_streams_its_store_over_the_authenticated_server_link() -> TestResult {
+    use pi_rs_chord::{
+        host::{PluginFacet, define_facet},
+        link::memory_link_pair,
+        remote::{RemoteOptions, RemotePeer},
+        sqlite::SqliteDatabase,
+        sync::FileSystemSyncRemote,
+    };
+    use pi_rs_p2::{
+        api::v1::p2_contracts::lookup,
+        hosts::server::{ServerOptions, start_server},
+        plugins::backup::{self, BACKUP_UPLOADS, BackupService, BackupStore},
+        runtime::server::{install_service, service_of},
+    };
+    use std::{path::PathBuf, sync::Mutex};
+
+    const FIXTURE: &str = "PI_RS_SHARD_E_BACKUP_FIXTURE";
+    let Some(root) = std::env::var_os(FIXTURE).map(PathBuf::from) else {
+        let fixture = tempfile::tempdir()?;
+        let executable = std::env::current_exe()?;
+        let directory = fixture.path();
+        let output = tokio::time::timeout(
+            Duration::from_secs(45),
+            tokio::process::Command::new(executable)
+                .args([
+                    "--exact",
+                    "backup_worker_streams_its_store_over_the_authenticated_server_link",
+                    "--nocapture",
+                ])
+                .env(FIXTURE, directory)
+                .env("P2_BACKUP_DIR", directory.join("remote"))
+                .env_remove("P2_BACKUP")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await??;
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    };
+
+    let mut options = ServerOptions::new(root.join("p2"));
+    options.port = 0;
+    options.fake = true;
+    options.dev = false;
+    backup::register(&mut options.registry)?;
+    let registry = options.registry.clone();
+    let server = start_server(options).await?;
+    let context = Context::background();
+    let backup_local = server
+        .host
+        .get(Arc::new(lookup("p2.backup")?), json!({}).into(), &context)
+        .await?;
+    let service = service_of::<BackupService>(&server.host, BACKUP_UPLOADS)?;
+    service.run().await?;
+
+    let (server_link, worker_link) = memory_link_pair();
+    let server_options =
+        RemoteOptions::new(json!({"kind":"worker","session":"sample","generation":1}));
+    let serving = server.host.accept(server_link, server_options)?;
+    let connection = Arc::new(Mutex::new(None::<Arc<RemotePeer>>));
+    let (session, _parent) = handshake(&server.data_dir).await?;
+    let fake = faux_provider(Default::default());
+    let models = Models::default();
+    models.set_provider(fake.provider.clone());
+    let retained = connection.clone();
+    let worker = start_session_worker_configured(
+        session,
+        &registry,
+        Some(&["backup".into()]),
+        models,
+        move |_| {
+            Ok(vec![PluginFacet::new(
+                "backup-fixture-peer",
+                define_facet(move |facet| {
+                    let options = RemoteOptions::new(json!({"kind":"server"}));
+                    let host = facet.host();
+                    let peer = Arc::new(host.connect(worker_link.clone(), options)?);
+                    install_service(&host, "p2.server-peer", &peer)?;
+                    *retained.lock().unwrap_or_else(|error| error.into_inner()) = Some(peer);
+                    Ok(())
+                }),
+            )])
+        },
+    )
+    .await?;
+    let parts = worker.process.harness()?;
+    let conversation = parts.durable.root(&context).await?;
+    fake.set_responses([faux_assistant_message(vec![faux_text("Back me up")]).into()]);
+    let submission = conversation
+        .submit(
+            serde_json::from_value(json!({"type":"input","content":"Please answer"}))?,
+            &context,
+        )
+        .await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), submission.wait(&context))
+            .await??
+            .status,
+        SubmissionStatus::Done
+    );
+    let expected_head = parts.store.meta().await?.last_seq;
+    let remote = Arc::new(FileSystemSyncRemote::new(root.join("remote")));
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let statuses = backup_local
+                .member("statuses")?
+                .value()?
+                .to_json()
+                .to_serde()?;
+            if statuses["session-sample"]["state"] == "synced"
+                && statuses["session-sample"]["syncedHead"]
+                    .as_i64()
+                    .is_some_and(|head| head >= expected_head)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<_, pi_rs_chord::Error>(())
+    })
+    .await??;
+    let listing = remote.list("session-sample")?;
+    let uploaded_head = pi_rs_chord::sync::remote_head(&listing)?;
+    assert!(uploaded_head >= u64::try_from(expected_head)?);
+    let device = backup_local
+        .member("device")?
+        .value()?
+        .to_json()
+        .to_serde()?;
+    let restored = BackupStore::restore(
+        remote,
+        device
+            .as_str()
+            .ok_or("missing server backup device")?
+            .into(),
+        "session-sample",
+        &root.join("restored"),
+        "fixture",
+        SqliteDatabase::open(":memory:", Default::default()).await?,
+    )
+    .await?;
+    assert!(u64::try_from(restored.meta().await?.last_seq)? >= uploaded_head);
+
+    // An owner on a different link cannot obtain the worker-only interface.
+    let (server_link, owner_link) = memory_link_pair();
+    let owner = server.host.accept(
+        server_link,
+        RemoteOptions::new(json!({"kind":"owner","access":"local"})),
+    )?;
+    let options = RemoteOptions::new(json!({"kind":"server"}));
+    let client = RemotePeer::connect(owner_link, options, server.host.batch())?;
+    let denied = client.hold(
+        Arc::new(lookup("p2.backup-remote")?),
+        json!({}).into(),
+        &context,
+    )?;
+    let error = tokio::time::timeout(Duration::from_secs(5), denied.wait(&context)).await?;
+    assert!(error.is_err());
+    drop((owner, client, denied));
+    worker.close().await?;
+    drop((connection, serving));
+    server.close().await?;
+    Ok(())
+}

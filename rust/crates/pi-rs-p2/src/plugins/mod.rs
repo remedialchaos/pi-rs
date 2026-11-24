@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod agent_plugins;
+pub mod backup;
 pub mod cache_warming;
 pub mod codemode;
 pub mod coding_tools;
