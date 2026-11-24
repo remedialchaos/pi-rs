@@ -119,6 +119,46 @@ pub fn server_facet() -> Result<Facet> {
                                 .await?
                                 .clone();
                             install_service(&open_host, MODEL_RESOURCES_SERVICE, &res)?;
+                            let res_pub = res.clone();
+                            let login_res = Arc::new(crate::plugins::shard_a::LoginResources {
+                                directory: res.directory.clone(),
+                                models: res.models.clone(),
+                                model_store: Arc::new(
+                                    pi_rs_ai::models_store::InMemoryModelsStore::default(),
+                                ),
+                                publish: Arc::new(move || {
+                                    let res_pub = res_pub.clone();
+                                    Box::pin(async move { res_pub.reload().await })
+                                }),
+                            });
+                            install_service(
+                                &open_host,
+                                crate::plugins::shard_a::MODEL_RESOURCES,
+                                &login_res,
+                            )?;
+                            let res_save = res.clone();
+                            let saver: Arc<crate::plugins::settings::SettingsSaver> =
+                                Arc::new(move |set, unset| {
+                                    let res_save = res_save.clone();
+                                    Box::pin(async move {
+                                        let mut next = res_save.settings();
+                                        if let Some(obj) = next.as_object_mut() {
+                                            for (k, v) in set {
+                                                obj.insert(k, v);
+                                            }
+                                            for k in unset {
+                                                obj.shift_remove(&k);
+                                            }
+                                        }
+                                        res_save.save_settings(next).await
+                                    })
+                                });
+                            let saver_slot = Arc::new(saver);
+                            install_service(
+                                &open_host,
+                                crate::plugins::settings::SETTINGS_SAVER_SERVICE,
+                                &saver_slot,
+                            )?;
 
                             let (sum_val, snap_val) = resources_state_json(&res)?;
                             sum_w.set(JsonValue::from_serde(sum_val), &ctx.context)?;
@@ -137,12 +177,12 @@ pub fn server_facet() -> Result<Facet> {
                                     }
                                 }
                             });
-                            Ok(task.abort_handle())
+                            Ok((task.abort_handle(), login_res, saver_slot))
                         })
                     },
-                    |handle, _| {
+                    |state, _| {
                         Box::pin(async move {
-                            handle.abort();
+                            state.0.abort();
                             Ok(())
                         })
                     },

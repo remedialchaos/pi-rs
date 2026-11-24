@@ -18,6 +18,10 @@ struct WorkerEnvProvider {
     data_dir: PathBuf,
 }
 
+pub(crate) fn env_provider(data_dir: PathBuf) -> Arc<dyn EnvironmentProvider> {
+    Arc::new(WorkerEnvProvider { data_dir })
+}
+
 impl WorkerEnvProvider {
     fn load_sync(
         &self,

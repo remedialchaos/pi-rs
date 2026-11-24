@@ -133,6 +133,7 @@ pub fn server_facet() -> Result<Facet> {
                                     .get_or_try_init(|| EnvStore::open(dir.clone()))
                                     .await?
                                     .clone();
+                                let dir_for_provider = dir.clone();
                                 let mgr = open_mgr
                                     .get_or_init(|| async {
                                         let cat = cat_open.clone();
@@ -154,6 +155,14 @@ pub fn server_facet() -> Result<Facet> {
 
                                 let wrapper = Arc::new(EnvManagers::new(mgr));
                                 install_service(&open_host, ENV_MANAGERS_SERVICE, &wrapper)?;
+                                let term_provider = Arc::new(
+                                    crate::plugins::envs::worker::env_provider(dir_for_provider),
+                                );
+                                install_service(
+                                    &open_host,
+                                    crate::plugins::terminals::ENVIRONMENT_PROVIDER_SERVICE,
+                                    &term_provider,
+                                )?;
 
                                 let (cfgs, fail) = store_state_json(&store)?;
                                 cfg_w.set(JsonValue::from_serde(cfgs), &ctx.context)?;
@@ -172,7 +181,7 @@ pub fn server_facet() -> Result<Facet> {
                                         }
                                     }
                                 });
-                                Ok((task.abort_handle(), wrapper))
+                                Ok((task.abort_handle(), wrapper, term_provider))
                             })
                         },
                         |state, _| {

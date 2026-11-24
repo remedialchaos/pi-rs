@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 /// Native service key under which `ModelResources` is published via `install_service`.
-pub const MODEL_RESOURCES_SERVICE: &str = "p2.model-resources";
+pub const MODEL_RESOURCES_SERVICE: &str = "p2.model-resources-state";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
