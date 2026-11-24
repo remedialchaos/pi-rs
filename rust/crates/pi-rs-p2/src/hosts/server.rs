@@ -99,6 +99,9 @@ pub struct P2Server {
     loading: Option<Arc<tokio::sync::Mutex<RunningPlugins>>>,
     http: HttpServer,
     natives: Arc<ServerNatives>,
+    _telemetry: Arc<Arc<dyn crate::plugins::telemetry::TelemetryBackend>>,
+    #[cfg(unix)]
+    _reload: Option<Arc<Arc<crate::plugins::dev_tools::ReloadHandler>>>,
     _lock: ProcessLock,
     #[cfg(unix)]
     dev: Option<(Arc<StandaloneDev>, channel::Channel)>,
@@ -416,6 +419,11 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         host.clone(),
         store,
     ));
+    let telemetry_backend: Arc<Arc<dyn crate::plugins::telemetry::TelemetryBackend>> = Arc::new(
+        Arc::new(crate::plugins::telemetry::InMemoryTelemetryBackend(
+            pi_rs_telemetry::InMemoryTelemetryContext::new(),
+        )),
+    );
     let mut server = P2Server {
         host,
         address: http.address,
@@ -425,21 +433,19 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         loading: None,
         http,
         natives,
+        _telemetry: telemetry_backend.clone(),
+        #[cfg(unix)]
+        _reload: None,
         _lock: lock,
         #[cfg(unix)]
         dev: None,
     };
     let load = async {
         install_natives(&server.host, &server.natives)?;
-        let telemetry_backend: Arc<dyn crate::plugins::telemetry::TelemetryBackend> = Arc::new(
-            crate::plugins::telemetry::InMemoryTelemetryBackend(
-                pi_rs_telemetry::InMemoryTelemetryContext::new(),
-            ),
-        );
         crate::runtime::server::install_service(
             &server.host,
             crate::plugins::telemetry::TELEMETRY_STORE_SERVICE,
-            &Arc::new(telemetry_backend),
+            &telemetry_backend,
         )?;
         add_request_services(&mut routes, &server.natives);
         let core = vec![
@@ -499,7 +505,7 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
                 })
                 .await?;
                 let reload_dev = dev.clone();
-                let reload_handler: Arc<crate::plugins::dev_tools::ReloadHandler> =
+                let reload_handler: Arc<Arc<crate::plugins::dev_tools::ReloadHandler>> = Arc::new(
                     Arc::new(move |plugins| {
                         let reload_dev = reload_dev.clone();
                         Box::pin(async move {
@@ -510,12 +516,14 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
                                 "logs": []
                             })))
                         })
-                    });
+                    }),
+                );
                 crate::runtime::server::install_service(
                     &server.host,
                     crate::plugins::dev_tools::PLUGIN_RELOAD_SERVICE,
-                    &Arc::new(reload_handler),
+                    &reload_handler,
                 )?;
+                server._reload = Some(reload_handler);
                 server.dev = Some((dev, channel));
             }
             #[cfg(not(unix))]

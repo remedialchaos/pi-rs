@@ -99,7 +99,7 @@ impl ModelResources {
     pub async fn open(directory: PathBuf, fake: bool) -> Result<Arc<Self>> {
         let credentials = FileCredentialStore::new(directory.join("auth.json"));
         let models = if fake {
-            Models::default()
+            crate::hosts::worker::fake_models()
         } else {
             Models::builtin(ModelsOptions {
                 credentials: Arc::new(credentials.clone()),

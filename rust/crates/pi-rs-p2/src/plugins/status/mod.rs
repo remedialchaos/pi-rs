@@ -505,5 +505,110 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                 ServeOptions::default(),
             )
         }),
+    )?;
+
+    let report_contract = Arc::new(lookup("p2.status-report")?);
+    let remote_status_contract = Arc::new(lookup("p2.session-status")?);
+    registry.register(
+        "status",
+        FacetKind::Worker,
+        define_facet(move |host| {
+            let report_contract = report_contract.clone();
+            let remote_status_contract = remote_status_contract.clone();
+            host.serve(
+                report_contract,
+                move |_, _, object| {
+                    let host_handle = object.host();
+                    let remote_status = remote_status_contract.clone();
+                    let since: Arc<Mutex<BTreeMap<u64, u64>>> = Arc::default();
+                    let mut members = Members::new();
+                    members.method("push", move |_, ctx| {
+                        let host_handle = host_handle.clone();
+                        let remote_status = remote_status.clone();
+                        let since = since.clone();
+                        Box::pin(async move {
+                            let worker = crate::api::v1::worker::worker_of(&host_handle)?;
+                            let harness = worker.harness()?;
+                            let graph = harness
+                                .durable
+                                .task_graph(|_| None, &ctx.context)
+                                .await
+                                .map_err(|e| pi_rs_chord::Error::Invalid(e.to_string()))?;
+                            let tasks = graph.tasks.len();
+                            let mut busy_kinds: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+                            for node in graph.tasks.values() {
+                                if !node.background {
+                                    busy_kinds
+                                        .entry(node.conversation_id)
+                                        .or_default()
+                                        .insert(node.kind.clone());
+                                }
+                            }
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                            let mut work_map = serde_json::Map::new();
+                            {
+                                let mut since_guard =
+                                    since.lock().unwrap_or_else(|e| e.into_inner());
+                                since_guard.retain(|id, _| busy_kinds.contains_key(id));
+                                for (&id, kinds) in &busy_kinds {
+                                    let started = *since_guard.entry(id).or_insert(now_ms);
+                                    let step = if kinds.contains("pi.compaction") {
+                                        json!({"kind": "compacting"})
+                                    } else if kinds.contains("pi.generation") {
+                                        json!({"kind": "thinking"})
+                                    } else {
+                                        json!({"kind": "working"})
+                                    };
+                                    work_map.insert(
+                                        id.to_string(),
+                                        json!({
+                                            "since": started,
+                                            "rounds": 0,
+                                            "step": step,
+                                        }),
+                                    );
+                                }
+                            }
+                            let busy: Vec<u64> = busy_kinds.keys().copied().collect();
+                            if let Ok(peer) = crate::api::v1::server::service_of::<
+                                pi_rs_chord::remote::RemotePeer,
+                            >(
+                                &host_handle, "p2.server-peer"
+                            ) && let Ok(held) = peer.hold(
+                                remote_status,
+                                JsonValue::from_serde(json!({})),
+                                &ctx.context,
+                            ) {
+                                let payload = json!({
+                                    "tasks": tasks,
+                                    "busy": busy,
+                                    "work": Value::Object(work_map),
+                                });
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    async {
+                                        if held.wait(&ctx.context).await.is_ok() {
+                                            let _ = held
+                                                .call(
+                                                    "report",
+                                                    JsonValue::from_serde(payload),
+                                                    &ctx.context,
+                                                )
+                                                .await;
+                                        }
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(JsonValue::Null)
+                        })
+                    })?;
+                    Ok(members)
+                },
+                ServeOptions::default(),
+            )
+        }),
     )
 }

@@ -876,51 +876,10 @@ async fn discord_bot_mock_gateway_and_rest() -> TestResult {
 
 #[tokio::test]
 async fn discord_server_facet_access() -> TestResult {
-    use pi_rs_chord::host::{Members, ServeOptions};
-    use pi_rs_p2::{api::v1::p2_contracts::lookup, runtime::server::ServerServices};
-
     let dir = tempfile::tempdir()?;
     let mut options = ServerOptions::new(dir.path().into());
     options.port = 0;
     register_builtins(&mut options.registry)?;
-    let env_contract = Arc::new(lookup("p2.env-service")?);
-    let env_facet = ServerServices::default().with_facet(move |host| {
-        host.serve(
-            env_contract.clone(),
-            |_, _, self_| {
-                let mut members = Members::new();
-                let configs = self_.follow(|target, ctx| {
-                    Box::pin(async move {
-                        target.set(JsonValue::Object(IndexMap::new()), &ctx.context)?;
-                        Ok(Box::new(|| {}) as Box<dyn FnOnce() + Send>)
-                    })
-                })?;
-                let tests = self_.follow(|target, ctx| {
-                    Box::pin(async move {
-                        target.set(JsonValue::Object(IndexMap::new()), &ctx.context)?;
-                        Ok(Box::new(|| {}) as Box<dyn FnOnce() + Send>)
-                    })
-                })?;
-                let failure = self_.follow(|target, ctx| {
-                    Box::pin(async move {
-                        target.set(JsonValue::Null, &ctx.context)?;
-                        Ok(Box::new(|| {}) as Box<dyn FnOnce() + Send>)
-                    })
-                })?;
-                members.state("configs", configs)?;
-                members.state("tests", tests)?;
-                members.state("failure", failure)?;
-                members.method("test", |_, _| Box::pin(async { Ok(JsonValue::Null) }))?;
-                members.method("reload", |_, _| Box::pin(async { Ok(JsonValue::Null) }))?;
-                Ok(members)
-            },
-            ServeOptions::default(),
-        )?;
-        Ok(())
-    });
-    options
-        .registry
-        .register("test-env-service", FacetKind::Server, env_facet)?;
     let server = start_server(options).await?;
 
     let ctx = Context::background();

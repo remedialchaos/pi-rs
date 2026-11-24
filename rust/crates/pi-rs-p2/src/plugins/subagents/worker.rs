@@ -526,12 +526,10 @@ pub fn worker_facet() -> Result<Facet> {
         let endings_state = Arc::new(AsyncMutex::new(BTreeMap::<ConversationId, usize>::new()));
         let one_shots_cache = Arc::new(AsyncMutex::new(HashSet::<ConversationId>::new()));
 
-        let root_hold = host_handle.root();
-        let held_feed = root_hold.hold(subagents.clone(), JsonValue::Object(IndexMap::new()))?;
-
         // Serve SubagentControl (`p2.subagent-control`).
         let ctrl_proc = process.clone();
-        let ctrl_feed = held_feed.clone();
+        let ctrl_host = host_handle.clone();
+        let ctrl_contract = subagents.clone();
         let ctrl_lock = report_lock.clone();
         let ctrl_seen = seen_state.clone();
         let ctrl_endings = endings_state.clone();
@@ -556,7 +554,8 @@ pub fn worker_facet() -> Result<Facet> {
                 }
 
                 let proc = ctrl_proc.clone();
-                let feed = ctrl_feed.clone();
+                let feed_host = ctrl_host.clone();
+                let feed_contract = ctrl_contract.clone();
                 let lock = ctrl_lock.clone();
                 let seen = ctrl_seen.clone();
                 let endings = ctrl_endings.clone();
@@ -564,7 +563,8 @@ pub fn worker_facet() -> Result<Facet> {
                 let mut members = Members::variant("participant");
                 members.method("archive", move |args, ctx| {
                     let proc = proc.clone();
-                    let feed = feed.clone();
+                    let feed_host = feed_host.clone();
+                    let feed_contract = feed_contract.clone();
                     let lock = lock.clone();
                     let seen = seen.clone();
                     let endings = endings.clone();
@@ -621,12 +621,8 @@ pub fn worker_facet() -> Result<Facet> {
                             let mut e = endings.lock().await;
                             let children =
                                 children_of(&parts.durable, &mut s, &mut e, &ctx.context).await?;
-                            feed.call(
-                                "report",
-                                JsonValue::from_serde(json!({ "children": children })),
-                                &ctx.context,
-                            )
-                            .await?;
+                            report_children(&feed_host, &feed_contract, &children, &ctx.context)
+                                .await?;
                             Ok(JsonValue::Null)
                         })
                         .await
@@ -639,13 +635,13 @@ pub fn worker_facet() -> Result<Facet> {
 
         // Reporter & script-tools sync loop.
         let live_proc = process;
-        let live_feed = held_feed;
+        let live_host = host_handle.downgrade();
+        let live_contract = subagents.clone();
         let lock = report_lock;
         let seen = seen_state;
         let endings = endings_state;
         let one_shots = one_shots_cache;
         tokio::spawn(async move {
-            let _keep_root = root_hold;
             let ctx = Context::background();
             let parts = loop {
                 if live_proc.stopping() {
@@ -754,13 +750,9 @@ pub fn worker_facet() -> Result<Facet> {
                             }
                         }
                     }
-                    live_feed
-                        .call(
-                            "report",
-                            JsonValue::from_serde(json!({ "children": children })),
-                            &ctx,
-                        )
-                        .await?;
+                    if let Some(host) = live_host.upgrade() {
+                        report_children(&host, &live_contract, &children, &ctx).await?;
+                    }
                     Ok::<_, Error>(())
                 }
                 .await;
@@ -778,4 +770,31 @@ pub fn worker_facet() -> Result<Facet> {
 
         Ok(())
     }))
+}
+
+async fn report_children<T: serde::Serialize>(
+    host: &pi_rs_chord::host::Host,
+    contract: &Arc<pi_rs_chord::contracts::Contract>,
+    children: &[T],
+    ctx: &Context,
+) -> Result<()> {
+    let payload = JsonValue::from_serde(json!({ "children": children }));
+    if let Ok(peer) = crate::api::v1::server::service_of::<pi_rs_chord::remote::RemotePeer>(
+        host,
+        "p2.server-peer",
+    ) {
+        let held = peer.hold(contract.clone(), JsonValue::Object(IndexMap::new()), ctx)?;
+        held.wait(ctx).await?;
+        held.call("report", payload, ctx).await?;
+        drop(held);
+        return Ok(());
+    }
+    if host.served_contract(contract.name()).is_some() {
+        let held = host.hold(contract.clone(), JsonValue::Object(IndexMap::new()), ctx)?;
+        held.wait(ctx).await?;
+        let result = held.call("report", payload, ctx).await;
+        held.release();
+        result?;
+    }
+    Ok(())
 }

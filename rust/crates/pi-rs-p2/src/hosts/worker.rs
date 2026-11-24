@@ -113,6 +113,13 @@ pub fn worker_of(host: &Host) -> Result<Arc<WorkerProcess>> {
     crate::runtime::server::service_of::<WorkerProcess>(host, WORKER_PROCESS_SERVICE)
 }
 
+struct HeldWorkerServices {
+    _parent: Arc<pi_rs_chord::remote::RemotePeer>,
+    _files: Arc<pi_rs_chord::node::app::Files>,
+}
+
+type HeldWorkerServicesSlot = Arc<std::sync::Mutex<Option<HeldWorkerServices>>>;
+
 async fn start(
     mut worker: WorkerSession,
     registry: &PluginRegistry,
@@ -175,6 +182,8 @@ async fn start(
         .map(|s| (s.name.clone(), s.digest.clone()))
         .collect();
     let opening = process.clone();
+    let held_services: HeldWorkerServicesSlot = Arc::default();
+    let setup_services = held_services.clone();
     let app = start_worker_with_setup(
         worker,
         WorkerAppOptions {
@@ -188,17 +197,21 @@ async fn start(
             principal_policy: Some(crate::runtime::principals::Principal::POLICY),
             ..Default::default()
         },
-        |host, parent, files| {
-            crate::runtime::server::install_service(
-                host,
-                "p2.server-peer",
-                &Arc::new(parent.clone()),
-            )?;
+        move |host, parent, files| {
+            let parent_arc = Arc::new(parent.clone());
+            let files_arc = Arc::new(files.clone());
+            crate::runtime::server::install_service(host, "p2.server-peer", &parent_arc)?;
             crate::runtime::server::install_service(
                 host,
                 crate::plugins::send_file::WORKER_FILES_SERVICE,
-                &Arc::new(files.clone()),
+                &files_arc,
             )?;
+            *setup_services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HeldWorkerServices {
+                _parent: parent_arc,
+                _files: files_arc,
+            });
             Ok(())
         },
         async move |store| {
@@ -221,12 +234,17 @@ async fn start(
             eprintln!("p2 worker: optional component {name} was not registered");
         }
     }
-    Ok(SessionWorker { app, process })
+    Ok(SessionWorker {
+        app,
+        process,
+        _services: held_services,
+    })
 }
 
 pub struct SessionWorker {
     app: WorkerApp,
     pub process: Arc<WorkerProcess>,
+    _services: HeldWorkerServicesSlot,
 }
 
 impl std::ops::Deref for SessionWorker {
@@ -255,7 +273,7 @@ impl SessionWorker {
     }
 }
 
-fn fake_models() -> Models {
+pub(crate) fn fake_models() -> Models {
     let models = Models::default();
     for (provider, id) in [("faux", "faux-1"), ("fake", "fake")] {
         let faux = Arc::new(faux_provider(FauxOptions {

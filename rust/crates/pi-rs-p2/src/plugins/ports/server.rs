@@ -160,16 +160,20 @@ fn forward_store_members(
     let server_held = object.get(server.clone(), params())?;
     let catalog_held = object.get(catalog.clone(), params())?;
     let host_handle = object.host();
+    let resolver_slot: Arc<Mutex<Option<Arc<crate::plugins::radius::ResolveForward>>>> =
+        Arc::default();
     let opened = object.open(
         {
             let forwards = forwards.clone();
             let revision = revision.clone();
+            let resolver_slot = resolver_slot.clone();
             move |ctx: Ctx| {
                 let server = server_held.clone();
                 let catalog = catalog_held.clone();
                 let forwards = forwards.clone();
                 let revision = revision.clone();
                 let host_handle = host_handle.clone();
+                let resolver_slot = resolver_slot.clone();
                 Box::pin(async move {
                     server.wait(&ctx.context).await?;
                     let info = server.read("info")?.to_serde()?;
@@ -196,29 +200,39 @@ fn forward_store_members(
                     }
                     *lock(&forwards) = Some(store.clone());
                     let resolver_store = store.clone();
-                    let resolver: crate::plugins::radius::ResolveForward = Arc::new(move |id| {
-                        resolver_store
-                            .get(id)
-                            .map(|forward| crate::plugins::radius::Forward {
-                                port: forward.port,
-                                public: forward.public.unwrap_or(false),
-                            })
-                    });
+                    let resolver: Arc<crate::plugins::radius::ResolveForward> =
+                        Arc::new(Arc::new(move |id: &str| {
+                            resolver_store
+                                .get(id)
+                                .map(|forward| crate::plugins::radius::Forward {
+                                    port: forward.port,
+                                    public: forward.public.unwrap_or(false),
+                                })
+                        }));
                     let _ = crate::api::v1::server::install_service(
                         &host_handle,
                         crate::plugins::radius::FORWARD_RESOLVER,
-                        &Arc::new(resolver),
+                        &resolver,
                     );
+                    *resolver_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolver);
                     Ok(store)
                 })
             }
         },
         {
             let forwards = forwards.clone();
+            let resolver_slot = resolver_slot.clone();
             move |_, _| {
                 let forwards = forwards.clone();
+                let resolver_slot = resolver_slot.clone();
                 Box::pin(async move {
                     lock(&forwards).take();
+                    resolver_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
                     Ok(())
                 })
             }

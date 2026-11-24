@@ -7,7 +7,7 @@ use std::{
 
 use indexmap::{IndexMap, IndexSet};
 use pi_rs_ai::{ImageContent, ImageContentKind, InputContent, Tool};
-use pi_rs_chord::{context::Context, host::Held};
+use pi_rs_chord::context::Context;
 use pi_rs_durable::{
     ConversationId,
     harness::{Extension, ToolRegistration, Wrap, section},
@@ -66,7 +66,11 @@ pub(super) struct Variant {
 
 pub(super) type Key = (String, String, String);
 
-pub(super) fn extension(offer: Offer, held: Held, worker: Arc<WorkerProcess>) -> Result<Extension> {
+pub(super) fn extension(
+    offer: Offer,
+    held: super::worker::McpViewRef,
+    worker: Arc<WorkerProcess>,
+) -> Result<Extension> {
     let worker = Arc::downgrade(&worker);
     let variants = variants(&offer);
     let views = Arc::new(offer);
@@ -195,7 +199,7 @@ impl Offer {
 
 fn registration(
     variant: Variant,
-    held: Held,
+    held: super::worker::McpViewRef,
     offer: Arc<Offer>,
     worker: Weak<WorkerProcess>,
 ) -> Result<ToolRegistration> {

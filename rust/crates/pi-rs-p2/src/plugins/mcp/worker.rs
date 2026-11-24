@@ -7,6 +7,9 @@ use pi_rs_chord::{
     context::Context,
     contracts::Contract,
     host::{Facet, Held, Members, RefState, ServeOptions, define_facet},
+    json::JsonValue,
+    remote::{RemotePeer, RemoteReference},
+    state::{NativeSource, Source},
     watch::NativeWatchCall,
 };
 use pi_rs_durable::{
@@ -26,6 +29,54 @@ use super::tools::{NAME, Offer, extension, locate};
 
 const PROJECT_LIMIT: usize = 256 * 1024;
 const SUBAGENTS: &str = "p2.subagents";
+
+#[derive(Clone)]
+pub(super) enum McpViewRef {
+    Local(Held),
+    Remote(RemoteReference),
+}
+
+impl McpViewRef {
+    pub(super) fn state(&self) -> NativeSource<RefState> {
+        match self {
+            Self::Local(held) => held.state(),
+            Self::Remote(remote) => remote.state(),
+        }
+    }
+
+    pub(super) fn member(&self, name: &str) -> Result<Source> {
+        match self {
+            Self::Local(held) => held.member(name),
+            Self::Remote(remote) => remote.member(name),
+        }
+    }
+
+    pub(super) async fn wait(&self, ctx: &Context) -> Result<()> {
+        match self {
+            Self::Local(held) => held.wait(ctx).await,
+            Self::Remote(remote) => remote.wait(ctx).await,
+        }
+    }
+
+    pub(super) async fn call(
+        &self,
+        method: &str,
+        args: JsonValue,
+        ctx: &Context,
+    ) -> Result<JsonValue> {
+        match self {
+            Self::Local(held) => held.call(method, args, ctx).await,
+            Self::Remote(remote) => remote.call(method, args, ctx).await,
+        }
+    }
+
+    pub(super) fn release(self) {
+        match self {
+            Self::Local(held) => held.release(),
+            Self::Remote(remote) => remote.release(),
+        }
+    }
+}
 
 pub(super) fn facet() -> Result<Facet> {
     let view = Arc::new(lookup("p2.mcp")?);
@@ -61,7 +112,24 @@ pub(super) fn facet() -> Result<Facet> {
                             }
                         };
                         let parts = ctx.context.await_with(ready).await.map_err(invalid)?;
-                        let held = host.hold(view, json!({}).into(), &ctx.context)?;
+                        let held = match crate::api::v1::server::service_of::<RemotePeer>(
+                            &host,
+                            "p2.server-peer",
+                        ) {
+                            Ok(peer) => McpViewRef::Remote(peer.hold(
+                                view,
+                                json!({}).into(),
+                                &ctx.context,
+                            )?),
+                            Err(_) if host.served_contract(view.name()).is_some() => {
+                                McpViewRef::Local(host.hold(
+                                    view,
+                                    json!({}).into(),
+                                    &ctx.context,
+                                )?)
+                            }
+                            Err(_) => return Ok(()),
+                        };
                         let run = async {
                             tokio::try_join!(
                                 leases(&worker, &held, &parts.durable.session, &ctx.context),
@@ -87,7 +155,7 @@ pub(super) fn facet() -> Result<Facet> {
 
 async fn leases(
     worker: &WorkerProcess,
-    held: &Held,
+    held: &McpViewRef,
     session: &pi_rs_durable::Session,
     ctx: &Context,
 ) -> Result<()> {
@@ -148,13 +216,18 @@ async fn leases(
                     _ = moves.recv() => {},
                 }
             }
-            Err(Error::Chord(error)) if error.code == "forbidden" => return Ok(()),
+            Err(Error::Chord(error))
+                if error.code == "forbidden"
+                    || (error.code == "unavailable" && error.message == "type is not served") =>
+            {
+                return Ok(());
+            }
             Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
         }
     }
 }
 
-async fn offer_tools(worker: &Arc<WorkerProcess>, held: &Held, ctx: &Context) -> Result<()> {
+async fn offer_tools(worker: &Arc<WorkerProcess>, held: &McpViewRef, ctx: &Context) -> Result<()> {
     let servers = held.member("servers")?;
     let leases = held.member("leases")?;
     let (changed, mut changes) = tokio::sync::watch::channel(0u64);
@@ -180,7 +253,16 @@ async fn offer_tools(worker: &Arc<WorkerProcess>, held: &Held, ctx: &Context) ->
         changes.borrow_and_update();
         settings.borrow_and_update();
         while moves.try_recv().is_ok() {}
-        held.wait(ctx).await?;
+        match held.wait(ctx).await {
+            Ok(()) => {}
+            Err(Error::Chord(error))
+                if error.code == "forbidden"
+                    || (error.code == "unavailable" && error.message == "type is not served") =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         let mut listed: Value = servers.value()?.to_json().to_serde()?;
         let locations = leases.value()?.to_json().to_serde()?;
         let session = worker.location.value();

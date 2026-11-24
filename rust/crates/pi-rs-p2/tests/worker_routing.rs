@@ -11,7 +11,7 @@ use std::{
 
 use pi_rs_chord::{
     context::Context,
-    data::{ChordError, FailureKind},
+    data::ChordError,
     host::{Members, RefState, ServeOptions, define_facet},
     json::JsonValue,
     node::{
@@ -533,10 +533,8 @@ async fn each_guest_hold_requires_a_current_grant_and_an_active_authorizer() -> 
 
     let current = hold_chat(&guest)?;
     let reached = routed_state(&current).await?;
-    // The routing-only binary has no chat facet. Its real worker returns the unserved contract status.
     assert!(
-        matches!(&reached, RefState::Live)
-            || matches!(&reached, RefState::Failed { cause, .. } if cause.kind == FailureKind::Waiting && cause.error.message == "type is not served"),
+        matches!(&reached, RefState::Live),
         "current guest hold: {reached:?}"
     );
     assert_eq!(reads.load(Ordering::SeqCst), 1);
@@ -552,6 +550,9 @@ async fn each_guest_hold_requires_a_current_grant_and_an_active_authorizer() -> 
         .ok_or("child process lock is missing")??
         .path();
     current.release();
+    // `p2.chat` lingers for 30s per upstream spec; stop explicitly so we can assert
+    // the next unauthorized holds do not spawn a new worker.
+    server.workers.stop(ID).await?;
     drop(ProcessLock::acquire(&lock, TIMEOUT).await?);
 
     fs::write(&revision_file, "2")?;
@@ -591,9 +592,14 @@ async fn each_guest_hold_requires_a_current_grant_and_an_active_authorizer() -> 
     );
     let allowed = hold_chat(&internal)?;
     let reached = routed_state(&allowed).await?;
+    // Routing admits `Principal::Host` to non-privileged worker contracts (spawning the worker),
+    // where `p2.chat`'s own viewer check then rejects non-viewer principals with "viewers only".
     assert!(
-        matches!(&reached, RefState::Live)
-            || matches!(&reached, RefState::Failed { cause, .. } if cause.kind == FailureKind::Waiting && cause.error.message == "type is not served"),
+        matches!(
+            &reached,
+            RefState::Failed { cause, .. }
+                if cause.error.code == "forbidden" && cause.error.message == "viewers only"
+        ),
         "internal host hold: {reached:?}"
     );
     assert_eq!(reads.load(Ordering::SeqCst), 2);

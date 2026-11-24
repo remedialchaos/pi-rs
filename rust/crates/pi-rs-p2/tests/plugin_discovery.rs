@@ -209,7 +209,7 @@ async fn server_reload_replaces_native_closure_and_child_serves_delivered_worker
     process.start_timeout = Duration::from_secs(30);
     let workers = Workers::new(process)?;
     let init = serde_json::from_value(
-        json!({"app":"","dataDir":dir.path(),"fake":true,"telemetry":false,"generation":1,"values":{"session":{"id":"active","cwd":"/","model":{"provider":"faux","modelId":"model"},"thinkingLevel":"off"}}}),
+        json!({"app":"","dataDir":dir.path(),"fake":true,"telemetry":false,"generation":1,"values":{"session":{"id":"active","cwd":"/","model":{"provider":"faux","modelId":"faux-1"},"thinkingLevel":"off"}}}),
     )?;
     let child = demand_session(
         &workers,
