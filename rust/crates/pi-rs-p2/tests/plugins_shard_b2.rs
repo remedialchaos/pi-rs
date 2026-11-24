@@ -33,6 +33,12 @@ use pi_rs_p2::{
             server::server_facet as locations_server_facet,
             tool::{LocateConversation, create_location_extension},
         },
+        models::{
+            MODEL_RESOURCES_SERVICE, ModelResources,
+            resources::ModelInfo,
+            scope::{ScopedModel, resolve_model_scope},
+            server::server_facet as models_server_facet,
+        },
         shard_b2::register_builtins,
     },
     runtime::{
@@ -129,8 +135,9 @@ fn shard_b2_registers_locations_plugin() -> TestResult {
     register_builtins(&mut registry)?;
     let selected = registry.select(None)?;
     assert!(selected.contains(&"locations".to_owned()));
-    assert_eq!(registry.facets(FacetKind::Server, &selected).len(), 1);
-    assert_eq!(registry.facets(FacetKind::Worker, &selected).len(), 1);
+    assert!(selected.contains(&"models".to_owned()));
+    assert_eq!(registry.facets(FacetKind::Server, &selected).len(), 2);
+    assert_eq!(registry.facets(FacetKind::Worker, &selected).len(), 2);
     Ok(())
 }
 
@@ -710,5 +717,199 @@ async fn location_tools_defer_main_move_and_place_subagent() -> TestResult {
 
     harness.close(&ctx).await?;
     open.close().await?;
+    Ok(())
+}
+
+#[test]
+fn models_scope_resolves_exact_globs_thinking_levels_and_colons() {
+    let catalog = vec![
+        ModelInfo {
+            provider: "anthropic".into(),
+            model_id: "claude-sonnet-4".into(),
+            name: "Claude Sonnet 4".into(),
+            thinking_levels: vec!["off".into(), "medium".into(), "high".into()],
+            context_window: 200_000,
+        },
+        ModelInfo {
+            provider: "openrouter".into(),
+            model_id: "deepseek/deepseek-r1:exacto".into(),
+            name: "DeepSeek R1 Exacto".into(),
+            thinking_levels: vec!["off".into(), "high".into()],
+            context_window: 64_000,
+        },
+        ModelInfo {
+            provider: "openai".into(),
+            model_id: "gpt-4o".into(),
+            name: "GPT-4o".into(),
+            thinking_levels: vec!["off".into()],
+            context_window: 128_000,
+        },
+    ];
+    let patterns = vec![
+        "anthropic/claude-sonnet-4:medium".to_owned(),
+        "deepseek/deepseek-r1:exacto".to_owned(),
+        "openai/*:off".to_owned(),
+        "claude-sonnet-4:high".to_owned(),
+        "missing-model".to_owned(),
+    ];
+    let result = resolve_model_scope(&patterns, &catalog);
+    assert_eq!(
+        result.models,
+        vec![
+            ScopedModel {
+                provider: "anthropic".into(),
+                model_id: "claude-sonnet-4".into(),
+                thinking_level: Some("medium".into()),
+            },
+            ScopedModel {
+                provider: "openrouter".into(),
+                model_id: "deepseek/deepseek-r1:exacto".into(),
+                thinking_level: None,
+            },
+            ScopedModel {
+                provider: "openai".into(),
+                model_id: "gpt-4o".into(),
+                thinking_level: Some("off".into()),
+            },
+        ]
+    );
+    assert_eq!(result.unmatched, vec!["missing-model".to_owned()]);
+}
+
+#[tokio::test]
+async fn models_server_publishes_resources_enforces_owner_and_persists_settings() -> TestResult {
+    let temp = TempDir::new()?;
+    std::fs::write(
+        temp.path().join("auth.json"),
+        serde_json::to_string(&json!({
+            "anthropic": { "type": "api_key", "key": "test-key" }
+        }))?,
+    )?;
+
+    let server_contract = Arc::new(lookup("p2.server")?);
+    let models_contract = Arc::new(lookup("p2.models")?);
+    let data_dir = temp.path().to_path_buf();
+    let mock_server = define_facet(move |facet_host| {
+        let data_dir = data_dir.clone();
+        facet_host.serve(
+            server_contract.clone(),
+            move |_, _, object| {
+                let mut m = Members::new();
+                m.state(
+                    "info",
+                    object.writable(JsonValue::from_serde(json!({
+                        "app": "",
+                        "dataDir": data_dir,
+                        "fake": false,
+                        "allowedHosts": [],
+                        "port": 0
+                    })))?,
+                )?;
+                m.method("revokeOwners", |_, _| {
+                    Box::pin(async { Ok(JsonValue::Null) })
+                })?;
+                m.method("revokeGuests", |_, _| {
+                    Box::pin(async { Ok(JsonValue::Null) })
+                })?;
+                Ok(m)
+            },
+            ServeOptions::default(),
+        )
+    });
+
+    let ctx = Context::background();
+    let host = create_host(HostOptions {
+        address: Some(JsonValue::from_serde(server_address())),
+        principal: Some(json!({ "kind": "server" })),
+        principal_policy: Some(Principal::POLICY),
+        ..Default::default()
+    })?;
+    let ready = host
+        .load(
+            vec![
+                PluginFacet::new("server", mock_server),
+                PluginFacet::new("models", models_server_facet()?),
+            ],
+            &ctx,
+        )
+        .await?;
+    assert!(ready.failed.is_empty(), "{:?}", ready.failed);
+
+    let worker_peer = connect_as(
+        &host,
+        &Principal::Worker {
+            session: "s1".into(),
+            generation: 1,
+        },
+    )?;
+    let denied = worker_peer.hold(
+        models_contract.clone(),
+        JsonValue::Object(Default::default()),
+        &ctx,
+    )?;
+    assert!(
+        tokio::time::timeout(TIMEOUT, denied.wait(&ctx))
+            .await?
+            .is_err(),
+        "non-owner must be rejected from p2.models"
+    );
+
+    let owner_peer = connect_as(
+        &host,
+        &Principal::Owner {
+            access: OwnerAccess::Local,
+        },
+    )?;
+    let held = owner_peer.hold(
+        models_contract.clone(),
+        JsonValue::Object(Default::default()),
+        &ctx,
+    )?;
+    tokio::time::timeout(TIMEOUT, held.wait(&ctx)).await??;
+
+    // MODEL_RESOURCES_SERVICE is published once ModelConfig opens.
+    let resources =
+        pi_rs_p2::api::v1::server::service_of::<ModelResources>(&host, MODEL_RESOURCES_SERVICE)?;
+    let all_models = resources.models.get_models(None);
+    let first = all_models
+        .iter()
+        .find(|m| m.base.provider == "anthropic")
+        .ok_or("missing builtin anthropic model")?;
+
+    held.call(
+        "setDefault",
+        JsonValue::from_serde(json!({
+            "provider": first.base.provider,
+            "modelId": first.base.id,
+            "thinkingLevel": "low"
+        })),
+        &ctx,
+    )
+    .await?;
+
+    held.call(
+        "setEnabledModels",
+        JsonValue::from_serde(json!({
+            "patterns": [format!("{}/{}", first.base.provider, first.base.id)]
+        })),
+        &ctx,
+    )
+    .await?;
+
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("settings.json"))?)?;
+    assert_eq!(saved["defaultModel"]["provider"], first.base.provider);
+    assert_eq!(saved["defaultModel"]["modelId"], first.base.id);
+    assert_eq!(saved["thinkingLevel"], "low");
+    assert_eq!(
+        saved["enabledModels"],
+        json!([format!("{}/{}", first.base.provider, first.base.id)])
+    );
+
+    let scoped = held.member("scopedModels")?.value()?.to_json().to_serde()?;
+    assert_eq!(scoped.as_array().map(Vec::len), Some(1));
+
+    drop((denied, worker_peer, held, owner_peer));
+    tokio::time::timeout(TIMEOUT, host.close(&ctx)).await??;
     Ok(())
 }
