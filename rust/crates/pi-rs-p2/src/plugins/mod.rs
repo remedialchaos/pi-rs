@@ -31,6 +31,7 @@ pub mod status;
 pub mod subagents;
 pub mod sync;
 pub mod telemetry;
+pub mod terminals;
 pub mod voice;
 pub mod web_shell;
 pub mod workspace;
