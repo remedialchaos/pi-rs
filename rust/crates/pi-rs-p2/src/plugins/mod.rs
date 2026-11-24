@@ -32,6 +32,7 @@ pub mod send_file;
 pub mod settings;
 pub mod shard_a;
 pub mod shard_b;
+pub mod shard_b3;
 pub mod shard_c;
 pub mod shard_c2;
 pub mod shard_d;
@@ -43,10 +44,12 @@ pub mod status;
 pub mod subagents;
 pub mod sync;
 pub mod telemetry;
+pub mod terminals;
 pub mod tree;
 pub mod views;
 pub mod voice;
 pub mod web_shell;
+pub mod workspace;
 
 use crate::api::v1::PluginRegistry;
 
@@ -54,6 +57,7 @@ use crate::api::v1::PluginRegistry;
 pub fn register_builtins(registry: &mut PluginRegistry) -> pi_rs_chord::Result<()> {
     shard_a::register(registry)?;
     shard_b::register(registry)?;
+    shard_b3::register(registry)?;
     shard_c::register(registry)?;
     shard_c2::register(registry)?;
     shard_d::register(registry)?;
