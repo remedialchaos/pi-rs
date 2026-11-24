@@ -10,6 +10,7 @@ pub mod codemode;
 pub mod coding_tools;
 pub mod dev_tools;
 pub mod devices;
+pub mod discord;
 pub mod drafts;
 pub mod familiar;
 pub mod file_index;
@@ -37,6 +38,7 @@ pub mod shard_d;
 pub mod shard_d2;
 pub mod shard_d3;
 pub mod shard_e;
+pub mod shard_e2;
 pub mod status;
 pub mod subagents;
 pub mod sync;
@@ -58,5 +60,6 @@ pub fn register_builtins(registry: &mut PluginRegistry) -> pi_rs_chord::Result<(
     shard_d2::register(registry)?;
     shard_d3::register(registry)?;
     shard_e::register(registry)?;
+    shard_e2::register(registry)?;
     Ok(())
 }
