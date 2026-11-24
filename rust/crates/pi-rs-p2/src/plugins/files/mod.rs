@@ -166,7 +166,10 @@ struct SaveArgs {
 #[derive(Deserialize)]
 struct ResolveArgs {
     ids: Vec<String>,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "deserialized to validate required wire argument on p2.attachments resolve"
+    )]
     conversation: u64,
 }
 

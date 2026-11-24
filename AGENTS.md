@@ -8,7 +8,7 @@ Before planning or editing code, read:
 
 1. [rust/HANDOFF.md](rust/HANDOFF.md) — current milestone, gate table, and hazards.
 2. [rust/MAP.md](rust/MAP.md) — full port plan, active claims, and dependency research queue.
-3. [rust/DECISIONS.md](rust/DECISIONS.md) — binding ADRs (ADR-001 through ADR-009 and any later ADRs).
+3. [rust/DECISIONS.md](rust/DECISIONS.md) — binding ADRs (ADR-001 through ADR-011 and any later ADRs).
 4. [rust/GLOSSARY.md](rust/GLOSSARY.md) — canonical crate, binary, and domain symbol names.
 
 When porting units or wiring front doors, follow the `rust-anything` skill (`SKILL.md` and `whole-app.md`).
@@ -53,9 +53,9 @@ When porting units or wiring front doors, follow the `rust-anything` skill (`SKI
 For every Rust crate change:
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --manifest-path rust/crates/Cargo.toml --all -- --check
+cargo clippy --manifest-path rust/crates/Cargo.toml --workspace --all-targets -- -D warnings
+cargo test --manifest-path rust/crates/Cargo.toml --workspace
 ```
 
 For `rust-anything` unit ports:
