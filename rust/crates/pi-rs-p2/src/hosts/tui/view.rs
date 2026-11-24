@@ -1097,5 +1097,5 @@ fn bound_names(
     let name = variants
         .get(variant as usize)
         .ok_or_else(|| Error::Invalid("Unknown terminal contract variant".into()))?;
-    contract.member_names(Some(name))
+    contract.variant_member_names(Some(name))
 }

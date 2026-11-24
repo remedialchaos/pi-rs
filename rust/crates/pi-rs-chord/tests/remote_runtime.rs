@@ -562,3 +562,160 @@ async fn child_links_stamp_principals_and_abort_drops_the_server_call() -> Resul
     host.close(&Context::background()).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn remote_wire_indexes_state_and_methods_in_sorted_utf16_order() -> Result<()> {
+    use pi_rs_chord::link::{
+        Body, Channel, ChannelHandler, ChannelOptions, Codec, Limits, Message, Part, Payload,
+    };
+
+    // Declare state and method names in reverse alphabetical order to verify wire links
+    // sort them canonically (per upstream contracts/contract.ts::variantNames).
+    let contract = remote_contract(
+        "unsorted",
+        IndexMap::from([
+            ("zebra".into(), Member::State(str())),
+            ("alpha".into(), Member::State(str())),
+            (
+                "z_call".into(),
+                Member::Method {
+                    args: nul(),
+                    result: str(),
+                },
+            ),
+            (
+                "a_call".into(),
+                Member::Method {
+                    args: nul(),
+                    result: str(),
+                },
+            ),
+        ]),
+    )?;
+    let host = remote_host()?;
+    let zebra = Source::new(host.batch(), JsonValue::String("Z".into()))?;
+    let alpha = Source::new(host.batch(), JsonValue::String("A".into()))?;
+    let ty = contract.clone();
+    host.load(
+        vec![PluginFacet::new(
+            "unsorted",
+            define_facet(move |setup| {
+                let (zebra, alpha) = (zebra.clone(), alpha.clone());
+                setup.serve(
+                    ty.clone(),
+                    move |_, _, _| {
+                        let mut members = Members::variant("main");
+                        members.state("zebra", zebra.clone())?;
+                        members.state("alpha", alpha.clone())?;
+                        members.method("z_call", |_, _| {
+                            Box::pin(async { Ok(JsonValue::String("called_z".into())) })
+                        })?;
+                        members.method("a_call", |_, _| {
+                            Box::pin(async { Ok(JsonValue::String("called_a".into())) })
+                        })?;
+                        Ok(members)
+                    },
+                    ServeOptions::default(),
+                )
+            }),
+        )],
+        &Context::background(),
+    )
+    .await?;
+
+    let (a, b) = memory_link_pair();
+    let server = host.accept(a, RemoteOptions::new(serde_json::json!("reader")))?;
+
+    struct Capture(tokio::sync::mpsc::UnboundedSender<Message>);
+    impl ChannelHandler for Capture {
+        fn opened(&self) {}
+        fn message(&self, message: Message) -> pi_rs_chord::sync::SyncFuture<()> {
+            let _ = self.0.send(message);
+            Box::pin(async { Ok(()) })
+        }
+        fn closed(&self) {}
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let channel = Channel::start(
+        b,
+        Arc::new(Capture(tx)),
+        ChannelOptions {
+            codec: Codec::Binary,
+            incarnation: [7; 16],
+            calls: None,
+            report: Arc::new(|_| {}),
+        },
+    )?;
+
+    let fp = u64::from_str_radix(contract.fingerprint(), 16)
+        .map_err(|e| pi_rs_chord::Error::Invalid(e.to_string()))?
+        .to_be_bytes();
+    channel.send(Message::new(Body::Hold {
+        hold: 1,
+        type_name: contract.name().into(),
+        version: contract.version(),
+        fingerprint: fp,
+        params: Part::Text("{}".into()),
+        address_kind: "server".into(),
+        address_params: Box::new(empty()),
+        principal: None,
+        incarnation: None,
+        chain: None,
+        limit: None,
+    }))?;
+
+    let bound = deadline(async {
+        while let Some(msg) = rx.recv().await {
+            if let Body::Bound(entries) = msg.body {
+                return Ok(entries);
+            }
+        }
+        Err(pi_rs_chord::Error::Closed)
+    })
+    .await?;
+    assert_eq!(bound.len(), 1);
+    let mut members: Vec<(u64, JsonValue)> = bound[0]
+        .members
+        .iter()
+        .map(|(i, p)| Ok((*i, p.parse(Limits::for_link(false))?)))
+        .collect::<Result<_>>()?;
+    members.sort_by_key(|(i, _)| *i);
+    // Index 0 MUST be "alpha" ("A"), index 1 MUST be "zebra" ("Z").
+    assert_eq!(
+        members,
+        vec![
+            (0, JsonValue::String("A".into())),
+            (1, JsonValue::String("Z".into())),
+        ]
+    );
+
+    // Method index 0 MUST dispatch "a_call", not "z_call".
+    channel.send(Message::new(Body::Call {
+        call: 1,
+        hold: 1,
+        method: 0,
+        args: Some(Payload {
+            part: Part::Text("null".into()),
+            segments: None,
+        }),
+    }))?;
+    let result = deadline(async {
+        while let Some(msg) = rx.recv().await {
+            if let Body::Result {
+                call: 1,
+                value: Some(payload),
+            } = msg.body
+            {
+                return payload.part.parse(Limits::for_link(false));
+            }
+        }
+        Err(pi_rs_chord::Error::Closed)
+    })
+    .await?;
+    assert_eq!(result, JsonValue::String("called_a".into()));
+
+    channel.close();
+    server.close();
+    host.close(&Context::background()).await?;
+    Ok(())
+}

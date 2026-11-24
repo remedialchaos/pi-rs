@@ -502,6 +502,7 @@ impl Link {
                             });
                             if contract == P2_ACCESS.name {
                                 self.ui.guest.set(variant == 0);
+                                self.ui.status.set("Connected".into());
                             } else if contract == P2_SESSIONS.name {
                                 self.catalog_member = if variant == indexes::sessions::VARIANT_OWNER
                                 {
@@ -512,11 +513,13 @@ impl Link {
                                 self.ui
                                     .create
                                     .set(variant == indexes::sessions::VARIANT_OWNER);
+                                self.ui.status.set("Connected".into());
                             } else if h == self.chat {
                                 self.ui.write.set(
                                     variant == indexes::chat::VARIANT_PARTICIPANT
                                         && self.ui.selected.get_untracked().is_some(),
                                 );
+                                self.ui.status.set("Connected".into());
                             }
                         }
                     }

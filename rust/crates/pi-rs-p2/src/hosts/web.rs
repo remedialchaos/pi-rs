@@ -62,7 +62,7 @@ struct BrowserBundle {
 
 include!(concat!(env!("OUT_DIR"), "/browser_bundle.rs"));
 
-pub(crate) fn browser_base() -> Option<&'static str> {
+pub fn browser_base() -> Option<&'static str> {
     BROWSER_BUNDLE.map(|bundle| bundle.base)
 }
 

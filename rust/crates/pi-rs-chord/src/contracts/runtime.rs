@@ -497,6 +497,16 @@ impl Contract {
             events: variant.events.keys().cloned().collect(),
         })
     }
+    /// A variant's state, method, and event names in canonical Chord wire order (sorted by UTF-16).
+    pub fn variant_member_names(&self, variant: Option<&str>) -> Result<MemberNames> {
+        let name = variant.unwrap_or(LOCAL);
+        let variant = self
+            .current
+            .variants
+            .get(name)
+            .ok_or_else(|| refused(self.name(), format!("no variant \"{name}\"")))?;
+        Ok(variant_names(variant))
+    }
     pub fn evolve(&self, edit: impl FnOnce(&mut Editor) -> Result<()>) -> Result<Self> {
         let mut editor = Editor {
             base: self.clone(),

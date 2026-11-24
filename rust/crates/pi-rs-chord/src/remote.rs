@@ -849,7 +849,7 @@ impl RemotePeer {
             .get(entry.variant as usize)
             .cloned()
             .ok_or_else(|| Error::Invalid("bound: unknown variant index".into()))?;
-        let names = held.contract.member_names(Some(&variant))?.state;
+        let names = held.contract.variant_member_names(Some(&variant))?.state;
         let mut decoders = (0..names.len())
             .map(|_| Decoder::default())
             .collect::<Vec<_>>();
@@ -911,7 +911,7 @@ impl RemotePeer {
         let variant = lock(&held.variant)
             .clone()
             .ok_or_else(|| Error::Invalid("state arrived before bound".into()))?;
-        let names = held.contract.member_names(Some(&variant))?.state;
+        let names = held.contract.variant_member_names(Some(&variant))?.state;
         for (index, part) in entry.members {
             let index = index as usize;
             let name = names
@@ -1028,7 +1028,7 @@ impl RemoteReference {
         let variant = self
             .variant()
             .ok_or_else(|| ChordError::new("not_ready", "reference is not bound"))?;
-        let names = self.0.contract.member_names(Some(&variant))?;
+        let names = self.0.contract.variant_member_names(Some(&variant))?;
         let method = names
             .methods
             .iter()

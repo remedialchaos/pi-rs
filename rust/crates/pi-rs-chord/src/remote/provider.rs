@@ -411,7 +411,7 @@ impl RemotePeer {
             RefState::Live => {
                 let variant = held.variant()?;
                 let contract = held.contract();
-                let names = contract.member_names(Some(&variant))?;
+                let names = contract.variant_member_names(Some(&variant))?;
                 let variant = contract
                     .variant_order()
                     .iter()

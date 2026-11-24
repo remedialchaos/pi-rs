@@ -5,5 +5,5 @@ pub mod server;
 pub mod session_workers;
 pub mod tui;
 pub mod tui_bundles;
-mod web;
+pub mod web;
 pub mod worker;
