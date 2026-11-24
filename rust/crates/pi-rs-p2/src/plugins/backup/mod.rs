@@ -61,6 +61,17 @@ pub type OpenTarget = Arc<dyn Fn() -> SyncFuture<OpenBackupTarget> + Send + Sync
 #[derive(Default)]
 pub struct BackupTargets(RwLock<HashMap<String, OpenTarget>>);
 
+pub fn get_or_install_backup_targets(host: &pi_rs_chord::host::Host) -> Result<Arc<BackupTargets>> {
+    match crate::runtime::server::service_of::<BackupTargets>(host, BACKUP_TARGETS) {
+        Ok(existing) => Ok(existing),
+        Err(_) => {
+            let targets = Arc::new(BackupTargets::default());
+            install_service(host, BACKUP_TARGETS, &targets)?;
+            Ok(targets)
+        }
+    }
+}
+
 impl BackupTargets {
     pub fn offer(&self, name: &str, target: OpenTarget) -> Result<()> {
         check_session_id(name)?;
@@ -271,9 +282,8 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
         FacetKind::Server,
         define_facet(move |facet| {
             let host = facet.host();
-            let targets = Arc::new(BackupTargets::default());
+            let targets = get_or_install_backup_targets(&host)?;
             let service = Arc::new(BackupService::default());
-            install_service(&host, BACKUP_TARGETS, &targets)?;
             install_service(&host, BACKUP_UPLOADS, &service)?;
             let statuses = Reports {
                 state: Source::new(host.batch(), json!({}).into())?,

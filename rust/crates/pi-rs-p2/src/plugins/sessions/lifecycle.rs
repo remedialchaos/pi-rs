@@ -915,6 +915,15 @@ impl Lifecycle {
         copy::remove(&target).await?;
         copy::copy(&session_directory(data, id)?, &target).await?;
         let row = self.row(id, context).await?;
+        if server.host().served_contract("p2.artifact-store").is_some() {
+            let _ = crate::plugins::artifacts::server::copy_session_artifacts(
+                server.host(),
+                id,
+                copy_id,
+                context,
+            )
+            .await;
+        }
         self.catalog
             .call(
                 "update",
@@ -947,6 +956,15 @@ impl Lifecycle {
                 .0
                 .call("copyFiles", wire(json!({"to":copy_id})), &ctx.context)
                 .await?;
+            if server.host().served_contract("p2.artifact-store").is_some() {
+                let _ = crate::plugins::artifacts::server::copy_session_artifacts(
+                    server.host(),
+                    id,
+                    copy_id,
+                    &ctx.context,
+                )
+                .await;
+            }
             ctx.change_state(|state| {
                 *state = wire(json!({"copying":false}));
                 Ok(())

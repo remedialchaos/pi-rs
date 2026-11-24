@@ -173,6 +173,24 @@ fn members(object: &mut ObjectSelf, relay: RelayAccess) -> Result<Members> {
                 install_service(&host, "p2.share-urls", &share)?;
                 let backup = Arc::new(RadiusBackupTarget(Arc::downgrade(&brain)));
                 install_service(&host, BACKUP_TARGET, &backup)?;
+                if let Ok(targets) = crate::plugins::backup::get_or_install_backup_targets(&host) {
+                    let radius_target = backup.clone();
+                    let _ = targets.offer(
+                        "radius",
+                        Arc::new(move || {
+                            let radius_target = radius_target.clone();
+                            Box::pin(async move {
+                                let opened = radius_target.open().await?;
+                                Ok(crate::plugins::backup::OpenBackupTarget {
+                                    remote: Arc::new(opened.remote),
+                                    device: opened.device,
+                                    server: opened.server,
+                                    terminal: None,
+                                })
+                            })
+                        }),
+                    );
+                }
                 let relay_task = if std::env::var("P2_RADIUS").as_deref() == Ok("0") {
                     None
                 } else {

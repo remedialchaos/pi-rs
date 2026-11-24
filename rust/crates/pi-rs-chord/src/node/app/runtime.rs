@@ -285,7 +285,7 @@ pub struct WorkerApp {
     pub files: Files,
     pub plugins: PluginRuntime,
     pub session: WorkerSession,
-    _parent: RemotePeer,
+    pub parent: RemotePeer,
 }
 /// Start a worker with the kit configuration sent by AppServer's native supervisor.
 pub async fn boot_worker(mut session: WorkerSession, core: Vec<PluginFacet>) -> Result<WorkerApp> {
@@ -323,9 +323,28 @@ pub async fn start_worker_with_host(
 
 /// Initialize the application's durable state on the worker store before reporting Ready.
 pub async fn start_worker_with(
+    session: WorkerSession,
+    options: WorkerAppOptions,
+    host_options: HostOptions,
+    before_ready: impl AsyncFnOnce(&StoreEngine) -> Result<bool>,
+) -> Result<WorkerApp> {
+    start_worker_with_setup(
+        session,
+        options,
+        host_options,
+        |_, _, _| Ok(()),
+        before_ready,
+    )
+    .await
+}
+
+/// Like `start_worker_with`, with a synchronous setup hook invoked after connecting to the
+/// parent peer and opening worker files, before loading plugin facets.
+pub async fn start_worker_with_setup(
     mut session: WorkerSession,
     options: WorkerAppOptions,
     host_options: HostOptions,
+    before_load: impl FnOnce(&Host, &RemotePeer, &Files) -> Result<()>,
     before_ready: impl AsyncFnOnce(&StoreEngine) -> Result<bool>,
 ) -> Result<WorkerApp> {
     private_directory(&options.directory)?;
@@ -349,6 +368,7 @@ pub async fn start_worker_with(
             options.files,
         )
         .await?;
+        before_load(&host, &parent, &files)?;
         let mut core = options.core;
         core.push(PluginFacet::new("chord.app.files", files.facet()?));
         core.push(PluginFacet::new(
@@ -394,7 +414,7 @@ pub async fn start_worker_with(
             files,
             plugins,
             session,
-            _parent: parent,
+            parent,
         }),
         Err(error) => {
             let _ = host.close(&Context::background()).await;

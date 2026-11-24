@@ -159,6 +159,7 @@ fn forward_store_members(
     // Recorded now, read once live: the server names the data directory.
     let server_held = object.get(server.clone(), params())?;
     let catalog_held = object.get(catalog.clone(), params())?;
+    let host_handle = object.host();
     let opened = object.open(
         {
             let forwards = forwards.clone();
@@ -168,6 +169,7 @@ fn forward_store_members(
                 let catalog = catalog_held.clone();
                 let forwards = forwards.clone();
                 let revision = revision.clone();
+                let host_handle = host_handle.clone();
                 Box::pin(async move {
                     server.wait(&ctx.context).await?;
                     let info = server.read("info")?.to_serde()?;
@@ -193,6 +195,20 @@ fn forward_store_members(
                         }
                     }
                     *lock(&forwards) = Some(store.clone());
+                    let resolver_store = store.clone();
+                    let resolver: crate::plugins::radius::ResolveForward = Arc::new(move |id| {
+                        resolver_store
+                            .get(id)
+                            .map(|forward| crate::plugins::radius::Forward {
+                                port: forward.port,
+                                public: forward.public.unwrap_or(false),
+                            })
+                    });
+                    let _ = crate::api::v1::server::install_service(
+                        &host_handle,
+                        crate::plugins::radius::FORWARD_RESOLVER,
+                        &Arc::new(resolver),
+                    );
                     Ok(store)
                 })
             }

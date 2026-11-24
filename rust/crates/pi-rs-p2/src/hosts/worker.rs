@@ -14,7 +14,7 @@ use pi_rs_chord::{
     context::Context,
     host::{Host, HostOptions, PluginFacet, define_facet},
     node::{
-        app::{FilesCaps, WorkerApp, WorkerAppOptions, start_worker_with},
+        app::{FilesCaps, WorkerApp, WorkerAppOptions, start_worker_with_setup},
         workers::WorkerSession,
     },
 };
@@ -175,7 +175,7 @@ async fn start(
         .map(|s| (s.name.clone(), s.digest.clone()))
         .collect();
     let opening = process.clone();
-    let app = start_worker_with(
+    let app = start_worker_with_setup(
         worker,
         WorkerAppOptions {
             directory,
@@ -187,6 +187,19 @@ async fn start(
         HostOptions {
             principal_policy: Some(crate::runtime::principals::Principal::POLICY),
             ..Default::default()
+        },
+        |host, parent, files| {
+            crate::runtime::server::install_service(
+                host,
+                "p2.server-peer",
+                &Arc::new(parent.clone()),
+            )?;
+            crate::runtime::server::install_service(
+                host,
+                crate::plugins::send_file::WORKER_FILES_SERVICE,
+                &Arc::new(files.clone()),
+            )?;
+            Ok(())
         },
         async move |store| {
             opening

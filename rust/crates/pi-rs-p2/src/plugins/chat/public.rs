@@ -337,6 +337,23 @@ impl Chat {
                 return Ok(json!({"submissionId":id}));
             }
         }
+        if let Some(host) = self.host.upgrade()
+            && let Ok(extra) = crate::api::v1::server::service_of::<
+                crate::plugins::chat_mode::SendRoutersService,
+            >(&host, crate::plugins::chat_mode::SEND_ROUTERS_SERVICE)
+            && let Ok(input) =
+                serde_json::from_value::<crate::plugins::chat_mode::SendRouterInput>(routed.clone())
+        {
+            for (_, route) in extra.list() {
+                if let Some(result) = route(input.clone(), ctx.clone()).await? {
+                    let value = result.to_serde()?;
+                    if value.is_object() {
+                        return Ok(value);
+                    }
+                    return Ok(json!({"submissionId": value}));
+                }
+            }
+        }
         if let Some(fields) = args.as_object_mut() {
             fields.shift_remove("attachments");
         }

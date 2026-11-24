@@ -431,6 +431,16 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     };
     let load = async {
         install_natives(&server.host, &server.natives)?;
+        let telemetry_backend: Arc<dyn crate::plugins::telemetry::TelemetryBackend> = Arc::new(
+            crate::plugins::telemetry::InMemoryTelemetryBackend(
+                pi_rs_telemetry::InMemoryTelemetryContext::new(),
+            ),
+        );
+        crate::runtime::server::install_service(
+            &server.host,
+            crate::plugins::telemetry::TELEMETRY_STORE_SERVICE,
+            &Arc::new(telemetry_backend),
+        )?;
         add_request_services(&mut routes, &server.natives);
         let core = vec![
             PluginFacet::new(
@@ -488,6 +498,24 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
                     async move { handler.execute(cmd).await }
                 })
                 .await?;
+                let reload_dev = dev.clone();
+                let reload_handler: Arc<crate::plugins::dev_tools::ReloadHandler> =
+                    Arc::new(move |plugins| {
+                        let reload_dev = reload_dev.clone();
+                        Box::pin(async move {
+                            let res = reload_dev.execute(DevCommand::Reload { plugins }).await;
+                            Ok(JsonValue::from_serde(json!({
+                                "refused": if res.ok { serde_json::Value::Null } else { json!(res.message) },
+                                "plugins": res.plugins.unwrap_or_default(),
+                                "logs": []
+                            })))
+                        })
+                    });
+                crate::runtime::server::install_service(
+                    &server.host,
+                    crate::plugins::dev_tools::PLUGIN_RELOAD_SERVICE,
+                    &Arc::new(reload_handler),
+                )?;
                 server.dev = Some((dev, channel));
             }
             #[cfg(not(unix))]

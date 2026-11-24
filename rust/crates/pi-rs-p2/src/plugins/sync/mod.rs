@@ -420,6 +420,84 @@ impl RadiusSyncRemote {
     }
 }
 
+fn map_sync_error(error: RadiusSyncError) -> pi_rs_chord::Error {
+    if is_terminal_sync_error(&error) {
+        pi_rs_chord::data::ChordError::new("backup_terminal", error.to_string()).into()
+    } else {
+        pi_rs_chord::Error::Invalid(error.to_string())
+    }
+}
+
+impl pi_rs_chord::sync::AsyncRemote for RadiusSyncRemote {
+    fn list(&self, id: String) -> SyncFuture<pi_rs_chord::sync::RemoteListing> {
+        let remote = self.clone();
+        Box::pin(async move {
+            let ctx = Context::background();
+            let listing = RadiusSyncRemote::list(&remote, &id, &ctx)
+                .await
+                .map_err(map_sync_error)?;
+            let value = serde_json::to_value(listing)
+                .map_err(|e| pi_rs_chord::Error::Invalid(e.to_string()))?;
+            serde_json::from_value(value).map_err(|e| pi_rs_chord::Error::Invalid(e.to_string()))
+        })
+    }
+
+    fn get_batch(&self, id: String, after: u64) -> SyncFuture<Option<pi_rs_chord::sync::Body>> {
+        let remote = self.clone();
+        Box::pin(async move {
+            let ctx = Context::background();
+            let bytes = RadiusSyncRemote::get_batch(&remote, &id, after, &ctx)
+                .await
+                .map_err(map_sync_error)?;
+            Ok(bytes.map(pi_rs_chord::sync::Body::from_bytes))
+        })
+    }
+
+    fn get_snapshot(&self, id: String, to: u64) -> SyncFuture<Option<pi_rs_chord::sync::Body>> {
+        let remote = self.clone();
+        Box::pin(async move {
+            let ctx = Context::background();
+            let bytes = RadiusSyncRemote::get_snapshot(&remote, &id, to, &ctx)
+                .await
+                .map_err(map_sync_error)?;
+            Ok(bytes.map(pi_rs_chord::sync::Body::from_bytes))
+        })
+    }
+
+    fn put_batch(
+        &self,
+        id: String,
+        batch: pi_rs_chord::sync::BatchInfo,
+        body: pi_rs_chord::sync::Body,
+    ) -> SyncFuture<pi_rs_chord::sync::PutBatchResult> {
+        let remote = self.clone();
+        Box::pin(async move {
+            let ctx = Context::background();
+            let bytes = body.collect().await?;
+            let result = RadiusSyncRemote::put_batch(
+                &remote,
+                &id,
+                batch.after,
+                batch.to,
+                bytes,
+                batch.archive.unwrap_or(false),
+                &ctx,
+            )
+            .await
+            .map_err(map_sync_error)?;
+            Ok(match result {
+                PutBatchResult::Created => pi_rs_chord::sync::PutBatchResult::Created,
+                PutBatchResult::Exists { to, device } => {
+                    pi_rs_chord::sync::PutBatchResult::Exists { to, device }
+                }
+                PutBatchResult::NotHead { head } => {
+                    pi_rs_chord::sync::PutBatchResult::NotHead { head }
+                }
+            })
+        })
+    }
+}
+
 async fn response_failure(resp: reqwest::Response, operation: &str) -> RadiusSyncError {
     let status = resp.status().as_u16();
     let detail = resp
