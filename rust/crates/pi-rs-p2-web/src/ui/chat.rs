@@ -1,6 +1,9 @@
 //! Streaming chat transcript and code blocks (upstream `Chat.tsx`, `Code.tsx`).
 
+use crate::activity::model::ToolActivityTable;
+use crate::browser_plugins::ChatActivity;
 use crate::markdown::{highlight_code, render_html};
+use crate::ui::activity_ui::ActivityRow;
 use leptos::prelude::*;
 
 /// One message in the transcript.
@@ -11,12 +14,15 @@ pub struct ChatMessage {
     pub text: String,
     /// Still receiving tokens.
     pub streaming: bool,
+    /// Tool/activity cards associated with this turn.
+    pub activities: Vec<ChatActivity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageRole {
     User,
     Assistant,
+    Tool,
 }
 
 impl MessageRole {
@@ -24,6 +30,7 @@ impl MessageRole {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::Tool => "tool",
         }
     }
 }
@@ -43,6 +50,7 @@ pub fn append_stream_token(messages: &mut Vec<ChatMessage>, id: &str, token: &st
         role: MessageRole::Assistant,
         text: token.to_owned(),
         streaming: true,
+        activities: Vec::new(),
     });
     true
 }
@@ -71,6 +79,7 @@ pub fn Code(code: String, #[prop(optional)] language: Option<String>) -> impl In
 #[component]
 pub fn MessageRow(message: ChatMessage) -> impl IntoView {
     let is_assistant = message.role == MessageRole::Assistant;
+    let is_tool = message.role == MessageRole::Tool;
     let role = message.role.as_str();
     let html = if is_assistant {
         render_html(&message.text)
@@ -78,13 +87,28 @@ pub fn MessageRow(message: ChatMessage) -> impl IntoView {
         String::new()
     };
     let text = message.text.clone();
+    let activities = message.activities.clone();
+    let tools = ToolActivityTable::new();
     view! {
         <div class="chat-row" data-role=role data-streaming=message.streaming.to_string() data-entry-id=message.id.clone()>
-            {move || if is_assistant {
-                view! { <div class="elanor-markdown" inner_html=html.clone()></div> }.into_any()
-            } else {
-                view! { <div class="user-message">{text.clone()}</div> }.into_any()
-            }}
+            {(!text.is_empty() && !is_tool).then(|| {
+                if is_assistant {
+                    view! { <div class="elanor-markdown" inner_html=html.clone()></div> }.into_any()
+                } else {
+                    view! { <div class="user-message">{text.clone()}</div> }.into_any()
+                }
+            })}
+            {(!activities.is_empty()).then(|| {
+                let activities = activities.clone();
+                let tools = tools.clone();
+                view! {
+                    <div class="chat-activities" data-testid="chat-activities">
+                        {activities.into_iter().map(|act| {
+                            view! { <ActivityRow step=act.step described=act.described tools=tools.clone() /> }
+                        }).collect_view()}
+                    </div>
+                }
+            })}
         </div>
     }
 }
@@ -98,7 +122,7 @@ pub fn Chat(messages: RwSignal<Vec<ChatMessage>>) -> impl IntoView {
             <div class="chat-transcript" role="log" aria-live="polite">
                 <For
                     each=move || messages.get()
-                    key=|message| (message.id.clone(), message.text.clone(), message.streaming)
+                    key=|message| (message.id.clone(), message.text.clone(), message.streaming, message.activities.len())
                     children={move |message: ChatMessage| view! { <MessageRow message=message /> }}
                 />
             </div>
@@ -116,6 +140,7 @@ mod tests {
             role,
             text: text.into(),
             streaming,
+            activities: Vec::new(),
         }
     }
 

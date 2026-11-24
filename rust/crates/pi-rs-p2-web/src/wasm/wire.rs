@@ -1,54 +1,22 @@
-use crate::chord_bridge::{decode_varint, encode_part, encode_string, encode_varint};
-use serde_json::{Value, json};
+use crate::browser_plugins::{
+    P2_ACCESS, P2_CHAT, P2_SESSIONS, encode_call_frame, hold_for_contract,
+};
+use crate::chord_bridge::decode_varint;
+use serde_json::Value;
 
 pub type Result<T> = std::result::Result<T, String>;
 
 pub fn hold(id: u64, session: Option<(&str, u64)>) -> Vec<u8> {
-    // Version, fingerprint and sorted member indexes from p2's declared contracts.
-    let (name, version, hash, params, address, route) = match session {
-        Some((session, conversation)) => (
-            "p2.chat",
-            6,
-            0x15b5fd3b4b340ecau64,
-            json!({ "session":session,"conversation":conversation}),
-            "session",
-            json!({"id":session}),
-        ),
-        None if id == 1 => (
-            "p2.access",
-            1,
-            0x2435548bc2ca4912,
-            json!({}),
-            "server",
-            json!({}),
-        ),
-        None => (
-            "p2.sessions",
-            7,
-            0x1e273ec42b804553,
-            json!({}),
-            "server",
-            json!({}),
-        ),
-    };
-    let mut buf = vec![1];
-    encode_varint(id, &mut buf);
-    encode_string(name, &mut buf);
-    encode_varint(version, &mut buf);
-    buf.extend(hash.to_be_bytes());
-    buf.extend(encode_part(params.to_string().as_bytes(), false));
-    encode_string(address, &mut buf);
-    encode_string(&route.to_string(), &mut buf);
-    buf.push(0);
-    buf
+    match session {
+        Some((session, conversation)) => {
+            hold_for_contract(id, &P2_CHAT, Some(session), Some(conversation), None)
+        }
+        None if id == 1 => hold_for_contract(id, &P2_ACCESS, None, None, None),
+        None => hold_for_contract(id, &P2_SESSIONS, None, None, None),
+    }
 }
 pub fn call(id: u64, hold: u64, method: u64, args: Value) -> Vec<u8> {
-    let mut buf = vec![3];
-    for field in [id, hold, method, 1] {
-        encode_varint(field, &mut buf);
-    }
-    buf.extend(encode_part(args.to_string().as_bytes(), false));
-    buf
+    encode_call_frame(id, hold, method, &args)
 }
 pub struct Reader<'a>(pub &'a [u8]);
 impl<'a> Reader<'a> {

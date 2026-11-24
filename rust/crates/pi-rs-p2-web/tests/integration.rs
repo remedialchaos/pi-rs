@@ -162,3 +162,167 @@ fn completion_popover_and_key_handling() {
         false
     ));
 }
+
+#[test]
+fn all_builtin_contracts_encode_canonical_hold_frames() {
+    use pi_rs_p2_web::browser_plugins::{ALL_CONTRACTS, hold_for_contract};
+    use pi_rs_p2_web::chord_bridge::decode_varint;
+
+    assert_eq!(ALL_CONTRACTS.len(), 14);
+    for (idx, spec) in ALL_CONTRACTS.iter().enumerate() {
+        let hold_id = (idx + 1) as u64;
+        let frame = hold_for_contract(hold_id, spec, Some("s-1"), Some(2), Some("web"));
+        assert_eq!(frame[0], 1, "Hold frame kind for {}", spec.name);
+        let (decoded_id, n1) = decode_varint(&frame[1..]).unwrap();
+        assert_eq!(decoded_id, hold_id);
+        let mut pos = 1 + n1;
+        let (name_len, n2) = decode_varint(&frame[pos..]).unwrap();
+        pos += n2;
+        assert_eq!(&frame[pos..pos + name_len as usize], spec.name.as_bytes());
+        pos += name_len as usize;
+        let (version, n3) = decode_varint(&frame[pos..]).unwrap();
+        assert_eq!(version, spec.version, "version for {}", spec.name);
+        pos += n3;
+        let fp = u64::from_be_bytes(frame[pos..pos + 8].try_into().unwrap());
+        assert_eq!(fp, spec.fingerprint, "fingerprint for {}", spec.name);
+    }
+}
+
+#[test]
+fn rich_chat_projection_and_plugin_decoders_and_fault_isolation() {
+    use pi_rs_p2_web::activity::model::{StepStatus, ToolActivityTable};
+    use pi_rs_p2_web::browser_plugins::{
+        ComposerAttachments, HoldStatus, HoldTracker, P2_CHAT, P2_MODELS, P2_SESSIONS,
+        ProjectedRole, SidePanel, builtin_commands, decode_artifacts_view, decode_costs_view,
+        decode_mcp_view, decode_models_view, decode_session_status_view, decode_settings_view,
+        decode_sharing_view, decode_terminals_list, decode_tree_view, decode_voice_view,
+        project_chat_transcript,
+    };
+    use pi_rs_p2_web::ui::terminal::VoiceState;
+    use serde_json::json;
+
+    let view = json!({
+        "entries": [
+            { "id": 1, "data": { "author": { "kind": "owner" }, "attachments": [], "text": "hello" }, "model": [] },
+            { "id": 2, "data": {}, "model": [{
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "checking" },
+                    { "type": "toolCall", "id": "call-1", "name": "read", "arguments": { "path": "Cargo.toml" } }
+                ]
+            }] },
+            { "id": 3, "data": {}, "model": [{
+                "role": "toolResult",
+                "toolCallId": "call-1",
+                "toolName": "read",
+                "isError": true,
+                "durationMs": 15,
+                "content": [{ "type": "text", "text": "not found" }]
+            }] }
+        ],
+        "docs": {
+            "pi.live": {
+                "generation": {
+                    "message": { "role": "assistant", "content": "working..." }
+                }
+            }
+        }
+    });
+    let projected = project_chat_transcript(&view, &ToolActivityTable::new());
+    assert_eq!(projected.len(), 3);
+    assert_eq!(projected[0].role, ProjectedRole::User);
+    assert_eq!(projected[1].activities.len(), 1);
+    assert_eq!(projected[1].activities[0].step.status, StepStatus::Error);
+    assert!(projected[2].streaming);
+
+    assert_eq!(decode_models_view(Some(&json!([{"provider":"openai","modelId":"gpt-5","name":"GPT-5","contextWindow":128000,"thinkingLevels":["low"]}])), None, None, None).models.len(), 1);
+    assert_eq!(
+        decode_settings_view(Some(&json!({"detail": 2})), None)
+            .entries
+            .get("detail")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        decode_mcp_view(
+            Some(
+                &json!([{"id":"1","server":"s","source":"owner","status":"connected","tools":[]}])
+            ),
+            None,
+            None
+        )
+        .instances
+        .len(),
+        1
+    );
+    assert_eq!(
+        decode_sharing_view(
+            None,
+            Some(&json!([{"mode":"full","token":"t","url":"u"}])),
+            None,
+            None
+        )
+        .links
+        .len(),
+        1
+    );
+    assert!(
+        decode_session_status_view(Some(&json!({"s1":{"running":true,"busy":[1],"tasks":1}})))
+            .statuses
+            .contains_key("s1")
+    );
+    assert_eq!(decode_costs_view(&json!([{"entryId":"e1","cost":0.1,"model":"m","provider":"p","stopReason":"stop","timestamp":1}])).len(), 1);
+    assert_eq!(
+        decode_artifacts_view(Some(
+            &json!([{"id":"a1","kind":"md","title":"A","version":1}])
+        ))
+        .len(),
+        1
+    );
+    assert_eq!(
+        decode_tree_view(
+            &json!({"current":1,"main":1,"branches":[{"conversation":1,"label":"main"}],"nodes":[]})
+        )
+        .branches
+        .len(),
+        1
+    );
+    assert_eq!(decode_terminals_list(&json!(["term-1"])), vec!["term-1"]);
+    assert_eq!(
+        decode_voice_view(Some(&json!(false)), None, None, None).state,
+        VoiceState::Idle
+    );
+
+    let mut attachments = ComposerAttachments::default();
+    attachments.add_files(
+        &[("notes.txt".into(), 100, false)],
+        |i| format!("k{i}"),
+        |_| false,
+    );
+    assert_eq!(
+        attachments
+            .referenced_for_draft("see [notes.txt](attachment:k0)")
+            .len(),
+        1
+    );
+    attachments.remove("k0");
+    assert!(attachments.files.is_empty());
+
+    assert!(SidePanel::Cost.is_open());
+    assert!(!SidePanel::None.is_open());
+    assert!(builtin_commands().iter().any(|c| c.id == "panel-models"));
+
+    let mut tracker = HoldTracker::default();
+    tracker.register(2, P2_SESSIONS.name, true);
+    tracker.register(3, P2_CHAT.name, true);
+    tracker.register(4, P2_MODELS.name, false);
+    assert_eq!(tracker.mark_failed(4, "owner only".into()), None);
+    assert_eq!(
+        tracker.status_of(P2_MODELS.name),
+        Some(&HoldStatus::Unavailable("owner only".into()))
+    );
+    assert_eq!(
+        tracker.mark_failed(3, "chat gone".into()),
+        Some("chat gone".into())
+    );
+}

@@ -59,12 +59,19 @@ pub fn Workbench(
     /// Which pane the main area shows.
     #[prop(optional)]
     shown: Option<MainPane>,
+    /// Reactive main pane signal when driven dynamically.
+    #[prop(optional)]
+    pane_signal: Option<RwSignal<MainPane>>,
 ) -> impl IntoView {
     let shown = shown.unwrap_or(MainPane::Chat);
     let drawer_open: RwSignal<bool> = RwSignal::new(false);
     let toggle_drawer = move |_| drawer_open.update(|open| *open = !*open);
     view! {
-        <div class="workbench" data-pane=shown.pane_name() data-drawer-open=move || drawer_open.get().to_string()>
+        <div
+            class="workbench"
+            data-pane=move || pane_signal.map_or(shown, |s| s.get()).pane_name()
+            data-drawer-open=move || drawer_open.get().to_string()
+        >
             <button type="button" class="drawer-toggle" aria-label="Toggle navigation" on:click=toggle_drawer>
                 "☰"
             </button>
@@ -97,10 +104,15 @@ impl MainPane {
 
 /// The application's root layout.
 #[component]
-pub fn AppLayout(sidebar: AnyView, main: AnyView, panel: Option<AnyView>) -> impl IntoView {
+pub fn AppLayout(
+    sidebar: AnyView,
+    main: AnyView,
+    panel: Option<AnyView>,
+    #[prop(optional)] pane_signal: Option<RwSignal<MainPane>>,
+) -> impl IntoView {
     view! {
         <AppBoundary>
-            <Workbench sidebar=sidebar main=main panel=panel />
+            <Workbench sidebar=sidebar main=main panel=panel pane_signal=pane_signal.unwrap_or_else(|| RwSignal::new(MainPane::Chat)) />
         </AppBoundary>
     }
 }

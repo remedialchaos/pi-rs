@@ -9,6 +9,7 @@
 
 pub mod activity;
 pub mod assets;
+pub mod browser_plugins;
 pub mod chord_bridge;
 pub mod command_menu;
 pub mod cost;
