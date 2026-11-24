@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 #[cfg(unix)]
 use super::dev::{DevCommand, DevControl, DevResult, channel};
@@ -97,6 +103,7 @@ pub struct P2Server {
     pub plugins: Vec<String>,
     pub workers: SessionWorkers,
     loading: Option<Arc<tokio::sync::Mutex<RunningPlugins>>>,
+    tui_bundles: super::tui_bundles::SharedTuiBundles,
     http: HttpServer,
     natives: Arc<ServerNatives>,
     _telemetry: Arc<Arc<dyn crate::plugins::telemetry::TelemetryBackend>>,
@@ -111,6 +118,8 @@ pub struct P2Server {
 struct StandaloneDev {
     control: DevControl,
     workers: SessionWorkers,
+    data_dir: PathBuf,
+    tui_bundles: super::tui_bundles::SharedTuiBundles,
     loading: Arc<tokio::sync::Mutex<RunningPlugins>>,
 }
 
@@ -144,6 +153,15 @@ impl StandaloneDev {
                         .map_err(|error| error.to_string())?;
                     update.log_problems();
                     let report = update.report;
+                    let reserved: BTreeSet<String> = registry
+                        .select(None)
+                        .map_err(|error| error.to_string())?
+                        .into_iter()
+                        .collect();
+                    let next_bundles =
+                        super::tui_bundles::TuiBundleIndex::build(&self.data_dir, &reserved)
+                            .map_err(|error| error.to_string())?;
+                    *self.tui_bundles.write().unwrap_or_else(|e| e.into_inner()) = next_bundles;
                     self.workers.update_authorizers(
                         registry.session_authorizers(&update.selected),
                         &report.failed,
@@ -206,6 +224,9 @@ impl P2Server {
         self.plugins = update.selected;
         let report = update.report;
         *active = registry.clone();
+        let reserved: BTreeSet<String> = registry.select(None)?.into_iter().collect();
+        let next_bundles = super::tui_bundles::TuiBundleIndex::build(&self.data_dir, &reserved)?;
+        *self.tui_bundles.write().unwrap_or_else(|e| e.into_inner()) = next_bundles;
         self.workers.set_builtin_names(registry.select(None)?);
         self.workers
             .update_authorizers(registry.session_authorizers(&self.plugins), &report.failed);
@@ -273,6 +294,11 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     routes.hosts.clone_from(&options.allowed_hosts);
     let nonce = uuid::Uuid::new_v4().to_string();
     super::web::add_routes(&mut routes, nonce.clone())?;
+    let reserved: BTreeSet<String> = options.registry.select(None)?.into_iter().collect();
+    let tui_bundles = Arc::new(std::sync::RwLock::new(
+        super::tui_bundles::TuiBundleIndex::build(&options.data_dir, &reserved)?,
+    ));
+    super::tui_bundles::add_routes(&mut routes, tui_bundles.clone())?;
     let mut headers = HttpWrap::new(
         "p2.response-headers",
         WrapPhase::Headers,
@@ -431,6 +457,7 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         plugins: selected,
         workers,
         loading: None,
+        tui_bundles: tui_bundles.clone(),
         http,
         natives,
         _telemetry: telemetry_backend.clone(),
@@ -496,6 +523,8 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
                 let dev = Arc::new(StandaloneDev {
                     control: DevControl::default(),
                     workers: server.workers.clone(),
+                    data_dir: server.data_dir.clone(),
+                    tui_bundles: server.tui_bundles.clone(),
                     loading,
                 });
                 let handler = dev.clone();

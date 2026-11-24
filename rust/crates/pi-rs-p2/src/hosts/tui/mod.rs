@@ -1,6 +1,6 @@
 mod admission;
 mod grants;
-mod plugins;
+pub mod plugins;
 mod preferences;
 #[cfg(test)]
 mod pty;
@@ -222,14 +222,21 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                     theme.clone(),
                     no_themes,
                 );
-                let plugins = if local && !guest {
-                    let data = env::var_os("P2_DATA_DIR")
+                let local_fallback = (local && !guest).then(|| {
+                    env::var_os("P2_DATA_DIR")
                         .map(PathBuf::from)
-                        .unwrap_or_else(|| home.join(".pi/p2"));
-                    plugins::Plugins::load(data.join("plugins")).await?
-                } else {
-                    None
+                        .unwrap_or_else(|| home.join(".pi/p2"))
+                        .join("plugins")
+                });
+                let remote = plugins::RemoteSource {
+                    client: client.clone(),
+                    base_url: url.clone(),
+                    origin: origin.clone(),
+                    cookie: cookie.clone(),
+                    poll_interval: Duration::from_secs(1),
                 };
+                let plugins =
+                    plugins::Plugins::load_remote_or_local(remote, local_fallback).await?;
                 mount(
                     view::View::connect(link, preferred.clone())?,
                     prefs,
@@ -384,10 +391,13 @@ async fn mount(
     let picking = visible.clone();
     let mut drafts = std::collections::HashMap::new();
     let mut destination = None;
-    let shortcuts = plugins
-        .as_ref()
-        .map(|p| p.shortcuts(&prefs.keys))
-        .unwrap_or_default();
+    let shortcuts = Rc::new(std::cell::RefCell::new(
+        plugins
+            .as_ref()
+            .map(|p| p.shortcuts(&prefs.keys))
+            .unwrap_or_default(),
+    ));
+    let shortcut_table = shortcuts.clone();
     let command = Rc::new(std::cell::RefCell::new(None));
     let shortcut_command = command.clone();
     let panel_open = Rc::new(Cell::new(false));
@@ -420,7 +430,7 @@ async fn mount(
             consume = true;
         }
         if !consume
-            && let Some((_, id, _)) = shortcuts.iter().find(|(key, _, when)| {
+            && let Some((_, id, _)) = shortcut_table.borrow().iter().find(|(key, _, when)| {
                 matches(key)
                     && when.matches(&command_context(
                         session.get(),
@@ -485,6 +495,28 @@ async fn mount(
         }
         let requested = command.borrow_mut().take();
         if let Some(p) = &mut plugins {
+            match p.poll_reload().await {
+                Ok(Some(outcome)) => {
+                    *shortcuts.borrow_mut() = p.shortcuts(&prefs.keys);
+                    if outcome.active_removed {
+                        client.close_side_panel();
+                        panel_open.set(false);
+                    }
+                    for failure in &outcome.failed {
+                        client.screen.flash(
+                            pi_rs_p2_tui::line_text(&format!(
+                                "TUI plugin {} reload failed: {}",
+                                failure.plugin, failure.error
+                            )),
+                            None,
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => client
+                    .screen
+                    .flash(pi_rs_p2_tui::line_text(&error.to_string()), None),
+            }
             if let Some((id, args)) = requested
                 && let Err(error) = p.run(&id, &args).await
             {
