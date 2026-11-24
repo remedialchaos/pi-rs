@@ -226,11 +226,21 @@ impl<T: Clone + Send + 'static> NativeSource<T> {
         lock(&self.0.state).invalidators.extend(invalidators);
     }
     pub fn set(&self, value: T, context: &Context) -> Result<()> {
+        self.set_with(value, context, || {})
+    }
+    pub(crate) fn set_with(
+        &self,
+        value: T,
+        context: &Context,
+        adopted: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
         let state = lock(&self.0.state);
         if let Some(error) = &state.ended {
             return Err(Error::Invalid(error.clone()));
         }
         if state.error.is_none() && (self.0.same)(&value, &state.value) {
+            drop(state);
+            adopted();
             return Ok(());
         }
         drop(state);
@@ -246,6 +256,7 @@ impl<T: Clone + Send + 'static> NativeSource<T> {
             state.error = None;
             drop(state);
             source.changed(&in_batch);
+            adopted();
             Ok(())
         })
     }

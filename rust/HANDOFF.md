@@ -1,47 +1,51 @@
-# pi-rs coordinator handoff
+# `pi-rs` Handoff
 
-**Stopped on 2026-11-23.** All six Astra Low and both Sol Medium Herdr workers exited. Their builds ended. All checkpoints are local. Upstream remains `earendil-works/pi` v1.6.0 at `780bf31fc`.
+- **Checkpoint**: Wave 2 + Phase 3 integration + Phase 4 E2E complete (`33f1ab38d` + docs commit, merged locally onto `main`; **not pushed**).
+- **Stage**: All 18 workspace crates, all 8 binaries (`pi`, `pi-ai`, `pi-env`, `pi-evals`, `p3`, `p2`, `pi-mac`, `pi-voice-server`), and all 49 built-in `p2` plugin directories (48 facet-bearing plugins + `sync` library module) are ported, integrated, and passing offline workspace gates.
+- **Fallback rate**: 0% fallback; `packages/` and `apps/` remain untouched (`git diff 780bf31fc -- packages/ apps/` is empty).
+- **Next action**: User review/push decision on local `main`, plus optional follow-up polish (live Chromium browser E2E with all 48 plugins, dynamic TUI guest dispatch, and any crate-level fidelity items below).
 
-**Resume from `checkpoint/integration-2026-11-23` at `42621514e`.** It contains the combined hosts, Chord changes, worker environment, TUI wheel and theme support, and the latest durable lifecycle changes composed with native telemetry. The primary checkout is on `main`. Its last code change is `0b4979219`. Subsequent changes on main at shutdown are documentation only.
+## Gate Table
 
-## Verification at shutdown
-
-| Area | Status and evidence |
-| --- | --- |
-| Workspace | The earlier 17-crate checkpoint passed 2,236 native tests and 21 leaf proof gates. The workspace now has 18 members. The combined 18-crate fmt, Clippy, WASM and native test gates are outstanding. |
-| Durable harness | On main at `bb908bd1c`, all 91 tests passed and strict all-target Clippy passed. The later worker candidate passed 92 tests on its own base and 81 upstream cases across five lifecycle suites. It adds six tests and strengthens two. The integrated revision has not run this suite. |
-| Durable environment bridge | 46 native tests passed. Two recorded live daemon scenarios matched upstream byte for byte. Both failed under mutation. The proof is in `rust/verification/env-listing`. |
-| Native p2 and browser | On main at `0b4979219`, all ten native tests passed with the production browser bundle. Two mutation checks cover owner access and stale-page reload. Six core HTTP replays passed earlier. The 106 shared contracts match 130 upstream versions. End-to-end native session creation, chat, and persistence are open. |
-| Worker placement and session documents | The placement candidate passed two native tests, the reader-precedence and confinement mutations, two upstream location cases and strict Clippy. Live SSH remains untested. The session-document candidate passed its reopen test, both mutations, strict Clippy and 14 upstream tree cases. |
-| Terminal | The launcher candidate passed the guest-panel PTY exercise and six HTTP replays. The upstream TUI run had 130 passes, two failures and one cancellation out of 133. Two affected cases passed on retry. Clipboard still timed out. The checkpointed WASM fixture has eight embedded build paths anonymized and was validated with the component encoder. The PTY run preceded that metadata change. |
-| Combined host integration | **Clippy failed** at `pi-rs-chord/src/host.rs:238` with E0308. `map_or` inferred a function-item type for the default and received a function pointer from the policy. The affected test suite and the final whole-workspace gates have not passed on this candidate. |
-| Built-in plugins | The six Wave 2 briefs cover all 49 plugin directories. No plugin-shard worktrees were launched. Complete the host contracts and native session/chat path before counting whole-app parity. |
-
-## Local recovery branches
-
-Each worker checkout is under `.worktrees/<branch suffix>`. These branches overlap. Several include dependencies copied from a different worker's branch for compilation. Start from the combined checkpoint and integrate the outstanding changes selectively.
-
-| Branch | Commit | Contents and remaining work |
+| Gate | Status | Evidence |
 | --- | --- | --- |
-| `wt/durable-2.2b` | `9b91a7726` | Standalone harness, 25-module export audit and lifecycle verification. The combined checkpoint includes its later changes alongside observation and telemetry. |
-| `wt/p2-revocation` | `0aaf0008d` | Earlier composition of revocation, server naming, logs, routing, dev socket and terminal launcher. Superseded as the integration starting point by `42621514e`. |
-| `wt/p2-routing` | `bbebf74e7` | Supervised session workers, caller forwarding, idle restart and authorization. Incorporated into the combined candidate. |
-| `wt/p2-dev-control` | `4e07d9d0f` | Standalone development controls. Incorporated into the combined candidate. |
-| `wt/p2-runtime-logs` | `ba710e152` | Process logs, redaction and host lifecycle. Incorporated into the combined candidate. |
-| `wt/p2-worker-environment` | `d4008d43d` | Typed location, placement, confinement and environment lifecycle. Incorporated into the combined candidate. |
-| `wt/p2-launcher` | `c380592a3` | The additional guest panel and shortcut dispatch work still needs integration. |
-| `wt/p2-plugin-discovery` | `b469a2b63` | Native and component discovery. Complete and verify production server and worker refresh. The tested discovery patch and a separate temporary integration overlay are in the evidence directory. |
-| `wt/p2-session-documents` | `875d5d52d` | Session store, main-conversation migration and session locks. Integrate with the worker harness. |
-| `wt/p2-session-files` | `11e01885d` | File transfer and filename/preview handling. Upstream filename cases ran. Native tests, mutations, Clippy and Unicode boundary parity are open. |
-| `wt/p2-server-registries` | `682fef73a` | Server services, request access and supervised host control. Four tests passed against cached artifacts on an earlier revision. The final Cargo and mutation run was interrupted. |
-| `wt/p2-worker-harness` | `a81d90907` | Native worker core, durable session startup and Chord's pre-ready hook. Its cold build was interrupted. |
-| `wt/durable-harness-proof` | `0b4979219` | Empty preparation worktree. No differential harness proof was recorded. |
+| Alignment, `doctor`, `analyze`, repo docs/license, oracle hydration | **PASS** | ADR-001..011 in [DECISIONS.md](DECISIONS.md); `git diff 780bf31fc -- packages/ apps/` empty; privacy scan 0 matches |
+| Primary-source research (8 of 8 topics) | **PASS** | All 8 notes complete in `rust/research/` |
+| Unified 18-crate Cargo workspace (`rust/crates/Cargo.toml`) | **PASS** | `cargo fmt --check` PASS; offline `cargo clippy --workspace --all-targets -- -D warnings` PASS (0 warnings); `cargo check --target wasm32-unknown-unknown -p pi-rs-p2-web` PASS |
+| **1.1** `pi-rs-schema` | **PASS** | 2/2 leaf gates (2,061/2,061); workspace suite PASS, 0 unsafe |
+| **1.2** `pi-rs-telemetry` | **PASS** | 1/1 leaf gate (210/210, 100% cov); workspace suite + 2/2 compile-fail doctests PASS, 0 unsafe |
+| **1.3** `pi-rs-mcp` | **PASS** | 3/3 leaf gates (870/870); workspace suite PASS, 0 lib unsafe |
+| **1.4** `pi-rs-codemode` | **PASS** | 3/3 leaf gates (1,174/1,174); `wasmtime 50.0.2` + `quickjs.wasm 3.6.2`, workspace suite PASS, `#![forbid(unsafe_code)]` |
+| **1.5** `pi-rs-tui` | **PASS** | 5/5 leaf gates (7,782/7,782); workspace suite PASS |
+| **1.6** `pi-rs-ai` (`pi-ai` bin) | **PASS** | 2/2 leaf gates (885/885); 39/39 offline loopback tests PASS, 0 unsafe |
+| **1.7** `pi-rs-agent` | **PASS** | 32/32 offline tests PASS, 0 unsafe/allow/unwrap |
+| **1.8** `pi-rs-coding-agent` (`pi` bin) | **PASS** | 3/3 leaf gates (1,839/1,839); workspace suite PASS (CLI/print/JSON/RPC/PTY/`pi mcp`/MCP+OAuth/WIT), `#![forbid(unsafe_code)]` |
+| **2.1** `pi-rs-chord` | **PASS** | 2/2 leaf gates (4,995/4,995); workspace suite PASS incl. `start_worker_with_setup` + exposed `WorkerApp::parent`, `#![forbid(unsafe_code)]` |
+| **2.2** `pi-rs-durable` (`2.2a` + `2.2b`) | **PASS** | Storage/env/session + full harness restart/recovery/cancellation tests PASS, `#![forbid(unsafe_code)]` |
+| **2.3** `pi-rs-env` (`pi-env` bin) | **PASS** | Daemon + durable bridge + in-process PTY transport for `p2` terminals; workspace suite PASS |
+| **2.4** `pi-rs-evals` (`pi-evals` bin) | **PASS** | Workspace suite PASS (golden report/SHA parity), `#![forbid(unsafe_code)]` |
+| **3.1** `pi-rs-p3` (`p3` bin) | **PASS** | Workspace suite PASS (lib + live `p3` CLI + live child-worker runner), `#![forbid(unsafe_code)]` |
+| **3.2-web** `pi-rs-p2-web` | **PASS (core)** | 135/135 native tests + `wasm32-unknown-unknown` build PASS; packaged into `pi-rs-p2` under production CSP |
+| **3.2-tui** `pi-rs-p2-tui` | **PASS (core)** | 22/22 native tests (5 unit + 11 headless + 6 rendering) + `pi-rs-p2` TUI launcher tests PASS |
+| **3.2** `pi-rs-p2` (`p2` bin, all 49 plugins) | **PASS** | All 49 upstream plugins ported (48 facet plugins + `sync` library); Phase 3 cross-plugin seams wired (`p2.server-peer`, `p2.worker-files`, `p2.send-routers`, `p2.radius-forward-resolver`, `p2.backup-targets`, `p2.model-resources`, `p2.settings-saver`, `p2.terminal-env-provider`, `p2.telemetry-store`, `p2.plugin-reload-handler`, `copy_session_artifacts`, `p2.status-report` worker facet); all 25 test binaries PASS incl. live `p2_all_builtins_e2e` (HTTP, cross-shard services, real `p2 --worker` chat turn, shutdown + restart persistence) |
+| **3.3** `pi-rs-p2-mac` (`pi-mac` bin) | **PASS** | 16/16 Linux tests PASS on `main` checkout + `aarch64-apple-darwin` type-check PASS |
+| **3.4** `pi-rs-voice-server` (`pi-voice-server` bin) | **PASS** | 17/17 offline tests PASS + real Supertonic/Kokoro/Silero/Parakeet verified |
 
-## Resume sequence
+## Key Links
 
-1. Start an isolated checkout with `git worktree add .worktrees/integration-resume checkpoint/integration-2026-11-23`. Fix the Chord type error there. Run strict offline all-target Clippy on `pi-rs-chord`, `pi-rs-p2` and `pi-rs-p2-tui`. Exercise revocation, server rename/restart, default routing, stale-browser handling and the standalone terminal.
-2. Run the combined durable suite and close three audited host contracts. Invalid structured tool output must report the owning extension. A failing host clock must fall back and report once, including reentrant reporting. A host-supplied model selector must be read at use time. Upstream reference cases are in `harness-structured-output.test.ts`, `harness-storage-failure.test.ts` and `harness-host-inputs.test.ts`.
-3. Compose session documents, session files, plugin discovery, server registries, the worker harness and the remaining launcher changes. Exercise a real child reaching Ready only after its durable session opens. Then distribute the 49 plugins and verify the native binary with a disposable data directory, authenticated owner and guest, fake model, persistence across restart, HTTP, WebSocket, terminal, and browser.
-4. Run the full 18-crate workspace format, offline strict Clippy, WASM check and native tests. Confirm `git diff 780bf31fc -- packages/ apps/` is empty and check privacy before delivery.
+- Plan & claims: [MAP.md](MAP.md) | Decisions: [DECISIONS.md](DECISIONS.md) | Glossary: [GLOSSARY.md](GLOSSARY.md) | Leaf map: [PORT_MAP.md](PORT_MAP.md) | Workspace: [crates/Cargo.toml](crates/Cargo.toml)
 
-The local evidence directory is `.git/pi-rs-wind-down-2026-11-23/`. It contains the worker briefs, selected gate and mutation logs, the frozen panel and discovery patches, and the discovery overlay. Build caches under `/var/tmp/pi-rs-target-*` were retained. Space was limited at shutdown. Use per-worker `TMPDIR` and `CARGO_TARGET_DIR` under `/var/tmp`, debug profiles set to zero and `--offline -j1` for cold verification. Keep upstream source read-only and commits local. See [MAP.md](MAP.md) for the milestone inventory and [DECISIONS.md](DECISIONS.md) for the binding ADRs.
+## Known Hazards & Notes
+
+1. **Workspace layout**: Cargo workspace root MUST stay at `rust/crates/Cargo.toml` so local `rust/pi-rs-*` proof crates stay outside Cargo discovery and ignored via `/pi-rs-*/` in `rust/.gitignore`.
+2. **Build cache & temp disk**: `/tmp` is a 4 GiB tmpfs. For large builds, set `CARGO_TARGET_DIR=/var/tmp/pi-rs-target-...` with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`. Avoid setting long `TMPDIR` or deep worktree paths when running `pi-rs-p2-mac` Unix-socket tests (`SUN_LEN` 108-byte limit).
+3. **`install_service` lifetimes**: `runtime/server_services.rs::install_service` stores `Weak<T>` keyed by service name string. Always retain a strong `Arc<T>` for the host/object lifetime and use distinct service keys per concrete type `T`.
+4. **Worker idle shutdown**: Worker facets MUST NOT hold server contracts on the worker's own `Host` (`host.hold(...)`), which increments `host.activity().references` and prevents idle exit; use `"p2.server-peer"` (`RemotePeer::hold`) instead.
+5. **Documented fidelity limits** (recorded per crate `MILESTONE.md`):
+   - `pi-rs-coding-agent`: external live OAuth browser sign-in, startup background catalog refresh/auto-install, single-server MCP reconnect, and exact interactive pixel replay remain future polish.
+   - `pi-rs-p2-web` / `pi-rs-p2-tui`: live Chromium browser E2E with all 48 built-in plugin UIs, dynamic TUI guest dispatch, and full upstream screen comparison remain follow-up polish.
+   - `pi-rs-p2` `ports`: `SessionArchived` cleanup contribution awaits a keyed native-registry seam (archived-session sweep at open is active).
+   - `pi-rs-env`: `packaged_daemon()` assumes npm `bin/` layout (`local_daemon()` is the native path); live `sshd`/Windows/macOS runtime untested on Linux host.
+   - `pi-rs-evals`: offline Docker verification via injectable runner; no live Docker daemon run.
+   - `pi-rs-p2-mac` & `pi-rs-voice-server`: macOS UI/signing deferred per ADR-005; Pocket TTS is a discovery/streaming hook.
+6. **Git & privacy safety**: `packages/` and `apps/` untouched; zero personal real-name metadata or home paths; local `main` held unpushed until user directs.

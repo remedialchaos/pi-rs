@@ -11,6 +11,8 @@ mod list;
 mod output;
 mod process;
 mod pty;
+#[cfg(unix)]
+pub use pty::LocalTerminal;
 mod scan;
 mod sys;
 mod util;

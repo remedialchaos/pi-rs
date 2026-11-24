@@ -1,8 +1,15 @@
-use std::{error::Error, net::SocketAddr, time::Duration};
+use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
-use pi_rs_chord::node::http::HttpContribution;
+use pi_rs_chord::{
+    context::Context,
+    json::JsonValue,
+    link::Link,
+    node::http::{HttpContribution, connect_websocket},
+    remote::{RemoteOptions, RemotePeer},
+    state::Batch,
+};
 use pi_rs_p2::{
-    api::v1::FacetKind,
+    api::v1::{FacetKind, p2_contracts::lookup},
     hosts::server::{P2Server, ServerOptions, start_server},
 };
 use serde_json::json;
@@ -20,6 +27,7 @@ async fn server(directory: &tempfile::TempDir) -> TestResult<P2Server> {
         Box::pin(async move {
             Ok(match request.header("cookie") {
                 Some("fixture=owner") => Some(json!({"kind":"owner","access":"local"})),
+                Some("fixture=device") => Some(json!({"kind":"owner","access":"device","device":"phone"})),
                 Some("fixture=guest" | "fixture=both") => Some(json!({
                     "kind":"guest","id":"guest","name":"Guest","home":"aa-11",
                     "sessions":{"aa-11":"view"},"revision":1
@@ -52,16 +60,6 @@ async fn server(directory: &tempfile::TempDir) -> TestResult<P2Server> {
 
 #[tokio::test]
 async fn access_over_chord_exposes_only_the_authenticated_browsers_own_grant() -> TestResult {
-    use pi_rs_chord::{
-        context::Context,
-        json::JsonValue,
-        node::http::connect_websocket,
-        remote::{RemoteOptions, RemotePeer},
-        state::Batch,
-    };
-    use pi_rs_p2::api::v1::p2_contracts::lookup;
-    use std::sync::Arc;
-
     let directory = tempfile::tempdir()?;
     let server = server(&directory).await?;
     let contract = Arc::new(lookup("p2.access")?);
@@ -85,20 +83,7 @@ async fn access_over_chord_exposes_only_the_authenticated_browsers_own_grant() -
         ),
         ("fixture=worker", "forbidden", None),
     ] {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::COOKIE, cookie.parse()?);
-        let link = connect_websocket(
-            &format!("ws://{}/chord?client=script", server.address),
-            headers,
-            1024 * 1024,
-            4 * 1024 * 1024,
-        )
-        .await?;
-        let client = RemotePeer::connect(
-            link,
-            RemoteOptions::new(json!({"kind":"server"})),
-            Batch::new(|_| {}),
-        )?;
+        let (client, _) = browser_link(server.address, cookie).await?;
         let held = client.hold(contract.clone(), JsonValue::from_serde(json!({})), &ctx)?;
         let ready = tokio::time::timeout(Duration::from_secs(5), held.wait(&ctx)).await?;
         if variant == "forbidden" {
@@ -116,6 +101,174 @@ async fn access_over_chord_exposes_only_the_authenticated_browsers_own_grant() -
         client.close();
     }
     server.close().await?;
+    Ok(())
+}
+
+async fn browser_link(
+    address: SocketAddr,
+    cookie: &str,
+) -> TestResult<(RemotePeer, Arc<dyn Link>)> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::COOKIE, cookie.parse()?);
+    let link = connect_websocket(
+        &format!("ws://{address}/chord?client=script"),
+        headers,
+        1024 * 1024,
+        4 * 1024 * 1024,
+    )
+    .await?;
+    let peer = RemotePeer::connect(
+        link.clone(),
+        RemoteOptions::new(json!({"kind":"server"})),
+        Batch::new(|_| {}),
+    )?;
+    Ok((peer, link))
+}
+
+#[tokio::test]
+async fn signing_out_closes_only_selected_live_clients_and_permits_fresh_authentication()
+-> TestResult {
+    use pi_rs_chord::host::Caller;
+    let directory = tempfile::tempdir()?;
+    let server = server(&directory).await?;
+    let ctx = Context::background();
+    let empty = JsonValue::from_serde(json!({}));
+    let core = server
+        .host
+        .get(Arc::new(lookup("p2.server")?), empty.clone(), &ctx)
+        .await?;
+    let access = Arc::new(lookup("p2.access")?);
+    let device_caller = Caller {
+        principal: Some(json!({"kind":"owner","access":"device","device":"phone"})),
+        incarnation: uuid::Uuid::new_v4().to_string(),
+    };
+    let device_access = server
+        .host
+        .hold_as(access.clone(), empty.clone(), device_caller, &ctx)?;
+    device_access.wait(&ctx).await?;
+    let mut clients = Vec::new();
+    for cookie in [
+        "fixture=device",
+        "fixture=owner",
+        "fixture=guest",
+        "fixture=shared",
+    ] {
+        let (client, link) = browser_link(server.address, cookie).await?;
+        let held = client.hold(access.clone(), empty.clone(), &ctx)?;
+        tokio::time::timeout(Duration::from_secs(5), held.wait(&ctx)).await??;
+        clients.push((client, link, held));
+    }
+    for (method, selector, target) in [
+        ("revokeOwners", json!({"device":"phone"}), 0),
+        ("revokeGuests", json!({"id":"guest"}), 2),
+        ("revokeOwners", json!({}), 1),
+    ] {
+        core.call(method, JsonValue::from_serde(selector), &ctx)
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !clients[target].1.closed() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        clients[3].0.fence().await?;
+        assert_eq!(clients[3].2.variant().as_deref(), Some("guest"));
+        if target == 0 {
+            clients[1].0.fence().await?;
+            clients[2].0.fence().await?;
+            assert!(matches!(device_access.wait(&ctx).await,
+                Err(pi_rs_chord::Error::Chord(e)) if e.code == "forbidden" && e.reason.as_deref() == Some("revoked")));
+        }
+    }
+    let (fresh, _) = browser_link(server.address, "fixture=device").await?;
+    let held = fresh.hold(access, empty, &ctx)?;
+    tokio::time::timeout(Duration::from_secs(5), held.wait(&ctx)).await??;
+    assert_eq!(held.variant().as_deref(), Some("owner"));
+    fresh.close();
+    for (client, _, _) in clients {
+        client.close();
+    }
+    server.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_renames_the_server_across_clients_and_restarts() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("identity.json");
+    std::fs::write(&path, b"{ broken")?;
+    let first = server(&directory).await?;
+    let ctx = Context::background();
+    let empty = JsonValue::from_serde(json!({}));
+    let local = first
+        .host
+        .get(Arc::new(lookup("p2.server-name")?), empty.clone(), &ctx)
+        .await?;
+    let settings = Arc::new(lookup("p2.server-name-settings")?);
+    let device = local.read("device")?.to_serde()?;
+    assert_eq!(local.read("name")?.to_serde()?, device);
+    assert!(
+        pi_rs_p2::runtime::logs::process_logs()
+            .notices()
+            .iter()
+            .any(|notice| notice.source == "server"
+                && notice.message.contains("identity.json is not usable"))
+    );
+    for cookie in ["fixture=guest", "fixture=worker"] {
+        let (client, _) = browser_link(first.address, cookie).await?;
+        let held = client.hold(settings.clone(), empty.clone(), &ctx)?;
+        let ready = tokio::time::timeout(Duration::from_secs(5), held.wait(&ctx)).await?;
+        assert!(matches!(ready, Err(pi_rs_chord::Error::Chord(e)) if e.code == "forbidden"));
+        client.close();
+    }
+    let (client, _) = browser_link(first.address, "fixture=owner").await?;
+    let held = client.hold(settings.clone(), empty.clone(), &ctx)?;
+    tokio::time::timeout(Duration::from_secs(5), held.wait(&ctx)).await??;
+    let expected = format!("Lab {}", "\u{10400}".repeat(59));
+    let raw = format!(" Lab\u{0000}\u{200b}\n {}   ", "\u{10400}".repeat(65));
+    held.call("rename", JsonValue::from_serde(json!({"name":raw})), &ctx)
+        .await?;
+    client.fence().await?;
+    assert_eq!(
+        held.member("name")?.value()?.to_json().to_serde()?,
+        json!(expected)
+    );
+    assert_eq!(local.read("chosen")?.to_serde()?, json!(expected));
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        format!("{{\n\t\"name\": \"{expected}\"\n}}\n")
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    client.close();
+    first.close().await?;
+
+    let restarted = server(&directory).await?;
+    let (client, _) = browser_link(restarted.address, "fixture=device").await?;
+    let held = client.hold(settings, empty, &ctx)?;
+    tokio::time::timeout(Duration::from_secs(5), held.wait(&ctx)).await??;
+    assert_eq!(
+        held.member("chosen")?.value()?.to_json().to_serde()?,
+        json!(expected)
+    );
+    held.call(
+        "rename",
+        JsonValue::from_serde(json!({"name":" \t "})),
+        &ctx,
+    )
+    .await?;
+    client.fence().await?;
+    assert!(!path.try_exists()?);
+    assert_eq!(held.member("name")?.value()?.to_json().to_serde()?, device);
+    assert_eq!(held.member("chosen")?.value()?.to_json(), JsonValue::Null);
+    client.close();
+    restarted.close().await?;
     Ok(())
 }
 

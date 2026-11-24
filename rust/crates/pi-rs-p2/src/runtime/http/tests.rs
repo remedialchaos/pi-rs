@@ -26,7 +26,7 @@ async fn authenticated_stale_pages_receive_reload_frame_before_chord_hello()
         host.clone(),
         HttpOptions {
             links_path: Some("/chord".into()),
-            admit_link: |req| super::admit_link(req, Some("current")),
+            admit_link: super::browser_links(Some("current")),
             ..Default::default()
         },
     );
@@ -69,6 +69,18 @@ async fn authenticated_stale_pages_receive_reload_frame_before_chord_hello()
     );
     assert!(super::stale_page("web=old", None).is_none());
     assert!(super::stale_page("", None).is_some());
+    let lines = super::process_logs().lines("stale-pages");
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[0]
+            .text
+            .contains("web bundle unnamed: from before 2026-11-12, current current")
+    );
+    assert!(lines[1].text.contains("web bundle old, current current"));
+    assert!(lines.iter().all(|line| {
+        line.text
+            .contains("the owner (local), unknown browser, from 127.0.0.1")
+    }));
     server.close().await?;
     host.close(&Context::background()).await?;
     Ok(())

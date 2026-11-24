@@ -94,6 +94,7 @@ struct Incoming {
 }
 struct PendingRoute {
     key: Arc<()>,
+    principal: serde_json::Value,
     cancel: Cancel,
 }
 #[derive(Default)]
@@ -103,12 +104,21 @@ struct ReplicaFlow {
     in_flight: usize,
     queued: std::collections::VecDeque<Body>,
 }
+#[derive(Default)]
+struct Connection {
+    channel: Option<Arc<Channel>>,
+    // The owner of a link change runs close/cancellation callbacks outside this lock.
+    changing: bool,
+}
 struct Inner {
     host: Option<crate::host::WeakHost>,
     batch: Batch,
     options: RemoteOptions,
+    principal: Mutex<serde_json::Value>,
+    retry_disconnected: Option<Arc<dyn Fn() + Send + Sync>>,
+    child_ready: AtomicBool,
     incarnation: [u8; 16],
-    channel: Mutex<Option<Arc<Channel>>>,
+    connection: Mutex<Connection>,
     epoch: AtomicU64,
     next_hold: AtomicU64,
     next_call: AtomicU64,
@@ -130,17 +140,19 @@ struct Handler {
 impl ChannelHandler for Handler {
     fn opened(&self) {
         if let Some(inner) = self.peer.upgrade() {
-            if inner.epoch.load(Ordering::Acquire) != self.epoch {
-                return;
-            }
             let peer = RemotePeer(inner);
-            let calls = lock(&peer.0.channel)
-                .as_ref()
-                .and_then(|c| c.peer())
-                .and_then(|(_, calls)| calls);
-            *lock(&peer.0.window) = Arc::new(Semaphore::new(
-                calls.and_then(|n| usize::try_from(n).ok()).unwrap_or(65536),
-            ));
+            {
+                let connection = lock(&peer.0.connection);
+                if peer.0.epoch.load(Ordering::Acquire) != self.epoch {
+                    return;
+                }
+                let Some((_, calls)) = connection.channel.as_ref().and_then(|c| c.peer()) else {
+                    return;
+                };
+                *lock(&peer.0.window) = Arc::new(Semaphore::new(
+                    calls.and_then(|n| usize::try_from(n).ok()).unwrap_or(65536),
+                ));
+            }
             let holds = lock(&peer.0.holds)
                 .values()
                 .filter_map(Weak::upgrade)
@@ -165,10 +177,8 @@ impl ChannelHandler for Handler {
         })
     }
     fn closed(&self) {
-        if let Some(inner) = self.peer.upgrade()
-            && inner.epoch.load(Ordering::Acquire) == self.epoch
-        {
-            RemotePeer(inner).dropped();
+        if let Some(inner) = self.peer.upgrade() {
+            RemotePeer(inner).disconnected(self.epoch);
         }
     }
 }
@@ -184,23 +194,101 @@ struct Reference {
     members: Mutex<IndexMap<String, Source>>,
     decoders: Mutex<Vec<Decoder>>,
     released: AtomicBool,
+    sent_epoch: AtomicU64,
     abort: Mutex<Option<AbortSubscription>>,
 }
 #[derive(Clone)]
 pub struct RemoteReference(Arc<Reference>);
 impl RemotePeer {
+    pub(crate) fn revoke_forwarded(
+        &self,
+        selector: &serde_json::Value,
+        matches: impl Fn(&serde_json::Value) -> bool,
+    ) -> Result<()> {
+        // The route may still be resolving when the caller loses access.
+        let pending = lock(&self.0.pending_routes)
+            .extract_if(.., |_, route| matches(&route.principal))
+            .collect::<Vec<_>>();
+        for (hold, route) in pending {
+            route.cancel.cancel("revoked");
+            if let Err(error) = self.send(Body::Gone {
+                hold,
+                error: wire_error(&crate::host::revoked().into())?,
+            }) {
+                (self.0.options.report)(error.to_string());
+            }
+        }
+        let options = &self.0.options;
+        if options.role != LinkRole::Route && !(options.role == LinkRole::Child && options.trusted)
+        {
+            return Ok(());
+        }
+        // A disconnected route still owns holds that would otherwise be retried.
+        if let Ok(channel) = self.channel() {
+            let selector = JsonValue::from_serde(selector.clone());
+            if let Err(error) = channel.send(Message::new(Body::Revoke(selector))) {
+                (options.report)(error.to_string());
+                channel.close();
+            }
+        }
+        let held: Vec<_> = lock(&self.0.holds)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for held in held {
+            if let Some((principal, _)) = &held.stamp
+                && matches(&principal.to_serde()?)
+            {
+                RemoteReference(held).end(crate::host::revoked());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close_revoked_child(&self, matches: impl Fn(&serde_json::Value) -> bool) {
+        if self.0.options.role == LinkRole::Child && matches(&lock(&self.0.principal)) {
+            self.close();
+        }
+    }
+
     pub fn connect(link: Arc<dyn Link>, options: RemoteOptions, batch: Batch) -> Result<Self> {
-        Self::make(None, link, options, batch)
+        let peer = Self::make(None, options, batch, None)?;
+        peer.reconnect(link)?;
+        Ok(peer)
     }
     pub fn serve(host: Host, link: Arc<dyn Link>, options: RemoteOptions) -> Result<Self> {
         let batch = host.batch();
-        Self::make(Some(host), link, options, batch)
+        let peer = Self::make(Some(host), options, batch, None)?;
+        peer.reconnect(link)?;
+        Ok(peer)
     }
+    /// Keep references and their caller stamps across replacement child processes.
+    /// The supervisor closes the peer when it retires so the host can release it.
+    pub fn supervised_child(
+        host: Host,
+        options: RemoteOptions,
+        retry: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
+        if !options.trusted || options.role != LinkRole::Child {
+            return Err(Error::Invalid(
+                "supervised peers require a trusted child link".into(),
+            ));
+        }
+        let batch = host.batch();
+        let peer = Self::make(Some(host.clone()), options, batch, Some(Arc::new(retry)))?;
+        host.keep_peer(peer.clone());
+        Ok(peer)
+    }
+
+    pub(crate) fn same_peer(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     fn make(
         host: Option<Host>,
-        link: Arc<dyn Link>,
         options: RemoteOptions,
         batch: Batch,
+        retry_disconnected: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self> {
         crate::data::principal_key(&options.principal)?;
         if options.call_window == 0 {
@@ -208,12 +296,15 @@ impl RemotePeer {
         }
         let id = uuid::Uuid::parse_str(&crate::jobs::uuid_v7()?)
             .map_err(|e| Error::Invalid(e.to_string()))?;
-        let peer = Self(Arc::new(Inner {
+        Ok(Self(Arc::new(Inner {
             host: host.as_ref().map(Host::downgrade),
             batch,
+            principal: Mutex::new(options.principal.clone()),
+            child_ready: AtomicBool::new(retry_disconnected.is_none()),
+            retry_disconnected,
             options,
             incarnation: *id.as_bytes(),
-            channel: Mutex::new(None),
+            connection: Mutex::default(),
             epoch: AtomicU64::new(0),
             next_hold: AtomicU64::new(0),
             next_call: AtomicU64::new(0),
@@ -225,22 +316,82 @@ impl RemotePeer {
             window: Mutex::new(Arc::new(Semaphore::new(0))),
             closed: AtomicBool::new(false),
             replica: Mutex::new(ReplicaFlow::default()),
-        }));
-        peer.reconnect(link)?;
-        Ok(peer)
+        })))
     }
-    pub fn reconnect(&self, link: Arc<dyn Link>) -> Result<()> {
-        if self.0.closed.load(Ordering::Acquire) {
-            return Err(Error::Closed);
+
+    pub fn connect_child(&self, link: Arc<dyn Link>, principal: serde_json::Value) -> Result<()> {
+        if self.0.retry_disconnected.is_none() || self.channel().is_ok() {
+            return Err(Error::Invalid(
+                "expected a disconnected supervised child".into(),
+            ));
         }
-        let epoch = self.0.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        let old = lock(&self.0.channel).take();
+        crate::data::principal_key(&principal)?;
+        self.0.child_ready.store(false, Ordering::Release);
+        *lock(&self.0.principal) = principal;
+        self.reconnect(link)
+    }
+
+    /// Child startup can call the parent before the child's objects are ready to bind.
+    pub fn child_ready(&self) -> Result<()> {
+        self.0.child_ready.store(true, Ordering::Release);
+        let holds = lock(&self.0.holds)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for hold in holds {
+            self.send_hold(&hold)?;
+        }
+        Ok(())
+    }
+
+    pub fn has_holds(&self) -> bool {
+        lock(&self.0.holds)
+            .values()
+            .any(|reference| reference.strong_count() > 0)
+    }
+
+    /// Publish a startup failure without retiring the holds needed for Retry.
+    pub fn fail_child(&self, error: ChordError) -> Result<()> {
+        if self.0.retry_disconnected.is_none() || self.channel().is_ok() {
+            return Err(Error::Invalid(
+                "expected a disconnected supervised child".into(),
+            ));
+        }
+        let holds = lock(&self.0.holds)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for hold in holds {
+            hold.transition(RefState::Failed {
+                cause: FailureCause {
+                    kind: FailureKind::Broken,
+                    error: error.clone(),
+                },
+                retry_at: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn reconnect(&self, link: Arc<dyn Link>) -> Result<()> {
+        let (epoch, old) = {
+            let mut connection = lock(&self.0.connection);
+            if self.0.closed.load(Ordering::Acquire) {
+                return Err(Error::Closed);
+            }
+            if connection.changing {
+                return Err(ChordError::new("unavailable", "link change in progress").into());
+            }
+            connection.changing = true;
+            let epoch = self.0.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            (epoch, connection.channel.take())
+        };
         if let Some(old) = old {
             old.close();
             self.dropped();
         }
         let report = self.0.options.report.clone();
-        let channel = Channel::start(
+        let prepared = Channel::prepare(
             link,
             Arc::new(Handler {
                 peer: Arc::downgrade(&self.0),
@@ -256,14 +407,63 @@ impl RemotePeer {
                 },
                 report: Arc::new(move |error| report(error.to_string())),
             },
-        )?;
-        *lock(&self.0.channel) = Some(channel);
-        Ok(())
+        );
+        match prepared {
+            Ok((channel, dispatch)) if self.finish_change(Some(channel.clone())) => {
+                dispatch();
+                Ok(())
+            }
+            Ok(_) => Err(Error::Closed),
+            Err(error) => {
+                self.finish_change(None);
+                Err(error)
+            }
+        }
+    }
+    fn finish_change(&self, channel: Option<Arc<Channel>>) -> bool {
+        let mut connection = lock(&self.0.connection);
+        connection.changing = false;
+        let closed = self.0.closed.load(Ordering::Acquire);
+        if !closed && !channel.as_ref().is_some_and(|channel| channel.closed()) {
+            connection.channel = channel;
+            return true;
+        }
+        drop(connection);
+        if let Some(channel) = channel {
+            channel.close();
+        }
+        if closed {
+            self.end_holds();
+        }
+        false
+    }
+    fn disconnected(&self, epoch: u64) {
+        let old = {
+            let mut connection = lock(&self.0.connection);
+            if connection.changing
+                || self.0.epoch.load(Ordering::Acquire) != epoch
+                || connection.channel.is_none()
+            {
+                return;
+            }
+            connection.changing = true;
+            self.0.epoch.fetch_add(1, Ordering::AcqRel);
+            connection.channel.take()
+        };
+        drop(old);
+        self.dropped();
+        self.finish_change(None);
     }
     fn channel(&self) -> Result<Arc<Channel>> {
-        lock(&self.0.channel)
+        self.channel_with_epoch().map(|(channel, _)| channel)
+    }
+    fn channel_with_epoch(&self) -> Result<(Arc<Channel>, u64)> {
+        let connection = lock(&self.0.connection);
+        connection
+            .channel
             .clone()
             .filter(|c| !c.closed())
+            .map(|channel| (channel, self.0.epoch.load(Ordering::Acquire)))
             .ok_or_else(|| ChordError::new("unavailable", "link is closed").into())
     }
     fn send(&self, body: Body) -> Result<()> {
@@ -326,21 +526,45 @@ impl RemotePeer {
         Ok(())
     }
     pub fn close(&self) {
-        if !self.0.closed.swap(true, Ordering::AcqRel) {
-            let channel = lock(&self.0.channel).clone();
-            if let Some(channel) = channel {
-                channel.close();
+        let channel = {
+            let mut connection = lock(&self.0.connection);
+            if self.0.closed.swap(true, Ordering::AcqRel) {
+                return;
             }
-            self.dropped();
-            let holds = lock(&self.0.holds)
-                .values()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
-            for hold in holds {
-                let _ = hold.transition(RefState::Ended {
-                    error: ChordError::new("released", "peer closed"),
-                });
+            if connection.changing {
+                // An in-progress change will observe the terminal close and end the holds.
+                None
+            } else {
+                connection.changing = true;
+                self.0.epoch.fetch_add(1, Ordering::AcqRel);
+                Some(connection.channel.take())
             }
+        };
+        if self.0.retry_disconnected.is_some()
+            && let Some(host) = self
+                .0
+                .host
+                .as_ref()
+                .and_then(crate::host::WeakHost::upgrade)
+        {
+            host.forget_peer(self);
+        }
+        let Some(channel) = channel else { return };
+        if let Some(channel) = channel {
+            channel.close();
+        }
+        self.dropped();
+        self.finish_change(None);
+    }
+    fn end_holds(&self) {
+        let holds = lock(&self.0.holds)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for hold in holds {
+            let _ = hold.transition(RefState::Ended {
+                error: ChordError::new("released", "peer closed"),
+            });
         }
     }
     pub async fn fence(&self) -> Result<()> {
@@ -409,9 +633,16 @@ impl RemotePeer {
             members: Mutex::new(IndexMap::new()),
             decoders: Mutex::new(Vec::new()),
             released: AtomicBool::new(false),
+            sent_epoch: AtomicU64::new(0),
             abort: Mutex::new(None),
         }));
-        lock(&self.0.holds).insert(id, Arc::downgrade(&held.0));
+        {
+            let mut holds = lock(&self.0.holds);
+            if self.0.closed.load(Ordering::Acquire) {
+                return Err(Error::Closed);
+            }
+            holds.insert(id, Arc::downgrade(&held.0));
+        }
         if let Some(signal) = context.abort_signal() {
             let weak = Arc::downgrade(&held.0);
             *lock(&held.0.abort) = Some(signal.subscribe(move |_| {
@@ -420,13 +651,21 @@ impl RemotePeer {
                 }
             }));
         }
-        if self.channel()?.peer().is_some() {
-            self.send_hold(&held.0)?;
+        match self.channel() {
+            Ok(channel) if channel.peer().is_some() => {
+                if let Err(error) = self.send_hold(&held.0)
+                    && (self.0.retry_disconnected.is_none() || !channel.closed())
+                {
+                    return Err(error);
+                }
+            }
+            Err(error) if self.0.retry_disconnected.is_none() => return Err(error),
+            _ => {}
         }
         Ok(held)
     }
     fn send_hold(&self, held: &Reference) -> Result<()> {
-        if held.released.load(Ordering::Acquire) {
+        if held.released.load(Ordering::Acquire) || !self.0.child_ready.load(Ordering::Acquire) {
             return Ok(());
         }
         let (kind, params) = if held.contract.kind() == crate::contracts::ContractKind::Remote {
@@ -435,7 +674,11 @@ impl RemotePeer {
         } else {
             ("server".into(), JsonValue::Object(IndexMap::new()))
         };
-        self.send(Body::Hold {
+        let (channel, epoch) = self.channel_with_epoch()?;
+        if channel.peer().is_none() || held.sent_epoch.fetch_max(epoch, Ordering::AcqRel) >= epoch {
+            return Ok(());
+        }
+        channel.send(Message::new(Body::Hold {
             hold: held.id,
             type_name: held.contract.name().into(),
             version: held.contract.version(),
@@ -447,7 +690,12 @@ impl RemotePeer {
             incarnation: held.stamp.as_ref().map(|(_, incarnation)| *incarnation),
             chain: None,
             limit: None,
-        })
+        }))?;
+        if held.released.load(Ordering::Acquire) {
+            // Release may have crossed the Hold while the child was becoming ready.
+            channel.send(Message::new(Body::Release { hold: held.id }))?;
+        }
+        Ok(())
     }
     fn dropped(&self) {
         let pending_routes = std::mem::take(&mut *lock(&self.0.pending_routes));
@@ -723,9 +971,10 @@ impl Reference {
         if self.released.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.state.set(state, &Context::background())?;
-        self.changed.send_modify(|n| *n = n.wrapping_add(1));
-        Ok(())
+        let changed = self.changed.clone();
+        self.state.set_with(state, &Context::background(), move || {
+            changed.send_modify(|n| *n = n.wrapping_add(1));
+        })
     }
 }
 impl RemoteReference {
@@ -830,26 +1079,39 @@ impl RemoteReference {
         self.retry_with_hops(16)
     }
     fn retry_with_hops(&self, hops: u64) -> Result<()> {
-        RemotePeer(self.0.peer.upgrade().ok_or(Error::Closed)?).send(Body::Retry {
+        let peer = RemotePeer(self.0.peer.upgrade().ok_or(Error::Closed)?);
+        if let Some(retry) = &peer.0.retry_disconnected
+            && peer.channel().is_err()
+            && !peer.0.closed.load(Ordering::Acquire)
+        {
+            retry();
+            return Ok(());
+        }
+        peer.send(Body::Retry {
             hold: self.0.id,
             hops,
         })
     }
     pub fn release(&self) {
+        self.end(ChordError::new("released", "reference released"));
+    }
+
+    fn end(&self, error: ChordError) {
         if !self.0.released.swap(true, Ordering::AcqRel) {
             lock(&self.0.abort).take();
-            let _ = self.0.state.set(
+            let changed = self.0.changed.clone();
+            let _ = self.0.state.set_with(
                 RefState::Ended {
-                    error: ChordError::new("released", "reference released"),
+                    error: error.clone(),
                 },
                 &Context::background(),
+                move || changed.send_modify(|n| *n = n.wrapping_add(1)),
             );
-            self.0.changed.send_modify(|n| *n = n.wrapping_add(1));
             for source in lock(&self.0.members).values() {
                 source.detach("released");
             }
             if let Some(peer) = self.0.peer.upgrade() {
-                RemotePeer(peer).release(self.0.id);
+                RemotePeer(peer).release(self.0.id, error);
             }
         }
     }
@@ -871,12 +1133,12 @@ impl Drop for Reference {
         if !self.released.load(Ordering::Acquire)
             && let Some(peer) = self.peer.upgrade()
         {
-            RemotePeer(peer).release(self.id);
+            RemotePeer(peer).release(self.id, ChordError::new("released", "reference released"));
         }
     }
 }
 impl RemotePeer {
-    fn release(&self, id: u64) {
+    fn release(&self, id: u64, error: ChordError) {
         lock(&self.0.holds).remove(&id);
         let _ = self.send(Body::Release { hold: id });
         let ids = lock(&self.0.outgoing)
@@ -885,9 +1147,7 @@ impl RemotePeer {
             .collect::<Vec<_>>();
         for id in ids {
             if let Some(call) = lock(&self.0.outgoing).remove(&id) {
-                let _ = call
-                    .reply
-                    .send(Err(ChordError::new("released", "reference released").into()));
+                let _ = call.reply.send(Err(error.clone().into()));
             }
         }
     }
@@ -946,5 +1206,34 @@ fn failure_kind(cause: u8) -> Result<FailureKind> {
         2 => Ok(FailureKind::Waiting),
         3 => Ok(FailureKind::Denied),
         _ => Err(Error::Invalid("unknown failure cause".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::{HostOptions, create_host};
+
+    #[tokio::test]
+    async fn host_keeps_supervised_peer_until_terminal_close() -> Result<()> {
+        let context = Context::background();
+        let host = create_host(HostOptions::default())?;
+        let mut options = RemoteOptions::new(serde_json::json!("worker"));
+        options.role = LinkRole::Child;
+        options.trusted = true;
+        let retiring = RemotePeer::supervised_child(host.clone(), options.clone(), || {})?;
+        let reconnecting = RemotePeer::supervised_child(host.clone(), options, || {})?;
+
+        let retired = Arc::downgrade(&retiring.0);
+        retiring.close();
+        retiring.close();
+        drop(retiring);
+        assert!(retired.upgrade().is_none());
+
+        let (link, _) = crate::link::memory_link_pair();
+        host.close(&context).await?;
+        assert!(matches!(reconnecting.reconnect(link), Err(Error::Closed)));
+        reconnecting.close();
+        Ok(())
     }
 }

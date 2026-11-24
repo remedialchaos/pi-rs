@@ -2,19 +2,27 @@
 
 pub mod p2_contracts;
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::Arc,
+};
+
+use pi_rs_chord::sync::SyncFuture;
 
 pub use pi_rs_chord::{
     Error, Result, context, contracts, data, documents,
     host::{
-        Ctx, Facet, FacetHost, Held, Host, Members, ObjectSelf, PluginFacet, ServeOptions,
-        define_facet,
+        Ctx, EventChannel, EventSubscription, Facet, FacetHost, Held, Host, Members, ObjectSelf,
+        PluginFacet, ServeOptions, define_facet,
     },
     jobs, json, registries, state, store, watch,
 };
 
 pub const API_NAME: &str = "@p2/app";
 pub const API_VERSION: &str = "v1";
+
+pub(crate) type SessionAuthorizer =
+    Arc<dyn Fn(Host, Principal, String, context::Context) -> SyncFuture<bool> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FacetKind {
@@ -41,6 +49,7 @@ impl FacetKind {
 #[derive(Clone, Default)]
 pub struct PluginRegistry {
     plugins: BTreeMap<String, BTreeMap<FacetKind, Facet>>,
+    session_authorizers: BTreeMap<String, SessionAuthorizer>,
 }
 
 impl PluginRegistry {
@@ -84,6 +93,41 @@ impl PluginRegistry {
             .collect())
     }
 
+    /// Register a server-side check for a guest's current access to a session.
+    /// The callback receives the live server host and the cancellation context for this hold.
+    pub fn register_session_authorizer(
+        &mut self,
+        plugin: impl Into<String>,
+        authorize: impl Fn(Host, Principal, String, context::Context) -> SyncFuture<bool>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<()> {
+        let plugin = plugin.into();
+        contracts::check_name(&plugin, "A plugin name")?;
+        match self.session_authorizers.entry(plugin.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::new(authorize));
+                self.plugins.entry(plugin).or_default();
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(Error::Invalid(format!(
+                "duplicate p2 session authorizer for {plugin}"
+            ))),
+        }
+    }
+
+    pub(crate) fn session_authorizers(
+        &self,
+        selected: &[String],
+    ) -> BTreeMap<String, SessionAuthorizer> {
+        self.session_authorizers
+            .iter()
+            .filter(|(name, _)| selected.contains(name))
+            .map(|(name, authorize)| (name.clone(), authorize.clone()))
+            .collect()
+    }
+
     pub fn facets(&self, kind: FacetKind, selected: &[String]) -> Vec<PluginFacet> {
         self.plugins
             .iter()
@@ -102,17 +146,23 @@ pub mod node {
 }
 
 pub mod server {
-    pub use crate::hosts::session_workers::SessionWorkers;
+    pub use crate::hosts::session_workers::{
+        SessionSuspendGuard, SessionWorkers, WORKER_INIT_PROVIDER_SERVICE, WorkerInitProvider,
+    };
     pub use crate::runtime::{
         http::*,
         local_owner::*,
-        server::{ServerInfo, server_contract},
+        server::{
+            ServerInfo, ServerNatives, install_service, server_contract, server_of, service_of,
+        },
     };
     pub use pi_rs_chord::node::{http::*, workers::ProcessLock};
 }
 
 pub mod worker {
-    pub use crate::hosts::worker::WorkerInit;
+    pub use crate::hosts::worker::{
+        WorkerInit, WorkerProcess, WorkerRegistries, durable, worker_of,
+    };
     pub use crate::runtime::session_worker::*;
     pub use pi_rs_chord::node::workers::{Control, WorkerOptions, WorkerSession};
 }

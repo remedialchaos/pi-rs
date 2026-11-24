@@ -84,6 +84,7 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
     for available in [false, true] {
         let telemetry = Recorder::new();
         let registry = create_registry();
+        let (report, mut observed) = tokio::sync::mpsc::unbounded_channel();
         if available {
             let parameters = json!({
                 "type":"object", "properties":{"text":{"type":"string"}}, "required":["text"]
@@ -152,11 +153,63 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
                 ],
                 ..Default::default()
             })?;
+            let finish: pi_rs_durable::tasks::PhaseHandler<pi_rs_durable::Invocation> =
+                Arc::new(|_, inv, ctx| {
+                    Box::pin(async move {
+                        inv.commit(ctx, async |_, _| {
+                            Ok(pi_rs_durable::TaskState::Terminal {
+                                outcome: pi_rs_durable::TaskOutcome::Completed {
+                                    result: json!({"continue":"invalid"}),
+                                },
+                            })
+                        })
+                        .await?;
+                        Ok(())
+                    })
+                });
+            let decider = Arc::new(pi_rs_durable::define_task(
+                pi_rs_durable::tasks::TaskDefinition {
+                    name: "test.decider".into(),
+                    version: 1,
+                    initial: Arc::new(|_| Ok(json!({"phase":"finish"}))),
+                    phases: [("finish".into(), finish.clone())].into_iter().collect(),
+                    abort: finish,
+                    migrate: None,
+                    hooks: (),
+                },
+            ));
+            registry.install(Extension {
+                name: "deciders".into(),
+                tasks: vec![decider],
+                ..Default::default()
+            })?;
+            let request: pi_rs_durable::HookHandler = Arc::new(|_, _, _| {
+                Box::pin(async {
+                    Ok(Some(
+                        json!({"tasks":[{"task":"test.decider","input":null}]}),
+                    ))
+                })
+            });
+            registry.install(Extension {
+                name: "requester".into(),
+                hooks: vec![pi_rs_durable::HookRegistration {
+                    task: "pi.generation".into(),
+                    handlers: [("afterTools".into(), request)].into_iter().collect(),
+                }],
+                ..Default::default()
+            })?;
         }
         let ctx = Context::background();
+        let fake = faux_provider(Default::default());
+        let models = pi_rs_ai::registry::Models::default();
+        models.set_provider(fake.provider.clone());
         let harness = Harness::open_with(
             Arc::new(MemoryStorage::new()),
             HarnessOptions {
+                report_hook: Some(Arc::new(move |name, error| {
+                    let _ = report.send((name.to_owned(), error.to_string()));
+                })),
+                models: models.into(),
                 registry: Arc::new(HarnessRegistry::Local(registry)),
                 telemetry: telemetry.clone(),
                 ..Default::default()
@@ -164,7 +217,6 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
             &ctx,
         )
         .await?;
-        let fake = faux_provider(Default::default());
         let model = &fake.models[0];
         let mut first = faux_assistant_message(vec![faux_tool_call(
             if available { "echo" } else { "unavailable" },
@@ -180,7 +232,6 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
             first.into(),
             faux_assistant_message(vec![faux_text("answer")]).into(),
         ]);
-        harness.models.set_provider(fake.provider.clone());
         let root = harness.root(&ctx).await?;
         root.configure(
             &[(
@@ -253,6 +304,11 @@ async fn model_tool_round_matches_upstream_entries_and_tool_output()
             json!([{"type":"text","text":if available { "hello" } else { "<harness>\n[error] Tool unavailable is not available\n</harness>" }}])
         );
         assert_eq!(fake.state.call_count(), 2);
+        if available {
+            let (extension, error) = observed.try_recv()?;
+            assert_eq!(extension, "deciders");
+            assert!(error.ends_with("(test.decider) completed with no AfterToolsDecision"));
+        }
         harness.wait_for_idle(&ctx).await?;
         harness.close(&ctx).await?;
 
@@ -420,16 +476,19 @@ async fn automatic_compaction_places_one_summary_before_answering_second_input()
             ..Default::default()
         })?;
         let ctx = Context::background();
+        let fake = faux_provider(Default::default());
+        let models = pi_rs_ai::registry::Models::default();
+        models.set_provider(fake.provider.clone());
         let harness = Harness::open_with(
             Arc::new(MemoryStorage::new()),
             HarnessOptions {
+                models: models.into(),
                 registry: Arc::new(HarnessRegistry::Local(registry)),
                 ..Default::default()
             },
             &ctx,
         )
         .await?;
-        let fake = faux_provider(Default::default());
         let model = &fake.models[0];
         let mut responses = vec![faux_assistant_message(vec![faux_text("first answer")]).into()];
         if trigger == "overflow" {
@@ -440,7 +499,6 @@ async fn automatic_compaction_places_one_summary_before_answering_second_input()
         }
         responses.push(faux_assistant_message(vec![faux_text("second answer")]).into());
         fake.set_responses(responses);
-        harness.models.set_provider(fake.provider.clone());
         let root = harness.root(&ctx).await?;
         root.configure(
             &[
@@ -529,19 +587,22 @@ async fn failed_run_policy_settles_or_preserves_the_queued_follow_up()
     use tokio::sync::Notify;
     for policy in ["keep", "withdraw", "continue"] {
         let ctx = Context::background();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let gate = (started.clone(), release.clone());
+        let fake = faux_provider(Default::default());
+        let models = pi_rs_ai::registry::Models::default();
+        models.set_provider(fake.provider.clone());
         let harness = Harness::open_with(
             Arc::new(MemoryStorage::new()),
             HarnessOptions {
+                models: models.into(),
                 settings: Arc::new(move || json!({"afterFailedRun": policy})),
                 ..Default::default()
             },
             &ctx,
         )
         .await?;
-        let started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let gate = (started.clone(), release.clone());
-        let fake = faux_provider(Default::default());
         let model = &fake.models[0];
         fake.set_responses([
             FauxStep::Factory(Arc::new(move |_, _, _, _| {
@@ -557,7 +618,6 @@ async fn failed_run_policy_settles_or_preserves_the_queued_follow_up()
             })),
             faux_assistant_message(vec![faux_text("next answer")]).into(),
         ]);
-        harness.models.set_provider(fake.provider.clone());
         let root = harness.root(&ctx).await?;
         root.configure(
             &[(
@@ -736,21 +796,33 @@ async fn after_run_reports_rejected_task_requests_and_preserves_answer()
         tasks: vec![Arc::new(child)],
         hooks: vec![HookRegistration {
             task: "pi.generation".into(),
-            handlers: [
-                ("afterRun".into(), handler),
-                ("afterResponse".into(), broken),
-            ]
-            .into_iter()
-            .collect(),
+            handlers: [("afterRun".into(), handler)].into_iter().collect(),
         }],
         ..Default::default()
     })?;
+    registry.install(Extension {
+        name: "broken-response".into(),
+        hooks: vec![HookRegistration {
+            task: "pi.generation".into(),
+            handlers: [("afterResponse".into(), broken)].into_iter().collect(),
+        }],
+        ..Default::default()
+    })?;
+    let (attributed, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (send, mut reports) = tokio::sync::mpsc::unbounded_channel();
     let ctx = Context::background();
+    let fake = faux_provider(Default::default());
+    fake.set_responses([faux_assistant_message(vec![faux_text("answer")]).into()]);
+    let models = pi_rs_ai::registry::Models::default();
+    models.set_provider(fake.provider.clone());
     let harness = Harness::open_with(
         Arc::new(MemoryStorage::new()),
         HarnessOptions {
+            models: models.into(),
             registry: Arc::new(HarnessRegistry::Local(registry)),
+            report_hook: Some(Arc::new(move |name, error| {
+                let _ = attributed.send((name.to_owned(), error.clone()));
+            })),
             session: SessionOptions {
                 report: Some(Arc::new(move |_, text| {
                     let _ = send.send(text.to_owned());
@@ -762,10 +834,7 @@ async fn after_run_reports_rejected_task_requests_and_preserves_answer()
         &ctx,
     )
     .await?;
-    let fake = faux_provider(Default::default());
-    fake.set_responses([faux_assistant_message(vec![faux_text("answer")]).into()]);
     let model = &fake.models[0];
-    harness.models.set_provider(fake.provider.clone());
     let root = harness.root(&ctx).await?;
     root.configure(
         &[(
@@ -793,6 +862,28 @@ async fn after_run_reports_rejected_task_requests_and_preserves_answer()
     assert_eq!(
         reports.try_recv()?.as_str(),
         "Task test.missing is not installed\nA hook cannot start the built-in task pi.generation\nTask test.child starts at the unknown phase unknown"
+    );
+    use pi_rs_durable::HookError;
+    assert_eq!(
+        events.try_recv()?,
+        (
+            "broken-response".into(),
+            HookError::Single("response hook failed".into())
+        )
+    );
+    assert_eq!(
+        events.try_recv()?,
+        (
+            "after-run".into(),
+            HookError::Aggregate {
+                message: "3 hook task requests were rejected".into(),
+                errors: vec![
+                    "Task test.missing is not installed".into(),
+                    "A hook cannot start the built-in task pi.generation".into(),
+                    "Task test.child starts at the unknown phase unknown".into()
+                ]
+            }
+        )
     );
     Ok(())
 }
@@ -872,11 +963,6 @@ async fn clean_close_resends_the_inflight_request_without_charging_a_retry()
     let ctx = Context::background();
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("resend.sqlite");
-    let options = || HarnessOptions {
-        settings: Arc::new(|| json!({"retry":{"enabled":false}})),
-        ..Default::default()
-    };
-    let first = Harness::open_with(Arc::new(SqliteStorage::open(&path)?), options(), &ctx).await?;
     let started = Arc::new(tokio::sync::Notify::new());
     let entered = started.clone();
     let fake = faux_provider(Default::default());
@@ -884,7 +970,14 @@ async fn clean_close_resends_the_inflight_request_without_charging_a_retry()
         entered.notify_one();
         Box::pin(std::future::pending())
     }))]);
-    first.models.set_provider(fake.provider.clone());
+    let models = pi_rs_ai::registry::Models::default();
+    models.set_provider(fake.provider.clone());
+    let options = || HarnessOptions {
+        models: models.clone().into(),
+        settings: Arc::new(|| json!({"retry":{"enabled":false}})),
+        ..Default::default()
+    };
+    let first = Harness::open_with(Arc::new(SqliteStorage::open(&path)?), options(), &ctx).await?;
     let model = &fake.models[0];
     let root = first.root(&ctx).await?;
     root.configure(
@@ -909,7 +1002,6 @@ async fn clean_close_resends_the_inflight_request_without_charging_a_retry()
     tokio::time::timeout(timeout, first.close(&ctx)).await??;
     let next = Harness::open_with(Arc::new(SqliteStorage::open(&path)?), options(), &ctx).await?;
     fake.set_responses([faux_assistant_message(vec![faux_text("answer")]).into()]);
-    next.models.set_provider(fake.provider.clone());
     next.resume()?;
     let submission = next
         .submission(id, &ctx)
@@ -919,5 +1011,352 @@ async fn clean_close_resends_the_inflight_request_without_charging_a_retry()
     next.close(&ctx).await?;
     assert_eq!(settled.status, SubmissionStatus::Done);
     assert_eq!(fake.state.call_count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn crashed_poll_retries_the_same_job_or_cancels_it_at_exhaustion()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_ai::faux::{FauxOptions, FauxStep, faux_assistant_message, faux_provider, faux_text};
+    use pi_rs_durable::{HarnessOptions, SubmissionStatus};
+    for retry in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let live = dir.path().join("live.sqlite");
+        let crash = dir.path().join("crash.sqlite");
+        let ctx = Context::background();
+        let fake = faux_provider(FauxOptions {
+            poll_after_ms: Some(1),
+            ..Default::default()
+        });
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gate = (entered.clone(), release.clone());
+        fake.set_responses([FauxStep::Factory(Arc::new(move |_, _, _, _| {
+            let (start, finish) = gate.clone();
+            Box::pin(async move {
+                start.notify_one();
+                finish.notified().await;
+                Ok(faux_assistant_message(vec![faux_text("answer")]))
+            })
+        }))]);
+        let models = pi_rs_ai::registry::Models::default();
+        models.set_provider(fake.provider.clone());
+        let options = || HarnessOptions {
+            models: models.clone().into(),
+            settings: Arc::new(
+                move || json!({"stream":{"deferred":true},"retry":{"enabled":retry,"baseDelayMs":1}}),
+            ),
+            ..Default::default()
+        };
+        let first =
+            Harness::open_with(Arc::new(SqliteStorage::open(&live)?), options(), &ctx).await?;
+        let root = first.root(&ctx).await?;
+        let model = &fake.models[0];
+        root.configure(
+            &[(
+                "model".into(),
+                json!({"provider":model.provider,"modelId":model.id}),
+            )]
+            .into_iter()
+            .collect(),
+            &ctx,
+        )
+        .await?;
+        let item = root
+            .submit(
+                serde_json::from_value(json!({"type":"input","content":"go"}))?,
+                &ctx,
+            )
+            .await?;
+        let deadline = std::time::Duration::from_secs(10);
+        tokio::time::timeout(deadline, entered.notified()).await?;
+        rusqlite::Connection::open(live)?.execute(
+            "VACUUM INTO ?1",
+            [crash.to_str().ok_or("non-UTF8 test path")?],
+        )?;
+        first.close(&ctx).await?;
+        release.notify_one();
+        let recovered =
+            Harness::open_with(Arc::new(SqliteStorage::open(crash)?), options(), &ctx).await?;
+        recovered.resume()?;
+        let receipt = recovered
+            .submission(item.id, &ctx)
+            .await?
+            .ok_or("missing submission")?;
+        let result = tokio::time::timeout(deadline, receipt.wait(&ctx)).await??;
+        recovered.close(&ctx).await?;
+        assert_eq!(fake.state.call_count(), 1);
+        if retry {
+            assert_eq!(result.status, SubmissionStatus::Done);
+            assert_eq!(fake.state.deferred_fetch_count(), 2);
+            assert!(fake.state.cancelled_deferred().is_empty());
+        } else {
+            assert_eq!(result.status, SubmissionStatus::Unanswered);
+            assert_eq!(result.reason.as_deref(), Some("interrupted"));
+            assert_eq!(fake.state.deferred_fetch_count(), 1);
+            assert_eq!(fake.state.cancelled_deferred().len(), 1);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn generation_cutoffs_settle_inputs_according_to_whether_the_run_answered()
+-> Result<(), Box<dyn std::error::Error>> {
+    check_cutoff(
+        "generation",
+        &[
+            "prepare",
+            "request",
+            "poll",
+            "retry",
+            "tools",
+            "afterTools",
+            "finish",
+            "yield",
+            "drain",
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn tool_cutoffs_append_an_error_result_without_rerunning_the_call()
+-> Result<(), Box<dyn std::error::Error>> {
+    check_cutoff("tool", &["call", "execute", "parked"]).await
+}
+
+#[tokio::test]
+async fn compaction_cutoffs_record_the_failure_for_every_phase()
+-> Result<(), Box<dyn std::error::Error>> {
+    check_cutoff("compaction", &["select", "summarize", "retry"]).await
+}
+
+#[tokio::test]
+async fn final_tool_abort_attempt_skips_after_tool_and_preserves_the_result()
+-> Result<(), Box<dyn std::error::Error>> {
+    check_cutoff("abort", &["execute"]).await
+}
+
+async fn check_cutoff(kind: &str, phases: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_durable::{
+        HarnessOptions, SubmissionCreate, SubmissionKind, SubmissionStatus, TaskOutcome,
+        TaskOwnership, TaskState, compaction_task, generation_task, session::TaskOptions,
+        tool_task,
+    };
+    let ctx = Context::background();
+    for (phase, limit) in phases.iter().flat_map(|phase| {
+        let limits: &[u64] = if kind == "abort" { &[2, 3] } else { &[1] };
+        limits.iter().map(move |limit| (phase, *limit))
+    }) {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("phase.sqlite");
+        let seed = Harness::open(
+            Arc::new(SqliteStorage::open(&path)?),
+            Default::default(),
+            &ctx,
+        )
+        .await?;
+        let root = seed.root(&ctx).await?;
+        let task = match kind {
+            "tool" | "abort" => tool_task(),
+            "compaction" => compaction_task(),
+            _ => generation_task(),
+        };
+        let (id, answer, submitted) = root
+            .commit(
+                async |tx| {
+                    let call = json!({"type":"toolCall","id":"call","name":"work","arguments":{}});
+                    let answer = tx
+                        .append_entry(
+                            root.id,
+                            EntryDraft {
+                                kind: "pi.assistant".into(),
+                                model: Some(vec![json!({"content":[call]})]),
+                                ..Default::default()
+                            },
+                        )
+                        .await?
+                        .id;
+                    let input = match kind {
+                        "tool" | "abort" => {
+                            json!({"kind":"model","assistant":answer,"callId":"call"})
+                        }
+                        "compaction" => json!({"reason":"manual"}),
+                        _ => json!({}),
+                    };
+                    let id = tx
+                        .create_task(&task, input, TaskOptions::new(TaskOwnership::Conversation))
+                        .await?;
+                    let mut record = tx
+                        .staged_tasks()
+                        .find(|r| r.id == id)
+                        .ok_or_else(|| Error::invalid("missing task"))?
+                        .clone();
+                    let mut checkpoint = json!({"phase":phase});
+                    match *phase {
+                        "finish" => checkpoint["run"] = json!({"answer":answer}),
+                        "yield" | "drain" => checkpoint["answer"] = json!(answer),
+                        _ => {}
+                    }
+                    record.state = TaskState::Running {
+                        checkpoint,
+                        wake: None,
+                    };
+                    record.abort_requested = kind == "abort";
+                    tx.set_task(record)?;
+                    let submitted = if kind == "generation" {
+                        let item = tx
+                            .create_submission(SubmissionCreate {
+                                trace: None,
+                                conversation_id: root.id,
+                                request_id: None,
+                                notify: None,
+                                kind: SubmissionKind::Input,
+                                status: SubmissionStatus::Placed,
+                                entry: Some(answer),
+                                answer: None,
+                                reason: None,
+                                detail: None,
+                            })
+                            .await?;
+                        let addr = resolve_address(&pi_rs_durable::LIVE_DOC, Some(root.id), None)?;
+                        tx.doc(&pi_rs_durable::LIVE_DOC, &addr, None).await?.set(
+                            &[pi_rs_chord::delta::Segment::Key("run".into())],
+                            json!({"taskId":id,"inputs":[item.id],"first":answer}).into(),
+                        )?;
+                        Some(item.id)
+                    } else {
+                        None
+                    };
+                    Ok((id, answer, submitted))
+                },
+                &ctx,
+                Default::default(),
+            )
+            .await?;
+        drop(root);
+        drop(seed);
+        let registry = pi_rs_durable::create_registry();
+        let hook_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if kind == "abort" {
+            let calls = hook_calls.clone();
+            let hook: pi_rs_durable::HookHandler = Arc::new(move |_, _, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(None) })
+            });
+            registry.install(pi_rs_durable::Extension {
+                name: "abort-observer".into(),
+                hooks: vec![pi_rs_durable::HookRegistration {
+                    task: "pi.tool".into(),
+                    handlers: [("afterTool".into(), hook)].into_iter().collect(),
+                }],
+                ..Default::default()
+            })?;
+        }
+        let recovered = Harness::open_with(
+            Arc::new(SqliteStorage::open(path)?),
+            HarnessOptions {
+                registry: Arc::new(pi_rs_durable::HarnessRegistry::Local(registry)),
+                settings: Arc::new(move || json!({"restartLimit":limit})),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .await?;
+        let record = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            recovered.wait_for_task(id, &ctx),
+        )
+        .await??;
+        let TaskState::Terminal { outcome } = &record.state else {
+            return Err("unfinished task".into());
+        };
+        if kind == "abort" {
+            assert!(
+                matches!(outcome,TaskOutcome::Aborted {result:Some(value),..} if value["entryId"].is_u64()),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                hook_calls.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(limit == 3)
+            );
+        } else if kind == "generation" && matches!(*phase, "finish" | "yield" | "drain") {
+            assert!(
+                matches!(outcome, TaskOutcome::Completed {result} if result["entryId"]==answer),
+                "{phase}: {outcome:?}"
+            );
+        } else {
+            let TaskOutcome::Failed { error, result } = outcome else {
+                return Err(format!("{kind}/{phase}: {outcome:?}").into());
+            };
+            assert_eq!(
+                error.detail,
+                Some(json!({"reason":"restart_limit"})),
+                "{kind}/{phase}"
+            );
+            match kind {
+                "tool" => {
+                    assert_eq!(
+                        error.message,
+                        "Tool work was interrupted once; it is not run again"
+                    );
+                    let entry_id = result
+                        .as_ref()
+                        .and_then(|v| v["entryId"].as_u64())
+                        .ok_or("missing result entry")?;
+                    let stored = recovered
+                        .entry(entry_id, &ctx)
+                        .await?
+                        .ok_or("missing stored tool result")?;
+                    let message = &stored
+                        .entry
+                        .model
+                        .as_ref()
+                        .ok_or("missing result message")?[0];
+                    assert_eq!(message["toolCallId"], "call");
+                    assert_eq!(message["isError"], true);
+                    assert!(message["content"][0]["text"].as_str().is_some_and(|text| {
+                        text.contains("Tool work was interrupted once; it is not run again")
+                    }));
+                }
+                "compaction" => {
+                    let addr = resolve_address(
+                        &pi_rs_durable::LIVE_DOC,
+                        Some(record.conversation_id),
+                        None,
+                    )?;
+                    let state = recovered
+                        .snapshot(&pi_rs_durable::LIVE_DOC, &addr, &ctx)
+                        .await?
+                        .ok_or("missing live state")?;
+                    assert_eq!(
+                        state["compactionFailure"]["error"],
+                        "Compaction was interrupted once"
+                    );
+                }
+                _ => assert_eq!(
+                    error.message,
+                    format!("The generation was interrupted once in its {phase} phase")
+                ),
+            }
+        }
+        if let Some(id) = submitted {
+            let item = recovered
+                .submission(id, &ctx)
+                .await?
+                .ok_or("missing submission")?
+                .status(&ctx)
+                .await?;
+            if matches!(*phase, "finish" | "yield" | "drain") {
+                assert_eq!(item.status, SubmissionStatus::Done);
+                assert_eq!(item.answer, Some(answer));
+            } else {
+                assert_eq!(item.status, SubmissionStatus::Unanswered);
+                assert_eq!(item.reason.as_deref(), Some("restart_limit"));
+            }
+        }
+        recovered.close(&ctx).await?;
+    }
     Ok(())
 }

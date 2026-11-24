@@ -55,7 +55,19 @@ pub fn watch_theme_file(
         .ok_or_else(|| std::io::Error::other("theme file has no parent directory"))?
         .to_owned();
     let load = move |path: &std::path::Path| -> Result<Theme, ThemeFileError> {
-        let json = serde_json::from_slice(&std::fs::read(path)?)?;
+        use std::io::Read;
+        let limit = crate::MAX_PREFERENCE_FILE;
+        if !std::fs::metadata(path)?.is_file() {
+            return Err(std::io::Error::other("theme must be a regular file").into());
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(std::io::Error::other("theme exceeds preference size limit").into());
+        }
+        let json = serde_json::from_slice(&bytes)?;
         let palette = validate_theme_json(&path.display().to_string(), &json)?;
         Ok(create_theme(&palette, mode, terminal.clone())?)
     };

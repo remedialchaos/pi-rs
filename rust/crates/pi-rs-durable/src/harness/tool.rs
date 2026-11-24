@@ -97,7 +97,7 @@ pub async fn append_tool_result(
     .await
 }
 
-use super::Invocation;
+use super::{Agent, Invocation, tool_extension};
 use crate::{
     TaskOutcome, TaskState,
     session::Error,
@@ -131,6 +131,18 @@ pub fn tool_task() -> Arc<Task<Invocation>> {
 }
 
 impl Invocation {
+    /// Report a failure of the tool's code as an `extension_error`, naming the extension that
+    /// provides or wraps the tool when the agent resolves one.
+    fn report_tool_error(&self, agent: &Agent, name: &str, message: String) {
+        match tool_extension(agent, name) {
+            Some(extension) => self.report_hook_error(extension, vec![message]),
+            None => self
+                .harness
+                .session
+                .harness_report(crate::session::ReportKind::Extension, &message),
+        }
+    }
+
     async fn run_tool(&self, ctx: &Context) -> Result<()> {
         let conversation = self.harness.handle(self.record.conversation_id);
         let input = &self.record.input;
@@ -190,9 +202,7 @@ impl Invocation {
                 && let Err(error) = cancel(checkpoint["arguments"].clone(), self, ctx).await
             {
                 ctx.check()?;
-                self.harness
-                    .session
-                    .harness_report(crate::session::ReportKind::Extension, &error.to_string());
+                self.report_tool_error(&agent, &call.name, error.to_string());
             }
             let (code, message) = if input["unoffered"] == true {
                 (
@@ -242,7 +252,7 @@ impl Invocation {
                     }
                 }
                 for hook in agent.hooks("pi.tool", "beforeTool") {
-                    match hook(serde_json::to_value(&checked_call)?, self, ctx).await {
+                    match (hook.1)(serde_json::to_value(&checked_call)?, self, ctx).await {
                         Ok(Some(decision)) => {
                             if let Some(block) = decision["block"].as_str() {
                                 denied = Some(block.to_owned());
@@ -364,12 +374,17 @@ impl Invocation {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .finish(&mut result);
-        if cutoff
-            .as_ref()
-            .is_none_or(|(_, salvage)| *salvage && !self.record.abort_requested)
-        {
+        let run_after_tool = if self.record.abort_requested {
+            let limit = (self.harness.settings)()["restartLimit"]
+                .as_u64()
+                .unwrap_or(super::DEFAULT_RESTART_LIMIT);
+            self.record.restarts.unwrap_or(0) < limit.saturating_sub(1)
+        } else {
+            cutoff.as_ref().is_none_or(|(_, salvage)| *salvage)
+        };
+        if run_after_tool {
             for hook in agent.hooks("pi.tool", "afterTool") {
-                let change = hook(json!({"call":call,"result":result}), self, ctx)
+                let change = (hook.1)(json!({"call":call,"result":result}), self, ctx)
                     .await
                     .and_then(|value| {
                         value
@@ -382,10 +397,7 @@ impl Invocation {
                     Ok(None) => {}
                     Err(error) => {
                         ctx.check()?;
-                        self.harness.session.harness_report(
-                            crate::session::ReportKind::Extension,
-                            &error.to_string(),
-                        );
+                        self.report_hook_error(&hook.0, vec![error.to_string()]);
                     }
                 }
             }
@@ -480,9 +492,9 @@ impl Invocation {
                             error,
                         ));
                 } else {
-                    self.harness
-                        .session
-                        .harness_report(crate::session::ReportKind::Extension, &error);
+                    // The model never sees structured output, so its call stands; the host
+                    // learns of the broken tool and the extension that owns it.
+                    self.report_tool_error(&agent, &call.name, error);
                 }
             }
         }
@@ -750,6 +762,10 @@ impl Invocation {
     }
     pub fn now(&self) -> u64 {
         (self.harness.now)()
+    }
+    /// The host's current `Models` with the Harness identity applied, read at each access.
+    pub fn models(&self) -> pi_rs_ai::registry::Models {
+        self.harness.models()
     }
     pub fn call_id(&self) -> Option<&str> {
         self.record.input["callId"]

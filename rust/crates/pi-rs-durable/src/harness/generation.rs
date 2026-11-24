@@ -330,7 +330,7 @@ impl Invocation {
             && let Some((provider, model)) = poll["model"]["provider"]
                 .as_str()
                 .zip(poll["model"]["modelId"].as_str())
-            && let Some(model) = self.harness.models.get_model(provider, model)
+            && let Some(model) = self.harness.models().get_model(provider, model)
             && let Ok(handle) = serde_json::from_value(poll["handle"].clone())
         {
             let options = StreamOptions {
@@ -339,7 +339,7 @@ impl Invocation {
             };
             let _ = self
                 .harness
-                .models
+                .models()
                 .cancel_deferred(model, handle, options)
                 .await;
             ctx.check().map_err(Error::from)?;
@@ -631,10 +631,40 @@ impl Invocation {
             let mut hook_terminate = false;
             if phase == "afterTools" {
                 for child in serde_json::from_value::<Vec<u64>>(checkpoint["tasks"].clone())? {
-                    if let Some(task) = self.harness.session.task(child, ctx).await?
-                        && matches!(&task.state,TaskState::Terminal{outcome:TaskOutcome::Completed{result}} if result["terminate"]==true)
+                    let Some(task) = self.harness.session.task(child, ctx).await? else {
+                        continue;
+                    };
+                    let TaskState::Terminal {
+                        outcome: TaskOutcome::Completed { result },
+                    } = &task.state
+                    else {
+                        continue;
+                    };
+                    if result.is_null() || result.as_object().is_some_and(|v| v.is_empty()) {
+                        continue;
+                    }
+                    if result
+                        .as_object()
+                        .is_some_and(|v| v.len() == 1 && result["terminate"] == true)
                     {
                         hook_terminate = true;
+                        continue;
+                    }
+                    let message = format!(
+                        "afterTools task {child} ({}) completed with no AfterToolsDecision",
+                        task.kind
+                    );
+                    let registry = self.harness.registry.snapshot();
+                    if let Some(extension) = registry
+                        .installed()
+                        .filter(|ext| ext.tasks.iter().any(|t| t.name() == task.kind))
+                        .last()
+                    {
+                        self.report_hook_error(&extension.name, vec![message]);
+                    } else {
+                        self.harness
+                            .session
+                            .harness_report(crate::session::ReportKind::Extension, &message);
                     }
                 }
             } else if !agent.hooks("pi.generation", "afterTools").is_empty() {
@@ -816,7 +846,7 @@ impl Invocation {
         let model = reference["provider"]
             .as_str()
             .zip(reference["modelId"].as_str())
-            .and_then(|(p, m)| self.harness.models.get_model(p, m));
+            .and_then(|(p, m)| self.harness.models().get_model(p, m));
         let Some(model) = model else {
             let text = if reference.is_null() {
                 "No model is configured".into()
@@ -1042,7 +1072,7 @@ impl Invocation {
         }
         let message = if phase == "poll" {
             self.harness
-                .models
+                .models()
                 .fetch_deferred(
                     model,
                     serde_json::from_value(checkpoint["handle"].clone())?,
@@ -1068,7 +1098,7 @@ impl Invocation {
                 .map(serde_json::from_value)
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             self.stream_response(
-                &self.harness.models,
+                &self.harness.models(),
                 GenerationRequest {
                     model,
                     context: pi_rs_ai::types::Context {

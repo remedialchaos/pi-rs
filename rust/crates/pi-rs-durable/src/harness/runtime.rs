@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use pi_rs_ai::registry::Models;
 use pi_rs_chord::{context::Context, delta::Op};
 
 use super::{AGENT_DOC, EntryLoader, INBOX_DOC, LIVE_DOC, PROVIDER_DOC, USAGE_DOC};
@@ -26,12 +27,97 @@ pub type BuildEnv = Arc<
         > + Send
         + Sync,
 >;
+/// Errors from one extension hook, with rejected requests in their original order.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HookError {
+    #[error("{0}")]
+    Single(String),
+    #[error("{message}")]
+    Aggregate {
+        message: String,
+        errors: Vec<String>,
+    },
+}
+
+pub type HookReporter = Arc<dyn Fn(&str, &HookError) + Send + Sync>;
+
+/// `HarnessOptions.models`: the host's model registry, plain or as a selector that the Harness
+/// reads at each use, with the Harness identity applied.
+#[derive(Clone)]
+pub enum ModelsInput {
+    Static(Models),
+    Dynamic(Arc<dyn Fn() -> Models + Send + Sync>),
+}
+impl Default for ModelsInput {
+    fn default() -> Self {
+        Self::Static(Models::default())
+    }
+}
+impl From<Models> for ModelsInput {
+    fn from(models: Models) -> Self {
+        Self::Static(models)
+    }
+}
+
+/// One report of a host-clock failure: the message, and a clock handle that answers the system
+/// fallback, so a handler that reads the clock again cannot report again.
+pub type ClockReport = Arc<dyn Fn(&str, &dyn Fn() -> u64) + Send + Sync>;
+
+/// The host clock, falling back to the system clock when it panics: a broken clock must not
+/// stop commits. The first failure is reported; the clock is read in every task change, so
+/// later ones are not. A panicking report handler is dropped, as reporting it would report
+/// again.
+pub fn safe_now(
+    now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    report: ClockReport,
+) -> Arc<dyn Fn() -> u64 + Send + Sync> {
+    struct SafeClock {
+        now: Arc<dyn Fn() -> u64 + Send + Sync>,
+        report: ClockReport,
+        reported: std::sync::atomic::AtomicBool,
+    }
+    fn read(clock: &SafeClock) -> u64 {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (clock.now)())) {
+            Ok(value) => value,
+            Err(error) => {
+                // Set first: a report handler that reads the clock again must not report again.
+                if !clock
+                    .reported
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let message = format!(
+                        "now callback panicked: {}",
+                        crate::session::panic_message(&*error)
+                    );
+                    let reenter = || read(clock);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (clock.report)(&message, &reenter)
+                    }));
+                }
+                crate::session::wall_clock()
+            }
+        }
+    }
+    let handle = Arc::new(SafeClock {
+        now,
+        report,
+        reported: std::sync::atomic::AtomicBool::new(false),
+    });
+    Arc::new(move || read(&handle))
+}
+
 pub struct HarnessOptions {
+    /// Receives the owning extension name and one report per failed hook invocation, and for
+    /// tool failures the Harness reports on an extension's behalf: invalid structured output
+    /// and failed cancels. The session reporter also receives its existing text notification.
+    pub report_hook: Option<HookReporter>,
     pub env: Option<BuildEnv>,
     pub on_wake: Option<Arc<dyn Fn(super::Wake) + Send + Sync>>,
     pub session: SessionOptions,
     pub telemetry: pi_rs_telemetry::Context,
-    pub models: pi_rs_ai::registry::Models,
+    /// The host's model registry: a plain `Models` is wrapped with the Harness identity once,
+    /// a selector is read at each use.
+    pub models: ModelsInput,
     pub identity: pi_rs_ai::request::ClientIdentity,
     pub registry: Arc<super::HarnessRegistry>,
     pub settings: Arc<dyn Fn() -> serde_json::Value + Send + Sync>,
@@ -39,6 +125,7 @@ pub struct HarnessOptions {
 impl Default for HarnessOptions {
     fn default() -> Self {
         Self {
+            report_hook: None,
             env: None,
             on_wake: None,
             session: Default::default(),
@@ -52,12 +139,16 @@ impl Default for HarnessOptions {
 }
 #[derive(Clone)]
 pub struct Harness {
+    pub(super) report_hook: Option<HookReporter>,
     pub(super) telemetry: Arc<super::telemetry::HarnessTelemetry>,
     pub(super) env: Option<BuildEnv>,
     pub(super) on_wake: Option<Arc<dyn Fn(super::Wake) + Send + Sync>>,
     pub(super) driver: Arc<super::scheduler::Driver>,
     pub(super) read_only: bool,
-    pub models: pi_rs_ai::registry::Models,
+    /// The host's model registry, plain (wrapped once) or a selector read at each use.
+    pub models: ModelsInput,
+    /// The merged request identity applied to each models read.
+    pub(super) identity: pi_rs_ai::request::ClientIdentity,
     pub registry: Arc<super::HarnessRegistry>,
     pub settings: Arc<dyn Fn() -> serde_json::Value + Send + Sync>,
     pub(super) now: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -123,20 +214,43 @@ impl Harness {
         let telemetry = Arc::new(super::telemetry::HarnessTelemetry::new(
             host_options.telemetry,
         ));
+        let identity = pi_rs_ai::registry::merge_identity(
+            &DEFAULT_HARNESS_IDENTITY,
+            host_options.identity.clone(),
+        );
+        // A plain registry is wrapped once; a selector is wrapped at each use.
+        let models = match host_options.models {
+            ModelsInput::Static(models) => {
+                ModelsInput::Static(models.with_identity(identity.clone()))
+            }
+            ModelsInput::Dynamic(select) => ModelsInput::Dynamic(select),
+        };
+        // The host clock, wrapped once: every harness read and every Session read go through it.
+        let clock_report = {
+            let reporter = options.report.clone();
+            let telemetry = telemetry.clone();
+            Arc::new(move |message: &str, _: &dyn Fn() -> u64| {
+                if let Some(reporter) = &reporter {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        reporter(crate::session::ReportKind::Host, message)
+                    }));
+                }
+                telemetry.report("host_error", None, None);
+            }) as ClockReport
+        };
+        let now = safe_now(options.now.clone(), clock_report);
+        options.now = now.clone();
         let harness = Self {
+            report_hook: host_options.report_hook,
             env: host_options.env,
             on_wake: host_options.on_wake,
             driver: Arc::default(),
             read_only,
-            models: host_options
-                .models
-                .with_identity(pi_rs_ai::registry::merge_identity(
-                    &DEFAULT_HARNESS_IDENTITY,
-                    host_options.identity,
-                )),
+            models,
+            identity,
             registry: host_options.registry,
             settings: Arc::new(move || super::resolve_settings(&(host_options.settings)())),
-            now: options.now.clone(),
+            now,
             session: Session::new_tracked(storage, options, Some(telemetry.clone())),
             telemetry,
         };
@@ -277,6 +391,15 @@ impl std::ops::Deref for Harness {
 }
 
 impl Harness {
+    /// The host's current `Models` with the Harness identity applied, read at each use: a plain
+    /// registry is wrapped once, a selector at each call.
+    pub fn models(&self) -> Models {
+        match &self.models {
+            ModelsInput::Static(models) => models.clone(),
+            ModelsInput::Dynamic(select) => select().with_identity(self.identity.clone()),
+        }
+    }
+
     pub async fn get_task(
         &self,
         id: crate::TaskId,

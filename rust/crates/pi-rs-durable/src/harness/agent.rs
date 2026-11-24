@@ -334,6 +334,19 @@ pub fn resolve_agent(
     }
 }
 
+/// The extension whose code a tool of `agent` runs: the last selected one that provides or
+/// wraps it.
+pub fn tool_extension<'a>(agent: &'a Agent, name: &str) -> Option<&'a str> {
+    agent.extensions.iter().rev().find_map(|extension| {
+        let provides = extension.tools.iter().any(|t| t.declaration.name == name);
+        let wraps = extension
+            .wraps
+            .iter()
+            .any(|w| matches!(w, Wrap::Tool { name: target, .. } if target == name));
+        (provides || wraps).then_some(extension.name.as_str())
+    })
+}
+
 pub async fn add_tools(
     tx: &mut Transaction<'_>,
     conversation: ConversationId,

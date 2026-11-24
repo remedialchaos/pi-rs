@@ -1,26 +1,33 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
+#[cfg(unix)]
+use super::dev::{DevCommand, DevControl, DevResult, channel};
 use pi_rs_chord::{
     context::Context,
+    contracts::Contract,
     host::{Host, HostOptions, PluginFacet, ReloadReport, create_host},
     json::JsonValue,
     node::{
-        app::{Files, FilesCaps, private_directory},
+        app::{Files, FilesCaps, host_data_contract, private_directory},
         http::{
             Http, HttpContribution, HttpError, HttpOptions, HttpServer, HttpWrap, Provenance,
             RouteOptions, WrapPhase, json_response,
         },
-        workers::ProcessLock,
+        workers::{ProcessLock, WorkerOptions},
     },
-    store::StoreEngine,
 };
-use serde_json::json;
+use serde_json::{Map, json};
+
+use super::{
+    session_workers::{SessionWorkers, catalog_session},
+    worker::WorkerInit,
+};
 
 use crate::{
     api::v1::{FacetKind, PluginRegistry},
     runtime::{
         host_dirs,
-        server::{ServerInfo, info_facet},
+        server::{ServerInfo, ServerNatives, add_request_services, info_facet, install_natives},
     },
 };
 
@@ -50,9 +57,14 @@ pub struct ServerOptions {
     pub app_dir: Option<PathBuf>,
     pub port: u16,
     pub fake: bool,
+    pub dev: bool,
     pub allowed_hosts: Vec<String>,
     pub registry: PluginRegistry,
     pub plugins: Option<Vec<String>>,
+    /// Additional session RPC contracts supplied by plugins outside the built-in catalog.
+    pub worker_contracts: Vec<Arc<Contract>>,
+    /// Defaults to this application with the native `--worker` entry point.
+    pub worker_process: Option<WorkerOptions>,
 }
 
 impl ServerOptions {
@@ -62,11 +74,20 @@ impl ServerOptions {
             app_dir: None,
             port: 8788,
             fake: false,
+            dev: std::env::var("P2_DEV").as_deref() == Ok("1"),
             allowed_hosts: Vec::new(),
             registry: PluginRegistry::new(),
             plugins: None,
+            worker_contracts: Vec::new(),
+            worker_process: None,
         }
     }
+}
+
+struct RunningPlugins {
+    sources: super::plugins::PluginSources,
+    runtime: pi_rs_chord::node::plugins::PluginRuntime,
+    registry: PluginRegistry,
 }
 
 pub struct P2Server {
@@ -74,10 +95,90 @@ pub struct P2Server {
     pub address: SocketAddr,
     pub data_dir: PathBuf,
     pub plugins: Vec<String>,
-    core: Vec<PluginFacet>,
+    pub workers: SessionWorkers,
+    loading: Option<Arc<tokio::sync::Mutex<RunningPlugins>>>,
     http: HttpServer,
-    store: StoreEngine,
+    natives: Arc<ServerNatives>,
+    _telemetry: Arc<Arc<dyn crate::plugins::telemetry::TelemetryBackend>>,
+    #[cfg(unix)]
+    _reload: Option<Arc<Arc<crate::plugins::dev_tools::ReloadHandler>>>,
     _lock: ProcessLock,
+    #[cfg(unix)]
+    dev: Option<(Arc<StandaloneDev>, channel::Channel)>,
+}
+
+#[cfg(unix)]
+struct StandaloneDev {
+    control: DevControl,
+    workers: SessionWorkers,
+    loading: Arc<tokio::sync::Mutex<RunningPlugins>>,
+}
+
+#[cfg(unix)]
+impl StandaloneDev {
+    async fn execute(&self, command: DevCommand) -> DevResult {
+        let DevCommand::Reload { plugins } = command else {
+            let result = DevResult {
+                ok: false,
+                message: "Restart refused: Restart needs the npm run dev supervisor".into(),
+                plugins: None,
+            };
+            self.control.notify(&result, str::to_owned).await;
+            return result;
+        };
+        let result = self
+            .control
+            .reload(
+                plugins,
+                Default::default(),
+                |names| async move {
+                    let mut loading = self.loading.lock().await;
+                    let RunningPlugins {
+                        sources,
+                        runtime,
+                        registry,
+                    } = &mut *loading;
+                    let update = sources
+                        .reload_named(runtime, &names, &Context::background())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    update.log_problems();
+                    let report = update.report;
+                    self.workers.update_authorizers(
+                        registry.session_authorizers(&update.selected),
+                        &report.failed,
+                    );
+                    if let Some(failure) = report.failed.first() {
+                        return Err(format!("{} (server): {}", failure.plugin, failure.error));
+                    }
+                    let changed: Vec<_> = report
+                        .changed
+                        .into_iter()
+                        .chain(report.added)
+                        .chain(report.removed)
+                        .collect();
+                    Ok((changed.clone(), changed))
+                },
+                str::to_owned,
+            )
+            .await;
+        match result {
+            Ok(plugins) => DevResult {
+                ok: true,
+                message: if plugins.is_empty() {
+                    "No dirty plugins".into()
+                } else {
+                    format!("Reloaded {}", plugins.join(", "))
+                },
+                plugins: Some(plugins),
+            },
+            Err(error) => DevResult {
+                ok: false,
+                message: format!("Reload refused: {error}"),
+                plugins: None,
+            },
+        }
+    }
 }
 
 impl P2Server {
@@ -88,31 +189,49 @@ impl P2Server {
         registry: &PluginRegistry,
         requested: Option<&[String]>,
     ) -> Result<ReloadReport> {
-        let selected = registry.select(requested)?;
-        let mut facets = self.core.clone();
-        facets.extend(registry.facets(FacetKind::Server, &selected));
-        let report = self.host.reload(facets, &Context::background()).await?;
-        self.plugins.retain(|name| {
-            selected.contains(name) || report.failed.iter().any(|f| &f.plugin == name)
-        });
-        self.plugins.extend(
-            selected
-                .into_iter()
-                .filter(|name| !report.failed.iter().any(|f| &f.plugin == name)),
-        );
-        self.plugins.sort();
-        self.plugins.dedup();
+        let mut loading = self
+            .loading
+            .as_ref()
+            .ok_or(pi_rs_chord::Error::Closed)?
+            .lock()
+            .await;
+        let RunningPlugins {
+            sources,
+            runtime,
+            registry: active,
+        } = &mut *loading;
+        sources.replace_registry(registry, requested)?;
+        let update = sources.reload(runtime, &Context::background()).await?;
+        update.log_problems();
+        self.plugins = update.selected;
+        let report = update.report;
+        *active = registry.clone();
+        self.workers.set_builtin_names(registry.select(None)?);
+        self.workers
+            .update_authorizers(registry.session_authorizers(&self.plugins), &report.failed);
         Ok(report)
     }
 
     pub async fn close(self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some((dev, channel)) = self.dev {
+            dev.control.close().await;
+            channel.close().await;
+        }
         let http = self.http.close().await.map_err(Error::from);
+        self.workers.close().await;
         let host = self
             .host
             .close(&Context::background())
             .await
             .map_err(Error::from);
-        let store = self.store.database().close().await.map_err(Error::from);
+        let store = self
+            .natives
+            .store()
+            .database()
+            .close()
+            .await
+            .map_err(Error::from);
         http.and(host).and(store)
     }
 }
@@ -135,12 +254,13 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     let directory = host_dirs::server_directory(&options.data_dir);
     let store = host_dirs::open_host_store(&directory).await?;
     let host = create_host(HostOptions {
+        principal_policy: Some(crate::runtime::principals::Principal::POLICY),
         address: Some(JsonValue::from_serde(
             crate::runtime::address::server_address(),
         )),
         principal: Some(json!({"kind":"server"})),
         store: Some(store.clone()),
-        on_error: Arc::new(|error| eprintln!("p2 server: {}", error.error)),
+        on_error: Arc::new(|error| server_error(&error.error)),
         ..Default::default()
     })?;
     let files = Files::open(
@@ -199,58 +319,219 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     });
     health.cross_site = true;
     routes.route("GET /health", health)?;
+    let mut process = match options.worker_process {
+        Some(process) => process,
+        None => {
+            let mut process =
+                WorkerOptions::new(std::env::current_exe()?, directory.join("worker-locks"));
+            process.args.push("--worker".into());
+            if let Ok(idle) = std::env::var("P2_IDLE_MS")
+                && let Ok(idle) = idle.parse::<u64>()
+            {
+                process.idle_timeout = Duration::from_millis(idle);
+            }
+            process
+        }
+    };
+    process.lock_dir = directory.join("worker-locks");
+    let mut worker_contracts = BTreeMap::new();
+    for name in crate::api::v1::p2_contracts::SESSION_CONTRACTS {
+        let contract = crate::api::v1::p2_contracts::lookup(name)?;
+        worker_contracts.insert((*name).to_owned(), Arc::new(contract));
+    }
+    for contract in options
+        .worker_contracts
+        .into_iter()
+        .chain([host_data_contract()?])
+    {
+        let name = contract.name().to_owned();
+        if worker_contracts.insert(name.clone(), contract).is_some() {
+            return Err(
+                pi_rs_chord::Error::Invalid(format!("Duplicate worker contract: {name}")).into(),
+            );
+        }
+    }
+    let catalog = Arc::new(crate::api::v1::p2_contracts::lookup("p2.catalog")?);
+    let catalog_host = host.clone();
+    let data_dir = std::fs::canonicalize(&options.data_dir)?;
+    let app = options.app_dir.clone().unwrap_or_default();
+    let fake = options.fake;
+    let workers = SessionWorkers::new(&host, process, move |session, generation, context| {
+        let (host, catalog, data_dir, app) = (
+            catalog_host.clone(),
+            catalog.clone(),
+            data_dir.clone(),
+            app.clone(),
+        );
+        Box::pin(async move {
+            let values = if let Ok(provider) =
+                crate::api::v1::server::service_of::<super::session_workers::WorkerInitProvider>(
+                    &host,
+                    super::session_workers::WORKER_INIT_PROVIDER_SERVICE,
+                ) {
+                (*provider)(session, generation, context).await?
+            } else {
+                let value = catalog_session(&host, catalog, &session, &context).await?;
+                Map::from_iter([("session".into(), value)])
+            };
+            Ok(WorkerInit {
+                app,
+                data_dir,
+                fake,
+                telemetry: false,
+                generation,
+                values,
+            })
+        })
+    })?;
+    let route_workers = workers.clone();
     let http = Http::new(
         host.clone(),
         HttpOptions {
             links_path: Some("/chord".into()),
+            remote: Arc::new(move |principal| {
+                route_workers.remote_options(principal, worker_contracts.clone())
+            }),
             prefer_principal: |principal| principal["kind"] == "owner",
-            admit_link: |request| {
-                crate::runtime::http::admit_link(request, super::web::browser_base())
-            },
+            admit_link: crate::runtime::http::browser_links(super::web::browser_base()),
             max_payload: 1024 * 1024,
             max_buffered: 4 * 1024 * 1024,
             close_timeout: Duration::from_secs(8),
-            on_error: Arc::new(|error| eprintln!("p2 server: {error}")),
+            on_error: Arc::new(|error| server_error(&error)),
             ..Default::default()
         },
     );
     let http = http
         .listen(SocketAddr::from(([127, 0, 0, 1], options.port)))
         .await?;
+    let natives = Arc::new(ServerNatives::new(
+        ServerInfo {
+            app: options
+                .app_dir
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            data_dir: options.data_dir.to_string_lossy().into_owned(),
+            fake: options.fake,
+            allowed_hosts: options.allowed_hosts,
+            port: http.address.port(),
+        },
+        workers.clone(),
+        host.clone(),
+        store,
+    ));
+    let telemetry_backend: Arc<Arc<dyn crate::plugins::telemetry::TelemetryBackend>> = Arc::new(
+        Arc::new(crate::plugins::telemetry::InMemoryTelemetryBackend(
+            pi_rs_telemetry::InMemoryTelemetryContext::new(),
+        )),
+    );
     let mut server = P2Server {
         host,
         address: http.address,
         data_dir: options.data_dir,
         plugins: selected,
-        core: Vec::new(),
+        workers,
+        loading: None,
         http,
-        store,
+        natives,
+        _telemetry: telemetry_backend.clone(),
+        #[cfg(unix)]
+        _reload: None,
         _lock: lock,
+        #[cfg(unix)]
+        dev: None,
     };
     let load = async {
-        let info = ServerInfo {
-            app: options
-                .app_dir
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            data_dir: server.data_dir.to_string_lossy().into_owned(),
-            fake: options.fake,
-            allowed_hosts: options.allowed_hosts,
-            port: server.address.port(),
-        };
-        server.core = vec![
-            PluginFacet::new("@p2/core", info_facet(info)?),
+        install_natives(&server.host, &server.natives)?;
+        crate::runtime::server::install_service(
+            &server.host,
+            crate::plugins::telemetry::TELEMETRY_STORE_SERVICE,
+            &telemetry_backend,
+        )?;
+        add_request_services(&mut routes, &server.natives);
+        let core = vec![
+            PluginFacet::new(
+                "@p2/core",
+                info_facet(&server.natives, server.host.downgrade())?,
+            ),
             PluginFacet::new("p2.core-http", routes.facet()),
             PluginFacet::new("chord.app.files", files.facet()?),
         ];
-        let mut facets = server.core.clone();
-        facets.extend(options.registry.facets(FacetKind::Server, &server.plugins));
-        let report = server.host.load(facets, &Context::background()).await?;
-        if let Some(failure) = report.failed.into_iter().next() {
+        let mut sources = super::plugins::PluginSources::new(
+            &options.registry,
+            options.plugins.as_deref(),
+            &host_dirs::user_plugins_directory(&server.data_dir),
+            FacetKind::Server,
+        )?;
+        let (runtime, update) = sources
+            .load(server.host.clone(), core, &Context::background())
+            .await?;
+        update.log_problems();
+        if let Some(failure) = update.report.failed.iter().find(|f| {
+            matches!(
+                f.plugin.as_str(),
+                "@p2/core" | "p2.core-http" | "chord.app.files"
+            )
+        }) {
             return Err(Error::Activation {
-                plugin: failure.plugin,
-                reason: failure.error,
+                plugin: failure.plugin.clone(),
+                reason: failure.error.clone(),
             });
+        }
+        server.plugins = update.selected;
+        let loading = Arc::new(tokio::sync::Mutex::new(RunningPlugins {
+            sources,
+            runtime,
+            registry: options.registry.clone(),
+        }));
+        server.loading = Some(loading.clone());
+        server
+            .workers
+            .set_builtin_names(options.registry.select(None)?);
+        server
+            .workers
+            .update_authorizers(options.registry.session_authorizers(&server.plugins), &[]);
+        if options.dev {
+            #[cfg(unix)]
+            {
+                let dev = Arc::new(StandaloneDev {
+                    control: DevControl::default(),
+                    workers: server.workers.clone(),
+                    loading,
+                });
+                let handler = dev.clone();
+                let channel = channel::serve(&server.data_dir, move |cmd| {
+                    let handler = handler.clone();
+                    async move { handler.execute(cmd).await }
+                })
+                .await?;
+                let reload_dev = dev.clone();
+                let reload_handler: Arc<Arc<crate::plugins::dev_tools::ReloadHandler>> = Arc::new(
+                    Arc::new(move |plugins| {
+                        let reload_dev = reload_dev.clone();
+                        Box::pin(async move {
+                            let res = reload_dev.execute(DevCommand::Reload { plugins }).await;
+                            Ok(JsonValue::from_serde(json!({
+                                "refused": if res.ok { serde_json::Value::Null } else { json!(res.message) },
+                                "plugins": res.plugins.unwrap_or_default(),
+                                "logs": []
+                            })))
+                        })
+                    }),
+                );
+                crate::runtime::server::install_service(
+                    &server.host,
+                    crate::plugins::dev_tools::PLUGIN_RELOAD_SERVICE,
+                    &reload_handler,
+                )?;
+                server._reload = Some(reload_handler);
+                server.dev = Some((dev, channel));
+            }
+            #[cfg(not(unix))]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Private dev control requires Unix sockets",
+            )
+            .into());
         }
         Ok(())
     }
@@ -259,9 +540,16 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         Ok(()) => Ok(server),
         Err(error) => {
             if let Err(close) = server.close().await {
-                eprintln!("p2 server: {close}");
+                server_error(&close);
             }
             Err(error)
         }
     }
+}
+
+fn server_error(error: &impl std::fmt::Display) {
+    use crate::runtime::logs::{LogLevel, process_logs};
+    let message = format!("p2 server: {error}");
+    eprintln!("{message}");
+    process_logs().append("server", LogLevel::Stderr, &message);
 }

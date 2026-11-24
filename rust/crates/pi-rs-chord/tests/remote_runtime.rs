@@ -5,11 +5,14 @@ use pi_rs_chord::{
     contracts::{Contract, Member, schema::*},
     host::*,
     json::JsonValue,
-    link::memory_link_pair,
+    link::{Link, memory_link_pair},
     remote::{RemoteOptions, RemotePeer},
     state::{Batch, Source},
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 fn remote_contract(name: &str, members: IndexMap<String, Member>) -> Result<Arc<Contract>> {
     Ok(Arc::new(Contract::remote(
         name,
@@ -41,6 +44,208 @@ async fn deadline<T>(future: impl std::future::Future<Output = Result<T>>) -> Re
     tokio::time::timeout(Duration::from_secs(3), future)
         .await
         .map_err(|_| pi_rs_chord::Error::Invalid("remote deadline".into()))?
+}
+
+#[tokio::test]
+async fn revoking_a_forwarded_caller_cancels_pending_demand_without_closing_the_parent()
+-> Result<()> {
+    let contract = remote_contract("pending-demand", IndexMap::new())?;
+    let context = Context::background();
+    let host = create_host(HostOptions {
+        principal_policy: Some(PrincipalPolicy {
+            key: pi_rs_chord::data::principal_key,
+            revoked_by: |who, selector| who == selector,
+        }),
+        ..Default::default()
+    })?;
+    let (a, b) = memory_link_pair();
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut parent = RemoteOptions::new(serde_json::json!("parent"));
+    parent.trusted = true;
+    parent
+        .route_contracts
+        .insert(contract.name().into(), contract.clone());
+    parent.route = Some(Arc::new(move |request| {
+        let _ = requests.send(request.context);
+        Box::pin(std::future::pending())
+    }));
+    let serving = host.connect(a, parent)?;
+    let mut child = RemoteOptions::new(serde_json::json!("child"));
+    child.role = pi_rs_chord::remote::LinkRole::Child;
+    child.trusted = true;
+    let client = RemotePeer::connect(b, child, Batch::new(|_| {}))?;
+    let guest = serde_json::json!({"kind":"guest"});
+    let held = client.hold_as(
+        contract,
+        empty(),
+        Caller {
+            principal: Some(guest.clone()),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        },
+        &context,
+    )?;
+    let demand = tokio::time::timeout(Duration::from_secs(5), received.recv())
+        .await
+        .map_err(|_| pi_rs_chord::Error::Invalid("route demand timed out".into()))?
+        .ok_or(pi_rs_chord::Error::Closed)?;
+    host.revoke(&guest, &context).await?;
+    client.fence().await?;
+    assert!(demand.is_aborted());
+    assert!(
+        matches!(held.state().value(), RefState::Ended { error } if error.code == "forbidden" && error.reason.as_deref() == Some("revoked"))
+    );
+    serving.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn holds_before_handshake_bind_and_replay_after_reconnect() -> Result<()> {
+    let ty = remote_contract(
+        "handshake",
+        IndexMap::from([("get".into(), method(None, Some(int())))]),
+    )?;
+    let host = remote_host()?;
+    let contract = ty.clone();
+    host.load(
+        vec![PluginFacet::new(
+            "handshake",
+            define_facet(move |setup| {
+                setup.serve(
+                    contract.clone(),
+                    |_, _, _| {
+                        let mut members = Members::variant("main");
+                        members
+                            .method("get", |_, _| Box::pin(async { Ok(JsonValue::Number(4.)) }))?;
+                        Ok(members)
+                    },
+                    ServeOptions::default(),
+                )
+            }),
+        )],
+        &Context::background(),
+    )
+    .await?;
+    let (a, b) = memory_link_pair();
+    let client = RemotePeer::connect(
+        a,
+        RemoteOptions::new(serde_json::json!("server")),
+        Batch::new(|_| {}),
+    )?;
+    let context = Context::background();
+    let held = client.hold(ty.clone(), empty(), &context)?;
+    assert!(matches!(held.state().value(), RefState::Loading));
+    let server = RemotePeer::serve(
+        host.clone(),
+        b,
+        RemoteOptions::new(serde_json::json!("user")),
+    )?;
+    assert_eq!(
+        deadline(held.call("get", JsonValue::Null, &context)).await?,
+        JsonValue::Number(4.)
+    );
+
+    let (a, b) = memory_link_pair();
+    client.reconnect(a)?;
+    let new_hold = client.hold(ty, empty(), &context)?;
+    assert!(matches!(held.state().value(), RefState::Loading));
+    assert!(matches!(new_hold.state().value(), RefState::Loading));
+    server.reconnect(b)?;
+    assert_eq!(
+        deadline(held.call("get", JsonValue::Null, &context)).await?,
+        JsonValue::Number(4.)
+    );
+    assert_eq!(
+        deadline(new_hold.call("get", JsonValue::Null, &context)).await?,
+        JsonValue::Number(4.)
+    );
+    Ok(())
+}
+
+struct GreetingGate {
+    link: Arc<dyn Link>,
+    during_greeting: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Link for GreetingGate {
+    fn send(&self, bytes: Vec<u8>) -> Result<()> {
+        let gate = self
+            .during_greeting
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(gate) = gate {
+            gate();
+        }
+        self.link.send(bytes)
+    }
+    fn close(&self) {
+        self.link.close();
+    }
+    fn on_message(&self, listener: Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
+        self.link.on_message(listener);
+    }
+    fn on_close(&self, listener: Arc<dyn Fn() + Send + Sync>) {
+        self.link.on_close(listener);
+    }
+    fn closed(&self) -> bool {
+        self.link.closed()
+    }
+}
+
+#[tokio::test]
+async fn close_wins_during_a_reconnect_greeting_callback() -> Result<()> {
+    let ty = remote_contract("close-during-reconnect", IndexMap::new())?;
+    let (original, _other) = memory_link_pair();
+    let peer = RemotePeer::connect(
+        original,
+        RemoteOptions::new(serde_json::json!("server")),
+        Batch::new(|_| {}),
+    )?;
+    let held = peer.hold(ty, empty(), &Context::background())?;
+    let (new, _other) = memory_link_pair();
+    let (began, greeting) = tokio::sync::oneshot::channel();
+    let (resume, paused) = std::sync::mpsc::channel();
+    let gated = Arc::new(GreetingGate {
+        link: new.clone(),
+        during_greeting: Mutex::new(Some(Box::new(move || {
+            let _ = began.send(());
+            let _ = paused.recv_timeout(Duration::from_secs(10));
+        }))),
+    });
+    let reconnecting = peer.clone();
+    let reconnect = tokio::task::spawn_blocking(move || reconnecting.reconnect(gated));
+    greeting
+        .await
+        .map_err(|err| pi_rs_chord::Error::Invalid(err.to_string()))?;
+    let replacing = peer.clone();
+    let mut close = tokio::task::spawn_blocking(move || {
+        let (rival, _other) = memory_link_pair();
+        let competing = replacing.reconnect(rival);
+        replacing.close();
+        competing
+    });
+    let before_resume = tokio::time::timeout(Duration::from_secs(3), &mut close).await;
+    let _ = resume.send(());
+    let reconnected = reconnect
+        .await
+        .map_err(|err| pi_rs_chord::Error::Invalid(err.to_string()))?;
+    let competing = match before_resume {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = close.await;
+            return Err(pi_rs_chord::Error::Invalid(
+                "close was blocked by the greeting callback".into(),
+            ));
+        }
+    }
+    .map_err(|err| pi_rs_chord::Error::Invalid(err.to_string()))?;
+    assert!(
+        matches!(competing, Err(pi_rs_chord::Error::Chord(error)) if error.code == "unavailable")
+    );
+    assert!(matches!(reconnected, Err(pi_rs_chord::Error::Closed)));
+    assert!(new.closed());
+    assert!(matches!(held.state().value(), RefState::Ended { .. }));
+    Ok(())
 }
 #[tokio::test]
 async fn memory_peer_calls_subscriptions_deltas_and_reconnect() -> Result<()> {

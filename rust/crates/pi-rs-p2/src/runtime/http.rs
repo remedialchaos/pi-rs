@@ -1,20 +1,93 @@
 use http::{HeaderMap, Method, header};
-use pi_rs_chord::node::http::{HttpRequest, LinkAdmission};
+use pi_rs_chord::node::http::{AdmitLink, LinkAdmission};
+use serde::Deserialize;
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
+
+use super::{
+    logs::{LogLevel, process_logs},
+    principals::{OwnerAccess, Principal},
+};
 
 #[cfg(test)]
 mod tests;
 
 pub const PROXY_MARKER_HEADER: &str = "x-p2-proxy-secret";
 
-pub(crate) fn admit_link(request: &HttpRequest, base: Option<&str>) -> LinkAdmission {
-    if request.principal.is_none() {
-        return LinkAdmission::Reject(http::StatusCode::FORBIDDEN);
-    }
-    stale_page(&request.query, base).map_or(LinkAdmission::Attach, LinkAdmission::Close)
+pub(crate) fn browser_links(base: Option<&'static str>) -> AdmitLink {
+    let reported = Mutex::new(HashSet::new());
+    Arc::new(move |request| {
+        let Some(principal) = &request.principal else {
+            return LinkAdmission::Reject(http::StatusCode::FORBIDDEN);
+        };
+        let Some(stale) = stale_page(&request.query, base) else {
+            return LinkAdmission::Attach;
+        };
+        let who = match Principal::deserialize(principal) {
+            Ok(Principal::Owner {
+                access: OwnerAccess::Device { device },
+            }) => format!("the owner's device {device}"),
+            Ok(Principal::Owner {
+                access: OwnerAccess::Local,
+            }) => "the owner (local)".to_owned(),
+            Ok(Principal::Owner {
+                access: OwnerAccess::Relay,
+            }) => "the owner (relay)".to_owned(),
+            Ok(Principal::Guest { name, id, .. }) => format!("guest {name} ({id})"),
+            Ok(Principal::Worker { session, .. }) => format!("session {session}'s worker"),
+            _ => principal["kind"].as_str().unwrap_or("unknown").to_owned(),
+        };
+        // Node exposes incoming header bytes as Latin-1 code units.
+        let agent = request.headers.get(header::USER_AGENT).map_or_else(
+            || "unknown browser".to_owned(),
+            |header| {
+                header
+                    .as_bytes()
+                    .iter()
+                    .take(200)
+                    .map(|&b| char::from(b))
+                    .collect()
+            },
+        );
+        let key = format!(
+            "{who}\n{agent}\n{}",
+            stale.sent.as_deref().unwrap_or("null")
+        );
+        if reported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key)
+        {
+            let sent = stale
+                .sent
+                .as_deref()
+                .unwrap_or("unnamed: from before 2026-11-12");
+            let current = base.unwrap_or("not built");
+            let remote = request.remote_address.map_or_else(
+                || "unknown address".to_owned(),
+                |addr| addr.ip().to_string(),
+            );
+            let text = format!(
+                "A page running an older p2 (web bundle {sent}, current {current}) tried to connect and was told to reload: {who}, {agent}, from {remote} (WebSocket /chord)."
+            );
+            process_logs().append("stale-pages", LogLevel::Event, &text);
+        }
+        LinkAdmission::Close(axum::extract::ws::CloseFrame {
+            code: 4001,
+            reason: "p2: stale page, reload".into(),
+        })
+    })
+}
+
+struct StalePage<'a> {
+    sent: Option<Cow<'a, str>>,
 }
 
 /// An old browser reloads on this close frame. Named non-browser clients may omit the base.
-fn stale_page(query: &str, base: Option<&str>) -> Option<axum::extract::ws::CloseFrame> {
+fn stale_page<'a>(query: &'a str, base: Option<&str>) -> Option<StalePage<'a>> {
     let params = form_urlencoded::parse(query.as_bytes());
     let first = |key: &str| {
         params
@@ -22,14 +95,12 @@ fn stale_page(query: &str, base: Option<&str>) -> Option<axum::extract::ws::Clos
             .find(|(name, _)| name == key)
             .map(|(_, value)| value)
     };
-    let is_current = match first("web") {
+    let sent = first("web");
+    let is_current = match sent.as_deref() {
         Some(sent) => base.is_none_or(|base| sent == base),
         None => matches!(first("client").as_deref(), Some("tui" | "cloud" | "script")),
     };
-    (!is_current).then(|| axum::extract::ws::CloseFrame {
-        code: 4001,
-        reason: "p2: stale page, reload".into(),
-    })
+    (!is_current).then_some(StalePage { sent })
 }
 
 pub fn parse_allowed_hosts(value: &str) -> Vec<String> {

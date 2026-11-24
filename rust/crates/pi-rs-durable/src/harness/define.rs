@@ -79,12 +79,16 @@ pub type HookHandler = Arc<
 pub type HookHandlers = indexmap::IndexMap<String, HookHandler>;
 
 impl super::Agent {
-    pub(super) fn hooks(&self, kind: &str, event: &str) -> Vec<HookHandler> {
+    pub(super) fn hooks(&self, kind: &str, event: &str) -> Vec<(String, HookHandler)> {
         self.extensions
             .iter()
-            .flat_map(|e| e.hooks.iter())
-            .filter(|h| h.task == kind)
-            .filter_map(|h| h.handlers.get(event).cloned())
+            .flat_map(|e| {
+                e.hooks
+                    .iter()
+                    .filter(|h| h.task == kind)
+                    .filter_map(|h| h.handlers.get(event))
+                    .map(|handler| (e.name.clone(), handler.clone()))
+            })
             .collect()
     }
 }

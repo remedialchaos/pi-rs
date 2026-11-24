@@ -23,6 +23,122 @@ const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 /// Largest terminal size accepted, in cells.
 const MAX_CELLS: u64 = 4096;
 
+/// An in-process PTY using the same shell and platform operations as the daemon.
+#[cfg(unix)]
+pub struct LocalTerminal {
+    master: Arc<std::fs::File>,
+    pid: u32,
+    running: Arc<Mutex<bool>>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    input: Mutex<()>,
+    result: Mutex<std::sync::mpsc::Receiver<std::io::Result<i32>>>,
+}
+
+#[cfg(unix)]
+impl LocalTerminal {
+    pub fn open(options: crate::TerminalOptions) -> std::io::Result<Self> {
+        use std::sync::{atomic::AtomicBool, mpsc};
+        use std::thread;
+
+        let request = PtyRequest::from_json(&json!({
+            "cwd": options.cwd, "argv": options.argv, "env": options.env,
+            "inheritEnv": options.inherit_env, "cols": options.cols, "rows": options.rows
+        }))
+        .map_err(|error| std::io::Error::other(error.to_json().to_string()))?;
+        let (master, mut child) = unix::spawn(&request)?;
+        let pid = child.id();
+        let master = Arc::new(master);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let reader_master = master.clone();
+        let stop_reading = stopped.clone();
+        let (read_done, read_finished) = mpsc::channel();
+        let reader = thread::Builder::new().spawn(move || {
+            unix::read(&reader_master, &stop_reading, |bytes| {
+                (options.on_data)(bytes);
+                true
+            });
+            let _ = read_done.send(());
+        });
+        let reader = match reader {
+            Ok(reader) => reader,
+            Err(error) => {
+                kill_group(pid);
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        let (send, result) = mpsc::channel();
+        let running = Arc::new(Mutex::new(true));
+        let wait_running = running.clone();
+        let wait_stopped = stopped.clone();
+        thread::spawn(move || {
+            let status = loop {
+                let mut running = lock(&wait_running);
+                match child.try_wait() {
+                    Ok(None) => {}
+                    result => {
+                        *running = false;
+                        break result.map(|status| {
+                            status.map_or(1, |status| crate::daemon::sys::exit_code(status) as i32)
+                        });
+                    }
+                }
+                drop(running);
+                thread::sleep(std::time::Duration::from_millis(25));
+            };
+            let _ = read_finished.recv_timeout(EXIT_GRACE);
+            wait_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = reader.join();
+            let _ = send.send(status);
+        });
+        Ok(Self {
+            master,
+            pid,
+            running,
+            stopped,
+            input: Mutex::new(()),
+            result: Mutex::new(result),
+        })
+    }
+
+    pub fn write(&self, bytes: &[u8]) {
+        let _input = lock(&self.input);
+        unix::write_all(&self.master, bytes, &self.stopped);
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        unix::set_size(&self.master, cols, rows)
+    }
+
+    pub fn foreground(&self) -> std::io::Result<Option<crate::TerminalForeground>> {
+        let pid = unix::foreground(&self.master)?;
+        Ok(
+            (pid > 0 && pid as u32 != self.pid).then(|| crate::TerminalForeground {
+                pid: pid as u32,
+                name: crate::daemon::sys::process_name(pid),
+            }),
+        )
+    }
+
+    pub fn close(&self) {
+        use std::sync::atomic::Ordering;
+        if *lock(&self.running) && !self.stopped.swap(true, Ordering::SeqCst) {
+            kill_group(self.pid);
+        }
+    }
+
+    pub fn wait(&self) -> std::io::Result<i32> {
+        lock(&self.result).recv().map_err(std::io::Error::other)?
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LocalTerminal {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// What `ptyWrite`, `ptyResize` and `ptyForeground` reach: the terminal of one running `pty` request.
 pub struct Terminal {
     input: Sender<Vec<u8>>,

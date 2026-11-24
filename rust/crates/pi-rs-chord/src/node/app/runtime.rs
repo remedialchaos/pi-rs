@@ -285,7 +285,7 @@ pub struct WorkerApp {
     pub files: Files,
     pub plugins: PluginRuntime,
     pub session: WorkerSession,
-    _parent: RemotePeer,
+    pub parent: RemotePeer,
 }
 /// Start a worker with the kit configuration sent by AppServer's native supervisor.
 pub async fn boot_worker(mut session: WorkerSession, core: Vec<PluginFacet>) -> Result<WorkerApp> {
@@ -309,6 +309,44 @@ pub async fn boot_worker(mut session: WorkerSession, core: Vec<PluginFacet>) -> 
     .await
 }
 pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> Result<WorkerApp> {
+    start_worker_with_host(session, options, HostOptions::default()).await
+}
+
+/// Start a worker with the application's principal and reference policies.
+pub async fn start_worker_with_host(
+    session: WorkerSession,
+    options: WorkerAppOptions,
+    host_options: HostOptions,
+) -> Result<WorkerApp> {
+    start_worker_with(session, options, host_options, async |_| Ok(true)).await
+}
+
+/// Initialize the application's durable state on the worker store before reporting Ready.
+pub async fn start_worker_with(
+    session: WorkerSession,
+    options: WorkerAppOptions,
+    host_options: HostOptions,
+    before_ready: impl AsyncFnOnce(&StoreEngine) -> Result<bool>,
+) -> Result<WorkerApp> {
+    start_worker_with_setup(
+        session,
+        options,
+        host_options,
+        |_, _, _| Ok(()),
+        before_ready,
+    )
+    .await
+}
+
+/// Like `start_worker_with`, with a synchronous setup hook invoked after connecting to the
+/// parent peer and opening worker files, before loading plugin facets.
+pub async fn start_worker_with_setup(
+    mut session: WorkerSession,
+    options: WorkerAppOptions,
+    host_options: HostOptions,
+    before_load: impl FnOnce(&Host, &RemotePeer, &Files) -> Result<()>,
+    before_ready: impl AsyncFnOnce(&StoreEngine) -> Result<bool>,
+) -> Result<WorkerApp> {
     private_directory(&options.directory)?;
     let path = options.directory.join("store.sqlite");
     private_store(&path)?;
@@ -318,9 +356,9 @@ pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> 
         principal: Some(options.principal),
         address: Some(JsonValue::from_serde(session.address.clone())),
         store: Some(store.clone()),
-        ..Default::default()
+        ..host_options
     })?;
-    let result = async {
+    let result: Result<_> = async {
         let mut parent_options = RemoteOptions::new(options.server_principal.clone());
         parent_options.trusted = true;
         let parent = host.connect(session.parent.clone(), parent_options)?;
@@ -330,6 +368,7 @@ pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> 
             options.files,
         )
         .await?;
+        before_load(&host, &parent, &files)?;
         let mut core = options.core;
         core.push(PluginFacet::new("chord.app.files", files.facet()?));
         core.push(PluginFacet::new(
@@ -358,10 +397,11 @@ pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> 
             .collect();
         let (plugins, _) =
             PluginRuntime::load(host.clone(), core, scripts, &Context::background()).await?;
+        let idle = before_ready(&store).await?;
         let activity = host.activity().value();
         session
             .report(Control::Ready {
-                idle: activity.references + activity.jobs + activity.lingering == 0,
+                idle: idle && activity.references + activity.jobs + activity.lingering == 0,
             })
             .await?;
         Ok((parent, files, plugins))
@@ -374,17 +414,25 @@ pub async fn start_worker(session: WorkerSession, options: WorkerAppOptions) -> 
             files,
             plugins,
             session,
-            _parent: parent,
+            parent,
         }),
         Err(error) => {
             let _ = host.close(&Context::background()).await;
             let _ = db.close().await;
+            let _ = session.report_start_failure(error.to_string()).await;
             Err(error)
         }
     }
 }
 impl WorkerApp {
     pub async fn run(mut self) -> Result<()> {
+        self.serve_with_idle(|| true).await?;
+        self.host.close(&Context::background()).await?;
+        self.store.database().close().await
+    }
+
+    /// Drive worker controls while reporting both Chord and application activity.
+    pub async fn serve_with_idle(&mut self, is_idle: impl Fn() -> bool) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_millis(50));
         let mut idle = None;
         loop {
@@ -406,10 +454,19 @@ impl WorkerApp {
                     },
                     _ => {}
                 },
-                _=interval.tick()=>{if self.session.parent.closed(){break;}let activity=self.host.activity().value();let next=activity.references+activity.jobs+activity.lingering==0;if idle!=Some(next){idle=Some(next);self.session.report(Control::Idle {idle:next}).await?;}}
+                _ = interval.tick() => {
+                    if self.session.parent.closed() {
+                        break;
+                    }
+                    let activity = self.host.activity().value();
+                    let next = is_idle() && activity.references + activity.jobs + activity.lingering == 0;
+                    if idle != Some(next) {
+                        idle = Some(next);
+                        self.session.report(Control::Idle { idle: next }).await?;
+                    }
+                }
             }
         }
-        self.host.close(&Context::background()).await?;
-        self.store.database().close().await
+        Ok(())
     }
 }

@@ -1,10 +1,20 @@
 use std::{path::PathBuf, sync::Arc};
 
+use pi_rs_ai::{
+    Message, StringOrBlocks,
+    faux::{
+        FauxModelDefinition, FauxOptions, FauxStep, faux_assistant_message, faux_provider,
+        faux_text,
+    },
+    registry::Models,
+    transcript::input_text,
+};
 use pi_rs_chord::{
     Error, Result,
-    host::PluginFacet,
+    context::Context,
+    host::{Host, HostOptions, PluginFacet, define_facet},
     node::{
-        app::{FilesCaps, WorkerApp, WorkerAppOptions, start_worker},
+        app::{FilesCaps, WorkerApp, WorkerAppOptions, start_worker_with_setup},
         workers::WorkerSession,
     },
 };
@@ -18,6 +28,13 @@ use crate::{
         session_worker::{SessionInit, WorkerBoundary},
     },
 };
+
+// These paths keep the worker's native API together with its entry point.
+#[path = "../runtime/durable.rs"]
+pub mod durable;
+#[path = "../runtime/worker_core.rs"]
+mod worker_core;
+pub use worker_core::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,18 +62,72 @@ pub async fn start_session_worker(
     worker: WorkerSession,
     registry: &PluginRegistry,
     requested: Option<&[String]>,
-) -> Result<WorkerApp> {
-    start_session_worker_with(worker, registry, requested, |_, _| Ok(None)).await
+) -> Result<SessionWorker> {
+    start(
+        worker,
+        registry,
+        requested,
+        None,
+        |_| Ok(Vec::new()),
+        |_, _| Ok(None),
+    )
+    .await
 }
 
-/// Assemble the native session runtime after validating the parent handshake.
-/// The factory can share its boundary with the plugin facets that admit work.
+/// Existing embedders can supply a lifecycle boundary of their own.
 pub async fn start_session_worker_with(
     worker: WorkerSession,
     registry: &PluginRegistry,
     requested: Option<&[String]>,
     boundary: impl FnOnce(&WorkerInit, &SessionInit) -> Result<Option<Arc<WorkerBoundary>>>,
-) -> Result<WorkerApp> {
+) -> Result<SessionWorker> {
+    start(
+        worker,
+        registry,
+        requested,
+        None,
+        |_| Ok(Vec::new()),
+        boundary,
+    )
+    .await
+}
+
+/// Supply registered models and construct native facets with access to the shared worker process.
+pub async fn start_session_worker_configured(
+    worker: WorkerSession,
+    registry: &PluginRegistry,
+    requested: Option<&[String]>,
+    models: Models,
+    facets: impl FnOnce(&Arc<WorkerProcess>) -> Result<Vec<PluginFacet>>,
+) -> Result<SessionWorker> {
+    start(worker, registry, requested, Some(models), facets, |_, _| {
+        Ok(None)
+    })
+    .await
+}
+
+const WORKER_PROCESS_SERVICE: &str = "p2.worker-process";
+
+/// Retrieve the active `WorkerProcess` from a worker Chord `Host`.
+pub fn worker_of(host: &Host) -> Result<Arc<WorkerProcess>> {
+    crate::runtime::server::service_of::<WorkerProcess>(host, WORKER_PROCESS_SERVICE)
+}
+
+struct HeldWorkerServices {
+    _parent: Arc<pi_rs_chord::remote::RemotePeer>,
+    _files: Arc<pi_rs_chord::node::app::Files>,
+}
+
+type HeldWorkerServicesSlot = Arc<std::sync::Mutex<Option<HeldWorkerServices>>>;
+
+async fn start(
+    mut worker: WorkerSession,
+    registry: &PluginRegistry,
+    requested: Option<&[String]>,
+    models: Option<Models>,
+    facets: impl FnOnce(&Arc<WorkerProcess>) -> Result<Vec<PluginFacet>>,
+    boundary: impl FnOnce(&WorkerInit, &SessionInit) -> Result<Option<Arc<WorkerBoundary>>>,
+) -> Result<SessionWorker> {
     let init: WorkerInit = serde_json::from_value(worker.start.clone())?;
     let session = init.session()?;
     let id = &session.id;
@@ -65,13 +136,55 @@ pub async fn start_session_worker_with(
             "Session parameters do not match worker address".into(),
         ));
     }
+    let reserved = registry.select(None)?;
+    worker.scripts.retain(|script| {
+        if reserved.contains(&script.name) {
+            eprintln!("p2 plugins: plugin {} is already discovered", script.name);
+            false
+        } else {
+            true
+        }
+    });
     let selected = registry.select(requested)?;
+
     let directory = session_directory(&init.data_dir, id)?;
-    let mut core = registry.facets(FacetKind::Worker, &selected);
-    if let Some(boundary) = boundary(&init, &session)? {
-        core.push(PluginFacet::new("@p2/core", boundary.facet(id.clone())?));
-    }
-    start_worker(
+    let boundary = boundary(&init, &session)?;
+    let models = match models {
+        Some(models) => models,
+        None if init.fake => fake_models(),
+        None => Models::builtin(Default::default()).map_err(durable::durable_error)?,
+    };
+    let process = Arc::new(WorkerProcess::new(init, &session, models));
+    let boundary = boundary.unwrap_or_else(|| {
+        Arc::new(WorkerBoundary::new(
+            process.location.value(),
+            Arc::new(BoundaryBackend(Arc::downgrade(&process))),
+        ))
+    });
+    let mut core = Vec::new();
+    let installed = process.clone();
+    core.push(PluginFacet::new(
+        "@p2/worker-process",
+        define_facet(move |host| {
+            crate::runtime::server::install_service(
+                &host.host(),
+                WORKER_PROCESS_SERVICE,
+                &installed,
+            )
+        }),
+    ));
+    core.extend(registry.facets(FacetKind::Worker, &selected));
+    core.extend(facets(&process)?);
+    core.push(PluginFacet::new("@p2/core", boundary.facet(id.clone())?));
+    let delivered: Vec<_> = worker
+        .scripts
+        .iter()
+        .map(|s| (s.name.clone(), s.digest.clone()))
+        .collect();
+    let opening = process.clone();
+    let held_services: HeldWorkerServicesSlot = Arc::default();
+    let setup_services = held_services.clone();
+    let app = start_worker_with_setup(
         worker,
         WorkerAppOptions {
             directory,
@@ -80,6 +193,126 @@ pub async fn start_session_worker_with(
             core,
             files: FilesCaps::default(),
         },
+        HostOptions {
+            principal_policy: Some(crate::runtime::principals::Principal::POLICY),
+            ..Default::default()
+        },
+        move |host, parent, files| {
+            let parent_arc = Arc::new(parent.clone());
+            let files_arc = Arc::new(files.clone());
+            crate::runtime::server::install_service(host, "p2.server-peer", &parent_arc)?;
+            crate::runtime::server::install_service(
+                host,
+                crate::plugins::send_file::WORKER_FILES_SERVICE,
+                &files_arc,
+            )?;
+            *setup_services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HeldWorkerServices {
+                _parent: parent_arc,
+                _files: files_arc,
+            });
+            Ok(())
+        },
+        async move |store| {
+            opening
+                .open(store, &session, boundary, &Context::background())
+                .await?;
+            Ok(opening.liveness().idle())
+        },
     )
-    .await
+    .await;
+    let app = match app {
+        Ok(app) => app,
+        Err(error) => {
+            let _ = process.close().await;
+            return Err(error);
+        }
+    };
+    for (name, digest) in delivered {
+        if app.plugins.digest(&name).as_ref() != Some(&digest) {
+            eprintln!("p2 worker: optional component {name} was not registered");
+        }
+    }
+    Ok(SessionWorker {
+        app,
+        process,
+        _services: held_services,
+    })
+}
+
+pub struct SessionWorker {
+    app: WorkerApp,
+    pub process: Arc<WorkerProcess>,
+    _services: HeldWorkerServicesSlot,
+}
+
+impl std::ops::Deref for SessionWorker {
+    type Target = WorkerApp;
+
+    fn deref(&self) -> &Self::Target {
+        &self.app
+    }
+}
+
+impl SessionWorker {
+    pub async fn run(mut self) -> Result<()> {
+        let result = self
+            .app
+            .serve_with_idle(|| self.process.liveness().idle())
+            .await;
+        result.and(self.close().await)
+    }
+
+    pub async fn close(self) -> Result<()> {
+        self.process.stop();
+        let host = self.app.host.close(&Context::background()).await;
+        let durable = self.process.close().await;
+        let store = self.app.store.database().close().await;
+        durable.and(host).and(store)
+    }
+}
+
+pub(crate) fn fake_models() -> Models {
+    let models = Models::default();
+    for (provider, id) in [("faux", "faux-1"), ("fake", "fake")] {
+        let faux = Arc::new(faux_provider(FauxOptions {
+            api: Some("p2-faux".into()),
+            provider: Some(provider.into()),
+            models: vec![FauxModelDefinition {
+                id: id.into(),
+                ..Default::default()
+            }],
+            tokens_per_second: Some(200.0),
+            ..Default::default()
+        }));
+        let mut provider = faux.provider.clone();
+        if let Some(chat) = provider.chat.take() {
+            let queue = std::sync::Mutex::new(());
+            provider.chat = Some(Arc::new(move |model, context, options, simple| {
+                let text = context
+                    .messages()
+                    .iter()
+                    .rev()
+                    .find_map(|message| match message {
+                        Message::User(message) => Some(match &message.content {
+                            StringOrBlocks::String(text) => text.clone(),
+                            StringOrBlocks::Blocks(content) => input_text(content, "\n"),
+                        }),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let response = text
+                    .strip_prefix("json ")
+                    .map_or_else(|| format!("Echo: {text}"), str::to_owned);
+                let _guard = queue.lock().unwrap_or_else(|err| err.into_inner());
+                faux.append_responses([FauxStep::from(faux_assistant_message(vec![faux_text(
+                    response,
+                )]))]);
+                chat(model, context, options, simple)
+            }));
+        }
+        models.set_provider(provider);
+    }
+    models
 }
