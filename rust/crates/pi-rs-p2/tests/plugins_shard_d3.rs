@@ -35,6 +35,20 @@ use pi_rs_p2::{
             },
             display::chat_entry_display,
         },
+        prompt::{
+            app_guide,
+            context_files::{LocalPromptFiles, load_prompt_resources},
+            contract::{PLUGIN_SKILLS_SERVICE, PluginSkillsService, TemplateSource},
+            templates::{
+                expand_prompt, parse_command_args, parse_frontmatter, parse_template,
+                substitute_args,
+            },
+        },
+        tree::{
+            branch_target::{BranchRef, branch_of, branch_target},
+            contract::{Tree, TreeBranch, TreeNode, TreeRole},
+            toc::{TurnMessages, table_of_contents},
+        },
         views::{
             contract::{
                 AnnotationInput, MESSAGE_CONTEXTS_SERVICE, MessageContext, MessageContextsService,
@@ -1151,6 +1165,501 @@ async fn views_worker_permissions_methods_and_send_router() -> TestResult {
             &context,
         )
         .await?;
+
+    worker.close().await?;
+    Ok(())
+}
+
+// ============================================================================
+// tree pure unit tests
+// ============================================================================
+
+#[test]
+fn tree_branch_target_and_toc() {
+    let bref = BranchRef {
+        session: "s1".into(),
+        conversation: 3,
+    };
+    let target = branch_target(&bref, "Fix bug");
+    assert_eq!(target.target_type, "branch");
+    assert_eq!(branch_of(Some(&target.id)), Some(bref));
+    assert_eq!(branch_of(Some("[\"s1\",0]")), None);
+    assert_eq!(branch_of(None), None);
+
+    let tree = Tree {
+        nodes: vec![
+            TreeNode {
+                entry: 1,
+                parent: None,
+                role: TreeRole::User,
+                text: "Hello".into(),
+                conversation: 1,
+            },
+            TreeNode {
+                entry: 2,
+                parent: Some(1),
+                role: TreeRole::Assistant,
+                text: "Step 1".into(),
+                conversation: 1,
+            },
+            TreeNode {
+                entry: 3,
+                parent: Some(2),
+                role: TreeRole::Assistant,
+                text: "Final answer".into(),
+                conversation: 1,
+            },
+            TreeNode {
+                entry: 4,
+                parent: Some(3),
+                role: TreeRole::User,
+                text: "Branch msg".into(),
+                conversation: 2,
+            },
+        ],
+        branches: vec![
+            TreeBranch {
+                conversation: 1,
+                label: None,
+            },
+            TreeBranch {
+                conversation: 2,
+                label: Some("Alt".into()),
+            },
+        ],
+        main: 1,
+        current: Some(3),
+    };
+    let toc = table_of_contents(&tree);
+    assert_eq!(toc.turns.len(), 1);
+    assert!(toc.turns[0].head);
+    assert!(toc.turns[0].current);
+    // Intermediate assistant step (entry 2) was collapsed; exchange pairs entry 1 + entry 3.
+    match &toc.turns[0].messages {
+        TurnMessages::Exchange { user, answer } => {
+            assert_eq!(user.entry, 1);
+            assert_eq!(answer.as_ref().map(|a| a.entry), Some(3));
+        }
+        TurnMessages::Answer { .. } => panic!("expected exchange"),
+    }
+    assert_eq!(toc.turns[0].branches.len(), 1);
+    assert_eq!(toc.turns[0].branches[0].conversation, 2);
+}
+
+// ============================================================================
+// tree worker facet integration tests
+// ============================================================================
+
+#[tokio::test]
+async fn tree_worker_permissions_branch_select_rename_and_read_only() -> TestResult {
+    let fixture = TempDir::new()?;
+    let context = Context::background();
+
+    let mut registry = PluginRegistry::new();
+    let sessions_c = Arc::new(lookup("p2.sessions")?);
+    let tree_reports = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let tree_reports_w = tree_reports.clone();
+    registry.register(
+        "mock-sessions",
+        FacetKind::Worker,
+        define_facet(move |h| {
+            let tr = tree_reports_w.clone();
+            h.serve(
+                sessions_c.clone(),
+                move |_, _, object| {
+                    let mut members = Members::variant("worker");
+                    let session_state = object.writable(JsonValue::Null)?;
+                    members.state("session", session_state)?;
+                    for m in ["renameSelf", "configureSelf"] {
+                        members.method(m, |_, _| Box::pin(async { Ok(JsonValue::Null) }))?;
+                    }
+                    let tr2 = tr.clone();
+                    members.method("treeSelf", move |args, _| {
+                        let tr2 = tr2.clone();
+                        Box::pin(async move {
+                            tr2.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(args.to_serde()?);
+                            Ok(JsonValue::Null)
+                        })
+                    })?;
+                    Ok(members)
+                },
+                ServeOptions::default(),
+            )
+        }),
+    )?;
+    pi_rs_p2::plugins::tree::register(&mut registry)?;
+
+    let (worker, _parent) = spawn_worker(fixture.path(), "sess-tr", &registry).await?;
+    let host = worker.host.clone();
+    let tree_c = Arc::new(lookup("p2.tree")?);
+    let params = JsonValue::from_serde(json!({ "session": "sess-tr" }));
+
+    // Guest is forbidden.
+    let guest_held = host.hold_as(
+        tree_c.clone(),
+        params.clone(),
+        Caller {
+            principal: Some(serde_json::to_value(guest(
+                "guest-1",
+                "sess-tr",
+                GrantMode::Full,
+            ))?),
+            incarnation: "inc-1".into(),
+        },
+        &context,
+    )?;
+    assert!(guest_held.wait(&context).await.is_err());
+
+    // Owner holds p2.tree.
+    let owner_held = host.hold_as(
+        tree_c,
+        params,
+        Caller {
+            principal: Some(serde_json::to_value(owner())?),
+            incarnation: "inc-1".into(),
+        },
+        &context,
+    )?;
+    owner_held.wait(&context).await?;
+    assert_eq!(owner_held.variant()?, "owner");
+
+    // Seed root conversation with two entries (user + assistant) via Durable.
+    let session = &worker.process.harness()?.durable.session;
+    let (user_entry_id, asst_entry_id) = session
+        .commit(
+            async |tx| {
+                let u = tx
+                    .append_entry(
+                        1,
+                        pi_rs_durable::EntryDraft {
+                            kind: "p2.input".into(),
+                            model: Some(vec![json!({ "role": "user", "content": "First prompt" })]),
+                            data: Some(json!({
+                                "author": { "kind": "owner", "id": "o1", "name": "Owner" },
+                                "text": "First prompt",
+                                "attachments": []
+                            })),
+                            head: None,
+                            edits: None,
+                        },
+                    )
+                    .await?;
+                let a = tx
+                    .append_entry(
+                        1,
+                        pi_rs_durable::EntryDraft {
+                            kind: "pi.assistant".into(),
+                            model: Some(vec![json!({
+                                "role": "assistant",
+                                "content": [{ "type": "text", "text": "First reply" }]
+                            })]),
+                            data: None,
+                            head: None,
+                            edits: None,
+                        },
+                    )
+                    .await?;
+                Ok((u.id, a.id))
+            },
+            &context,
+        )
+        .await?;
+
+    let initial_tree: Tree = serde_json::from_value(
+        owner_held
+            .call("tree", JsonValue::Null, &context)
+            .await?
+            .to_serde()?,
+    )?;
+    assert_eq!(initial_tree.main, 1);
+    assert_eq!(initial_tree.nodes.len(), 2);
+    assert_eq!(initial_tree.current, Some(asst_entry_id));
+
+    // Fork a new branch.
+    let branched = owner_held
+        .call(
+            "branch",
+            JsonValue::from_serde(json!({ "conversation": 1, "label": "Explore" })),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    let fork_id = branched["conversation"].as_u64().expect("fork id");
+    assert_ne!(fork_id, 1);
+
+    // Conversation 1 is now read-only because fork_id is main.
+    assert!(
+        worker
+            .process
+            .registries
+            .read_only_reason(1, &context)
+            .await?
+            .is_some()
+    );
+    assert!(
+        worker
+            .process
+            .registries
+            .read_only_reason(fork_id, &context)
+            .await?
+            .is_none()
+    );
+
+    // Rename the fork; blank label rejected for non-root.
+    assert!(
+        owner_held
+            .call(
+                "rename",
+                JsonValue::from_serde(json!({ "conversation": fork_id, "label": "   " })),
+                &context
+            )
+            .await
+            .is_err()
+    );
+    owner_held
+        .call(
+            "rename",
+            JsonValue::from_serde(json!({ "conversation": fork_id, "label": "Renamed" })),
+            &context,
+        )
+        .await?;
+
+    // Navigate to user_entry_id -> returns user text and creates/switches to new branch before it.
+    let nav = owner_held
+        .call(
+            "navigate",
+            JsonValue::from_serde(json!({ "entry": user_entry_id })),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    assert_eq!(nav["text"].as_str(), Some("First prompt"));
+
+    // Select back to conversation 1.
+    owner_held
+        .call(
+            "select",
+            JsonValue::from_serde(json!({ "conversation": 1 })),
+            &context,
+        )
+        .await?;
+    assert!(
+        worker
+            .process
+            .registries
+            .read_only_reason(1, &context)
+            .await?
+            .is_none()
+    );
+    assert!(
+        !tree_reports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    );
+
+    worker.close().await?;
+    Ok(())
+}
+
+// ============================================================================
+// prompt pure unit tests
+// ============================================================================
+
+#[tokio::test]
+async fn prompt_templates_frontmatter_and_context_files() -> TestResult {
+    let raw = "---\ndescription: \"Summarize diff\"\nargument-hint: \"[scope]\"\n---\nReview $1 and ${2:-all} (${@:2:2})";
+    let (fm, body) = parse_frontmatter(raw);
+    assert_eq!(
+        fm.get("description").and_then(Value::as_str),
+        Some("Summarize diff")
+    );
+    assert_eq!(body, "Review $1 and ${2:-all} (${@:2:2})");
+
+    let tpl = parse_template("review.md", raw, TemplateSource::Project, "/tmp/review.md");
+    assert_eq!(tpl.name, "review");
+    assert_eq!(tpl.argument_hint.as_deref(), Some("[scope]"));
+
+    let args = parse_command_args("src \"two words\" three four");
+    assert_eq!(args, vec!["src", "two words", "three", "four"]);
+    assert_eq!(
+        substitute_args(&tpl.content, &args),
+        "Review src and two words (two words three)"
+    );
+    assert_eq!(substitute_args("All: ${ARGUMENTS:-none}", &[]), "All: none");
+
+    let expanded = expand_prompt("/review src", &[tpl], &[], |_| async { None }).await;
+    assert_eq!(expanded.text, "Review src and all ()");
+
+    let guide = app_guide("/opt/p2", "/var/p2-data", Some("dev-box"));
+    assert!(guide.contains("\"/opt/p2\""));
+    assert!(guide.contains("dev-box"));
+
+    // Filesystem discovery test.
+    let dir = TempDir::new()?;
+    let data = dir.path().join("data");
+    let cwd = dir.path().join("project");
+    let plugin_sk = dir.path().join("plugin-skills");
+    std::fs::create_dir_all(data.join("skills/global-sk"))?;
+    std::fs::create_dir_all(data.join("prompts"))?;
+    std::fs::create_dir_all(cwd.join(".pi/skills/proj-sk"))?;
+    std::fs::create_dir_all(cwd.join(".pi/prompts"))?;
+    std::fs::create_dir_all(plugin_sk.join("plug-sk"))?;
+
+    std::fs::write(data.join("AGENTS.md"), "Global rules")?;
+    std::fs::write(cwd.join("AGENTS.md"), "Project rules")?;
+    std::fs::write(
+        data.join("skills/global-sk/SKILL.md"),
+        "---\ndescription: Global skill\n---\nGlobal body",
+    )?;
+    std::fs::write(
+        cwd.join(".pi/skills/proj-sk/SKILL.md"),
+        "---\ndescription: Project skill\ndisable-model-invocation: true\n---\nProject body",
+    )?;
+    std::fs::write(
+        plugin_sk.join("plug-sk/SKILL.md"),
+        "---\ndescription: Plugin skill\n---\nPlugin body",
+    )?;
+    std::fs::write(
+        cwd.join(".pi/prompts/hello.md"),
+        "---\ndescription: Greet\n---\nHello $1!",
+    )?;
+
+    let loaded = load_prompt_resources(
+        data.to_str().unwrap_or(""),
+        cwd.to_str().unwrap_or(""),
+        &LocalPromptFiles,
+        data.join("skills").to_str().unwrap_or(""),
+        data.join("prompts").to_str().unwrap_or(""),
+        &[plugin_sk.to_string_lossy().into_owned()],
+    )
+    .await?;
+
+    assert!(loaded.agents.contains("Global rules"));
+    assert!(loaded.agents.contains("Project rules"));
+    assert!(!loaded.project.agents.contains("Global rules"));
+    assert!(loaded.project.agents.contains("Project rules"));
+    // proj-sk has disable-model-invocation: true so it's in skill_files (for /skill:) but not <available_skills>.
+    assert_eq!(loaded.skill_files.len(), 3);
+    assert!(loaded.skills.contains("global-sk"));
+    assert!(loaded.skills.contains("plug-sk"));
+    assert!(!loaded.skills.contains("proj-sk"));
+    assert_eq!(loaded.templates.len(), 1);
+    assert_eq!(loaded.templates[0].name, "hello");
+    Ok(())
+}
+
+// ============================================================================
+// prompt worker facet integration tests
+// ============================================================================
+
+#[tokio::test]
+async fn prompt_worker_permissions_and_expand() -> TestResult {
+    let fixture = TempDir::new()?;
+    let context = Context::background();
+    std::fs::create_dir_all(fixture.path().join(".pi/prompts"))?;
+    std::fs::create_dir_all(fixture.path().join(".pi/skills/my-skill"))?;
+    std::fs::write(
+        fixture.path().join(".pi/prompts/greet.md"),
+        "---\ndescription: Greet user\n---\nHi $1!",
+    )?;
+    std::fs::write(
+        fixture.path().join(".pi/skills/my-skill/SKILL.md"),
+        "---\ndescription: My skill\n---\nSkill instructions here.",
+    )?;
+
+    let mut registry = PluginRegistry::new();
+    pi_rs_p2::plugins::prompt::register(&mut registry)?;
+
+    let (worker, _parent) = spawn_worker(fixture.path(), "sess-pr", &registry).await?;
+    let host = worker.host.clone();
+
+    assert!(
+        worker
+            .process
+            .registries
+            .extensions
+            .snapshot()
+            .extension("p2-prompt")
+            .is_some()
+    );
+    assert!(service_of::<PluginSkillsService>(&host, PLUGIN_SKILLS_SERVICE).is_ok());
+
+    let res_c = Arc::new(lookup("p2.prompt-resources")?);
+    let params = JsonValue::from_serde(json!({ "session": "sess-pr", "conversation": 1 }));
+
+    // View-only guest is forbidden.
+    let viewer = host.hold_as(
+        res_c.clone(),
+        params.clone(),
+        Caller {
+            principal: Some(serde_json::to_value(guest(
+                "guest-view",
+                "sess-pr",
+                GrantMode::View,
+            ))?),
+            incarnation: "inc-1".into(),
+        },
+        &context,
+    )?;
+    assert!(viewer.wait(&context).await.is_err());
+
+    // Participant (full-grant guest) can expand templates and skills.
+    let participant = host.hold_as(
+        res_c,
+        params,
+        Caller {
+            principal: Some(serde_json::to_value(guest(
+                "guest-full",
+                "sess-pr",
+                GrantMode::Full,
+            ))?),
+            incarnation: "inc-1".into(),
+        },
+        &context,
+    )?;
+    participant.wait(&context).await?;
+    assert_eq!(participant.variant()?, "participant");
+
+    let tpl_exp = participant
+        .call(
+            "expand",
+            JsonValue::from_serde(json!({ "text": "/greet World" })),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    assert_eq!(tpl_exp["text"].as_str(), Some("Hi World!"));
+    assert!(tpl_exp.get("skill").is_none());
+
+    let sk_exp = participant
+        .call(
+            "expand",
+            JsonValue::from_serde(json!({ "text": "/skill:my-skill extra arg" })),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    assert_eq!(sk_exp["skill"]["name"].as_str(), Some("my-skill"));
+    assert!(
+        sk_exp["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Skill instructions here.")
+    );
+    assert!(sk_exp["text"].as_str().unwrap_or("").contains("extra arg"));
+
+    let unknown = participant
+        .call(
+            "expand",
+            JsonValue::from_serde(json!({ "text": "/unknown foo" })),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    assert_eq!(unknown["text"].as_str(), Some("/unknown foo"));
 
     worker.close().await?;
     Ok(())

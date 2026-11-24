@@ -1,7 +1,9 @@
 //! Built-in native `p2` plugins (Wave 2).
 
 pub mod chat_mode;
+pub mod prompt;
 pub mod shard_d3;
+pub mod tree;
 pub mod views;
 
 use crate::api::v1::PluginRegistry;

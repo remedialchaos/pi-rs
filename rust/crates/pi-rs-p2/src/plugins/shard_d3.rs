@@ -6,5 +6,7 @@ use crate::api::v1::PluginRegistry;
 pub fn register(registry: &mut PluginRegistry) -> pi_rs_chord::Result<()> {
     super::chat_mode::register(registry)?;
     super::views::register(registry)?;
+    super::tree::register(registry)?;
+    super::prompt::register(registry)?;
     Ok(())
 }
