@@ -1405,12 +1405,75 @@ fn update_message(
     format!("{source}{scope} {} -> {}", label(from, git), label(to, git))
 }
 
+const PI_RS_MANAGED_MARKER: &str = "pi-rs-install.json";
+
+fn active_pi_rs_managed_root() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    pi_rs_managed_root_for_exe(&exe)
+}
+
+fn pi_rs_managed_root_for_exe(exe: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    for ancestor in canonical.ancestors().skip(1).take(5) {
+        let marker_path = ancestor.join(PI_RS_MANAGED_MARKER);
+        let Some(marker) = read_json(&marker_path) else {
+            continue;
+        };
+        let valid = marker["kind"] == "pi-rs-managed-install"
+            && marker["schemaVersion"] == 1
+            && marker["layout"] == "releases-v1";
+        if !valid {
+            continue;
+        }
+        let releases = ancestor.join("releases");
+        let releases = fs::canonicalize(&releases).unwrap_or(releases);
+        if canonical.starts_with(&releases) {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn cleanup_pi_rs_staging(root: &Path) {
+    if let Ok(entries) = fs::read_dir(root.join("staging")) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("install-") {
+                let _ = remove_dir_if_present(&entry.path());
+            }
+        }
+    }
+}
+
+fn pi_rs_self_update_command_for_marker(marker: Option<&Value>, windows: bool) -> String {
+    let side_by_side = marker
+        .and_then(|value| value["installMode"].as_str())
+        .is_some_and(|mode| mode == "side-by-side");
+    if windows {
+        if side_by_side {
+            "$env:PI_AS_PI_RS = \"1\"; powershell -c \"irm https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.ps1 | iex\""
+                .to_owned()
+        } else {
+            "powershell -c \"irm https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.ps1 | iex\""
+                .to_owned()
+        }
+    } else if side_by_side {
+        "curl -fsSL https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.sh | sh -s -- --as-pi-rs"
+            .to_owned()
+    } else {
+        "curl -fsSL https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.sh | sh"
+            .to_owned()
+    }
+}
+
 /// Remove staging directories left by failed managed updates and, on Windows,
 /// native-addon quarantine left by an earlier npm-distributed Pi.
 pub fn cleanup_installation() {
     #[cfg(windows)]
     if let Ok(package_dir) = config::get_package_dir() {
         windows_self_update::cleanup(&package_dir);
+    }
+    if let Some(root) = active_pi_rs_managed_root() {
+        cleanup_pi_rs_staging(&root);
     }
     if let Ok(Some(root)) = active_managed_root()
         && let Ok(_guard) = managed_lock(&root)
@@ -1835,6 +1898,21 @@ async fn global_self_update_roots(
 
 async fn update_self(manager: &PackageManager, global: &Value, force: bool) -> Result<u8, String> {
     let configured = configured_self_update_argv(global);
+    if configured.is_none()
+        && let Some(pi_rs_root) = active_pi_rs_managed_root()
+    {
+        let marker = read_json(&pi_rs_root.join(PI_RS_MANAGED_MARKER));
+        let installer_cmd = pi_rs_self_update_command_for_marker(marker.as_ref(), cfg!(windows));
+        eprintln!(
+            "This pi-rs installation is managed natively in {}.",
+            pi_rs_root.display()
+        );
+        eprintln!("Update or reinstall pi-rs with:\n\n  {installer_cmd}\n");
+        eprintln!(
+            "To make `pi update` run your own update command, set PI_SELF_UPDATE_COMMAND or the selfUpdateCommand setting."
+        );
+        return Ok(1);
+    }
     let managed = if configured.is_some() {
         None
     } else {
@@ -2584,6 +2662,64 @@ mod tests {
         restore_model_catalogs(&models, root.path())?;
         assert!(models.get_model("anthropic", builtin.id.as_str()).is_some());
         assert!(models.get_model("anthropic", "remote-test").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn pi_rs_managed_root_detects_marker_and_cleans_only_own_staging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let rs_root = root.path().join("install-rs");
+        let upstream_root = root.path().join("install");
+        let bin_path = rs_root
+            .join("releases")
+            .join("v1.6.0")
+            .join("bin")
+            .join("pi");
+        fs::create_dir_all(bin_path.parent().ok_or("missing parent")?)?;
+        fs::write(&bin_path, b"")?;
+        fs::write(
+            rs_root.join(PI_RS_MANAGED_MARKER),
+            r#"{"kind":"pi-rs-managed-install","schemaVersion":1,"layout":"releases-v1","installMode":"side-by-side"}"#,
+        )?;
+        fs::create_dir_all(rs_root.join("staging").join("install-999"))?;
+        fs::create_dir_all(upstream_root.join("staging").join("update-123"))?;
+        fs::write(
+            upstream_root.join("managed-install.json"),
+            r#"{"kind":"pi-managed-install","schemaVersion":1,"layout":"releases-v1"}"#,
+        )?;
+
+        let detected = pi_rs_managed_root_for_exe(&bin_path).ok_or("expected pi-rs root")?;
+        assert_eq!(detected, fs::canonicalize(&rs_root)?);
+
+        // Upstream managed-install.json alone must not be mistaken for a pi-rs install.
+        let upstream_bin = upstream_root
+            .join("releases")
+            .join("1.6.0")
+            .join("bin")
+            .join("pi");
+        fs::create_dir_all(upstream_bin.parent().ok_or("missing parent")?)?;
+        fs::write(&upstream_bin, b"")?;
+        assert!(pi_rs_managed_root_for_exe(&upstream_bin).is_none());
+
+        cleanup_pi_rs_staging(&detected);
+        assert!(!rs_root.join("staging").join("install-999").exists());
+        assert!(upstream_root.join("staging").join("update-123").exists());
+
+        let marker = read_json(&rs_root.join(PI_RS_MANAGED_MARKER));
+        assert!(
+            pi_rs_self_update_command_for_marker(marker.as_ref(), false).contains("--as-pi-rs")
+        );
+        assert!(
+            pi_rs_self_update_command_for_marker(marker.as_ref(), true).contains("PI_AS_PI_RS")
+        );
+        assert!(
+            !pi_rs_self_update_command_for_marker(
+                Some(&serde_json::json!({"installMode": "drop-in"})),
+                false,
+            )
+            .contains("--as-pi-rs")
+        );
         Ok(())
     }
 }

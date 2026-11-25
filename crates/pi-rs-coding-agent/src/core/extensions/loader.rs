@@ -251,19 +251,26 @@ async fn load_paths(
     // Keep the logical path key alongside its factory. An extension's
     // `path()` may be its display name, so it cannot be used to recognize an
     // already-loaded path in the second (post-trust) pass.
-    let resolved: Vec<(String, ExtensionFactory)> = paths
-        .iter()
-        .filter_map(|path| {
-            factory_for(catalog, path)
-                .cloned()
-                .map(|factory| (path.clone(), factory))
-        })
-        .collect();
+    let mut resolved: Vec<(String, ExtensionFactory)> = Vec::new();
+    let mut skipped_warnings: Vec<ResourceDiagnostic> = Vec::new();
+    for path in paths {
+        if let Some(factory) = factory_for(catalog, path) {
+            resolved.push((path.clone(), factory.clone()));
+        } else if path.ends_with(".ts") || path.ends_with(".js") {
+            skipped_warnings.push(ResourceDiagnostic::warning(
+                format!(
+                    "Skipped JavaScript/TypeScript extension `{path}`: pi-rs loads native and WASM/WIT extensions (`.wasm`). If you share `~/.pi/agent` with upstream pi, this is safe to ignore."
+                ),
+                Some(Path::new(path)),
+            ));
+        }
+    }
     let factories: Vec<ExtensionFactory> = resolved
         .iter()
         .map(|(_, factory)| factory.clone())
         .collect();
-    let result = runner.load_extensions(&factories).await;
+    let mut result = runner.load_extensions(&factories).await;
+    result.warnings.extend(skipped_warnings);
     let path_keys = resolved.into_iter().map(|(path, _)| path).collect();
     (result, path_keys)
 }
@@ -662,6 +669,26 @@ mod tests {
         assert_eq!(
             pre.path_keys,
             vec![global_file.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistered_upstream_ts_extension_is_skipped_with_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let options = LoadOptions::new(dir.path(), dir.path().join("agent"));
+        fs::create_dir_all(options.global_dir()).expect("mkdir");
+        let upstream_ext = options.global_dir().join("upstream-only.ts");
+        fs::write(&upstream_ext, "export default function() {}").expect("write");
+
+        let runner = runner();
+        let pre = load_pre_trust(&runner, &ExtensionCatalog::default(), &options).await;
+        assert!(pre.result.errors.is_empty());
+        assert!(pre.result.extensions.is_empty());
+        assert_eq!(pre.result.warnings.len(), 1);
+        assert!(
+            pre.result.warnings[0]
+                .message
+                .contains("Skipped JavaScript/TypeScript extension")
         );
     }
 

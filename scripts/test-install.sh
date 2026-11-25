@@ -105,11 +105,13 @@ assert_eq() {
   [[ "$got" == "$expected" ]] || fail "$msg (expected '$expected', got '$got')"
 }
 
-# 0. Syntax check under both sh and bash.
+# 0. Syntax check under sh, dash (when present), and bash.
 sh -n "$INSTALLER"
+command -v dash >/dev/null 2>&1 && dash -n "$INSTALLER"
 bash -n "$INSTALLER"
 
-# 1. Fresh install via latest-version.txt, SHA-256 verification, marker, and smoke test.
+# 1. Solo drop-in install: installs `pi` + `pi-rs` alias under ~/.pi/agent/install-rs
+#    without touching ~/.pi/agent/install.
 HOME1="$TMP_ROOT/home1"
 mkdir -p "$HOME1/.local/bin" "$HOME1/.pi/agent"
 printf '{"theme":"dark"}\n' >"$HOME1/.pi/agent/settings.json"
@@ -118,32 +120,39 @@ env -i HOME="$HOME1" PATH="$HOME1/.local/bin:/usr/bin:/bin" \
   sh "$INSTALLER" --yes --no-modify-path --no-start --release-base-url "$BASE_URL"
 
 assert_eq "$("$HOME1/.local/bin/pi" --version)" "pi v9.9.9" "fresh install pi --version"
+assert_eq "$("$HOME1/.local/bin/pi-rs" --version)" "pi v9.9.9" "fresh install pi-rs alias --version"
 assert_eq "$("$HOME1/.local/bin/p2" --version)" "p2 v9.9.9" "fresh install p2 --version"
-assert_eq "$(cat "$HOME1/.pi/agent/install/current-version")" "v9.9.9" "current-version file"
-grep -q '"kind": "pi-rs-managed-install"' "$HOME1/.pi/agent/install/pi-rs-install.json" \
+assert_eq "$(cat "$HOME1/.pi/agent/install-rs/current-version")" "v9.9.9" "current-version file"
+[[ ! -e "$HOME1/.pi/agent/install" ]] || fail "solo install touched upstream ~/.pi/agent/install"
+grep -q '"kind": "pi-rs-managed-install"' "$HOME1/.pi/agent/install-rs/pi-rs-install.json" \
   || fail "marker missing kind"
+grep -q '"installMode": "drop-in"' "$HOME1/.pi/agent/install-rs/pi-rs-install.json" \
+  || fail "marker missing drop-in installMode"
 
 # 2. Upgrade/reinstall to v9.9.10 replaces symlinks and prunes v9.9.9 release dir.
 env -i HOME="$HOME1" PATH="$HOME1/.local/bin:/usr/bin:/bin" \
   sh "$INSTALLER" --yes --no-modify-path --no-start --version 9.9.10 --release-base-url "$BASE_URL"
 
 assert_eq "$("$HOME1/.local/bin/pi" --version)" "pi v9.9.10" "upgraded pi --version"
-assert_eq "$(cat "$HOME1/.pi/agent/install/current-version")" "v9.9.10" "upgraded current-version"
-[[ ! -d "$HOME1/.pi/agent/install/releases/v9.9.9" ]] || fail "old release v9.9.9 was not pruned"
+assert_eq "$("$HOME1/.local/bin/pi-rs" --version)" "pi v9.9.10" "upgraded pi-rs alias --version"
+assert_eq "$(cat "$HOME1/.pi/agent/install-rs/current-version")" "v9.9.10" "upgraded current-version"
+[[ ! -d "$HOME1/.pi/agent/install-rs/releases/v9.9.9" ]] || fail "old release v9.9.9 was not pruned"
 
-# 3. --core-only removes previously linked non-core managed binaries and keeps pi.
+# 3. --core-only removes previously linked non-core managed binaries and keeps pi + pi-rs.
 env -i HOME="$HOME1" PATH="$HOME1/.local/bin:/usr/bin:/bin" \
   sh "$INSTALLER" --yes --no-modify-path --no-start --version v9.9.10 --core-only --release-base-url "$BASE_URL"
 
 [[ -L "$HOME1/.local/bin/pi" ]] || fail "--core-only missing pi symlink"
+[[ -L "$HOME1/.local/bin/pi-rs" ]] || fail "--core-only missing pi-rs alias"
 [[ ! -e "$HOME1/.local/bin/p2" ]] || fail "--core-only left stale p2 symlink"
 
-# 4. --uninstall removes managed install and symlinks while preserving ~/.pi/agent/ user data.
+# 4. --uninstall removes managed install and symlinks (including pi-rs alias) while preserving user data.
 env -i HOME="$HOME1" PATH="$HOME1/.local/bin:/usr/bin:/bin" \
   sh "$INSTALLER" --uninstall
 
 [[ ! -e "$HOME1/.local/bin/pi" ]] || fail "uninstall left pi symlink"
-[[ ! -d "$HOME1/.pi/agent/install" ]] || fail "uninstall left install dir"
+[[ ! -e "$HOME1/.local/bin/pi-rs" ]] || fail "uninstall left pi-rs symlink"
+[[ ! -d "$HOME1/.pi/agent/install-rs" ]] || fail "uninstall left install-rs dir"
 assert_eq "$(cat "$HOME1/.pi/agent/settings.json")" '{"theme":"dark"}' "uninstall modified user settings.json"
 
 # 5. Tampered SHA256SUMS.txt MUST fail loudly and leave no release installed.
@@ -161,40 +170,77 @@ fi
 grep -qi "checksum mismatch" "$TMP_ROOT/bad.err" || fail "missing checksum mismatch error: $(cat "$TMP_ROOT/bad.err")"
 [[ ! -e "$HOME2/.local/bin/pi" ]] || fail "failed checksum install still linked pi"
 
-# 6. Unmanaged `pi` on PATH blocks non-interactive install unless --force is passed,
-#    and uninstall never touches the unmanaged binary.
+# 6. Side-by-side coexistence with an existing upstream managed pi installation:
+#    - Upstream lives in ~/.pi/agent/install + ~/.pi/agent/bin/pi
+#    - Non-interactive install without --as-pi-rs or --force fails cleanly
+#    - --as-pi-rs installs `pi-rs` (and non-colliding companions) into ~/.local/bin
+#      while leaving upstream `pi` and ~/.pi/agent/install 100% untouched
+#    - Reinstalling without --as-pi-rs remembers side-by-side mode
+#    - --uninstall removes only pi-rs and ~/.pi/agent/install-rs, leaving upstream intact
 HOME3="$TMP_ROOT/home3"
-mkdir -p "$HOME3/other-bin" "$HOME3/custom-bin"
-cat >"$HOME3/other-bin/pi" <<'EOF'
+mkdir -p "$HOME3/.local/bin" "$HOME3/.pi/agent/bin" "$HOME3/.pi/agent/install/releases/1.6.0"
+printf '{"kind":"pi-managed-install","schemaVersion":1,"layout":"releases-v1"}\n' \
+  >"$HOME3/.pi/agent/install/managed-install.json"
+cat >"$HOME3/.pi/agent/bin/pi" <<'EOF'
 #!/bin/sh
-echo "upstream-node-pi"
+echo "upstream-managed-pi"
 EOF
-chmod 0755 "$HOME3/other-bin/pi"
+chmod 0755 "$HOME3/.pi/agent/bin/pi"
 
-if env -i HOME="$HOME3" PATH="$HOME3/other-bin:/usr/bin:/bin" \
+if env -i HOME="$HOME3" PATH="$HOME3/.pi/agent/bin:$HOME3/.local/bin:/usr/bin:/bin" \
   sh "$INSTALLER" --yes --no-modify-path --no-start --version v9.9.9 --release-base-url "$BASE_URL" 2>"$TMP_ROOT/conflict.err"; then
-  fail "unmanaged pi conflict should fail without --force"
+  fail "unmanaged pi conflict should fail without --as-pi-rs or --force"
 fi
-grep -qi "already on PATH" "$TMP_ROOT/conflict.err" || fail "missing conflict error"
+grep -qi -- "--as-pi-rs" "$TMP_ROOT/conflict.err" || fail "conflict error should suggest --as-pi-rs"
 
-env -i HOME="$HOME3" PATH="$HOME3/other-bin:/usr/bin:/bin" \
-  sh "$INSTALLER" --yes --force --no-modify-path --no-start --bin-dir "$HOME3/custom-bin" --binaries pi,p2 --version v9.9.9 --release-base-url "$BASE_URL"
+env -i HOME="$HOME3" PATH="$HOME3/.pi/agent/bin:$HOME3/.local/bin:/usr/bin:/bin" \
+  sh "$INSTALLER" --yes --as-pi-rs --no-modify-path --no-start --version v9.9.9 --release-base-url "$BASE_URL"
 
-assert_eq "$("$HOME3/custom-bin/pi" --version)" "pi v9.9.9" "forced custom-bin pi"
-assert_eq "$("$HOME3/custom-bin/p2" --version)" "p2 v9.9.9" "forced custom-bin p2"
-[[ ! -e "$HOME3/custom-bin/pi-env" ]] || fail "--binaries pi,p2 installed unexpected pi-env"
-assert_eq "$("$HOME3/other-bin/pi")" "upstream-node-pi" "unmanaged pi was modified"
+assert_eq "$("$HOME3/.pi/agent/bin/pi")" "upstream-managed-pi" "side-by-side install modified upstream pi"
+assert_eq "$("$HOME3/.pi/agent/bin/pi-rs" --version)" "pi v9.9.9" "side-by-side install pi-rs --version"
+[[ -f "$HOME3/.pi/agent/install/managed-install.json" ]] || fail "side-by-side touched upstream managed-install.json"
+grep -q '"installMode": "side-by-side"' "$HOME3/.pi/agent/install-rs/pi-rs-install.json" \
+  || fail "marker did not record side-by-side mode"
 
-env -i HOME="$HOME3" PATH="$HOME3/other-bin:/usr/bin:/bin" \
+# Reinstall/upgrade remembers side-by-side mode without touching upstream pi.
+env -i HOME="$HOME3" PATH="$HOME3/.pi/agent/bin:$HOME3/.local/bin:/usr/bin:/bin" \
+  sh "$INSTALLER" --yes --no-modify-path --no-start --version v9.9.10 --release-base-url "$BASE_URL"
+
+assert_eq "$("$HOME3/.pi/agent/bin/pi")" "upstream-managed-pi" "side-by-side upgrade modified upstream pi"
+assert_eq "$("$HOME3/.pi/agent/bin/pi-rs" --version)" "pi v9.9.10" "side-by-side upgrade pi-rs --version"
+
+# Uninstall cleans only pi-rs + install-rs, leaving upstream pi and install dir intact.
+env -i HOME="$HOME3" PATH="$HOME3/.pi/agent/bin:$HOME3/.local/bin:/usr/bin:/bin" \
   sh "$INSTALLER" --uninstall
-assert_eq "$("$HOME3/other-bin/pi")" "upstream-node-pi" "uninstall touched unmanaged pi"
+assert_eq "$("$HOME3/.pi/agent/bin/pi")" "upstream-managed-pi" "uninstall touched upstream pi"
+[[ -f "$HOME3/.pi/agent/install/managed-install.json" ]] || fail "uninstall removed upstream managed-install.json"
+[[ ! -e "$HOME3/.pi/agent/bin/pi-rs" ]] || fail "uninstall left pi-rs symlink"
+[[ ! -d "$HOME3/.pi/agent/install-rs" ]] || fail "uninstall left install-rs dir"
 
-# 7. Piped stdin (`curl ... | sh` simulation) works with env vars.
+# 7. --force + --bin-dir + --binaries installs drop-in `pi` alongside unmanaged `pi` cleanly.
 HOME4="$TMP_ROOT/home4"
-mkdir -p "$HOME4/.local/bin"
-env -i HOME="$HOME4" PATH="$HOME4/.local/bin:/usr/bin:/bin" \
-  PI_YES=1 PI_NO_MODIFY_PATH=1 PI_NO_START=1 PI_CORE_ONLY=1 PI_RELEASE_BASE_URL="$BASE_URL" \
-  sh < "$INSTALLER"
-assert_eq "$("$HOME4/.local/bin/pi" --version)" "pi v9.9.9" "piped sh install failed"
+mkdir -p "$HOME4/other-bin" "$HOME4/custom-bin"
+cat >"$HOME4/other-bin/pi" <<'EOF'
+#!/bin/sh
+echo "other-pi"
+EOF
+chmod 0755 "$HOME4/other-bin/pi"
 
-echo "PASS: all 7 install.sh end-to-end checks passed"
+env -i HOME="$HOME4" PATH="$HOME4/other-bin:/usr/bin:/bin" \
+  sh "$INSTALLER" --yes --force --no-modify-path --no-start --bin-dir "$HOME4/custom-bin" --binaries pi,p2 --version v9.9.9 --release-base-url "$BASE_URL"
+
+assert_eq "$("$HOME4/custom-bin/pi" --version)" "pi v9.9.9" "forced custom-bin pi"
+assert_eq "$("$HOME4/custom-bin/p2" --version)" "p2 v9.9.9" "forced custom-bin p2"
+[[ ! -e "$HOME4/custom-bin/pi-env" ]] || fail "--binaries pi,p2 installed unexpected pi-env"
+assert_eq "$("$HOME4/other-bin/pi")" "other-pi" "forced install modified unmanaged pi"
+
+# 8. Piped stdin (`curl ... | sh` simulation) works with env vars.
+HOME5="$TMP_ROOT/home5"
+mkdir -p "$HOME5/.local/bin"
+env -i HOME="$HOME5" PATH="$HOME5/.local/bin:/usr/bin:/bin" \
+  PI_YES=1 PI_NO_MODIFY_PATH=1 PI_NO_START=1 PI_CORE_ONLY=1 PI_NO_ALIAS=1 PI_RELEASE_BASE_URL="$BASE_URL" \
+  sh < "$INSTALLER"
+assert_eq "$("$HOME5/.local/bin/pi" --version)" "pi v9.9.9" "piped sh install failed"
+[[ ! -e "$HOME5/.local/bin/pi-rs" ]] || fail "PI_NO_ALIAS=1 still created pi-rs alias"
+
+echo "PASS: all 8 install.sh end-to-end checks passed"

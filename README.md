@@ -27,7 +27,7 @@ Pi's core design — a minimal, composable agent harness that adapts to your wor
 
 ## Install
 
-Install prebuilt native binaries on Linux or macOS (verifies `SHA256SUMS.txt`, installs into `~/.pi/agent/install`, and links binaries onto `PATH`):
+Install prebuilt native binaries on Linux or macOS (verifies `SHA256SUMS.txt`, installs into `~/.pi/agent/install-rs`, and links `pi`, `pi-rs`, and companion binaries onto `PATH`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.sh | sh
@@ -39,9 +39,14 @@ On Windows (PowerShell):
 powershell -c "irm https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.ps1 | iex"
 ```
 
+When `pi-rs` is the only installation on the machine, it installs `pi` directly as a drop-in command (plus a `pi-rs` alias). If upstream `pi` is already on `PATH`, the installer never overwrites it and offers to install side-by-side as `pi-rs` (`--as-pi-rs`). Managed files live in `~/.pi/agent/install-rs` so they never collide with upstream's `~/.pi/agent/install`; user config and sessions in `~/.pi/agent/` are shared by default (override with `PI_CODING_AGENT_DIR` if you want separate state), and any upstream `.ts`/`.js` extensions in `~/.pi/agent/extensions/` are skipped with a non-fatal warning rather than blocking startup.
+
 Common installer options (pass via `sh -s -- ...` or `PI_*` environment variables):
 
 ```bash
+# Install side-by-side as `pi-rs` without touching an existing upstream `pi`
+curl -fsSL https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.sh | sh -s -- --as-pi-rs
+
 # Install only the `pi` coding agent CLI (skip p2, p3, pi-env, etc.)
 curl -fsSL https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.sh | sh -s -- --core-only
 

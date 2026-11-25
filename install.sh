@@ -8,12 +8,23 @@
 # Mirrors upstream pi's managed installer experience (interactive install,
 # reinstall/update, uninstall, PATH detection, and profile setup) using native
 # Rust release archives or --from-source builds with zero Node.js dependency.
+#
+# Coexistence & drop-in guarantees:
+#   - When pi-rs is the only installation on the machine, it installs `pi`
+#     directly onto PATH as a drop-in replacement (plus a `pi-rs` alias).
+#   - Managed files live in ~/.pi/agent/install-rs so they never collide with
+#     upstream pi's ~/.pi/agent/install directory.
+#   - When an existing upstream/other `pi` is detected on PATH, the installer
+#     never overwrites it and offers side-by-side installation as `pi-rs`
+#     (`--as-pi-rs`).
 
 set -eu
 
 PI_CMD="pi"
+PI_ALIAS_CMD="pi-rs"
 PI_DEFAULT_REPO="remedialchaos/pi-rs"
 PI_MARKER_NAME="pi-rs-install.json"
+PI_UPSTREAM_MARKER_NAME="managed-install.json"
 PI_ALL_BINARIES="pi pi-ai pi-env pi-evals p3 p2 pi-voice-server pi-mac"
 PI_ESC=$(printf '\033')
 PI_CR=$(printf '\r')
@@ -31,18 +42,20 @@ Usage:
 Options:
   -v, --version <TAG>        Release tag to install (e.g. v1.6.0) or "latest" (default: latest)
       --bin-dir <DIR>        Directory for installed binary symlinks (default: auto-detected on PATH)
-      --install-dir <DIR>    Managed install root (default: ~/.pi/agent/install)
+      --install-dir <DIR>    Managed install root (default: ~/.pi/agent/install-rs)
       --all                  Install all binaries from the release (default)
       --core-only            Install only the `pi` coding agent binary
       --binaries <LIST>      Comma-separated list of binaries to install (e.g. pi,p2,pi-env)
+      --as-pi-rs             Install side-by-side as `pi-rs` without touching or shadowing `pi`
+      --no-alias             Do not create the companion `pi-rs` alias symlink in drop-in mode
       --from-source          Build from source using Cargo instead of downloading a release archive
       --git-ref <REF>        Git branch, tag, or commit to build when using --from-source
       --uninstall            Uninstall managed pi-rs binaries (preserves ~/.pi/agent/ user data)
       --reinstall            Reinstall or update without prompting for action
   -y, --yes                  Non-interactive mode; accept default actions without prompts
-      --force                Allow installing alongside an unmanaged `pi` in non-interactive mode
+      --force                Allow installing `pi` alongside an unmanaged `pi` in non-interactive mode
       --no-modify-path       Do not prompt to edit shell profile files
-      --no-start             Do not prompt to launch `pi` after installation
+      --no-start             Do not prompt to launch `pi`/`pi-rs` after installation
       --repo <OWNER/REPO>    GitHub repository (default: remedialchaos/pi-rs)
       --release-base-url <U> Base URL for release downloads (default: GitHub Releases)
       --archive <PATH>       Install from a local .tar.gz release archive
@@ -51,9 +64,10 @@ Options:
 
 Environment variable equivalents (useful when piping to `sh` without `-s --`):
   PI_VERSION, PI_BIN_DIR, PI_INSTALL_DIR, PI_CORE_ONLY, PI_BINARIES,
-  PI_FROM_SOURCE, PI_GIT_REF, PI_UNINSTALL, PI_YES, PI_FORCE,
-  PI_NO_MODIFY_PATH, PI_NO_START, PI_REPO, PI_RELEASE_BASE_URL,
-  PI_ARCHIVE_PATH, PI_CHECKSUMS_PATH, PI_CODING_AGENT_DIR
+  PI_AS_PI_RS, PI_NO_ALIAS, PI_FROM_SOURCE, PI_GIT_REF, PI_UNINSTALL,
+  PI_YES, PI_FORCE, PI_NO_MODIFY_PATH, PI_NO_START, PI_REPO,
+  PI_RELEASE_BASE_URL, PI_ARCHIVE_PATH, PI_CHECKSUMS_PATH,
+  PI_CODING_AGENT_DIR
 EOF
 }
 
@@ -89,6 +103,8 @@ parse_args() {
   PI_CHECKSUMS_PATH="${PI_CHECKSUMS_PATH:-}"
 
   PI_OPT_CORE_ONLY=0
+  PI_OPT_AS_PI_RS=0
+  PI_OPT_NO_ALIAS=0
   PI_OPT_FROM_SOURCE=0
   PI_OPT_UNINSTALL=0
   PI_OPT_REINSTALL=0
@@ -98,6 +114,8 @@ parse_args() {
   PI_OPT_NO_START=0
 
   is_truthy "${PI_CORE_ONLY:-0}" && PI_OPT_CORE_ONLY=1
+  is_truthy "${PI_AS_PI_RS:-0}" && PI_OPT_AS_PI_RS=1
+  is_truthy "${PI_NO_ALIAS:-0}" && PI_OPT_NO_ALIAS=1
   is_truthy "${PI_FROM_SOURCE:-0}" && PI_OPT_FROM_SOURCE=1
   is_truthy "${PI_UNINSTALL:-0}" && PI_OPT_UNINSTALL=1
   is_truthy "${PI_YES:-0}" && PI_OPT_YES=1
@@ -157,6 +175,14 @@ parse_args() {
         PI_OPT_CORE_ONLY=0
         PI_BINARIES="${1#*=}"
         [ -n "$PI_BINARIES" ] || die "--binaries requires a non-empty value"
+        shift
+        ;;
+      --as-pi-rs)
+        PI_OPT_AS_PI_RS=1
+        shift
+        ;;
+      --no-alias)
+        PI_OPT_NO_ALIAS=1
         shift
         ;;
       --from-source)
@@ -388,13 +414,14 @@ command_belongs_to_managed_root() {
   return 1
 }
 
-managed_bin_dir_is_free() {
-  mb_dir="$1"
-  mb_root="$2"
-  if [ ! -e "$mb_dir/$PI_CMD" ] && [ ! -L "$mb_dir/$PI_CMD" ]; then
+bin_slot_is_free() {
+  bs_dir="$1"
+  bs_name="$2"
+  bs_root="$3"
+  if [ ! -e "$bs_dir/$bs_name" ] && [ ! -L "$bs_dir/$bs_name" ]; then
     return 0
   fi
-  command_belongs_to_managed_root "$mb_dir/$PI_CMD" "$mb_root"
+  command_belongs_to_managed_root "$bs_dir/$bs_name" "$bs_root"
 }
 
 select_install_dir() {
@@ -403,13 +430,22 @@ select_install_dir() {
     return 0
   fi
   sid_agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
-  printf '%s/install' "${sid_agent_dir%/}"
+  sid_default="${sid_agent_dir%/}/install-rs"
+  # Support uninstalling a legacy ~/.pi/agent/install created by earlier pi-rs
+  # ONLY when it is exclusively owned by pi-rs (never upstream managed-install.json).
+  sid_legacy="${sid_agent_dir%/}/install"
+  if [ ! -e "$sid_default" ] && [ -f "$sid_legacy/$PI_MARKER_NAME" ] && [ ! -f "$sid_legacy/$PI_UPSTREAM_MARKER_NAME" ]; then
+    printf '%s' "$sid_legacy"
+    return 0
+  fi
+  printf '%s' "$sid_default"
 }
 
 select_bin_dir() {
   sbd_agent_dir="$1"
   sbd_install_dir="$2"
   sbd_existing_path="$3"
+  sbd_primary_cmd="$4"
 
   if [ -n "$PI_BIN_DIR" ]; then
     printf '%s' "${PI_BIN_DIR%/}"
@@ -437,8 +473,8 @@ select_bin_dir() {
     IFS=$sbd_old_ifs
     sbd_dir=${sbd_dir%/}
     case "$sbd_dir" in
-      "$sbd_agent_dir/bin"|"$HOME/.local/bin"|"$HOME/bin"|"$HOME/.bin"|"$HOME/local/bin")
-        if path_is_writable_or_creatable "$sbd_dir" && managed_bin_dir_is_free "$sbd_dir" "$sbd_install_dir"; then
+      "$sbd_agent_dir/bin"|"$sbd_agent_dir/bin-rs"|"$HOME/.local/bin"|"$HOME/bin"|"$HOME/.bin"|"$HOME/local/bin")
+        if path_is_writable_or_creatable "$sbd_dir" && bin_slot_is_free "$sbd_dir" "$sbd_primary_cmd" "$sbd_install_dir"; then
           printf '%s' "$sbd_dir"
           return 0
         fi
@@ -453,7 +489,7 @@ select_bin_dir() {
   for sbd_dir in ${PATH:-}; do
     IFS=$sbd_old_ifs
     sbd_dir=${sbd_dir%/}
-    if [ -n "$sbd_dir" ] && [ -x "$sbd_dir/brew" ] && [ -w "$sbd_dir" ] && managed_bin_dir_is_free "$sbd_dir" "$sbd_install_dir"; then
+    if [ -n "$sbd_dir" ] && [ -x "$sbd_dir/brew" ] && [ -w "$sbd_dir" ] && bin_slot_is_free "$sbd_dir" "$sbd_primary_cmd" "$sbd_install_dir"; then
       printf '%s' "$sbd_dir"
       return 0
     fi
@@ -461,7 +497,34 @@ select_bin_dir() {
   done
   IFS=$sbd_old_ifs
 
-  printf '%s/bin' "${sbd_agent_dir%/}"
+  # Default to ~/.pi/agent/bin when free (drop-in match with upstream);
+  # fall back to ~/.pi/agent/bin-rs only if upstream owns ~/.pi/agent/bin/pi.
+  if bin_slot_is_free "$sbd_agent_dir/bin" "$sbd_primary_cmd" "$sbd_install_dir"; then
+    printf '%s/bin' "${sbd_agent_dir%/}"
+  else
+    printf '%s/bin-rs' "${sbd_agent_dir%/}"
+  fi
+}
+
+describe_other_pi() {
+  dop_path="$1"
+  dop_agent_dir="$2"
+  dop_real=$(resolve_path "$dop_path")
+  if [ -f "$dop_agent_dir/install/$PI_UPSTREAM_MARKER_NAME" ]; then
+    case "$dop_real" in
+      "$dop_agent_dir/bin/"*|"$dop_agent_dir/install/"*)
+        printf 'upstream managed pi (%s)' "$dop_path"
+        return 0
+        ;;
+    esac
+  fi
+  case "$dop_real" in
+    *"/node_modules/"*)
+      printf 'upstream npm/Node pi (%s)' "$dop_path"
+      return 0
+      ;;
+  esac
+  printf '%s' "$dop_path"
 }
 
 has_tty() {
@@ -490,7 +553,7 @@ default_action() {
   elif [ "$PI_HAS_MANAGED" -eq 1 ]; then
     printf 'reinstall'
   elif [ -n "$PI_OTHER_PI_PATH" ]; then
-    if [ "$PI_OPT_FORCE" -eq 1 ]; then
+    if [ "$PI_INSTALL_MODE" = "side-by-side" ] || [ "$PI_OPT_FORCE" -eq 1 ]; then
       printf 'install'
     else
       printf 'none'
@@ -517,22 +580,29 @@ print_action_menu() {
     pam_prev_ver=$(marker_read_field "$PI_RESOLVED_INSTALL_DIR/$PI_MARKER_NAME" "version" || true)
     printf 'Existing managed pi-rs installation found in %s' "$PI_RESOLVED_INSTALL_DIR"
     if [ -n "$pam_prev_ver" ]; then
-      printf ' (%s)' "$pam_prev_ver"
+      printf ' (%s, mode: %s)' "$pam_prev_ver" "$PI_INSTALL_MODE"
     fi
     printf '.\n'
     printf 'Target bin directory: %s\n\n' "$PI_RESOLVED_BIN_DIR"
     printf '  [Enter/y] Reinstall or update pi-rs\n'
     printf '  [u]       Uninstall pi-rs (keeps ~/.pi/agent/ config and sessions)\n'
     printf '  [n/Esc]   Cancel\n\n'
-  elif [ -n "$PI_OTHER_PI_PATH" ]; then
-    printf 'Another `pi` binary is already on PATH: %s\n' "$PI_OTHER_PI_PATH"
+  elif [ -n "$PI_OTHER_PI_PATH" ] && [ "$PI_INSTALL_MODE" != "side-by-side" ]; then
+    pam_other_desc=$(describe_other_pi "$PI_OTHER_PI_PATH" "$PI_AGENT_DIR")
+    printf 'Another `pi` is already on PATH: %s\n' "$pam_other_desc"
     printf 'This installer will not overwrite or remove it.\n'
     printf 'Target bin directory for pi-rs: %s\n\n' "$PI_RESOLVED_BIN_DIR"
-    printf '  [y]       Install pi-rs alongside it\n'
+    printf '  [a]       Install side-by-side as `pi-rs` (keep existing `pi` untouched)\n'
+    printf '  [y]       Install as `pi` (and `pi-rs`) alongside it\n'
     printf '  [Enter/n] Cancel\n\n'
   else
     printf 'Install directory: %s\n' "$PI_RESOLVED_INSTALL_DIR"
-    printf 'Bin directory:     %s\n\n' "$PI_RESOLVED_BIN_DIR"
+    printf 'Bin directory:     %s\n' "$PI_RESOLVED_BIN_DIR"
+    if [ "$PI_INSTALL_MODE" = "side-by-side" ]; then
+      printf 'Command mode:      side-by-side (`pi-rs`, leaves `pi` untouched)\n\n'
+    else
+      printf 'Command mode:      drop-in (`pi` + `pi-rs` alias)\n\n'
+    fi
     printf '  [Enter/y] Install pi-rs\n'
     printf '  [n/Esc]   Cancel\n\n'
   fi
@@ -549,9 +619,12 @@ choose_action() {
   fi
 
   if ! has_tty; then
-    if [ -n "$PI_OTHER_PI_PATH" ] && [ "$PI_OPT_FORCE" -eq 0 ]; then
-      printf 'Another `pi` binary is already on PATH: %s\n' "$PI_OTHER_PI_PATH" >&2
-      printf 'Refusing to install alongside it in non-interactive mode. Pass --force or --bin-dir to install anyway.\n' >&2
+    if [ -n "$PI_OTHER_PI_PATH" ] && [ "$PI_INSTALL_MODE" != "side-by-side" ] && [ "$PI_OPT_FORCE" -eq 0 ]; then
+      ca_other_desc=$(describe_other_pi "$PI_OTHER_PI_PATH" "$PI_AGENT_DIR")
+      printf 'Another `pi` is already on PATH: %s\n' "$ca_other_desc" >&2
+      printf 'Refusing to install `pi` alongside it in non-interactive mode.\n' >&2
+      printf '  - To install side-by-side as `pi-rs` (leaving `pi` untouched): pass --as-pi-rs\n' >&2
+      printf '  - To install `pi` alongside it anyway: pass --force (optionally with --bin-dir)\n' >&2
       exit 1
     fi
     PI_ACTION=$(default_action)
@@ -568,6 +641,13 @@ choose_action() {
       ""|" "|"$PI_CR")
         PI_ACTION=$(default_action)
         break
+        ;;
+      a|A)
+        if [ -n "$PI_OTHER_PI_PATH" ] && [ "$PI_HAS_MANAGED" -eq 0 ]; then
+          PI_INSTALL_MODE="side-by-side"
+          PI_ACTION="install"
+          break
+        fi
         ;;
       y|Y)
         if [ -n "$PI_OTHER_PI_PATH" ]; then
@@ -709,11 +789,12 @@ write_marker() {
   wm_version="$2"
   wm_target="$3"
   wm_bin_dir="$4"
-  wm_binaries_space="$5"
+  wm_links_space="$5"
   wm_source_mode="$6"
+  wm_install_mode="$7"
 
   wm_bins_json=""
-  for wm_b in $wm_binaries_space; do
+  for wm_b in $wm_links_space; do
     if [ -z "$wm_bins_json" ]; then
       wm_bins_json="\"$wm_b\""
     else
@@ -727,6 +808,7 @@ write_marker() {
   "kind": "pi-rs-managed-install",
   "schemaVersion": 1,
   "layout": "releases-v1",
+  "installMode": "$wm_install_mode",
   "version": "$wm_version",
   "target": "$wm_target",
   "source": "$wm_source_mode",
@@ -756,7 +838,6 @@ stage_from_archive() {
     sfa_archive="$PI_ARCHIVE_PATH"
     sfa_archive_name=$(basename "$sfa_archive")
     if [ "$PI_VERSION" = "latest" ]; then
-      # Infer version from pi-rs-<version>-<target>.tar.gz when possible.
       sfa_inferred="${sfa_archive_name#pi-rs-}"
       sfa_inferred="${sfa_inferred%-"${sfa_target}".tar.gz}"
       if [ -n "$sfa_inferred" ] && [ "$sfa_inferred" != "$sfa_archive_name" ]; then
@@ -802,7 +883,6 @@ stage_from_archive() {
 
   sfa_payload_dir="$sfa_extract_dir/pi-rs-${PI_RESOLVED_VERSION}-${sfa_target}"
   if [ ! -d "$sfa_payload_dir" ]; then
-    # Fallback: find the single top-level directory or extracted root.
     sfa_first_dir=$(find "$sfa_extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)
     if [ -n "$sfa_first_dir" ] && [ -d "$sfa_first_dir" ]; then
       sfa_payload_dir="$sfa_first_dir"
@@ -848,7 +928,6 @@ stage_from_source() {
 
   command -v cargo >/dev/null 2>&1 || die "--from-source requires Rust and cargo (https://rustup.rs)"
 
-  # Detect whether we are already inside a pi-rs checkout.
   sfs_src_dir=""
   if [ -f "./Cargo.toml" ] && [ -d "./crates/pi-rs-coding-agent" ] && [ -z "$PI_GIT_REF" ] && [ "$PI_VERSION" = "latest" ]; then
     sfs_src_dir=$(pwd)
@@ -993,30 +1072,58 @@ install_release() {
   ln -sfn "$ir_release_dir" "$ir_install_dir/current"
   write_current_version "$ir_install_dir" "$PI_RESOLVED_VERSION"
 
+  # Build the list of symlink names to create in ir_bin_dir.
+  PI_LINKED_COMMANDS=""
+  PI_SKIPPED_COMMANDS=""
+
+  for ir_bin in $PI_STAGED_BINARIES; do
+    if [ "$ir_bin" = "$PI_CMD" ] && [ "$PI_INSTALL_MODE" = "side-by-side" ]; then
+      # Side-by-side mode intentionally leaves `pi` untouched and exposes `pi-rs`.
+      continue
+    fi
+    if ! bin_slot_is_free "$ir_bin_dir" "$ir_bin" "$ir_install_dir"; then
+      if [ "$PI_INSTALL_MODE" = "side-by-side" ] && [ "$PI_OPT_FORCE" -eq 0 ]; then
+        PI_SKIPPED_COMMANDS="${PI_SKIPPED_COMMANDS:+$PI_SKIPPED_COMMANDS }$ir_bin"
+        continue
+      elif [ "$PI_OPT_FORCE" -eq 0 ]; then
+        die "refusing to overwrite existing non-managed binary at $ir_bin_dir/$ir_bin (use --as-pi-rs, --bin-dir, or --force)"
+      fi
+    fi
+    ir_link_tmp="$ir_bin_dir/.${ir_bin}.tmp.$$"
+    ln -sfn "$ir_install_dir/current/bin/$ir_bin" "$ir_link_tmp"
+    mv -f "$ir_link_tmp" "$ir_bin_dir/$ir_bin"
+    PI_LINKED_COMMANDS="${PI_LINKED_COMMANDS:+$PI_LINKED_COMMANDS }$ir_bin"
+  done
+
+  # Link `pi-rs` alias whenever `pi` is in the staged binaries (required in side-by-side
+  # mode, and optional convenience alias in drop-in mode unless --no-alias).
+  case " $PI_STAGED_BINARIES " in
+    *" $PI_CMD "*)
+      if [ "$PI_INSTALL_MODE" = "side-by-side" ] || [ "$PI_OPT_NO_ALIAS" -eq 0 ]; then
+        if bin_slot_is_free "$ir_bin_dir" "$PI_ALIAS_CMD" "$ir_install_dir" || [ "$PI_OPT_FORCE" -eq 1 ]; then
+          ir_alias_tmp="$ir_bin_dir/.${PI_ALIAS_CMD}.tmp.$$"
+          ln -sfn "$ir_install_dir/current/bin/$PI_CMD" "$ir_alias_tmp"
+          mv -f "$ir_alias_tmp" "$ir_bin_dir/$PI_ALIAS_CMD"
+          PI_LINKED_COMMANDS="${PI_LINKED_COMMANDS:+$PI_LINKED_COMMANDS }$PI_ALIAS_CMD"
+        elif [ "$PI_INSTALL_MODE" = "side-by-side" ]; then
+          die "refusing to overwrite existing non-managed binary at $ir_bin_dir/$PI_ALIAS_CMD (use --bin-dir or --force)"
+        fi
+      fi
+      ;;
+  esac
+
   # Remove any stale symlinks in ir_bin_dir that belonged to a previous managed release
-  # of binaries no longer selected.
-  for ir_old_bin in $PI_ALL_BINARIES; do
+  # of binaries/aliases no longer linked.
+  for ir_old_bin in $PI_ALL_BINARIES $PI_ALIAS_CMD; do
     if [ -L "$ir_bin_dir/$ir_old_bin" ] && command_belongs_to_managed_root "$ir_bin_dir/$ir_old_bin" "$ir_install_dir"; then
-      case " $PI_STAGED_BINARIES " in
+      case " $PI_LINKED_COMMANDS " in
         *" $ir_old_bin "*) ;;
         *) rm -f "$ir_bin_dir/$ir_old_bin" ;;
       esac
     fi
   done
 
-  # Link newly installed binaries into ir_bin_dir.
-  for ir_bin in $PI_STAGED_BINARIES; do
-    if [ -e "$ir_bin_dir/$ir_bin" ] && ! command_belongs_to_managed_root "$ir_bin_dir/$ir_bin" "$ir_install_dir"; then
-      if [ "$PI_OPT_FORCE" -eq 0 ]; then
-        die "refusing to overwrite existing non-managed binary at $ir_bin_dir/$ir_bin (use --bin-dir or --force)"
-      fi
-    fi
-    ir_link_tmp="$ir_bin_dir/.${ir_bin}.tmp.$$"
-    ln -sfn "$ir_install_dir/current/bin/$ir_bin" "$ir_link_tmp"
-    mv -f "$ir_link_tmp" "$ir_bin_dir/$ir_bin"
-  done
-
-  write_marker "$ir_install_dir" "$PI_RESOLVED_VERSION" "$ir_target" "$ir_bin_dir" "$PI_STAGED_BINARIES" "$ir_source_mode"
+  write_marker "$ir_install_dir" "$PI_RESOLVED_VERSION" "$ir_target" "$ir_bin_dir" "$PI_LINKED_COMMANDS" "$ir_source_mode" "$PI_INSTALL_MODE"
   cleanup_old_releases "$ir_install_dir/releases" "$PI_RESOLVED_VERSION"
   rm -rf "$ir_install_dir/staging"
 }
@@ -1030,7 +1137,11 @@ uninstall_release() {
     return 0
   fi
 
-  # Collect candidate bin dirs to clean managed symlinks from.
+  # Safety guard: never remove an upstream managed-install.json directory.
+  if [ -f "$ur_install_dir/$PI_UPSTREAM_MARKER_NAME" ] && [ ! -f "$ur_install_dir/$PI_MARKER_NAME" ]; then
+    die "refusing to remove upstream managed installation at $ur_install_dir"
+  fi
+
   ur_recorded_bin=$(marker_read_field "$ur_install_dir/$PI_MARKER_NAME" "binDir" || true)
   ur_dirs="$ur_bin_dir"
   if [ -n "$ur_recorded_bin" ] && [ "$ur_recorded_bin" != "$ur_bin_dir" ]; then
@@ -1042,7 +1153,7 @@ uninstall_release() {
   for ur_dir in $ur_dirs; do
     IFS=$ur_old_ifs
     [ -n "$ur_dir" ] && [ -d "$ur_dir" ] || { IFS=:; continue; }
-    for ur_bin in $PI_ALL_BINARIES; do
+    for ur_bin in $PI_ALL_BINARIES $PI_ALIAS_CMD; do
       if [ -L "$ur_dir/$ur_bin" ] && command_belongs_to_managed_root "$ur_dir/$ur_bin" "$ur_install_dir"; then
         rm -f "$ur_dir/$ur_bin"
       fi
@@ -1115,23 +1226,25 @@ prompt_add_path_to_profile() {
   printf 'Added %s to %s.\n' "$pap_dir" "$pap_cfg"
 }
 
-installed_pi_is_first_on_path() {
-  ip_installed="$PI_RESOLVED_BIN_DIR/$PI_CMD"
-  [ -x "$ip_installed" ] || return 1
-  ip_active=$(command -v "$PI_CMD" 2>/dev/null || true)
-  [ -n "$ip_active" ] || return 1
-  [ "$(resolve_path "$ip_active")" = "$(resolve_path "$ip_installed")" ]
+installed_cmd_is_first_on_path() {
+  ic_name="$1"
+  ic_installed="$PI_RESOLVED_BIN_DIR/$ic_name"
+  [ -x "$ic_installed" ] || return 1
+  ic_active=$(command -v "$ic_name" 2>/dev/null || true)
+  [ -n "$ic_active" ] || return 1
+  [ "$(resolve_path "$ic_active")" = "$(resolve_path "$ic_installed")" ]
 }
 
 prompt_start_pi() {
+  psp_cmd="$1"
   [ "$PI_OPT_NO_START" -eq 0 ] || return 0
-  psp_path="$PI_RESOLVED_BIN_DIR/$PI_CMD"
+  psp_path="$PI_RESOLVED_BIN_DIR/$psp_cmd"
   [ -x "$psp_path" ] || return 0
   [ -t 1 ] || return 0
   has_tty || return 0
 
   exec 3<>/dev/tty
-  printf '\nStart pi now? [Y/n] ' >&3
+  printf '\nStart %s now? [Y/n] ' "$psp_cmd" >&3
   if ! IFS= read -r psp_answer <&3; then
     psp_answer="n"
   fi
@@ -1153,14 +1266,24 @@ main() {
   PI_RESOLVED_INSTALL_DIR=$(select_install_dir)
   PI_AGENT_DIR=$(dirname "$PI_RESOLVED_INSTALL_DIR")
 
+  PI_HAS_MANAGED=0
+  PI_RECORDED_MODE=""
+  if [ -f "$PI_RESOLVED_INSTALL_DIR/$PI_MARKER_NAME" ] || [ -L "$PI_RESOLVED_INSTALL_DIR/current" ]; then
+    PI_HAS_MANAGED=1
+    PI_RECORDED_MODE=$(marker_read_field "$PI_RESOLVED_INSTALL_DIR/$PI_MARKER_NAME" "installMode" || true)
+  fi
+
+  if [ "$PI_OPT_AS_PI_RS" -eq 1 ]; then
+    PI_INSTALL_MODE="side-by-side"
+  elif [ "$PI_HAS_MANAGED" -eq 1 ] && [ "$PI_RECORDED_MODE" = "side-by-side" ]; then
+    PI_INSTALL_MODE="side-by-side"
+  else
+    PI_INSTALL_MODE="drop-in"
+  fi
+
   PI_EXISTING_PATH=$(command -v "$PI_CMD" 2>/dev/null || true)
   if [ -n "$PI_EXISTING_PATH" ] && path_is_on_windows_drive "$PI_EXISTING_PATH" && ! command_belongs_to_managed_root "$PI_EXISTING_PATH" "$PI_RESOLVED_INSTALL_DIR"; then
     PI_EXISTING_PATH=""
-  fi
-
-  PI_HAS_MANAGED=0
-  if [ -f "$PI_RESOLVED_INSTALL_DIR/$PI_MARKER_NAME" ] || [ -L "$PI_RESOLVED_INSTALL_DIR/current" ]; then
-    PI_HAS_MANAGED=1
   fi
 
   PI_OTHER_PI_PATH=""
@@ -1168,9 +1291,21 @@ main() {
     PI_OTHER_PI_PATH="$PI_EXISTING_PATH"
   fi
 
-  PI_RESOLVED_BIN_DIR=$(select_bin_dir "$PI_AGENT_DIR" "$PI_RESOLVED_INSTALL_DIR" "$PI_EXISTING_PATH")
+  if [ "$PI_INSTALL_MODE" = "side-by-side" ]; then
+    PI_PRIMARY_CMD="$PI_ALIAS_CMD"
+  else
+    PI_PRIMARY_CMD="$PI_CMD"
+  fi
+
+  PI_RESOLVED_BIN_DIR=$(select_bin_dir "$PI_AGENT_DIR" "$PI_RESOLVED_INSTALL_DIR" "$PI_EXISTING_PATH" "$PI_PRIMARY_CMD")
 
   choose_action
+
+  # Recompute primary command & bin dir if the user selected `[a]` (side-by-side) in the interactive menu.
+  if [ "$PI_INSTALL_MODE" = "side-by-side" ] && [ "$PI_PRIMARY_CMD" != "$PI_ALIAS_CMD" ]; then
+    PI_PRIMARY_CMD="$PI_ALIAS_CMD"
+    PI_RESOLVED_BIN_DIR=$(select_bin_dir "$PI_AGENT_DIR" "$PI_RESOLVED_INSTALL_DIR" "" "$PI_PRIMARY_CMD")
+  fi
 
   case "$PI_ACTION" in
     none)
@@ -1194,21 +1329,27 @@ main() {
   else
     printf '\npi-rs (%s) was installed successfully.\n' "$PI_RESOLVED_VERSION"
   fi
-  printf 'Installed binaries (%s): %s\n' "$PI_RESOLVED_BIN_DIR" "$PI_STAGED_BINARIES"
+  printf 'Installed commands (%s): %s\n' "$PI_RESOLVED_BIN_DIR" "$PI_LINKED_COMMANDS"
+  if [ -n "$PI_SKIPPED_COMMANDS" ]; then
+    printf 'Skipped existing non-managed commands in %s: %s\n' "$PI_RESOLVED_BIN_DIR" "$PI_SKIPPED_COMMANDS"
+  fi
+  if [ -n "$PI_OTHER_PI_PATH" ]; then
+    printf 'Shared state note: both `pi` and `pi-rs` use %s by default (override with PI_CODING_AGENT_DIR).\n' "$PI_AGENT_DIR"
+  fi
   printf 'Update or uninstall later by re-running the installer.\n'
 
-  if [ -x "$PI_RESOLVED_BIN_DIR/$PI_CMD" ]; then
-    if installed_pi_is_first_on_path; then
-      printf '\nRun it with: pi\n'
+  if [ -x "$PI_RESOLVED_BIN_DIR/$PI_PRIMARY_CMD" ]; then
+    if installed_cmd_is_first_on_path "$PI_PRIMARY_CMD"; then
+      printf '\nRun it with: %s\n' "$PI_PRIMARY_CMD"
     else
-      printf '\npi-rs was installed, but your current shell is not resolving %s/pi first on PATH.\n' "$PI_RESOLVED_BIN_DIR"
-      if [ -n "$PI_OTHER_PI_PATH" ]; then
+      printf '\npi-rs was installed, but your current shell is not resolving %s/%s first on PATH.\n' "$PI_RESOLVED_BIN_DIR" "$PI_PRIMARY_CMD"
+      if [ "$PI_PRIMARY_CMD" = "$PI_CMD" ] && [ -n "$PI_OTHER_PI_PATH" ]; then
         printf 'Your shell currently resolves pi to: %s\n' "$PI_OTHER_PI_PATH"
       fi
       prompt_add_path_to_profile "$PI_RESOLVED_BIN_DIR" || true
-      printf 'Restart your shell or run:\n\n  %s\n\nThen run: pi\n' "$(path_update_command "$PI_RESOLVED_BIN_DIR")"
+      printf 'Restart your shell or run:\n\n  %s\n\nThen run: %s\n' "$(path_update_command "$PI_RESOLVED_BIN_DIR")" "$PI_PRIMARY_CMD"
     fi
-    prompt_start_pi
+    prompt_start_pi "$PI_PRIMARY_CMD"
   fi
 }
 

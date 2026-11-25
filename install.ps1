@@ -6,14 +6,15 @@
 .DESCRIPTION
   Downloads the verified prebuilt pi-rs Windows release archive from GitHub Releases,
   checks SHA256SUMS.txt, installs binaries into a managed directory under
-  %USERPROFILE%\.pi\agent\install, links/copies them into the target bin directory,
-  and optionally adds the bin directory to the user PATH.
+  %USERPROFILE%\.pi\agent\install-rs (isolated from upstream pi's install folder),
+  copies them into the target bin directory, and optionally adds the bin directory
+  to the user PATH.
 
 .EXAMPLE
   powershell -c "irm https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.ps1 | iex"
 
 .EXAMPLE
-  $env:PI_CORE_ONLY = "1"; powershell -c "irm https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.ps1 | iex"
+  $env:PI_AS_PI_RS = "1"; powershell -c "irm https://raw.githubusercontent.com/remedialchaos/pi-rs/main/install.ps1 | iex"
 
 .EXAMPLE
   .\install.ps1 -Version v1.6.0 -CoreOnly -Yes
@@ -26,6 +27,8 @@ param(
   [string]$InstallDir = $(if ($env:PI_INSTALL_DIR) { $env:PI_INSTALL_DIR } else { "" }),
   [switch]$CoreOnly,
   [string]$Binaries = $(if ($env:PI_BINARIES) { $env:PI_BINARIES } else { "" }),
+  [switch]$AsPiRs,
+  [switch]$NoAlias,
   [switch]$Uninstall,
   [switch]$Yes,
   [switch]$Force,
@@ -47,6 +50,8 @@ function Test-EnvTruthy {
 }
 
 if (-not $CoreOnly -and (Test-EnvTruthy $env:PI_CORE_ONLY)) { $CoreOnly = $true }
+if (-not $AsPiRs -and (Test-EnvTruthy $env:PI_AS_PI_RS)) { $AsPiRs = $true }
+if (-not $NoAlias -and (Test-EnvTruthy $env:PI_NO_ALIAS)) { $NoAlias = $true }
 if (-not $Uninstall -and (Test-EnvTruthy $env:PI_UNINSTALL)) { $Uninstall = $true }
 if (-not $Yes -and (Test-EnvTruthy $env:PI_YES)) { $Yes = $true }
 if (-not $Force -and (Test-EnvTruthy $env:PI_FORCE)) { $Force = $true }
@@ -60,6 +65,7 @@ if ($Help) {
 
 $Target = "x86_64-pc-windows-msvc"
 $MarkerName = "pi-rs-install.json"
+$UpstreamMarkerName = "managed-install.json"
 $AllBinaries = @("pi", "pi-ai", "pi-env", "pi-evals", "p3", "p2", "pi-voice-server")
 
 $AgentDir = if ($env:PI_CODING_AGENT_DIR) {
@@ -67,21 +73,55 @@ $AgentDir = if ($env:PI_CODING_AGENT_DIR) {
 } else {
   Join-Path $env:USERPROFILE ".pi\agent"
 }
+
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
-  $InstallDir = Join-Path $AgentDir "install"
+  $DefaultInstallDir = Join-Path $AgentDir "install-rs"
+  $LegacyInstallDir = Join-Path $AgentDir "install"
+  if ((-not (Test-Path $DefaultInstallDir)) -and (Test-Path (Join-Path $LegacyInstallDir $MarkerName)) -and (-not (Test-Path (Join-Path $LegacyInstallDir $UpstreamMarkerName)))) {
+    $InstallDir = $LegacyInstallDir
+  } else {
+    $InstallDir = $DefaultInstallDir
+  }
 }
 $InstallDir = $InstallDir.TrimEnd('\', '/')
 
-if ([string]::IsNullOrWhiteSpace($BinDir)) {
-  $MarkerPath = Join-Path $InstallDir $MarkerName
-  if (Test-Path $MarkerPath) {
-    try {
-      $MarkerData = Get-Content -Raw -Path $MarkerPath | ConvertFrom-Json
-      if ($MarkerData.binDir) { $BinDir = [string]$MarkerData.binDir }
-    } catch {}
+$MarkerPath = Join-Path $InstallDir $MarkerName
+$ExistingMarker = $null
+if (Test-Path $MarkerPath) {
+  try {
+    $ExistingMarker = Get-Content -Raw -Path $MarkerPath | ConvertFrom-Json
+  } catch {}
+}
+
+$InstallMode = if ($AsPiRs) {
+  "side-by-side"
+} elseif ($ExistingMarker -and $ExistingMarker.installMode -eq "side-by-side") {
+  "side-by-side"
+} else {
+  "drop-in"
+}
+
+$ExistingPiCmd = Get-Command "pi" -ErrorAction SilentlyContinue
+$OtherPiPath = ""
+if ($ExistingPiCmd -and $ExistingPiCmd.Source) {
+  $isOwnPi = $ExistingMarker -and $ExistingMarker.binDir -and ($ExistingPiCmd.Source -like "$($ExistingMarker.binDir)\*")
+  if (-not $isOwnPi) {
+    $OtherPiPath = $ExistingPiCmd.Source
   }
-  if ([string]::IsNullOrWhiteSpace($BinDir)) {
-    $BinDir = Join-Path $AgentDir "bin"
+}
+
+if ([string]::IsNullOrWhiteSpace($BinDir)) {
+  if ($ExistingMarker -and $ExistingMarker.binDir) {
+    $BinDir = [string]$ExistingMarker.binDir
+  } else {
+    $DefaultBin = Join-Path $AgentDir "bin"
+    $UpstreamDefaultPi = Join-Path $DefaultBin "pi.exe"
+    $UpstreamDefaultCmd = Join-Path $DefaultBin "pi.cmd"
+    if (($InstallMode -eq "drop-in") -and (-not $ExistingMarker) -and ((Test-Path $UpstreamDefaultPi) -or (Test-Path $UpstreamDefaultCmd))) {
+      $BinDir = Join-Path $AgentDir "bin-rs"
+    } else {
+      $BinDir = $DefaultBin
+    }
   }
 }
 $BinDir = $BinDir.TrimEnd('\', '/')
@@ -159,17 +199,16 @@ function Verify-Checksum {
 }
 
 function Uninstall-PiRs {
-  $markerPath = Join-Path $InstallDir $MarkerName
+  if ((Test-Path (Join-Path $InstallDir $UpstreamMarkerName)) -and (-not (Test-Path $MarkerPath))) {
+    throw "Refusing to remove upstream managed installation at $InstallDir"
+  }
   $trackedBins = @()
   $targetBinDir = $BinDir
-  if (Test-Path $markerPath) {
-    try {
-      $marker = Get-Content -Raw -Path $markerPath | ConvertFrom-Json
-      if ($marker.binDir) { $targetBinDir = [string]$marker.binDir }
-      if ($marker.binaries) { $trackedBins = @($marker.binaries) }
-    } catch {}
+  if ($ExistingMarker) {
+    if ($ExistingMarker.binDir) { $targetBinDir = [string]$ExistingMarker.binDir }
+    if ($ExistingMarker.binaries) { $trackedBins = @($ExistingMarker.binaries) }
   }
-  if ($trackedBins.Count -eq 0) { $trackedBins = $AllBinaries }
+  if ($trackedBins.Count -eq 0) { $trackedBins = $AllBinaries + @("pi-rs") }
 
   foreach ($b in $trackedBins) {
     $exePath = Join-Path $targetBinDir "$b.exe"
@@ -208,14 +247,14 @@ if ($Uninstall) {
   exit 0
 }
 
-$HasManaged = Test-Path (Join-Path $InstallDir $MarkerName)
+$HasManaged = $null -ne $ExistingMarker
 if (-not $Yes -and -not [Console]::IsInputRedirected) {
   Write-Host ""
   Write-Host "  pi-rs Installer"
   Write-Host "  100% Rust port of pi"
   Write-Host ""
   if ($HasManaged) {
-    Write-Host "Existing managed pi-rs installation found in $InstallDir."
+    Write-Host "Existing managed pi-rs installation found in $InstallDir (mode: $InstallMode)."
     Write-Host "  [Enter/y] Reinstall or update pi-rs"
     Write-Host "  [u]       Uninstall pi-rs"
     Write-Host "  [n]       Cancel"
@@ -228,15 +267,31 @@ if (-not $Yes -and -not [Console]::IsInputRedirected) {
       Write-Host "Cancelled."
       exit 0
     }
+  } elseif (-not [string]::IsNullOrWhiteSpace($OtherPiPath) -and ($InstallMode -ne "side-by-side")) {
+    Write-Host "Another pi is already on PATH: $OtherPiPath"
+    Write-Host "This installer will not overwrite or remove it."
+    Write-Host "  [a]       Install side-by-side as pi-rs (keep existing pi untouched)"
+    Write-Host "  [y]       Install as pi (and pi-rs) alongside it"
+    Write-Host "  [Enter/n] Cancel"
+    $choice = Read-Host "Action"
+    if ($choice -match '^(a|A)$') {
+      $InstallMode = "side-by-side"
+    } elseif ($choice -notmatch '^(y|Y)$') {
+      Write-Host "Cancelled."
+      exit 0
+    }
   } else {
     Write-Host "Install directory: $InstallDir"
     Write-Host "Bin directory:     $BinDir"
+    Write-Host "Command mode:      $InstallMode"
     $choice = Read-Host "Proceed with install? [Y/n]"
     if ($choice -match '^(n|N)$') {
       Write-Host "Cancelled."
       exit 0
     }
   }
+} elseif ((-not [string]::IsNullOrWhiteSpace($OtherPiPath)) -and ($InstallMode -ne "side-by-side") -and (-not $Force)) {
+  throw "Another pi is already on PATH ($OtherPiPath). Pass -AsPiRs to install side-by-side as pi-rs, or -Force to install alongside it."
 }
 
 $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pi-rs-installer-" + [System.Guid]::NewGuid().ToString("N"))
@@ -297,18 +352,18 @@ try {
   $StageBinDir = Join-Path $StageDir "bin"
   New-Item -ItemType Directory -Force -Path $StageBinDir, $BinDir | Out-Null
 
-  $InstalledBins = @()
+  $StagedBins = @()
   $Candidates = if ($Requested.Count -gt 0) { $Requested } else { $AllBinaries }
   foreach ($binName in $Candidates) {
     $srcExe = Join-Path $PayloadDir "$binName.exe"
     if (Test-Path $srcExe) {
       Copy-Item -Force $srcExe (Join-Path $StageBinDir "$binName.exe")
-      $InstalledBins += $binName
+      $StagedBins += $binName
     } elseif ($Requested.Count -gt 0) {
       throw "Requested binary '$binName.exe' was not found in archive"
     }
   }
-  if ($InstalledBins.Count -eq 0) {
+  if ($StagedBins.Count -eq 0) {
     throw "No pi-rs binaries found inside release archive"
   }
 
@@ -324,19 +379,30 @@ try {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ReleaseDir) | Out-Null
   Move-Item -Force $StageDir $ReleaseDir
 
-  foreach ($binName in $InstalledBins) {
+  $PublishedCommands = @()
+  foreach ($binName in $StagedBins) {
+    if (($binName -eq "pi") -and ($InstallMode -eq "side-by-side")) {
+      continue
+    }
     Copy-Item -Force (Join-Path (Join-Path $ReleaseDir "bin") "$binName.exe") (Join-Path $BinDir "$binName.exe")
+    $PublishedCommands += $binName
+  }
+
+  if (($StagedBins -contains "pi") -and (($InstallMode -eq "side-by-side") -or (-not $NoAlias))) {
+    Copy-Item -Force (Join-Path (Join-Path $ReleaseDir "bin") "pi.exe") (Join-Path $BinDir "pi-rs.exe")
+    $PublishedCommands += "pi-rs"
   }
 
   $MarkerObj = [ordered]@{
     kind          = "pi-rs-managed-install"
     schemaVersion = 1
     layout        = "releases-v1"
+    installMode   = $InstallMode
     version       = $ResolvedVersion
     target        = $Target
     source        = "release"
     binDir        = $BinDir
-    binaries      = $InstalledBins
+    binaries      = $PublishedCommands
   }
   $MarkerJson = $MarkerObj | ConvertTo-Json -Depth 4
   [System.IO.File]::WriteAllText((Join-Path $InstallDir $MarkerName), $MarkerJson + "`n", (New-Object System.Text.UTF8Encoding($false)))
@@ -352,20 +418,24 @@ try {
   $StagingRoot = Join-Path $InstallDir "staging"
   if (Test-Path $StagingRoot) { Remove-Item -Recurse -Force $StagingRoot }
 
+  $PrimaryCmd = if ($InstallMode -eq "side-by-side") { "pi-rs" } else { "pi" }
   Write-Host ""
   Write-Host "pi-rs ($ResolvedVersion) was installed successfully."
-  Write-Host "Installed binaries ($BinDir): $($InstalledBins -join ', ')"
+  Write-Host "Installed commands ($BinDir): $($PublishedCommands -join ', ')"
+  if (-not [string]::IsNullOrWhiteSpace($OtherPiPath)) {
+    Write-Host "Shared state note: both pi and pi-rs use $AgentDir by default (override with PI_CODING_AGENT_DIR)."
+  }
 
   if (-not $NoModifyPath) {
     if (Add-ToUserPath -Dir $BinDir) {
-      Write-Host "Added $BinDir to your user PATH. Open a new terminal to use `pi`."
+      Write-Host "Added $BinDir to your user PATH. Open a new terminal to use $PrimaryCmd."
     }
   }
 
-  if (-not $NoStart -and -not $Yes -and -not [Console]::IsInputRedirected -and ($InstalledBins -contains "pi")) {
-    $startChoice = Read-Host "Start pi now? [Y/n]"
+  if (-not $NoStart -and -not $Yes -and -not [Console]::IsInputRedirected -and ($PublishedCommands -contains $PrimaryCmd)) {
+    $startChoice = Read-Host "Start $PrimaryCmd now? [Y/n]"
     if ($startChoice -notmatch '^(n|N)') {
-      & (Join-Path $BinDir "pi.exe")
+      & (Join-Path $BinDir "$PrimaryCmd.exe")
     }
   }
 } finally {
