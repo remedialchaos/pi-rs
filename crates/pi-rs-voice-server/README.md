@@ -30,8 +30,9 @@ Model layout matches the [upstream Dockerfile](../../../apps/p2/voice-server/Doc
 - `parakeet/{encoder.int8.onnx,decoder.int8.onnx,joiner.int8.onnx,tokens.txt}`: sherpa-onnx's NeMo Parakeet TDT 0.6B v3 int8 export.
 - `supertonic3/onnx/{duration_predictor.onnx,text_encoder.onnx,vector_estimator.onnx,vocoder.onnx,tts.json,unicode_indexer.json}` and `supertonic3/voice_styles/{F1..F5,M1..M5}.json`.
 - `kokoro/{kokoro-v1.0.onnx,voices-v1.0.bin}`: Kokoro 82M v1.0.
+- `pocket/{pocket_tts.onnx,pocket.json,<voice>.safetensors}`: Pocket TTS ONNX export and prompt-state `.safetensors` tensors (`F32`, `F16`, or `BF16`).
 
-**Pocket:** the binary skips `pocket` with a diagnostic. `models::pocket_voices` discovers the upstream `pocket/*.safetensors` prompt states, and `Pocket::engine` accepts a native streaming `PocketSynthesis` implementation. Pocket's PyTorch checkpoint requires a native ONNX export or Candle implementation; the prompt states are not synthesis weights. This crate does not shell out to Python.
+**Pocket:** `Config::load` loads `PocketOnnx` automatically whenever `<models>/pocket/<onnx_model>` (default `pocket_tts.onnx`) is present alongside `<voice>.safetensors` prompt states, and skips `pocket` with a diagnostic only when the ONNX model file is not installed. Optional `pocket.json` configures `sample_rate` (default `24000`), `chunk_samples` (default `4800`), `onnx_model`, `vocab`, `token_encoding` (`auto` | `codepoints` | `utf8_bytes` | `vocab`), `tokens_input`, `state_input`, `state_tensor`, `speed_input`, `steps_input`, `default_speed`, and `audio_output`. This crate does not shell out to Python.
 
 Build and run from this directory:
 
@@ -49,6 +50,12 @@ The transport tests exercise real loopback HTTP and WebSocket connections with d
 cargo fmt --check
 cargo clippy --offline --locked -j 2 --all-targets -- -D warnings
 cargo test --offline --locked -j 2
+```
+
+To also run the real ONNX Runtime end-to-end tests:
+
+```sh
+ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo test --offline --locked -j 2 -- --include-ignored
 ```
 
 Verified: formatting and Clippy are clean, and all 17 offline tests pass. Removing the previous-utterance clamp made the pre-roll regression fail; restoring it made the suite pass.

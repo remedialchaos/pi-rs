@@ -11,12 +11,17 @@ use ort::value::{DynValue, PrimitiveTensorElementType, Tensor, TensorRef};
 mod kokoro;
 mod parakeet;
 mod phonemizer;
-mod pocket;
+pub mod pocket;
 mod silero;
 mod supertonic;
 
 pub use parakeet::Parakeet;
-pub use pocket::{POCKET_VOICES, Pocket, PocketSynthesis, pocket_voices};
+pub use pocket::{
+    DEFAULT_POCKET_CHUNK_SAMPLES, DEFAULT_POCKET_ONNX_MODEL, DEFAULT_POCKET_SAMPLE_RATE,
+    POCKET_VOICES, Pocket, PocketConfig, PocketOnnx, PocketSynthesis, PocketTensor,
+    PocketTokenEncoding, PocketVoiceState, PocketVoiceStateCache, load_safetensors_f32,
+    parse_safetensors_f32, pocket_voices,
+};
 pub use silero::{SileroModel, VadConfig};
 
 use crate::{Error, Result, VoiceServer};
@@ -73,7 +78,7 @@ impl Config {
         })
     }
 
-    pub fn load(&self, token: &str) -> Result<VoiceServer> {
+    pub fn load_engines(&self) -> Result<Vec<crate::Engine>> {
         let mut engines = Vec::new();
         for name in &self.engines {
             if engines
@@ -91,18 +96,29 @@ impl Config {
                 "kokoro" => {
                     engines.push(kokoro::load(&self.models.join("kokoro"), self.tts_threads)?)
                 }
-                "pocket" => eprintln!(
-                    "Pocket TTS not loaded: the upstream PyTorch/safetensors assets require a native ONNX or Candle synthesis adapter"
-                ),
+                "pocket" => {
+                    if let Some(engine) = pocket::load_if_present(
+                        &self.models.join("pocket"),
+                        self.tts_threads,
+                        self.tts_steps,
+                    )? {
+                        engines.push(engine);
+                    }
+                }
                 _ => {}
             }
         }
         if engines.is_empty() {
             return Err(Error::Config(
-                "no native voice engines enabled; configure VOICE_ENGINES=supertonic or kokoro"
+                "no native voice engines enabled; configure VOICE_ENGINES=supertonic, pocket, or kokoro"
                     .into(),
             ));
         }
+        Ok(engines)
+    }
+
+    pub fn load(&self, token: &str) -> Result<VoiceServer> {
+        let engines = self.load_engines()?;
         let vad = SileroModel::load(&self.models.join("silero_vad.onnx"), self.vad)?;
         let stt = Arc::new(Parakeet::load(&self.models.join("parakeet"))?);
         VoiceServer::new(
@@ -132,7 +148,7 @@ fn number<T: FromStr>(name: &str, default: T) -> Result<T> {
 pub fn init_runtime(path: Option<&OsStr>) -> Result<()> {
     let path = path
         .map(OsString::from)
-        .or_else(|| env::var_os("ORT_DYLIB_PATH"))
+        .or_else(|| env::var_os("ORT_DYLIB_PATH").filter(|p| !p.is_empty()))
         .unwrap_or_else(|| {
             let name = if cfg!(target_os = "windows") {
                 "onnxruntime.dll"
