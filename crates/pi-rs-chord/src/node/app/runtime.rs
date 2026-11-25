@@ -127,6 +127,7 @@ pub async fn start_server(options: AppOptions) -> Result<AppServer> {
     let layout = AppLayout::create(&options.data_dir)?;
     let lock = ProcessLock::try_acquire(&layout.data_dir.join("server.lock"))?
         .ok_or_else(|| Error::Invalid("server data directory is already in use".into()))?;
+    recover_swaps(&layout.server.join("swaps"))?;
     let db = SqliteDatabase::open(&layout.server_store, Options::default()).await?;
     let store = StoreEngine::open(db.clone()).await?;
     let host = create_host(HostOptions {

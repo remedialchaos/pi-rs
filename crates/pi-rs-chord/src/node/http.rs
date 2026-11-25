@@ -25,7 +25,7 @@ pub(crate) use registry::{
     HttpRegistry, HttpTable, RegisteredHttp, new_registry, registry_provider,
 };
 use tokio::sync::watch;
-pub use websocket::connect_websocket;
+pub use websocket::{WebSocketTlsConfig, connect_websocket, connect_websocket_with_tls};
 
 pub type HttpResponse = Response<Body>;
 pub type HttpResult<T> = std::result::Result<T, HttpError>;

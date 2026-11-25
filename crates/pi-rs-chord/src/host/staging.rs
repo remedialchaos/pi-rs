@@ -1,5 +1,230 @@
 use super::declarations::{RegistryDeclaration, Request};
 use super::*;
+/// A validated host reload ready to commit or abort without mutating live host state.
+pub struct StagedReload {
+    host: Host,
+    _reload: tokio::sync::OwnedMutexGuard<()>,
+    old: IndexMap<String, Plugin>,
+    objects: Vec<Arc<Object>>,
+    plugins: IndexMap<String, Plugin>,
+    failed: Vec<PluginFailure>,
+}
+
+impl StagedReload {
+    /// Plugin setup/rehearsal failures detected while staging.
+    pub fn failed(&self) -> &[PluginFailure] {
+        &self.failed
+    }
+
+    /// Whether any plugin failed validation or rehearsal during staging.
+    pub fn has_failures(&self) -> bool {
+        !self.failed.is_empty()
+    }
+
+    /// Abort the staged reload, releasing the host reload lock with zero state mutations.
+    pub fn abort(self) {}
+
+    /// Commit the staged reload onto the host, restarting affected objects and awaiting readiness.
+    pub async fn commit(self, context: &Context) -> Result<ReloadReport> {
+        let StagedReload {
+            host: this,
+            _reload,
+            old,
+            objects,
+            plugins,
+            failed,
+        } = self;
+        let mut report = ReloadReport {
+            failed,
+            ..ReloadReport::default()
+        };
+        for (name, plugin) in &plugins {
+            match old.get(name) {
+                None => report.added.push(name.clone()),
+                Some(was) if !was.facet.same(&plugin.facet) => report.changed.push(name.clone()),
+                _ => {}
+            }
+        }
+        for name in old.keys() {
+            if !plugins.contains_key(name) {
+                report.removed.push(name.clone());
+            }
+        }
+        let served = plugins
+            .values()
+            .flat_map(|p| p.types.iter().map(|(n, t)| (n.clone(), t.clone())))
+            .collect::<IndexMap<_, _>>();
+        let declarations: IndexMap<String, RegistryDeclaration> = plugins
+            .values()
+            .flat_map(|p| p.registries.iter().map(|(n, d)| (n.clone(), d.clone())))
+            .collect();
+        let changed: BTreeSet<_> = report
+            .changed
+            .iter()
+            .chain(report.removed.iter())
+            .cloned()
+            .collect();
+        let mut restarting = Vec::new();
+        let mut ending = Vec::new();
+        let host = this.clone();
+        let committed = plugins.clone();
+        let types = served.clone();
+        let active = objects.clone();
+        let changes = changed.clone();
+        this.0.batch.within(context, move || {
+            {
+                let mut state = lock(&host.0.state);
+                state.loaded = true;
+                state.plugins = committed;
+                state.served = types.clone();
+            }
+            let mut registry_names = lock(&host.0.state)
+                .registries
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            registry_names.extend(declarations.keys().cloned());
+            for name in registry_names {
+                let declaration = declarations.get(&name);
+                let token = declaration
+                    .map(|d| d.token.clone())
+                    .unwrap_or(crate::registries::define_registry(name.clone(), 1)?);
+                let record = host.registry(token);
+                let contributions = plugins
+                    .iter()
+                    .filter_map(|(owner, p)| {
+                        p.contributions.get(&name).map(|(token, value)| {
+                            (
+                                crate::registries::Contributor::facet(owner),
+                                token.version,
+                                value.clone(),
+                            )
+                        })
+                    })
+                    .collect();
+                if let Some(declaration) = declaration {
+                    record.replace_versioned(
+                        declaration.token.version,
+                        declaration.provider.clone(),
+                        contributions,
+                        true,
+                        &Context::background(),
+                    )?;
+                } else {
+                    record.unserve(&Context::background())?;
+                }
+            }
+            let previous_http = host.0.http.last_good();
+            host.0.http.replace(
+                crate::node::http::registry_provider(),
+                plugins
+                    .iter()
+                    .filter_map(|(owner, plugin)| {
+                        plugin
+                            .http
+                            .clone()
+                            .map(|http| (crate::registries::Contributor::facet(owner), 1, http))
+                    })
+                    .collect(),
+                &Context::background(),
+            )?;
+            if let Some(previous) = previous_http {
+                previous.retire_missing(host.0.http.last_good().as_ref());
+            }
+            for object in active {
+                let mut state = lock(&object.state);
+                let affected = state
+                    .served
+                    .as_ref()
+                    .is_none_or(|s| changes.contains(&s.plugin));
+                if !affected {
+                    continue;
+                }
+                let target = types.get(object.contract.name()).cloned();
+                state.generation += 1;
+                state.activating = false;
+                state.served = target.clone();
+                if target.is_some() {
+                    state.old = state.attempt.take();
+                    state.phase = RefState::Loading;
+                } else {
+                    state.phase = RefState::Ended {
+                        error: ChordError::new("released", "type is no longer served"),
+                    };
+                }
+                drop(state);
+                object.moved()?;
+            }
+            Ok(())
+        })?;
+        for object in objects {
+            let state = lock(&object.state);
+            let affected = state
+                .served
+                .as_ref()
+                .is_none_or(|s| changed.contains(&s.plugin))
+                || matches!(state.phase, RefState::Loading) && state.attempt.is_none();
+            if !affected {
+                continue;
+            }
+            let kind = if state.served.is_none() {
+                Fate::End
+            } else if state.old.is_some() {
+                Fate::Restart
+            } else {
+                Fate::Retry
+            };
+            drop(state);
+            report.objects.push(ObjectFate {
+                object: object.key.clone(),
+                kind,
+            });
+            if kind == Fate::End {
+                ending.push(object);
+            } else {
+                restarting.push(object);
+            }
+        }
+        for object in ending {
+            this.end_object(object, "type no longer served").await?;
+        }
+        for object in &restarting {
+            this.activate(object.clone())?;
+        }
+        // Local singletons are eager. The temporary held reference is not a lifetime pin.
+        for definition in served.values().filter(|s| s.singleton()) {
+            let held = this.hold(
+                definition.contract.clone(),
+                JsonValue::Object(IndexMap::new()),
+                context,
+            )?;
+            let object = held.object()?;
+            if !restarting.iter().any(|o| Arc::ptr_eq(o, &object)) {
+                restarting.push(object);
+            }
+            held.release();
+        }
+        for object in restarting {
+            let mut moved = object.changed.subscribe();
+            let ready = async {
+                loop {
+                    moved.borrow_and_update();
+                    if !matches!(lock(&object.state).phase, RefState::Loading) {
+                        return Ok::<(), Error>(());
+                    }
+                    moved.changed().await.map_err(|_| Error::Closed)?;
+                }
+            };
+            context
+                .await_with(tokio::time::timeout(this.0.options.ready_timeout, ready))
+                .await
+                .map_err(|e| ChordError::new("aborted", e.to_string()))?
+                .map_err(|_| ChordError::new("unavailable", "host ready timeout"))??;
+        }
+        Ok(report)
+    }
+}
+
 impl Host {
     pub async fn load(&self, facets: Vec<PluginFacet>, context: &Context) -> Result<ReloadReport> {
         if lock(&self.0.state).loaded {
@@ -14,14 +239,14 @@ impl Host {
     ) -> Result<ReloadReport> {
         self.reload_with_failures(facets, Vec::new(), context).await
     }
-    pub async fn reload_with_failures(
+    pub async fn stage_reload(
         &self,
         facets: Vec<PluginFacet>,
         failures: Vec<PluginFailure>,
         context: &Context,
-    ) -> Result<ReloadReport> {
+    ) -> Result<StagedReload> {
         self.0.batch.assert_outside("host.reload")?;
-        let _reload = self.0.reload.lock().await;
+        let reload = self.0.reload.clone().lock_owned().await;
         context
             .check()
             .map_err(|e| ChordError::new("aborted", e.to_string()))?;
@@ -178,197 +403,29 @@ impl Host {
                 break next;
             }
         };
-        let mut report = ReloadReport {
-            failed: failed
-                .into_iter()
-                .map(|(plugin, error)| PluginFailure { plugin, error })
-                .collect(),
-            ..ReloadReport::default()
-        };
-        for (name, plugin) in &plugins {
-            match old.get(name) {
-                None => report.added.push(name.clone()),
-                Some(was) if !was.facet.same(&plugin.facet) => report.changed.push(name.clone()),
-                _ => {}
-            }
-        }
-        for name in old.keys() {
-            if !plugins.contains_key(name) {
-                report.removed.push(name.clone());
-            }
-        }
-        let served = plugins
-            .values()
-            .flat_map(|p| p.types.iter().map(|(n, t)| (n.clone(), t.clone())))
-            .collect::<IndexMap<_, _>>();
-        let declarations: IndexMap<String, RegistryDeclaration> = plugins
-            .values()
-            .flat_map(|p| p.registries.iter().map(|(n, d)| (n.clone(), d.clone())))
+        let failed = failed
+            .into_iter()
+            .map(|(plugin, error)| PluginFailure { plugin, error })
             .collect();
-        let changed: BTreeSet<_> = report
-            .changed
-            .iter()
-            .chain(report.removed.iter())
-            .cloned()
-            .collect();
-        let mut restarting = Vec::new();
-        let mut ending = Vec::new();
-        let host = self.clone();
-        let committed = plugins.clone();
-        let types = served.clone();
-        let active = objects.clone();
-        let changes = changed.clone();
-        self.0.batch.within(context, move || {
-            {
-                let mut state = lock(&host.0.state);
-                state.loaded = true;
-                state.plugins = committed;
-                state.served = types.clone();
-            }
-            let mut registry_names = lock(&host.0.state)
-                .registries
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            registry_names.extend(declarations.keys().cloned());
-            for name in registry_names {
-                let declaration = declarations.get(&name);
-                let token = declaration
-                    .map(|d| d.token.clone())
-                    .unwrap_or(crate::registries::define_registry(name.clone(), 1)?);
-                let record = host.registry(token);
-                let contributions = plugins
-                    .iter()
-                    .filter_map(|(owner, p)| {
-                        p.contributions.get(&name).map(|(token, value)| {
-                            (
-                                crate::registries::Contributor::facet(owner),
-                                token.version,
-                                value.clone(),
-                            )
-                        })
-                    })
-                    .collect();
-                if let Some(declaration) = declaration {
-                    record.replace_versioned(
-                        declaration.token.version,
-                        declaration.provider.clone(),
-                        contributions,
-                        true,
-                        &Context::background(),
-                    )?;
-                } else {
-                    record.unserve(&Context::background())?;
-                }
-            }
-            let previous_http = host.0.http.last_good();
-            host.0.http.replace(
-                crate::node::http::registry_provider(),
-                plugins
-                    .iter()
-                    .filter_map(|(owner, plugin)| {
-                        plugin
-                            .http
-                            .clone()
-                            .map(|http| (crate::registries::Contributor::facet(owner), 1, http))
-                    })
-                    .collect(),
-                &Context::background(),
-            )?;
-            if let Some(previous) = previous_http {
-                previous.retire_missing(host.0.http.last_good().as_ref());
-            }
-            for object in active {
-                let mut state = lock(&object.state);
-                let affected = state
-                    .served
-                    .as_ref()
-                    .is_none_or(|s| changes.contains(&s.plugin));
-                if !affected {
-                    continue;
-                }
-                let target = types.get(object.contract.name()).cloned();
-                state.generation += 1;
-                state.activating = false;
-                state.served = target.clone();
-                if target.is_some() {
-                    state.old = state.attempt.take();
-                    state.phase = RefState::Loading;
-                } else {
-                    state.phase = RefState::Ended {
-                        error: ChordError::new("released", "type is no longer served"),
-                    };
-                }
-                drop(state);
-                object.moved()?;
-            }
-            Ok(())
-        })?;
-        for object in objects {
-            let state = lock(&object.state);
-            let affected = state
-                .served
-                .as_ref()
-                .is_none_or(|s| changed.contains(&s.plugin))
-                || matches!(state.phase, RefState::Loading) && state.attempt.is_none();
-            if !affected {
-                continue;
-            }
-            let kind = if state.served.is_none() {
-                Fate::End
-            } else if state.old.is_some() {
-                Fate::Restart
-            } else {
-                Fate::Retry
-            };
-            drop(state);
-            report.objects.push(ObjectFate {
-                object: object.key.clone(),
-                kind,
-            });
-            if kind == Fate::End {
-                ending.push(object);
-            } else {
-                restarting.push(object);
-            }
-        }
-        for object in ending {
-            self.end_object(object, "type no longer served").await?;
-        }
-        for object in &restarting {
-            self.activate(object.clone())?;
-        }
-        // Local singletons are eager. The temporary held reference is not a lifetime pin.
-        for definition in served.values().filter(|s| s.singleton()) {
-            let held = self.hold(
-                definition.contract.clone(),
-                JsonValue::Object(IndexMap::new()),
-                context,
-            )?;
-            let object = held.object()?;
-            if !restarting.iter().any(|o| Arc::ptr_eq(o, &object)) {
-                restarting.push(object);
-            }
-            held.release();
-        }
-        for object in restarting {
-            let mut moved = object.changed.subscribe();
-            let ready = async {
-                loop {
-                    moved.borrow_and_update();
-                    if !matches!(lock(&object.state).phase, RefState::Loading) {
-                        return Ok::<(), Error>(());
-                    }
-                    moved.changed().await.map_err(|_| Error::Closed)?;
-                }
-            };
-            context
-                .await_with(tokio::time::timeout(self.0.options.ready_timeout, ready))
-                .await
-                .map_err(|e| ChordError::new("aborted", e.to_string()))?
-                .map_err(|_| ChordError::new("unavailable", "host ready timeout"))??;
-        }
-        Ok(report)
+        Ok(StagedReload {
+            host: self.clone(),
+            _reload: reload,
+            old,
+            objects,
+            plugins,
+            failed,
+        })
+    }
+    pub async fn reload_with_failures(
+        &self,
+        facets: Vec<PluginFacet>,
+        failures: Vec<PluginFailure>,
+        context: &Context,
+    ) -> Result<ReloadReport> {
+        self.stage_reload(facets, failures, context)
+            .await?
+            .commit(context)
+            .await
     }
 }
 fn validate_recorded(old: &Recorded, next: &Recorded) -> Result<()> {

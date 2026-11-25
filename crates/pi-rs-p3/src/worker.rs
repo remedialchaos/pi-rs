@@ -17,18 +17,24 @@ use std::{
 use pi_rs_chord::{
     context::Context,
     host::{Host, HostOptions, PluginFacet, create_host},
+    link::Link,
+    remote::{LinkRole, RemoteOptions},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-    sync::watch,
+    io::{AsyncRead, AsyncWrite},
+    sync::{mpsc, watch},
 };
 
 use crate::{
-    api::v1::control::{CloseReason, FromWorker, ToWorker, decode_line, encode_line},
+    api::v1::control::{
+        CloseReason, FromWorker, IpcFrame, IpcPipeLink, ToWorker, read_ipc_frame, worker_control,
+        worker_message, write_ipc_frame,
+    },
     api::v1::session_address,
     app::worker_principal,
     files::private_directory,
-    plugins::runner_worker,
+    plugins::{runner_worker, sessions},
+    principals::Principal,
     registry::WorkerRegistries,
     worker_core,
 };
@@ -124,14 +130,18 @@ pub struct WorkerHost {
 }
 
 /// Runs this process as a session worker on `reader`/`writer`; returns the exit code.
-pub async fn run_worker<R, W>(reader: R, writer: W) -> Result<u8, WorkerError>
+pub async fn run_worker<R, W>(mut reader: R, mut writer: W) -> Result<u8, WorkerError>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    let mut lines = BufReader::new(reader).lines();
-    let mut writer = writer;
-    let first: Option<ToWorker> = read_message(&mut lines).await?;
+    let first: Option<ToWorker> = match read_ipc_frame(&mut reader).await {
+        Ok(IpcFrame::Control(bytes)) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| worker_control::<ToWorker>(&value)),
+        Ok(IpcFrame::Binary(_)) => None,
+        Err(_) => None,
+    };
     let Some(ToWorker::Start {
         session,
         dir,
@@ -146,6 +156,36 @@ where
     };
     let dir = PathBuf::from(dir);
     private_directory(&dir)?;
+    let (out_tx, mut out_rx) = mpsc::channel::<IpcFrame>(64);
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ToWorker>(32);
+    let parent_link = IpcPipeLink::new(out_tx.clone());
+    let reader_link = parent_link.clone();
+    let writer_link = parent_link.clone();
+    let write_task = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if write_ipc_frame(&mut writer, &frame).await.is_err() {
+                break;
+            }
+        }
+        writer_link.ended();
+    });
+    let read_task = tokio::spawn(async move {
+        while let Ok(frame) = read_ipc_frame(&mut reader).await {
+            match frame {
+                IpcFrame::Binary(bytes) => reader_link.deliver(bytes),
+                IpcFrame::Control(bytes) => {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        && let Some(message) = worker_control::<ToWorker>(&value)
+                        && ctrl_tx.send(message).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        reader_link.ended();
+    });
+
     let runtime = WorkerRuntime::new(session.clone(), dir, idle_ms);
     let registries = WorkerRegistries::default();
     let lives = crate::api::v1::contribute::PluginLives::new();
@@ -158,19 +198,28 @@ where
         ..HostOptions::default()
     })
     .map_err(|error| WorkerError::Host(error.to_string()))?;
+    let mut parent_options = RemoteOptions::new(Principal::Server.value());
+    parent_options.role = LinkRole::Parent;
+    parent_options.trusted = true;
+    let parent_peer = host
+        .connect(parent_link.clone(), parent_options)
+        .map_err(|error| WorkerError::Host(error.to_string()))?;
     let facets = worker_core::facets(&runtime, &registries, &lives)
         .into_iter()
-        .chain(std::iter::once(PluginFacet::new(
-            "p3-runner",
-            runner_worker::facet(runtime.clone(), registries.clone(), &lives),
-        )))
+        .chain([
+            sessions::worker_session_facet(runtime.clone(), parent_peer.clone()),
+            PluginFacet::new(
+                "p3-runner",
+                runner_worker::facet(runtime.clone(), registries.clone(), &lives),
+            ),
+        ])
         .collect::<Vec<_>>();
     let report = host
         .load(facets.clone(), &context)
         .await
         .map_err(|error| WorkerError::Host(error.to_string()))?;
-    write_message(
-        &mut writer,
+    write_control(
+        &out_tx,
         &FromWorker::Ready {
             failed: report.failed.iter().map(|f| f.plugin.clone()).collect(),
         },
@@ -180,44 +229,41 @@ where
     let mut closed = None;
     loop {
         tokio::select! {
-            line = lines.next_line() => {
-                match line? {
-                    Some(line) => match decode_line::<ToWorker>(line.as_bytes()) {
-                        Some(ToWorker::Reload { scripts: _ }) => {
-                            // Native facets cannot be replaced in a running process: a reload re-runs
-                            // the same facet instances, so nothing fails and nothing changes.
-                            match host.reload(facets.clone(), &context).await {
-                                Ok(report) => {
-                                    let failed = report
-                                        .failed
-                                        .iter()
-                                        .map(|failure| failure.plugin.clone())
-                                        .collect::<Vec<_>>();
-                                    write_message(&mut writer, &FromWorker::Reloaded { failed }).await?;
-                                }
-                                Err(error) => {
-                                    write_message(
-                                        &mut writer,
-                                        &FromWorker::ReloadFailed {
-                                            error: error.to_string(),
-                                        },
-                                    )
-                                    .await?;
-                                }
+            message = ctrl_rx.recv() => {
+                match message {
+                    Some(ToWorker::Reload { scripts: _ }) => {
+                        // Native facets cannot be replaced in a running process: a reload re-runs
+                        // the same facet instances, so nothing fails and nothing changes.
+                        match host.reload(facets.clone(), &context).await {
+                            Ok(report) => {
+                                let failed = report
+                                    .failed
+                                    .iter()
+                                    .map(|failure| failure.plugin.clone())
+                                    .collect::<Vec<_>>();
+                                write_control(&out_tx, &FromWorker::Reloaded { failed }).await?;
+                            }
+                            Err(error) => {
+                                write_control(
+                                    &out_tx,
+                                    &FromWorker::ReloadFailed {
+                                        error: error.to_string(),
+                                    },
+                                )
+                                .await?;
                             }
                         }
-                        Some(ToWorker::Shutdown) | None => break,
-                        Some(ToWorker::Start { .. }) => {
-                            write_message(
-                                &mut writer,
-                                &FromWorker::ReloadFailed {
-                                    error: "p3 worker: already started".into(),
-                                },
-                            )
-                            .await?;
-                        }
-                    },
-                    None => break,
+                    }
+                    Some(ToWorker::Shutdown) | None => break,
+                    Some(ToWorker::Start { .. }) => {
+                        write_control(
+                            &out_tx,
+                            &FromWorker::ReloadFailed {
+                                error: "p3 worker: already started".into(),
+                            },
+                        )
+                        .await?;
+                    }
                 }
             }
             reason = runtime.wait_closed() => {
@@ -228,35 +274,31 @@ where
     }
     if let Some(reason) = closed {
         // The server hears why while the channel still stands, then the host closes.
-        write_message(&mut writer, &FromWorker::Closed { reason }).await?;
+        write_control(&out_tx, &FromWorker::Closed { reason }).await?;
     }
+    parent_peer.close();
+    parent_link.close();
     lives.end_all();
     host.close(&context)
         .await
         .map_err(|error| WorkerError::Host(error.to_string()))?;
+    drop(out_tx);
+    let _ =
+        tokio::time::timeout(std::time::Duration::from_millis(FORCED_EXIT_MS), write_task).await;
+    read_task.abort();
     Ok(0)
 }
 
-async fn read_message<R, M>(
-    lines: &mut tokio::io::Lines<BufReader<R>>,
-) -> Result<Option<M>, WorkerError>
-where
-    R: AsyncRead + Unpin,
-    M: serde::de::DeserializeOwned,
-{
-    match lines.next_line().await? {
-        Some(line) => Ok(decode_line(line.as_bytes())),
-        None => Ok(None),
-    }
-}
-
-async fn write_message<M: serde::Serialize, W: AsyncWrite + Unpin>(
-    writer: &mut W,
+async fn write_control<M: serde::Serialize>(
+    outgoing: &mpsc::Sender<IpcFrame>,
     message: &M,
 ) -> Result<(), WorkerError> {
-    writer.write_all(&encode_line(message)).await?;
-    writer.flush().await?;
-    Ok(())
+    let bytes = serde_json::to_vec(&worker_message(message))
+        .map_err(|error| WorkerError::Io(std::io::Error::other(error)))?;
+    outgoing
+        .send(IpcFrame::Control(bytes))
+        .await
+        .map_err(|_| WorkerError::Io(std::io::Error::other("worker output closed")))
 }
 
 #[cfg(test)]

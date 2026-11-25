@@ -27,6 +27,7 @@ mod staging;
 pub use crate::jobs::{next_delay, uuid_v7};
 pub use declarations::*;
 pub use reload_cycle::{CycleWait, ReloadCycles};
+pub use staging::StagedReload;
 #[derive(Clone, Debug, PartialEq)]
 pub enum RefState {
     Loading,
@@ -213,7 +214,7 @@ struct HostInner {
     batch: Batch,
     http: crate::node::http::HttpRegistry,
     state: Mutex<HostState>,
-    reload: tokio::sync::Mutex<()>,
+    reload: Arc<tokio::sync::Mutex<()>>,
     host_data: Arc<tokio::sync::RwLock<()>>,
     activity: NativeSource<ActivityCounts>,
     cycles: ReloadCycles,
@@ -272,7 +273,7 @@ pub fn create_host(options: HostOptions) -> Result<Host> {
             revoked: BTreeSet::new(),
             links: Vec::new(),
         }),
-        reload: tokio::sync::Mutex::new(()),
+        reload: Arc::new(tokio::sync::Mutex::new(())),
         host_data: Arc::new(tokio::sync::RwLock::new(())),
         activity,
         cycles: ReloadCycles::default(),

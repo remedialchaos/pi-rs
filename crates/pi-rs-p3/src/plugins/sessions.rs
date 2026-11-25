@@ -16,14 +16,22 @@ use std::{
 use indexmap::IndexMap;
 use pi_rs_chord::{
     context::Context,
-    host::{Facet, PluginFacet, define_facet},
+    contracts::{Contract, Member, schema as s},
+    data::ChordError,
+    host::{Facet, Members, PluginFacet, ServeOptions, define_facet},
+    json::JsonValue,
+    remote::RemotePeer,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::watch;
 
 use crate::{
-    api::v1::contribute::PluginLives, files::write_private, principals::Principal,
+    api::v1::{contribute::PluginLives, server_chord_address, session_chord_address},
+    files::write_private,
+    principals::Principal,
     server::SessionRouter,
+    worker::WorkerRuntime,
 };
 
 /// Who made a session: the owner, or a person (by id).
@@ -459,8 +467,121 @@ pub fn admit_session(principal: &Principal, exists: bool) -> Admission {
     }
 }
 
-/// The sessions plugin on the server: the waker, once the server is up. A working session was cut off
-/// by a restart; its worker starts again, unasked.
+pub const SESSION_WORKER_CONTRACT: &str = "p3.session.worker";
+pub const SESSION_START_CONTRACT: &str = "p3.session.start";
+pub const SESSION_FACTS_CONTRACT: &str = "p3.session.facts";
+
+/// Remote Chord contract served by each session worker process.
+pub fn session_worker_contract() -> pi_rs_chord::Result<Arc<Contract>> {
+    Ok(Arc::new(Contract::remote(
+        SESSION_WORKER_CONTRACT,
+        1,
+        vec![("id".into(), s::str())],
+        IndexMap::from([(
+            "main".into(),
+            IndexMap::from([
+                ("session".into(), Member::State(s::str())),
+                ("pid".into(), Member::State(s::int())),
+                (
+                    "info".into(),
+                    Member::Method {
+                        args: s::unknown(),
+                        result: s::obj([
+                            ("session", s::required(s::str())),
+                            ("pid", s::required(s::int())),
+                            ("caller", s::required(s::unknown())),
+                        ]),
+                    },
+                ),
+                (
+                    "facts".into(),
+                    Member::Method {
+                        args: s::unknown(),
+                        result: s::unknown(),
+                    },
+                ),
+                (
+                    "report".into(),
+                    Member::Method {
+                        args: s::obj([("state", s::required(s::str()))]),
+                        result: s::unknown(),
+                    },
+                ),
+            ]),
+        )]),
+        Arc::new(|params| {
+            let id = params
+                .get("id")
+                .and_then(|v| v.to_serde().ok())
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or_else(|| pi_rs_chord::Error::Invalid("missing session id".into()))?;
+            session_chord_address(&id)
+        }),
+    )?))
+}
+
+/// Remote Chord contract served by each session worker for server-only start readiness.
+pub fn session_start_contract() -> pi_rs_chord::Result<Arc<Contract>> {
+    Ok(Arc::new(Contract::remote(
+        SESSION_START_CONTRACT,
+        1,
+        vec![("id".into(), s::str())],
+        IndexMap::from([(
+            "main".into(),
+            IndexMap::from([("ready".into(), Member::State(s::bool()))]),
+        )]),
+        Arc::new(|params| {
+            let id = params
+                .get("id")
+                .and_then(|v| v.to_serde().ok())
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or_else(|| pi_rs_chord::Error::Invalid("missing session id".into()))?;
+            session_chord_address(&id)
+        }),
+    )?))
+}
+
+/// Remote Chord contract served by the server host for a session worker to query/report its row.
+pub fn session_facts_contract() -> pi_rs_chord::Result<Arc<Contract>> {
+    Ok(Arc::new(Contract::remote(
+        SESSION_FACTS_CONTRACT,
+        1,
+        vec![("id".into(), s::str())],
+        IndexMap::from([(
+            "main".into(),
+            IndexMap::from([
+                (
+                    "row".into(),
+                    Member::Method {
+                        args: s::unknown(),
+                        result: s::unknown(),
+                    },
+                ),
+                (
+                    "report".into(),
+                    Member::Method {
+                        args: s::obj([("state", s::required(s::str()))]),
+                        result: s::unknown(),
+                    },
+                ),
+            ]),
+        )]),
+        Arc::new(|_| server_chord_address()),
+    )?))
+}
+
+fn parse_session_state(value: &str) -> pi_rs_chord::Result<SessionState> {
+    match value {
+        "working" => Ok(SessionState::Working),
+        "waiting" => Ok(SessionState::Waiting),
+        "settled" => Ok(SessionState::Settled),
+        "failed" => Ok(SessionState::Failed),
+        _ => Err(ChordError::invalid("state", "invalid session state", None).into()),
+    }
+}
+
+/// The sessions plugin on the server: serves `p3.session.facts` for workers and wakes `working`
+/// sessions after a restart.
 pub fn server_facet(
     store: Arc<SessionsStore>,
     router: Arc<SessionRouter>,
@@ -469,8 +590,77 @@ pub fn server_facet(
     let lives = lives.clone();
     PluginFacet::new(
         "p3-sessions",
-        define_facet(move |_host| -> pi_rs_chord::Result<()> {
+        define_facet(move |setup| -> pi_rs_chord::Result<()> {
             let live = lives.open("p3-sessions");
+            let facts_contract = session_facts_contract()?;
+            let api = Arc::new(SessionsApi::new(store.clone()));
+            setup.serve(
+                facts_contract,
+                move |params, who, _| {
+                    let id = params
+                        .get("id")
+                        .and_then(|v| v.to_serde().ok())
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .ok_or_else(|| ChordError::invalid("id", "session id is required", None))?;
+                    let caller = who
+                        .and_then(Principal::from_value)
+                        .ok_or_else(|| ChordError::new("forbidden", "missing caller principal"))?;
+                    if caller.session() != Some(id.as_str()) {
+                        return Err(ChordError::new(
+                            "forbidden",
+                            "sessions: a session's worker only",
+                        )
+                        .into());
+                    }
+                    let mut members = Members::variant("main");
+                    let row_api = api.clone();
+                    let row_id = id.clone();
+                    members.method("row", move |_, ctx| {
+                        let api = row_api.clone();
+                        let id = row_id.clone();
+                        Box::pin(async move {
+                            let caller = ctx
+                                .principal
+                                .as_ref()
+                                .and_then(Principal::from_value)
+                                .ok_or_else(|| {
+                                    ChordError::new("forbidden", "missing caller principal")
+                                })?;
+                            let row = api
+                                .facts(&caller, &id)
+                                .map_err(|err| ChordError::new("forbidden", err.to_string()))?;
+                            Ok(JsonValue::from_serde(serde_json::to_value(row)?))
+                        })
+                    })?;
+                    let report_api = api.clone();
+                    members.method("report", move |args, ctx| {
+                        let api = report_api.clone();
+                        Box::pin(async move {
+                            let caller = ctx
+                                .principal
+                                .as_ref()
+                                .and_then(Principal::from_value)
+                                .ok_or_else(|| {
+                                    ChordError::new("forbidden", "missing caller principal")
+                                })?;
+                            let args = args.to_serde()?;
+                            let state_str = args
+                                .get("state")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                ChordError::invalid("state", "state is required", None)
+                            })?;
+                            let state = parse_session_state(state_str)?;
+                            api.report(&caller, state)
+                                .map_err(|err| ChordError::new("forbidden", err.to_string()))?;
+                            Ok(JsonValue::Null)
+                        })
+                    })?;
+                    Ok(members)
+                },
+                ServeOptions::default(),
+            )?;
+
             let store = store.clone();
             let router = router.clone();
             live.spawn(async move {
@@ -483,6 +673,187 @@ pub fn server_facet(
                     }
                 }
             });
+            Ok(())
+        }),
+    )
+}
+
+/// The sessions Chord facet on a session worker: serves `p3.session.worker` and
+/// `p3.session.start` over the worker's routed link.
+pub fn worker_session_facet(runtime: Arc<WorkerRuntime>, parent: RemotePeer) -> PluginFacet {
+    PluginFacet::new(
+        "p3-session-worker",
+        define_facet(move |setup| -> pi_rs_chord::Result<()> {
+            let worker_contract = session_worker_contract()?;
+            let start_contract = session_start_contract()?;
+            let facts_contract = session_facts_contract()?;
+            let runtime_worker = runtime.clone();
+            let parent_peer = parent.clone();
+            setup.serve(
+                worker_contract,
+                move |params, who, self_| {
+                    let id = params
+                        .get("id")
+                        .and_then(|v| v.to_serde().ok())
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .ok_or_else(|| ChordError::invalid("id", "session id is required", None))?;
+                    if id != runtime_worker.session() {
+                        return Err(ChordError::new(
+                            "forbidden",
+                            "session worker address mismatch",
+                        )
+                        .into());
+                    }
+                    let caller = who
+                        .and_then(Principal::from_value)
+                        .ok_or_else(|| ChordError::new("forbidden", "missing caller principal"))?;
+                    if !(caller.is_owner() || caller == Principal::Server) {
+                        return Err(ChordError::new("forbidden", "sessions: the owner's").into());
+                    }
+                    let mut members = Members::variant("main");
+                    let pid = i64::from(std::process::id());
+                    members.state(
+                        "session",
+                        self_.writable(JsonValue::String(runtime_worker.session().into()))?,
+                    )?;
+                    members.state("pid", self_.writable(JsonValue::Number(pid as f64))?)?;
+                    let session_name = runtime_worker.session().to_string();
+                    members.method("info", move |_, ctx| {
+                        let session_name = session_name.clone();
+                        Box::pin(async move {
+                            let caller = ctx
+                                .principal
+                                .as_ref()
+                                .and_then(Principal::from_value)
+                                .ok_or_else(|| {
+                                    ChordError::new("forbidden", "missing caller principal")
+                                })?;
+                            if !(caller.is_owner() || caller == Principal::Server) {
+                                return Err(
+                                    ChordError::new("forbidden", "sessions: the owner's").into()
+                                );
+                            }
+                            Ok(JsonValue::from_serde(json!({
+                                "session": session_name,
+                                "pid": pid,
+                                "caller": caller.value(),
+                            })))
+                        })
+                    })?;
+                    let facts_parent = parent_peer.clone();
+                    let facts_contract_ref = facts_contract.clone();
+                    let default_session = runtime_worker.session().to_string();
+                    members.method("facts", move |args, ctx| {
+                        let parent = facts_parent.clone();
+                        let contract = facts_contract_ref.clone();
+                        let default_session = default_session.clone();
+                        Box::pin(async move {
+                            let caller = ctx
+                                .principal
+                                .as_ref()
+                                .and_then(Principal::from_value)
+                                .ok_or_else(|| {
+                                    ChordError::new("forbidden", "missing caller principal")
+                                })?;
+                            if !(caller.is_owner() || caller == Principal::Server) {
+                                return Err(
+                                    ChordError::new("forbidden", "sessions: the owner's").into()
+                                );
+                            }
+                            let target = args
+                                .to_serde()
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned)
+                                })
+                                .unwrap_or(default_session);
+                            let held = parent.hold(
+                                contract,
+                                JsonValue::from_serde(json!({ "id": target })),
+                                &ctx.context,
+                            )?;
+                            let result = async {
+                                held.wait(&ctx.context).await?;
+                                held.call("row", JsonValue::Null, &ctx.context).await
+                            }
+                            .await;
+                            held.release();
+                            result
+                        })
+                    })?;
+                    let report_parent = parent_peer.clone();
+                    let report_contract_ref = facts_contract.clone();
+                    let report_session = runtime_worker.session().to_string();
+                    members.method("report", move |args, ctx| {
+                        let parent = report_parent.clone();
+                        let contract = report_contract_ref.clone();
+                        let session = report_session.clone();
+                        Box::pin(async move {
+                            let caller = ctx
+                                .principal
+                                .as_ref()
+                                .and_then(Principal::from_value)
+                                .ok_or_else(|| {
+                                    ChordError::new("forbidden", "missing caller principal")
+                                })?;
+                            if !(caller.is_owner() || caller == Principal::Server) {
+                                return Err(
+                                    ChordError::new("forbidden", "sessions: the owner's").into()
+                                );
+                            }
+                            let held = parent.hold(
+                                contract,
+                                JsonValue::from_serde(json!({ "id": session })),
+                                &ctx.context,
+                            )?;
+                            let result = async {
+                                held.wait(&ctx.context).await?;
+                                held.call("report", args, &ctx.context).await
+                            }
+                            .await;
+                            held.release();
+                            result
+                        })
+                    })?;
+                    Ok(members)
+                },
+                ServeOptions::default(),
+            )?;
+
+            let runtime_start = runtime.clone();
+            setup.serve(
+                start_contract,
+                move |params, who, self_| {
+                    let id = params
+                        .get("id")
+                        .and_then(|v| v.to_serde().ok())
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .ok_or_else(|| ChordError::invalid("id", "session id is required", None))?;
+                    if id != runtime_start.session() {
+                        return Err(ChordError::new(
+                            "forbidden",
+                            "session worker address mismatch",
+                        )
+                        .into());
+                    }
+                    let caller = who
+                        .and_then(Principal::from_value)
+                        .ok_or_else(|| ChordError::new("forbidden", "missing caller principal"))?;
+                    if caller != Principal::Server {
+                        return Err(ChordError::new(
+                            "forbidden",
+                            "sessions: the server's waker only",
+                        )
+                        .into());
+                    }
+                    let mut members = Members::variant("main");
+                    members.state("ready", self_.writable(JsonValue::Bool(true))?)?;
+                    Ok(members)
+                },
+                ServeOptions::default(),
+            )?;
             Ok(())
         }),
     )
@@ -758,7 +1129,13 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(session.to_string());
                 let session = session.to_string();
-                Box::pin(async move { Ok(WorkerLink { session, pid: 7 }) })
+                Box::pin(async move {
+                    Ok(WorkerLink {
+                        session,
+                        pid: 7,
+                        link: None,
+                    })
+                })
             }
             fn stop(&self, _session: &str) -> crate::runner::RunnerFuture<()> {
                 Box::pin(async { Ok(()) })
@@ -796,7 +1173,12 @@ mod tests {
             started: started.clone(),
         }));
         let lives = PluginLives::new();
-        let host = pi_rs_chord::host::create_host(Default::default()).expect("host");
+        let host = pi_rs_chord::host::create_host(pi_rs_chord::host::HostOptions {
+            principal: Some(Principal::Server.value()),
+            address: Some(JsonValue::from_serde(crate::api::v1::server_address())),
+            ..Default::default()
+        })
+        .expect("host");
         host.load(
             vec![server_facet(store.clone(), router.clone(), &lives)],
             &Context::background(),

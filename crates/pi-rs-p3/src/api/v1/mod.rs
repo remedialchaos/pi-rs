@@ -10,11 +10,39 @@ pub mod contribute;
 pub mod control;
 pub mod forward;
 
+use indexmap::IndexMap;
+use pi_rs_chord::{
+    contracts::{Address, HostKind, read_params, schema as s},
+    json::JsonValue,
+};
 use serde_json::{Value, json};
 
 use crate::principals::Principal;
 
 pub use crate::principals::Principal as P3Principal;
+
+/// The Chord `HostKind` for the single server host.
+pub fn server_host_kind() -> pi_rs_chord::Result<HostKind> {
+    HostKind::new("server", read_params(&[], "server")?)
+}
+
+/// The Chord `HostKind` for a session worker host, keyed by session `id`.
+pub fn session_host_kind() -> pi_rs_chord::Result<HostKind> {
+    HostKind::new(
+        "session",
+        read_params(&[("id".into(), s::str())], "session")?,
+    )
+}
+
+/// The Chord `Address` of the server host.
+pub fn server_chord_address() -> pi_rs_chord::Result<Address> {
+    server_host_kind()?.address(JsonValue::Object(IndexMap::new()))
+}
+
+/// The Chord `Address` of session `id`'s worker host.
+pub fn session_chord_address(id: &str) -> pi_rs_chord::Result<Address> {
+    session_host_kind()?.address(JsonValue::from_serde(json!({ "id": id })))
+}
 
 /// The address of the server: one per Pi.
 pub fn server_address() -> Value {

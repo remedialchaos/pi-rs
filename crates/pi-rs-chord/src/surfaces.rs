@@ -91,9 +91,51 @@ pub struct SetEntry {
 pub struct LoadedFacets {
     host: Host,
     core: Vec<PluginFacet>,
-    loaded: Mutex<BTreeMap<String, PreparedFacet>>,
-    line: tokio::sync::Mutex<()>,
+    loaded: Arc<Mutex<BTreeMap<String, PreparedFacet>>>,
+    line: Arc<tokio::sync::Mutex<()>>,
 }
+
+/// A staged reload of [`LoadedFacets`], ready to commit or abort.
+pub struct StagedLoadedFacets {
+    loaded: Arc<Mutex<BTreeMap<String, PreparedFacet>>>,
+    _line: tokio::sync::OwnedMutexGuard<()>,
+    next: BTreeMap<String, PreparedFacet>,
+    staged: crate::host::StagedReload,
+}
+
+impl StagedLoadedFacets {
+    pub fn failed(&self) -> &[PluginFailure] {
+        self.staged.failed()
+    }
+
+    pub fn has_failures(&self) -> bool {
+        self.staged.has_failures()
+    }
+
+    pub fn abort(self) {
+        self.staged.abort();
+    }
+
+    pub async fn commit(self, context: &Context) -> Result<ReloadReport> {
+        let StagedLoadedFacets {
+            loaded,
+            _line,
+            mut next,
+            staged,
+        } = self;
+        let report = staged.commit(context).await?;
+        for failure in &report.failed {
+            if let Some(previous) = lock(&loaded).get(&failure.plugin).cloned() {
+                next.insert(failure.plugin.clone(), previous);
+            } else {
+                next.remove(&failure.plugin);
+            }
+        }
+        *lock(&loaded) = next;
+        Ok(report)
+    }
+}
+
 impl LoadedFacets {
     pub async fn load(
         host: Host,
@@ -125,8 +167,8 @@ impl LoadedFacets {
             Self {
                 host,
                 core,
-                loaded: Mutex::new(prepared),
-                line: tokio::sync::Mutex::new(()),
+                loaded: Arc::new(Mutex::new(prepared)),
+                line: Arc::new(tokio::sync::Mutex::new(())),
             },
             report,
         ))
@@ -134,8 +176,12 @@ impl LoadedFacets {
     pub fn digest(&self, name: &str) -> Option<String> {
         lock(&self.loaded).get(name).map(|p| p.digest.clone())
     }
-    pub async fn reload(&self, entries: Vec<SetEntry>, context: &Context) -> Result<ReloadReport> {
-        let _line = self.line.lock().await;
+    pub async fn stage_reload(
+        &self,
+        entries: Vec<SetEntry>,
+        context: &Context,
+    ) -> Result<StagedLoadedFacets> {
+        let line = self.line.clone().lock_owned().await;
         let mut next = BTreeMap::new();
         let mut failed = Vec::new();
         for entry in entries {
@@ -171,19 +217,19 @@ impl LoadedFacets {
                     .map(|(name, p)| PluginFacet::new(name, p.facet.clone())),
             )
             .collect();
-        let report = self
-            .host
-            .reload_with_failures(facets, failed, context)
-            .await?;
-        for failure in &report.failed {
-            if let Some(previous) = lock(&self.loaded).get(&failure.plugin).cloned() {
-                next.insert(failure.plugin.clone(), previous);
-            } else {
-                next.remove(&failure.plugin);
-            }
-        }
-        *lock(&self.loaded) = next;
-        Ok(report)
+        let staged = self.host.stage_reload(facets, failed, context).await?;
+        Ok(StagedLoadedFacets {
+            loaded: self.loaded.clone(),
+            _line: line,
+            next,
+            staged,
+        })
+    }
+    pub async fn reload(&self, entries: Vec<SetEntry>, context: &Context) -> Result<ReloadReport> {
+        self.stage_reload(entries, context)
+            .await?
+            .commit(context)
+            .await
     }
 }
 /// Host-owned values survive facet replacement, but not host shutdown.
