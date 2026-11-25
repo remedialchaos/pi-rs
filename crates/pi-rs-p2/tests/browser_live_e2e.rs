@@ -216,20 +216,27 @@ async fn run_chromium_e2e(p2_bin: &Path) -> TestResult {
     wait_for_connected(&cdp, &session_id).await?;
     assert_no_errors_and_assets_ok(&cdp, &session_id).await?;
 
-    // 4. Click "New session" and verify sidebar session + enabled composer.
-    let clicked = cdp
-        .eval_json(
-            &session_id,
-            r#"(() => {
-                const btn = Array.from(document.querySelectorAll('button'))
-                    .find((b) => b.textContent.trim() === 'New session' && !b.disabled);
-                if (!btn) return false;
-                btn.click();
-                return true;
-            })()"#,
-        )
-        .await?;
-    assert_eq!(clicked, json!(true), "New session button must be clickable");
+    // 4. Click "New session" once owner access settles and verify sidebar session + enabled composer.
+    wait_until(
+        "New session button clickable",
+        Duration::from_secs(10),
+        || async {
+            let clicked = cdp
+                .eval_json(
+                    &session_id,
+                    r#"(() => {
+                        const btn = Array.from(document.querySelectorAll('button'))
+                            .find((b) => b.textContent.trim() === 'New session' && !b.disabled);
+                        if (!btn) return null;
+                        btn.click();
+                        return true;
+                    })()"#,
+                )
+                .await?;
+            Ok(clicked.as_bool())
+        },
+    )
+    .await?;
 
     if let Err(err) = wait_until(
         "new session and enabled composer",
@@ -544,19 +551,26 @@ async fn run_guest_share_expiration_e2e(p2_bin: &Path) -> TestResult {
     assert_no_errors_and_assets_ok(&owner_cdp, &owner_sid).await?;
 
     // Owner creates Session 1 and sends a message before sharing.
-    let clicked = owner_cdp
-        .eval_json(
-            &owner_sid,
-            r#"(() => {
-                const btn = Array.from(document.querySelectorAll('button'))
-                    .find((b) => b.textContent.trim() === 'New session' && !b.disabled);
-                if (!btn) return false;
-                btn.click();
-                return true;
-            })()"#,
-        )
-        .await?;
-    assert_eq!(clicked, json!(true), "New session button must be clickable");
+    wait_until(
+        "New session button clickable",
+        Duration::from_secs(10),
+        || async {
+            let clicked = owner_cdp
+                .eval_json(
+                    &owner_sid,
+                    r#"(() => {
+                        const btn = Array.from(document.querySelectorAll('button'))
+                            .find((b) => b.textContent.trim() === 'New session' && !b.disabled);
+                        if (!btn) return null;
+                        btn.click();
+                        return true;
+                    })()"#,
+                )
+                .await?;
+            Ok(clicked.as_bool())
+        },
+    )
+    .await?;
 
     wait_until("owner session ready", Duration::from_secs(15), || async {
         let ready = owner_cdp
