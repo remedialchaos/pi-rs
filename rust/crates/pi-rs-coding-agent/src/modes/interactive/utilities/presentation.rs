@@ -255,10 +255,8 @@ impl CountdownTimer {
 }
 
 const BLOG_URL: &str = "https://mariozechner.at/posts/2026-04-08-ive-sold-out/";
-const ANNOUNCEMENT_IMAGE: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../packages/coding-agent/src/modes/interactive/assets/clankolas.png"
-));
+const ANNOUNCEMENT_IMAGE: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/clankolas.png"));
 
 pub struct EarendilAnnouncement {
     theme: Theme,

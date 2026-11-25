@@ -22,7 +22,7 @@ const KNOWN_FAILURES: &[&str] = &[
 ];
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/schema/test/fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 /// Every JSON file of a directory, by path.

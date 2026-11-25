@@ -414,7 +414,14 @@ async fn browser_bundle_paths_share_the_csp_bootstrap_version_and_serve_exact_as
         .filter_map(|tail| tail.split_once("\")").map(|(filename, _)| filename))
         .filter(|file| file.ends_with(".woff2"))
         .collect();
-    assert_eq!(fonts.len(), 5);
+    let expected_fonts = std::collections::BTreeSet::from([
+        "CommitMono-300-Regular.woff2",
+        "CommitMono-400-Regular.woff2",
+        "CommitMono-700-Regular.woff2",
+        "MallosSerif-Italic-Variable.woff2",
+        "MallosSerif-Variable.woff2",
+    ]);
+    assert_eq!(fonts, expected_fonts);
     let assets = [
         ("app.js", "text/javascript; charset=utf-8"),
         ("app_bg.wasm", "application/wasm"),

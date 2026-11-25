@@ -47,7 +47,8 @@ mod tests {
     #[test]
     fn elanor_declares_layer_and_token_imports() {
         assert!(ELANOR_CSS.contains("@layer"));
-        assert!(ELANOR_CSS.contains("design-tokens/pi.css"));
+        assert!(ELANOR_CSS.contains("./vendor/elanor/pi.css"));
+        assert!(!ELANOR_CSS.contains("@earendil-works/"));
     }
 
     #[test]

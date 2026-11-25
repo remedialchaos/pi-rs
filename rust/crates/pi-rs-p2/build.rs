@@ -8,16 +8,16 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-// The WOFF2 names are esbuild's output for the fonts pinned by package-lock.json.
+// The WOFF2 names match the vendored fonts emitted by `p2-bundle-assets`.
 const ASSETS: &[(&str, &str)] = &[
     ("app.js", "text/javascript; charset=utf-8"),
     ("app_bg.wasm", "application/wasm"),
     ("p2.css", "text/css; charset=utf-8"),
-    ("CommitMono-300-Regular-6YPFJLCF.woff2", "font/woff2"),
-    ("CommitMono-400-Regular-5X3MEPYG.woff2", "font/woff2"),
-    ("CommitMono-700-Regular-ZBGGEPPP.woff2", "font/woff2"),
-    ("MallosSerif-Italic-Variable-65GP6KZL.woff2", "font/woff2"),
-    ("MallosSerif-Variable-L4VRIFHQ.woff2", "font/woff2"),
+    ("CommitMono-300-Regular.woff2", "font/woff2"),
+    ("CommitMono-400-Regular.woff2", "font/woff2"),
+    ("CommitMono-700-Regular.woff2", "font/woff2"),
+    ("MallosSerif-Italic-Variable.woff2", "font/woff2"),
+    ("MallosSerif-Variable.woff2", "font/woff2"),
 ];
 
 fn main() -> io::Result<()> {

@@ -299,7 +299,8 @@ pub(super) fn submit(
                 }
             }
             "changelog" => {
-                let text = include_str!("../../../../../../packages/coding-agent/CHANGELOG.md");
+                let text =
+                    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/CHANGELOG.md"));
                 let start = text.find("\n## ").map_or(0, |start| start + 1);
                 let end = text[start..]
                     .match_indices("\n## ")

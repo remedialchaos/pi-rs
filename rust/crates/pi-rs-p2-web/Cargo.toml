@@ -9,6 +9,10 @@ description = "Leptos CSR WASM browser frontend for p2 (ADR-011, Rust port of ap
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "p2-bundle-assets"
+path = "src/bin/p2_bundle_assets.rs"
+
 [dependencies]
 indexmap = { version = "2", features = ["serde"] }
 leptos = { version = "0.8", features = ["csr"] }

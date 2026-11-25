@@ -76,7 +76,7 @@ async fn server_publishes_health_and_reloads_registered_routes() -> TestResult {
     let manifest = request(server.address, "GET", "/manifest.webmanifest", "").await?;
     assert!(manifest.contains("cache-control: public, max-age=86400"));
     assert!(manifest.ends_with(include_str!("../assets/public/manifest.webmanifest")));
-    let sign_in = request(server.address, "GET", "/__p2_tui", "").await?;
+    let sign_in = request(server.address, "GET", "/", "").await?;
     assert!(sign_in.starts_with("HTTP/1.1 401"));
     assert!(sign_in.contains("<h1>Sign in to Pi</h1>"));
 
@@ -92,8 +92,23 @@ async fn server_publishes_health_and_reloads_registered_routes() -> TestResult {
 
 #[test]
 fn discovers_upstream_aliases_and_respects_plugin_root_precedence() -> TestResult {
-    let app =
-        upstream::find_app(Path::new(env!("CARGO_MANIFEST_DIR")))?.ok_or("missing upstream app")?;
+    let fixture_repo = tempfile::tempdir()?;
+    let app_dir = fixture_repo.path().join("apps/p2");
+    std::fs::create_dir_all(app_dir.join("src/api/v1"))?;
+    std::fs::create_dir_all(app_dir.join("src/hosts"))?;
+    std::fs::create_dir_all(app_dir.join("plugins"))?;
+    std::fs::write(app_dir.join("src/api/v1/index.ts"), "")?;
+    std::fs::write(app_dir.join("src/hosts/server.ts"), "")?;
+    std::fs::write(
+        fixture_repo.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"paths":{}}}"#,
+    )?;
+    std::fs::write(
+        app_dir.join("tsconfig.json"),
+        r#"{"compilerOptions":{"paths":{"@p2/app/v1":["./src/api/v1/index.ts"]}}}"#,
+    )?;
+
+    let app = upstream::find_app(fixture_repo.path())?.ok_or("missing fixture app")?;
     let resolver = upstream::SourceResolver::open(&app)?;
     assert_eq!(
         resolver.resolve("@p2/app/v1")?,

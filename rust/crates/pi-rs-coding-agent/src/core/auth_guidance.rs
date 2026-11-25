@@ -5,8 +5,7 @@ pub fn docs_path() -> PathBuf {
         .ok()
         .filter(|path| path.is_dir())
         .or_else(|| {
-            let path =
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/coding-agent/docs");
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/docs");
             path.canonicalize().ok()
         })
         .unwrap_or_else(|| PathBuf::from("docs"))

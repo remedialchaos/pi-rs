@@ -1,10 +1,11 @@
-//! Whole-screen TUI visual parity tests against upstream `p2 tui` and `vt100` cell-grid geometry checks.
+//! Self-contained native `p2 tui` whole-screen PTY visual contract and `vt100` cell-grid geometry tests.
 
 use std::{
     error::Error,
     fs,
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    path::Path,
+    process::{Command, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -132,15 +133,6 @@ impl Drop for TmuxSession {
     }
 }
 
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 fn require_tool(name: &str) -> TestResult {
     let status = Command::new(name)
         .arg(if name == "tmux" { "-V" } else { "--version" })
@@ -151,32 +143,6 @@ fn require_tool(name: &str) -> TestResult {
         return Err(format!("{name} is required").into());
     }
     Ok(())
-}
-
-fn find_upstream_p2_dir() -> TestResult<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let worktree_root = manifest_dir
-        .ancestors()
-        .nth(3)
-        .ok_or("cannot locate workspace root")?;
-    for candidate in [
-        worktree_root.to_path_buf(),
-        worktree_root
-            .parent()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_default(),
-    ] {
-        if candidate.join("node_modules").exists()
-            && candidate
-                .join("packages/ai/src/providers/data/amazon-bedrock.json")
-                .exists()
-            && candidate.join("apps/p2/src/hosts/tui.ts").exists()
-        {
-            return Ok(candidate.join("apps/p2"));
-        }
-    }
-    Err("cannot locate hydrated upstream apps/p2 checkout".into())
 }
 
 fn parse_vt100_rows(ansi_capture: &str, rows: u16, cols: u16) -> vt100::Screen {
@@ -230,91 +196,18 @@ async fn start_native_server(directory: &Path) -> TestResult<P2Server> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_upstream_vs_native_whole_screen_100x24_parity() -> TestResult {
+async fn native_whole_screen_100x24_visual_contract() -> TestResult {
     require_tool("tmux")?;
-    require_tool("node")?;
-    let upstream_p2 = find_upstream_p2_dir()?;
 
     let dir = tempfile::tempdir()?;
-    let up_data = dir.path().join("up-data");
-    let up_cfg = dir.path().join("up-cfg");
-    let up_home = dir.path().join("up-home");
     let nat_data = dir.path().join("nat-data");
     let nat_cfg = dir.path().join("nat-cfg");
     let nat_home = dir.path().join("nat-home");
-    for p in [&up_data, &up_cfg, &up_home, &nat_data, &nat_cfg, &nat_home] {
+    for p in [&nat_data, &nat_cfg, &nat_home] {
         fs::create_dir_all(p)?;
     }
 
-    // 1. Start upstream disposable server (`P2_FAKE=1`).
-    let up_log = dir.path().join("up-server.log");
-    let up_log_file = fs::File::create(&up_log)?;
-    let up_log_err = up_log_file.try_clone()?;
-    let mut up_server = ChildGuard(
-        Command::new("node")
-            .args(["--import", "./src/source.ts", "src/hosts/server.ts"])
-            .current_dir(&upstream_p2)
-            .env("P2_FAKE", "1")
-            .env("P2_DATA_DIR", &up_data)
-            .env("PORT", "0")
-            .env("HOME", &up_home)
-            .stdout(Stdio::from(up_log_file))
-            .stderr(Stdio::from(up_log_err))
-            .spawn()?,
-    );
-    let up_url = {
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            let text = fs::read_to_string(&up_log).unwrap_or_default();
-            if let Some(pos) = text.find("http://127.0.0.1:") {
-                let rest = &text[pos..];
-                let end = rest.find([' ', '\n', '\r']).unwrap_or(rest.len());
-                break rest[..end].to_owned();
-            }
-            if let Some(status) = up_server.0.try_wait()? {
-                return Err(format!(
-                    "upstream server exited early ({status}) in {}:\n{text}",
-                    upstream_p2.display()
-                )
-                .into());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "upstream server did not start in {}:\n{text}",
-                    upstream_p2.display()
-                )
-                .into());
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    };
-
-    // 2. Drive upstream `p2 tui` in a 100x24 tmux PTY.
-    let up_cmd = format!(
-        "cd '{}' && env HOME='{}' P2_DATA_DIR='{}' P2_TUI_CONFIG_DIR='{}' TERM=xterm-256color node --import ./src/source.ts src/hosts/tui.ts '{}' --theme dark",
-        upstream_p2.display(),
-        up_home.display(),
-        up_data.display(),
-        up_cfg.display(),
-        up_url
-    );
-    let up_tmux = TmuxSession::spawn("p2-parity-up", 100, 24, &up_cmd)?;
-    up_tmux.wait_for("New session", Duration::from_secs(15))?;
-    up_tmux.send_key("Enter")?;
-    up_tmux.wait_for("enter creates", Duration::from_secs(10))?;
-    up_tmux.send_key("Enter")?;
-    up_tmux.wait_for("(faux)", Duration::from_secs(10))?;
-
-    let prompt = "Please explain how wrapping works in this terminal layout with a long paragraph that definitely exceeds eighty and one hundred columns so we can inspect wrapping.";
-    up_tmux.send_literal(prompt)?;
-    up_tmux.send_key("Enter")?;
-    up_tmux.wait_for("Echo:", Duration::from_secs(15))?;
-    thread::sleep(Duration::from_millis(300));
-    let up_plain = up_tmux.capture(false)?;
-    let up_ansi = up_tmux.capture(true)?;
-    let up_rows = assert_frame_bounds(&up_plain, 24, 100);
-
-    // 3. Start native disposable server + session + `p2 tui` in an identical 100x24 tmux PTY.
+    // Start native disposable server + session + `p2 tui` in a 100x24 tmux PTY.
     let server = start_native_server(&nat_data).await?;
     let context = Context::background();
     let sessions = server.host.hold_as(
@@ -349,6 +242,8 @@ async fn live_upstream_vs_native_whole_screen_100x24_parity() -> TestResult {
     );
     let nat_tmux = TmuxSession::spawn("p2-parity-nat", 100, 24, &nat_cmd)?;
     nat_tmux.wait_for("Parity Session", Duration::from_secs(15))?;
+
+    let prompt = "Please explain how wrapping works in this terminal layout with a long paragraph that definitely exceeds eighty and one hundred columns so we can inspect wrapping.";
     nat_tmux.send_literal(prompt)?;
     nat_tmux.send_key("Enter")?;
     nat_tmux.wait_for("Echo:", Duration::from_secs(15))?;
@@ -357,90 +252,82 @@ async fn live_upstream_vs_native_whole_screen_100x24_parity() -> TestResult {
     let nat_ansi = nat_tmux.capture(true)?;
     let nat_rows = assert_frame_bounds(&nat_plain, 24, 100);
 
-    // 4. Parse both ANSI captures with `vt100` and compare structural whole-screen parity.
-    let up_screen = parse_vt100_rows(&up_ansi, 24, 100);
+    // Parse ANSI capture with `vt100` and verify whole-screen frame, header, footer, wrapping, and theme colors.
     let nat_screen = parse_vt100_rows(&nat_ansi, 24, 100);
-    assert_eq!(up_screen.size(), (24, 100));
     assert_eq!(nat_screen.size(), (24, 100));
 
     // Header row presence & alignment (logo + origin · owner + help prompt).
-    for (label, rows, plain) in [
-        ("upstream", &up_rows, &up_plain),
-        ("native", &nat_rows, &nat_plain),
-    ] {
-        assert!(
-            rows[1].contains("▀▀█") && rows[1].contains("owner"),
-            "{label} header row 1 missing logo/owner:\n{plain}"
-        );
-        assert!(
-            rows[2].contains("█▀ █") && rows[2].contains("interrupt"),
-            "{label} header row 2 missing logo/hints:\n{plain}"
-        );
-        assert!(
-            rows[3].contains("Press ctrl+o to show full startup help."),
-            "{label} header row 3 missing startup help hint:\n{plain}"
-        );
-        // Transcript order & wrapped long paragraph.
-        let user_pos = plain
-            .find("Please explain how wrapping works")
-            .ok_or_else(|| format!("{label} missing user message"))?;
-        let echo_pos = plain
-            .find("Echo:")
-            .ok_or_else(|| format!("{label} missing assistant Echo"))?;
-        assert!(
-            user_pos < echo_pos,
-            "{label} user message should precede Echo"
-        );
-        assert!(
-            plain.contains("exceeds eighty and one hundred columns so we can inspect wrapping."),
-            "{label} missing wrapped second line of user message:\n{plain}"
-        );
-        // Editor borders anchored near bottom.
-        let border_rows: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.contains(&"─".repeat(80)))
-            .map(|(i, _)| i)
-            .collect();
-        assert!(
-            border_rows.len() >= 2 && *border_rows.last().unwrap_or(&0) >= 19,
-            "{label} editor borders missing near bottom: {border_rows:?}\n{plain}"
-        );
-    }
+    assert!(
+        nat_rows[1].contains("▀▀█") && nat_rows[1].contains("owner"),
+        "native header row 1 missing logo/owner:\n{nat_plain}"
+    );
+    assert!(
+        nat_rows[2].contains("█▀ █") && nat_rows[2].contains("interrupt"),
+        "native header row 2 missing logo/hints:\n{nat_plain}"
+    );
+    assert!(
+        nat_rows[3].contains("Press ctrl+o to show full startup help."),
+        "native header row 3 missing startup help hint:\n{nat_plain}"
+    );
 
-    // Dark-theme RGB ANSI color presence on both upstream and native.
-    for (label, ansi, rows, screen) in [
-        ("upstream", &up_ansi, &up_rows, &up_screen),
-        ("native", &nat_ansi, &nat_rows, &nat_screen),
-    ] {
-        assert!(
-            ansi.contains("38;2;228;138;122") && ansi.contains("48;2;79;142;179"),
-            "{label} missing Pi logo RGB ANSI colors"
-        );
-        assert!(
-            ansi.contains("48;2;33;59;73") && ansi.contains("38;2;222;224;225"),
-            "{label} missing dark theme userMessageBg/userMessageText ANSI colors"
-        );
-        let border_row = rows
-            .iter()
-            .position(|r| r.contains(&"─".repeat(80)))
-            .ok_or_else(|| format!("{label} missing editor border row"))?;
-        let border_fg = screen
-            .cell(border_row as u16, 0)
-            .ok_or("missing border cell")?
-            .fgcolor();
-        assert!(
-            matches!(border_fg, vt100::Color::Rgb(r, g, b) if r < 140 && g < 145 && b < 150),
-            "{label} unexpected dark theme borderMuted fg color: {border_fg:?}"
-        );
-    }
+    // Transcript order & wrapped long paragraph.
+    let user_pos = nat_plain
+        .find("Please explain how wrapping works")
+        .ok_or("native missing user message")?;
+    let echo_pos = nat_plain
+        .find("Echo:")
+        .ok_or("native missing assistant Echo")?;
+    assert!(
+        user_pos < echo_pos,
+        "native user message should precede Echo"
+    );
+    assert!(
+        nat_plain.contains("exceeds eighty and one hundred columns so we can inspect wrapping."),
+        "native missing wrapped second line of user message:\n{nat_plain}"
+    );
+
+    // Editor borders and footer/status anchored near bottom.
+    let border_rows: Vec<usize> = nat_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.contains(&"─".repeat(80)))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        border_rows.len() >= 2 && *border_rows.last().unwrap_or(&0) >= 19,
+        "native editor borders missing near bottom: {border_rows:?}\n{nat_plain}"
+    );
+    assert!(
+        nat_rows.iter().any(|r| r.contains("Parity Session")),
+        "native footer/status missing session title:\n{nat_plain}"
+    );
+
+    // Dark-theme RGB ANSI color presence.
+    assert!(
+        nat_ansi.contains("38;2;228;138;122") && nat_ansi.contains("48;2;79;142;179"),
+        "native missing Pi logo RGB ANSI colors"
+    );
+    assert!(
+        nat_ansi.contains("48;2;33;59;73") && nat_ansi.contains("38;2;222;224;225"),
+        "native missing dark theme userMessageBg/userMessageText ANSI colors"
+    );
+    let border_row = nat_rows
+        .iter()
+        .position(|r| r.contains(&"─".repeat(80)))
+        .ok_or("native missing editor border row")?;
+    let border_fg = nat_screen
+        .cell(border_row as u16, 0)
+        .ok_or("missing border cell")?
+        .fgcolor();
+    assert!(
+        matches!(border_fg, vt100::Color::Rgb(r, g, b) if r < 140 && g < 145 && b < 150),
+        "native unexpected dark theme borderMuted fg color: {border_fg:?}"
+    );
 
     sessions.release();
     server.close().await?;
     Ok(())
 }
-
-use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn side_panel_3_to_2_split_and_resize_cell_grid_parity() -> TestResult {

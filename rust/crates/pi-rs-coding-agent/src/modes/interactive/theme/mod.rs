@@ -24,19 +24,23 @@ use pi_rs_tui::{
 };
 use serde_json::Value;
 
-const DARK: &str = include_str!(
-    "../../../../../../../packages/coding-agent/src/modes/interactive/theme/dark.json"
-);
-const LIGHT: &str = include_str!(
-    "../../../../../../../packages/coding-agent/src/modes/interactive/theme/light.json"
-);
+const DARK: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/theme/dark.json"
+));
+const LIGHT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/theme/light.json"
+));
 static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 fn next_revision() -> u64 {
     NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
 }
-const SCHEMA: &str =
-    include_str!("../../../../../../../packages/coding-agent/schemas/theme.schema.json");
+const SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/theme/theme.schema.json"
+));
 const SYSTEM: &str = "system";
 const BACKGROUNDS: &[&str] = &[
     "selectedBg",

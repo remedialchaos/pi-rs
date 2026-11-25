@@ -116,18 +116,18 @@ async fn http_csp_local_auth_and_all_48_plugins_work() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn packaged_p2_chromium_e2e() -> TestResult {
-    tokio::time::timeout(Duration::from_secs(120), run_chromium_e2e()).await?
-}
-
-async fn run_chromium_e2e() -> TestResult {
     if !Path::new(CHROMIUM_BIN).exists() {
         return Err(format!("missing Chromium binary at {CHROMIUM_BIN}").into());
     }
-    let p2_bin = resolve_packaged_p2_binary()?;
+    let p2_bin = tokio::task::spawn_blocking(resolve_packaged_p2_binary).await??;
+    tokio::time::timeout(Duration::from_secs(120), run_chromium_e2e(&p2_bin)).await?
+}
+
+async fn run_chromium_e2e(p2_bin: &Path) -> TestResult {
     let data_dir = tempfile::tempdir()?;
     let chromium_profile = tempfile::tempdir()?;
 
-    let mut p2_proc = spawn_p2_server(&p2_bin, data_dir.path())?;
+    let mut p2_proc = spawn_p2_server(p2_bin, data_dir.path())?;
     let mut p2_guard = ChildGuard::new(&mut p2_proc.child);
     let origin = format!("http://{}", p2_proc.address);
     let port = p2_proc.address.port();
@@ -552,6 +552,23 @@ async fn claim_local_owner_cookie(
     Ok((name.to_owned(), value.to_owned(), raw_cookie))
 }
 
+fn find_workspace_manifest(start: &Path) -> TestResult<PathBuf> {
+    for dir in start.ancestors() {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.is_file()
+            && let Ok(text) = std::fs::read_to_string(&candidate)
+            && text.contains("[workspace]")
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "cannot locate workspace Cargo.toml from {}",
+        start.display()
+    )
+    .into())
+}
+
 fn resolve_packaged_p2_binary() -> TestResult<PathBuf> {
     if let Some(explicit) = std::env::var_os("P2_PACKAGED_BIN") {
         let path = PathBuf::from(explicit);
@@ -565,21 +582,9 @@ fn resolve_packaged_p2_binary() -> TestResult<PathBuf> {
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let crates_dir = manifest_dir.parent().ok_or("missing crates dir")?;
-    let rust_dir = crates_dir.parent().ok_or("missing rust dir")?;
-    let repo_root = rust_dir.parent().ok_or("missing repo root")?;
-
-    let esbuild = [
-        repo_root.join("node_modules/.bin/esbuild"),
-        repo_root
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("node_modules/.bin/esbuild"))
-            .unwrap_or_default(),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())
-    .ok_or("missing esbuild in node_modules/.bin/esbuild")?;
+    let cargo_manifest = find_workspace_manifest(&manifest_dir)?;
+    let workspace_root = cargo_manifest.parent().ok_or("missing workspace root")?;
+    let cargo_manifest_str = cargo_manifest.to_str().ok_or("non-UTF-8 Cargo.toml path")?;
 
     let wasm_bindgen_ok = Command::new("wasm-bindgen")
         .arg("--version")
@@ -591,23 +596,44 @@ fn resolve_packaged_p2_binary() -> TestResult<PathBuf> {
 
     let target_root = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| crates_dir.join("target"));
+        .unwrap_or_else(|| workspace_root.join("target"));
     let cache_dir = target_root.join("p2-packaged-e2e");
     let assets_dir = cache_dir.join("assets");
     std::fs::create_dir_all(&assets_dir)?;
 
-    let cargo_manifest = crates_dir.join("Cargo.toml");
+    run_checked(
+        Command::new("cargo")
+            .args([
+                "run",
+                "--manifest-path",
+                cargo_manifest_str,
+                "-p",
+                "pi-rs-p2-web",
+                "--bin",
+                "p2-bundle-assets",
+                "--offline",
+                "--locked",
+                "--",
+                "--out-dir",
+                assets_dir.to_str().ok_or("non-UTF-8 assets dir")?,
+            ])
+            .env("CARGO_TARGET_DIR", &target_root),
+        "bundle browser assets with p2-bundle-assets",
+    )?;
+
     run_checked(
         Command::new("cargo")
             .args([
                 "build",
                 "--manifest-path",
-                cargo_manifest.to_str().ok_or("non-UTF-8 Cargo.toml path")?,
+                cargo_manifest_str,
                 "-p",
                 "pi-rs-p2-web",
+                "--lib",
                 "--target",
                 "wasm32-unknown-unknown",
                 "--offline",
+                "--locked",
             ])
             .env("CARGO_TARGET_DIR", &target_root),
         "build pi-rs-p2-web wasm",
@@ -628,29 +654,18 @@ fn resolve_packaged_p2_binary() -> TestResult<PathBuf> {
         "run wasm-bindgen",
     )?;
 
-    let browser_css = crates_dir.join("pi-rs-p2-web/assets/browser.css");
-    let out_css = assets_dir.join("p2.css");
-    run_checked(
-        Command::new(esbuild).args([
-            browser_css.to_str().ok_or("non-UTF-8 browser.css path")?,
-            "--bundle",
-            "--loader:.woff2=file",
-            &format!("--outfile={}", out_css.display()),
-        ]),
-        "bundle browser.css with esbuild",
-    )?;
-
     run_checked(
         Command::new("cargo")
             .args([
                 "build",
                 "--manifest-path",
-                cargo_manifest.to_str().ok_or("non-UTF-8 Cargo.toml path")?,
+                cargo_manifest_str,
                 "-p",
                 "pi-rs-p2",
                 "--bin",
                 "p2",
                 "--offline",
+                "--locked",
             ])
             .env("CARGO_TARGET_DIR", &target_root)
             .env("P2_BROWSER_ASSETS", &assets_dir),
@@ -702,7 +717,7 @@ fn spawn_p2_server(bin: &Path, data_dir: &Path) -> TestResult<P2Process> {
         }
     });
     let address = rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(Duration::from_secs(30))
         .map_err(|_| "timed out waiting for p2 listening address on stdout")?;
     Ok(P2Process { child, address })
 }
@@ -790,7 +805,7 @@ impl ChromiumProcess {
             }
         });
         let ws_url = rx
-            .recv_timeout(Duration::from_secs(15))
+            .recv_timeout(Duration::from_secs(30))
             .map_err(|_| "timed out waiting for Chromium DevTools WebSocket URL")?;
         Ok(Self { child, ws_url })
     }

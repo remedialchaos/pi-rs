@@ -6,8 +6,8 @@
 /* Layer order: p2's element resets (style.css), then Elanor's components; p2's unlayered rules come last. */
 @layer p2-reset, elanor;
 
-@import "@earendil-works/elanor-fonts/mallos-serif.css";
-@import "@earendil-works/elanor-fonts/commit-mono.css";
-@import "@earendil-works/design-tokens/pi.css";
+@import "./vendor/elanor/mallos-serif.css";
+@import "./vendor/elanor/commit-mono.css";
+@import "./vendor/elanor/pi.css";
 /* Elanor's component styles, all in its "elanor" cascade layer: p2's unlayered rules win over them. */
-@import "@earendil-works/elanor-react/elanor.min.css";
+@import "./vendor/elanor/elanor.min.css";
