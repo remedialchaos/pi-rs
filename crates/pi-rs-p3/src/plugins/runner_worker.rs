@@ -27,7 +27,8 @@ pub fn facet(
     lives: &Arc<PluginLives>,
 ) -> Facet {
     let lives = lives.clone();
-    define_facet(move |_host| -> Result<()> {
+    define_facet(move |setup| -> Result<()> {
+        let host = setup.host();
         let live = lives.open("p3-runner");
         let runtime = runtime.clone();
         let registries = registries.clone();
@@ -37,7 +38,10 @@ pub fn facet(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(tick(runtime.idle_ms())) => {
-                        if registries.busy() > 0 {
+                        let activity = host.activity().value();
+                        let active = registries.busy() > 0
+                            || activity.references + activity.jobs + activity.lingering > 0;
+                        if active {
                             quiet_since = std::time::Instant::now();
                         } else if quiet_since.elapsed() >= idle {
                             runtime.close(CloseReason::Idle);

@@ -112,12 +112,112 @@ pub(super) fn server_link(
     (output, run)
 }
 
-/// Open a real binary Chord transport. Credentials stay with the caller, not guests.
+/// TLS root certificate configuration for `wss://` WebSocket links.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WebSocketTlsConfig {
+    /// Include operating-system native root CA certificates.
+    pub use_native_roots: bool,
+    /// Additional trusted root CA certificates in PEM format.
+    pub extra_root_ca_pem: Vec<Vec<u8>>,
+    /// Additional trusted root CA certificates in DER format.
+    pub extra_root_ca_der: Vec<Vec<u8>>,
+}
+
+impl WebSocketTlsConfig {
+    /// Trust the operating system's native root CA certificates.
+    pub fn native_roots() -> Self {
+        Self {
+            use_native_roots: true,
+            extra_root_ca_pem: Vec::new(),
+            extra_root_ca_der: Vec::new(),
+        }
+    }
+
+    /// Trust only the supplied PEM-encoded root CA certificate(s).
+    pub fn with_custom_root_pem(pem: impl Into<Vec<u8>>) -> Self {
+        Self {
+            use_native_roots: false,
+            extra_root_ca_pem: vec![pem.into()],
+            extra_root_ca_der: Vec::new(),
+        }
+    }
+
+    /// Trust the operating system's native root CAs plus the supplied PEM-encoded root CA(s).
+    pub fn with_extra_root_pem(pem: impl Into<Vec<u8>>) -> Self {
+        Self {
+            use_native_roots: true,
+            extra_root_ca_pem: vec![pem.into()],
+            extra_root_ca_der: Vec::new(),
+        }
+    }
+}
+
+fn build_tls_connector(tls: &WebSocketTlsConfig) -> Result<tokio_tungstenite::Connector> {
+    use rustls_pki_types::{CertificateDer, pem::PemObject};
+
+    let mut roots = rustls::RootCertStore::empty();
+    if tls.use_native_roots {
+        let native = rustls_native_certs::load_native_certs();
+        let (added, _ignored) = roots.add_parsable_certificates(native.certs);
+        if added == 0 && tls.extra_root_ca_pem.is_empty() && tls.extra_root_ca_der.is_empty() {
+            return Err(Error::Invalid(format!(
+                "no native root CA certificates found (errors: {:?})",
+                native.errors
+            )));
+        }
+    }
+    for pem in &tls.extra_root_ca_pem {
+        let mut count = 0usize;
+        for cert in CertificateDer::pem_slice_iter(pem) {
+            let cert = cert.map_err(|e| Error::Invalid(format!("invalid PEM root CA: {e}")))?;
+            roots
+                .add(cert)
+                .map_err(|e| Error::Invalid(format!("invalid root CA certificate: {e}")))?;
+            count += 1;
+        }
+        if count == 0 {
+            return Err(Error::Invalid(
+                "PEM root CA buffer contained no certificates".into(),
+            ));
+        }
+    }
+    for der in &tls.extra_root_ca_der {
+        roots
+            .add(CertificateDer::from(der.clone()))
+            .map_err(|e| Error::Invalid(format!("invalid DER root CA certificate: {e}")))?;
+    }
+    if roots.is_empty() {
+        return Err(Error::Invalid(
+            "TLS configuration has no trusted root certificates".into(),
+        ));
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| Error::Invalid(format!("TLS protocol configuration failed: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+}
+
+/// Open a real binary Chord transport over `ws://` or `wss://`. Credentials stay with the caller, not guests.
 pub async fn connect_websocket(
     url: &str,
     headers: http::HeaderMap,
     max_payload: usize,
     max_buffered: usize,
+) -> Result<Arc<dyn Link>> {
+    connect_websocket_with_tls(url, headers, max_payload, max_buffered, None).await
+}
+
+/// Open a real binary Chord transport with explicit TLS root CA configuration for `wss://`.
+pub async fn connect_websocket_with_tls(
+    url: &str,
+    headers: http::HeaderMap,
+    max_payload: usize,
+    max_buffered: usize,
+    tls: Option<&WebSocketTlsConfig>,
 ) -> Result<Arc<dyn Link>> {
     use tokio_tungstenite::tungstenite::{
         client::IntoClientRequest,
@@ -127,12 +227,34 @@ pub async fn connect_websocket(
         .into_client_request()
         .map_err(|e| Error::Invalid(e.to_string()))?;
     request.headers_mut().extend(headers);
+    let connector = if request
+        .uri()
+        .scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("wss"))
+    {
+        let owned;
+        let tls_cfg = match tls {
+            Some(cfg) => cfg,
+            None => {
+                owned = WebSocketTlsConfig::native_roots();
+                &owned
+            }
+        };
+        build_tls_connector(tls_cfg)?
+    } else {
+        tokio_tungstenite::Connector::Plain
+    };
     let config = WebSocketConfig::default()
         .max_message_size(Some(max_payload))
         .max_frame_size(Some(max_payload));
-    let (socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), false)
-        .await
-        .map_err(|e| Error::Invalid(e.to_string()))?;
+    let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        Some(config),
+        false,
+        Some(connector),
+    )
+    .await
+    .map_err(|e| Error::Invalid(e.to_string()))?;
     let (link, port, mut outgoing) = port(max_payload, max_buffered);
     let output: Arc<dyn Link> = link.clone();
     tokio::spawn(async move {

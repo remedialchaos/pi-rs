@@ -433,6 +433,15 @@ async fn start(path: &Path, port: Option<u16>) -> Result<(), Failure> {
                 data_dir.join("logs").join("server.log").display()
             )));
         };
+        if port.is_none()
+            && read_config(&data_dir)
+                .ok()
+                .flatten()
+                .and_then(|config| config.port)
+                .is_none()
+        {
+            let _ = keep_port(&data_dir, record.port);
+        }
         let link = owner_link(&data_dir, record.port).await?;
         println!(
             "p3 on {}, port {}. Open {link}",

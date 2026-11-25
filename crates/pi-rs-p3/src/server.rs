@@ -9,6 +9,7 @@
 //! session's worker, and calls the [`WorkerRunner`] the runner plugin contributed.
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -19,13 +20,19 @@ use std::{
 
 use pi_rs_chord::{
     context::Context,
-    host::{Host, HostOptions, PluginFacet, create_host},
+    contracts::Contract,
+    data::ChordError,
+    host::{Caller, Host, HostOptions, PluginFacet, create_host},
+    json::JsonValue,
+    link::Link,
     node::http::{Http, HttpOptions, HttpServer},
     node::workers::ProcessLock,
+    remote::{LinkRole, RemoteOptions, RemotePeer, RemoteReference},
 };
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
+    api::v1::{server_chord_address, session_host_kind},
     files::{open_data_dir, private_directory},
     install::{WorkerSpec, plugins_dir},
     plugins::{control, runner_server, sessions, sign_in},
@@ -95,23 +102,62 @@ pub const IDLE_MS: u64 = 5 * 60_000;
 /// A route operation's future.
 pub type RouteFuture<T> = Pin<Box<dyn Future<Output = Result<T, RouteError>> + Send + 'static>>;
 
-/// The route to session workers: whether a session exists, who may reach it, and which runner starts
-/// its worker. The local seam for `pi-rs-chord`'s address-level routing.
+struct CachedWorkerPeer {
+    link: Arc<dyn Link>,
+    peer: RemotePeer,
+}
+
+/// The route to session workers: whether a session exists, who may reach it, which runner starts
+/// its worker, and address-level Chord routing onto the worker's multiplexed IPC link.
 pub struct SessionRouter {
     sessions: Arc<sessions::SessionsStore>,
     runner: OnceLock<Arc<dyn WorkerRunner>>,
+    host: OnceLock<Host>,
+    contracts: BTreeMap<String, Arc<Contract>>,
+    peers: Mutex<BTreeMap<String, CachedWorkerPeer>>,
+    slots: Mutex<BTreeMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 impl SessionRouter {
     pub fn new(sessions: Arc<sessions::SessionsStore>) -> Arc<Self> {
+        let mut contracts = BTreeMap::new();
+        for build in [
+            sessions::session_worker_contract,
+            sessions::session_start_contract,
+        ] {
+            if let Ok(contract) = build() {
+                contracts.insert(contract.name().to_string(), contract);
+            }
+        }
         Arc::new(Self {
             sessions,
             runner: OnceLock::new(),
+            host: OnceLock::new(),
+            contracts,
+            peers: Mutex::new(BTreeMap::new()),
+            slots: Mutex::new(BTreeMap::new()),
         })
     }
 
     pub fn set_runner(&self, runner: Arc<dyn WorkerRunner>) {
         let _ = self.runner.set(runner);
+    }
+
+    pub fn set_host(&self, host: Host) {
+        let _ = self.host.set(host);
+    }
+
+    pub fn close_peers(&self) {
+        let peers = std::mem::take(
+            &mut *self
+                .peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (_, cached) in peers {
+            cached.peer.close();
+            cached.link.close();
+        }
     }
 
     pub fn exists(&self, session: &str) -> bool {
@@ -122,6 +168,153 @@ impl SessionRouter {
     /// session's worker.
     pub fn admit(&self, principal: &Principal, session: &str) -> sessions::Admission {
         sessions::admit_session(principal, self.exists(session))
+    }
+
+    fn slot(&self, session: &str) -> Arc<AsyncMutex<()>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Builds Chord `RemoteOptions` that route `session`-scoped holds to the supervised worker
+    /// process while enforcing principal authorization and session ownership.
+    pub fn remote_options(self: &Arc<Self>, principal: serde_json::Value) -> RemoteOptions {
+        let mut options = RemoteOptions::new(principal);
+        options.route_contracts.clone_from(&self.contracts);
+        let weak = Arc::downgrade(self);
+        options.route = Some(Arc::new(move |request| {
+            let router = weak.upgrade();
+            Box::pin(async move {
+                if request.address_kind == "server" {
+                    return Ok(None);
+                }
+                let router = router.ok_or(pi_rs_chord::Error::Closed)?;
+                let contract = router
+                    .contracts
+                    .get(request.contract.name())
+                    .cloned()
+                    .ok_or_else(|| {
+                        ChordError::new("unavailable", "type not served at worker kind")
+                    })?;
+                let address = contract.host_address(&request.params)?;
+                if request.address_kind != address.kind || request.address_params != address.params
+                {
+                    return Err(ChordError::invalid(
+                        "address",
+                        "does not match the contract's destination",
+                        None,
+                    )
+                    .into());
+                }
+                let kind = session_host_kind()?;
+                if kind
+                    .key_of_address(&JsonValue::Object(indexmap::IndexMap::from([
+                        (
+                            "kind".into(),
+                            JsonValue::String(address.kind.as_str().into()),
+                        ),
+                        ("params".into(), address.params.clone()),
+                    ])))?
+                    .as_deref()
+                    != Some(address.key.as_str())
+                {
+                    return Err(
+                        ChordError::invalid("address", "invalid worker address", None).into(),
+                    );
+                }
+                let session_id = address
+                    .params
+                    .get("id")
+                    .and_then(|v| v.to_serde().ok())
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .ok_or_else(|| ChordError::invalid("address", "missing session id", None))?;
+                let caller_principal = request
+                    .caller
+                    .principal
+                    .as_ref()
+                    .and_then(Principal::from_value)
+                    .ok_or_else(|| ChordError::new("forbidden", "worker requires a principal"))?;
+                if let sessions::Admission::Deny(reason) =
+                    router.admit(&caller_principal, &session_id)
+                {
+                    return Err(ChordError::new("forbidden", reason).into());
+                }
+                if contract.name() == sessions::SESSION_START_CONTRACT {
+                    if caller_principal != Principal::Server {
+                        return Err(ChordError::new(
+                            "forbidden",
+                            "sessions: the server's waker only",
+                        )
+                        .into());
+                    }
+                } else if !(caller_principal.is_owner() || caller_principal == Principal::Server) {
+                    return Err(ChordError::new("forbidden", "sessions: the owner's").into());
+                }
+                router
+                    .hold_worker(
+                        &session_id,
+                        contract,
+                        request.params,
+                        request.caller,
+                        &request.context,
+                    )
+                    .await
+                    .map(Some)
+            })
+        }));
+        options
+    }
+
+    /// Starts (or reuses) `session`'s worker process and holds `contract` over its Chord link.
+    pub async fn hold_worker(
+        self: &Arc<Self>,
+        session: &str,
+        contract: Arc<Contract>,
+        params: JsonValue,
+        caller: Caller,
+        context: &Context,
+    ) -> pi_rs_chord::Result<RemoteReference> {
+        let slot = self.slot(session);
+        let _guard = slot.lock().await;
+        let worker = self
+            .start(session, context)
+            .await
+            .map_err(|err| ChordError::new("unavailable", err.to_string()))?;
+        let link = worker
+            .link
+            .ok_or_else(|| ChordError::new("unavailable", "worker link unavailable"))?;
+        let host = self.host.get().cloned().ok_or(pi_rs_chord::Error::Closed)?;
+        let peer = {
+            let mut peers = self
+                .peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = peers
+                .get(session)
+                .filter(|cached| Arc::ptr_eq(&cached.link, &link) && !cached.link.closed())
+            {
+                cached.peer.clone()
+            } else {
+                let mut child_options = self.remote_options(Principal::worker(session).value());
+                child_options.role = LinkRole::Child;
+                child_options.trusted = true;
+                let peer = RemotePeer::serve(host, link.clone(), child_options)?;
+                if let Some(previous) = peers.insert(
+                    session.to_string(),
+                    CachedWorkerPeer {
+                        link,
+                        peer: peer.clone(),
+                    },
+                ) {
+                    previous.peer.close();
+                }
+                peer
+            }
+        };
+        peer.hold_as(contract, params, caller, context)
     }
 
     /// Starts session `id`'s worker through the runner.
@@ -165,6 +358,8 @@ pub struct ServerRuntime {
     data_dir: PathBuf,
     host: Host,
     router: Arc<SessionRouter>,
+    sessions_store: Arc<sessions::SessionsStore>,
+    sign_ins: Arc<sign_in::SignIns>,
     worker: WorkerSpec,
     worker_idle_ms: u64,
     listening: Mutex<Option<SocketAddr>>,
@@ -189,6 +384,16 @@ impl ServerRuntime {
     /// The route to session workers.
     pub fn sessions(&self) -> &Arc<SessionRouter> {
         &self.router
+    }
+
+    /// The server's sessions store.
+    pub fn sessions_store(&self) -> &Arc<sessions::SessionsStore> {
+        &self.sessions_store
+    }
+
+    /// The server's sign-in store.
+    pub fn sign_ins(&self) -> &Arc<sign_in::SignIns> {
+        &self.sign_ins
     }
 
     /// How a session's worker process starts.
@@ -340,6 +545,7 @@ impl RunningServer {
         if let Some(runner) = self.runtime.registries.runner() {
             let _ = runner.close().await;
         }
+        self.runtime.router.close_peers();
         self.runtime.lives.end_all();
         if let Some(http) = closer.http.take() {
             let _ = http.close().await;
@@ -389,10 +595,14 @@ async fn start_with(
     let registries = ServerRegistries::default();
 
     let on_error = options.on_error.clone();
+    let server_addr =
+        server_chord_address().map_err(|error| ServerError::Host(error.to_string()))?;
     let host = create_host(HostOptions {
-        address: Some(pi_rs_chord::json::JsonValue::from_serde(
-            crate::api::v1::server_address(),
-        )),
+        address: Some(JsonValue::Object(indexmap::IndexMap::from([
+            ("kind".into(), JsonValue::String(server_addr.kind.into())),
+            ("params".into(), server_addr.params),
+            ("key".into(), JsonValue::String(server_addr.key.into())),
+        ]))),
         principal: Some(crate::principals::SERVER.value()),
         on_error: Arc::new(move |error: pi_rs_chord::host::HostError| {
             on_error(ServerError::Host(format!(
@@ -403,6 +613,7 @@ async fn start_with(
         ..HostOptions::default()
     })
     .map_err(|error| ServerError::Host(error.to_string()))?;
+    router.set_host(host.clone());
     let mut closer = Closer {
         http: None,
         host: host.clone(),
@@ -412,10 +623,12 @@ async fn start_with(
 
     let links = registries.clone();
     let http_error = options.on_error.clone();
+    let route_sessions = router.clone();
     let http = Http::new(
         host.clone(),
         HttpOptions {
             links_path: Some("/chord".into()),
+            remote: Arc::new(move |principal| route_sessions.remote_options(principal)),
             opened: Arc::new(move |request: &pi_rs_chord::node::http::HttpRequest| {
                 let hook = links.link_hooks().into_iter();
                 let mut ends = Vec::new();
@@ -447,6 +660,8 @@ async fn start_with(
         data_dir: data_dir.to_path_buf(),
         host: host.clone(),
         router: router.clone(),
+        sessions_store: sessions.clone(),
+        sign_ins: sign_ins.clone(),
         worker: options.worker.clone(),
         worker_idle_ms: idle_ms,
         listening: Mutex::new(None),

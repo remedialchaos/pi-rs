@@ -2,8 +2,8 @@
 use crate::{
     Error, Result,
     context::Context,
-    host::{Facet, Host, PluginFacet, ReloadReport},
-    surfaces::{LoadedFacets, PreparedFacet, SetEntry},
+    host::{Facet, Host, PluginFacet, PluginFailure, ReloadReport},
+    surfaces::{LoadedFacets, PreparedFacet, SetEntry, StagedLoadedFacets},
 };
 use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
@@ -315,8 +315,33 @@ impl PluginScript {
 pub struct PluginRuntime {
     loaded: LoadedFacets,
     wasm: WasmPluginHost,
-    line: tokio::sync::Mutex<()>,
+    line: Arc<tokio::sync::Mutex<()>>,
 }
+
+/// A staged plugin reload on a single [`PluginRuntime`], ready to commit or abort.
+pub struct StagedPluginReload {
+    _line: tokio::sync::OwnedMutexGuard<()>,
+    staged: StagedLoadedFacets,
+}
+
+impl StagedPluginReload {
+    pub fn failed(&self) -> &[PluginFailure] {
+        self.staged.failed()
+    }
+
+    pub fn has_failures(&self) -> bool {
+        self.staged.has_failures()
+    }
+
+    pub fn abort(self) {
+        self.staged.abort();
+    }
+
+    pub async fn commit(self, context: &Context) -> Result<ReloadReport> {
+        self.staged.commit(context).await
+    }
+}
+
 impl PluginRuntime {
     pub async fn load(
         host: Host,
@@ -330,7 +355,7 @@ impl PluginRuntime {
         let runtime = Self {
             loaded,
             wasm,
-            line: tokio::sync::Mutex::new(()),
+            line: Arc::new(tokio::sync::Mutex::new(())),
         };
         if report
             .failed
@@ -347,14 +372,28 @@ impl PluginRuntime {
     pub fn digest(&self, name: &str) -> Option<String> {
         self.loaded.digest(name)
     }
+    pub async fn stage_reload(
+        &self,
+        scripts: Vec<PluginScript>,
+        context: &Context,
+    ) -> Result<StagedPluginReload> {
+        let line = self.line.clone().lock_owned().await;
+        let entries = prepare_scripts(&self.wasm, Some(&self.loaded), &scripts, context).await?;
+        let staged = self.loaded.stage_reload(entries, context).await?;
+        Ok(StagedPluginReload {
+            _line: line,
+            staged,
+        })
+    }
     pub async fn reload(
         &self,
         scripts: Vec<PluginScript>,
         context: &Context,
     ) -> Result<ReloadReport> {
-        let _line = self.line.lock().await;
-        let entries = prepare_scripts(&self.wasm, Some(&self.loaded), &scripts, context).await?;
-        self.loaded.reload(entries, context).await
+        self.stage_reload(scripts, context)
+            .await?
+            .commit(context)
+            .await
     }
 }
 async fn prepare_scripts(
@@ -471,4 +510,97 @@ pub async fn rollout(
         reports.push((step.name, step.runtime.reload(step.scripts, context).await?));
     }
     Ok(reports)
+}
+
+/// Result of a two-phase coordinated reload across multiple [`PluginRuntime`] participants.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoordinatedRolloutReport {
+    pub committed: bool,
+    pub participants: Vec<(String, ReloadReport)>,
+}
+
+/// Two-phase coordinated reload across multiple [`PluginRuntime`] participants.
+/// Stages and validates every participant first; commits all only if every participant
+/// stages with zero failures; otherwise aborts and holds back all participants.
+pub async fn coordinated_rollout(
+    steps: Vec<RolloutStep<'_>>,
+    context: &Context,
+) -> Result<CoordinatedRolloutReport> {
+    for (idx, step) in steps.iter().enumerate() {
+        if steps[idx + 1..]
+            .iter()
+            .any(|other| std::ptr::eq(step.runtime, other.runtime))
+        {
+            return Err(Error::Invalid("duplicate rollout participant".into()));
+        }
+    }
+    let mut staged = Vec::with_capacity(steps.len());
+    for step in steps {
+        match step.runtime.stage_reload(step.scripts, context).await {
+            Ok(participant) => staged.push((step.name, participant)),
+            Err(error) => {
+                for (_, participant) in staged {
+                    participant.abort();
+                }
+                return Err(error);
+            }
+        }
+    }
+    if staged
+        .iter()
+        .any(|(_, participant)| participant.has_failures())
+    {
+        let mut participants = Vec::with_capacity(staged.len());
+        for (name, participant) in staged {
+            let report = ReloadReport {
+                failed: participant.failed().to_vec(),
+                ..ReloadReport::default()
+            };
+            participant.abort();
+            participants.push((name, report));
+        }
+        return Ok(CoordinatedRolloutReport {
+            committed: false,
+            participants,
+        });
+    }
+    let mut participants = Vec::with_capacity(staged.len());
+    for (name, participant) in staged {
+        let report = participant.commit(context).await?;
+        participants.push((name, report));
+    }
+    Ok(CoordinatedRolloutReport {
+        committed: true,
+        participants,
+    })
+}
+
+/// Ergonomic builder for two-phase coordinated multi-host plugin reloads.
+#[derive(Default)]
+pub struct ReloadCoordinator<'a> {
+    steps: Vec<RolloutStep<'a>>,
+}
+
+impl<'a> ReloadCoordinator<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(
+        mut self,
+        name: impl Into<String>,
+        runtime: &'a PluginRuntime,
+        scripts: Vec<PluginScript>,
+    ) -> Self {
+        self.steps.push(RolloutStep {
+            name: name.into(),
+            runtime,
+            scripts,
+        });
+        self
+    }
+
+    pub async fn execute(self, context: &Context) -> Result<CoordinatedRolloutReport> {
+        coordinated_rollout(self.steps, context).await
+    }
 }

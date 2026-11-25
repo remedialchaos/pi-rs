@@ -570,29 +570,15 @@ impl AppServer {
         }
         // Own the lock and both rollback paths in the task even if the caller drops the future.
         let host = self.host.clone();
+        let journal_dir = self.layout.server.join("swaps");
         tokio::spawn(async move {
             let (_process, _permit) = (_process, current);
-            let aside = parent_path(&directory)?.join(format!(".chord-aside-{}", new_token(16)));
-            let had_data = occupied(&directory)?;
-            if had_data {
-                std::fs::rename(&directory, &aside)?;
-            }
-            if let Err(error) = std::fs::rename(&stage.0, &directory) {
-                if had_data {
-                    std::fs::rename(&aside, &directory)?;
-                }
-                return Err(error.into());
-            }
+            let swap = ScopedStoreSwap::begin_replace(&journal_dir, &stage.0, &directory)?;
             if let Err(error) = host.import_host_data(prepared, existing).await {
-                std::fs::rename(&directory, &stage.0)?;
-                if had_data {
-                    std::fs::rename(&aside, &directory)?;
-                }
+                swap.rollback()?;
                 return Err(error);
             }
-            if had_data {
-                let _ = std::fs::remove_dir_all(aside);
-            }
+            swap.commit()?;
             Ok(())
         })
         .await
@@ -606,29 +592,18 @@ impl AppServer {
         let process = self.workers.retire(kind, &address, &mut current).await?;
         let directory = self.layout.worker_directory(&address.kind, &address.key)?;
         let host = self.host.clone();
+        let journal_dir = self.layout.server.join("swaps");
         tokio::spawn(async move {
             let (_process, _permit) = (process, current);
-            let has_data = occupied(&directory)?;
-            let aside = parent_path(&directory)?.join(format!(".chord-deleted-{}", new_token(16)));
-            if has_data {
-                std::fs::rename(&directory, &aside)?;
-            }
+            let swap = ScopedStoreSwap::begin_delete(&journal_dir, &directory)?;
             if let Err(error) = host.delete_host_data(&address).await {
-                if has_data {
-                    std::fs::rename(&aside, &directory)?;
-                }
+                swap.rollback()?;
                 return Err(error);
             }
-            if has_data {
-                let _ = std::fs::remove_dir_all(aside);
-            }
+            swap.commit()?;
             Ok(())
         })
         .await
         .map_err(std::io::Error::other)?
     }
-}
-fn parent_path(path: &Path) -> Result<&Path> {
-    path.parent()
-        .ok_or_else(|| Error::Invalid("worker directory has no parent".into()))
 }

@@ -20,14 +20,16 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use pi_rs_chord::context::Context;
+use pi_rs_chord::{context::Context, link::Link};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
-    process::{ChildStdin, ChildStdout, Command},
-    sync::{Mutex as AsyncMutex, oneshot, watch},
+    process::Command,
+    sync::{Mutex as AsyncMutex, mpsc, oneshot, watch},
 };
 
-use crate::api::v1::control::{FromWorker, ToWorker, decode_line, encode_line};
+use crate::api::v1::control::{
+    FromWorker, IpcFrame, IpcPipeLink, ToWorker, read_ipc_frame, worker_control, worker_message,
+    write_ipc_frame,
+};
 use crate::install::WorkerSpec;
 
 /// One plugin's identity for a worker: what it runs, as a digest names it.
@@ -109,10 +111,21 @@ pub trait WorkerRunner: Send + Sync {
 }
 
 /// A session's worker as the route reached it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct WorkerLink {
     pub session: String,
     pub pid: u32,
+    pub link: Option<Arc<dyn Link>>,
+}
+
+impl std::fmt::Debug for WorkerLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerLink")
+            .field("session", &self.session)
+            .field("pid", &self.pid)
+            .field("has_link", &self.link.is_some())
+            .finish()
+    }
 }
 
 /// What the runner refused.
@@ -141,6 +154,9 @@ pub enum RunnerError {
 /// A worker's process, as the runner reaches it: its pid, its control channel, and its exit.
 pub trait WorkerTransport: Send + Sync {
     fn pid(&self) -> Option<u32>;
+    fn link(&self) -> Option<Arc<dyn Link>> {
+        None
+    }
     fn send(&self, message: ToWorker) -> RunnerFuture<()>;
     fn recv(&self) -> RunnerFuture<Option<FromWorker>>;
     fn stop(&self) -> RunnerFuture<()>;
@@ -175,7 +191,7 @@ impl WorkerLauncher for ProcessLauncher {
         let stdout = child.stdout.take();
         let pid = child.id();
         match (stdin, stdout) {
-            (Some(stdin), Some(stdout)) => {
+            (Some(mut stdin), Some(mut stdout)) => {
                 let (exit_code, exit) = watch::channel(None);
                 tokio::spawn(async move {
                     let code = child
@@ -187,10 +203,39 @@ impl WorkerLauncher for ProcessLauncher {
                         .unwrap_or(1);
                     exit_code.send_replace(Some(code));
                 });
+                let (out_tx, mut out_rx) = mpsc::channel::<IpcFrame>(64);
+                let (ctrl_tx, ctrl_rx) = mpsc::channel::<FromWorker>(32);
+                let link = IpcPipeLink::new(out_tx.clone());
+                let reader_link = link.clone();
+                tokio::spawn(async move {
+                    while let Some(frame) = out_rx.recv().await {
+                        if write_ipc_frame(&mut stdin, &frame).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    while let Ok(frame) = read_ipc_frame(&mut stdout).await {
+                        match frame {
+                            IpcFrame::Binary(bytes) => reader_link.deliver(bytes),
+                            IpcFrame::Control(bytes) => {
+                                if let Ok(value) =
+                                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                                    && let Some(message) = worker_control::<FromWorker>(&value)
+                                    && ctrl_tx.send(message).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    reader_link.ended();
+                });
                 Ok(Arc::new(ProcessTransport {
                     pid,
-                    stdin: Arc::new(AsyncMutex::new(Some(stdin))),
-                    lines: Arc::new(AsyncMutex::new(BufReader::new(stdout).lines())),
+                    outgoing: out_tx,
+                    controls: Arc::new(AsyncMutex::new(ctrl_rx)),
+                    link,
                     exit,
                 }))
             }
@@ -207,8 +252,9 @@ impl WorkerLauncher for ProcessLauncher {
 
 struct ProcessTransport {
     pid: Option<u32>,
-    stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
-    lines: Arc<AsyncMutex<Lines<BufReader<ChildStdout>>>>,
+    outgoing: mpsc::Sender<IpcFrame>,
+    controls: Arc<AsyncMutex<mpsc::Receiver<FromWorker>>>,
+    link: Arc<IpcPipeLink>,
     exit: watch::Receiver<Option<u32>>,
 }
 
@@ -223,43 +269,29 @@ impl WorkerTransport for ProcessTransport {
         self.pid
     }
 
+    fn link(&self) -> Option<Arc<dyn Link>> {
+        Some(self.link.clone())
+    }
+
     fn send(&self, message: ToWorker) -> RunnerFuture<()> {
-        let stdin = self.stdin.clone();
+        let outgoing = self.outgoing.clone();
         let session = self.pid.map(|pid| pid.to_string()).unwrap_or_default();
         Box::pin(async move {
-            let line = encode_line(&message);
-            let mut stdin = stdin.lock().await;
-            let Some(stdin) = stdin.as_mut() else {
-                return Err(ProcessTransport::channel_error(
+            let bytes = serde_json::to_vec(&worker_message(&message)).map_err(|err| {
+                ProcessTransport::channel_error(session.clone(), std::io::Error::other(err))
+            })?;
+            outgoing.send(IpcFrame::Control(bytes)).await.map_err(|_| {
+                ProcessTransport::channel_error(
                     session,
                     std::io::Error::other("worker input is closed"),
-                ));
-            };
-            stdin
-                .write_all(&line)
-                .await
-                .map_err(|source| ProcessTransport::channel_error(session.clone(), source))?;
-            stdin
-                .flush()
-                .await
-                .map_err(|source| ProcessTransport::channel_error(session, source))
+                )
+            })
         })
     }
 
     fn recv(&self) -> RunnerFuture<Option<FromWorker>> {
-        let lines = self.lines.clone();
-        let session = self.pid.map(|pid| pid.to_string()).unwrap_or_default();
-        Box::pin(async move {
-            let mut lines = lines.lock().await;
-            let line = match lines.next_line().await {
-                Ok(Some(line)) => line,
-                Ok(None) => return Ok(None),
-                Err(source) => {
-                    return Err(ProcessTransport::channel_error(session, source));
-                }
-            };
-            Ok(decode_line::<FromWorker>(line.as_bytes()))
-        })
+        let controls = self.controls.clone();
+        Box::pin(async move { Ok(controls.lock().await.recv().await) })
     }
 
     fn stop(&self) -> RunnerFuture<()> {
@@ -562,6 +594,9 @@ impl LocalRunner {
             {
                 queue.set_worker(None);
             }
+            if let Some(link) = transport.link() {
+                link.close();
+            }
         });
     }
 
@@ -590,6 +625,7 @@ impl WorkerRunner for LocalRunner {
                 return Ok(WorkerLink {
                     session,
                     pid: worker.pid,
+                    link: worker.transport.link(),
                 });
             }
             if let Some(reason) = queue.failed() {
@@ -630,7 +666,11 @@ impl WorkerRunner for LocalRunner {
             queue.set_worker(Some(worker.clone()));
             LocalRunner::spawn_monitor(transport.clone(), worker.clone(), queue.clone());
             match tokio::time::timeout(this.options.start_timeout, worker.wait_ready()).await {
-                Ok(Ok(())) => Ok(WorkerLink { session, pid }),
+                Ok(Ok(())) => Ok(WorkerLink {
+                    session,
+                    pid,
+                    link: transport.link(),
+                }),
                 Ok(Err(_exit)) => {
                     let reason = queue
                         .failed()

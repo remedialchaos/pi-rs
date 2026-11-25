@@ -6,10 +6,119 @@
 //! route a worker's links from the server (the `2.1b-3` gap), so this port's channel carries the
 //! control messages alone; the envelope keeps the shape a link frame could share later.
 
+use std::sync::Arc;
+
+use pi_rs_chord::{
+    Error as ChordError, Result as ChordResult,
+    link::{Link, LinkEnd},
+    node::workers::MAX_FRAME,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::mpsc,
+};
 
 use crate::runner::PluginScript;
+
+/// Multiplexed frame on the worker stdio IPC channel: control JSON (`0`) or binary Chord link (`1`).
+#[derive(Clone, Debug)]
+pub enum IpcFrame {
+    Control(Vec<u8>),
+    Binary(Vec<u8>),
+}
+
+/// Writes one bounded frame (`4-byte BE length || 1-byte tag || body`) to `writer`.
+pub async fn write_ipc_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &IpcFrame,
+) -> ChordResult<()> {
+    let (tag, body) = match frame {
+        IpcFrame::Control(bytes) => (0u8, bytes.as_slice()),
+        IpcFrame::Binary(bytes) => (1u8, bytes.as_slice()),
+    };
+    if body.len() >= MAX_FRAME {
+        return Err(ChordError::Invalid("worker IPC frame too large".into()));
+    }
+    writer.write_u32((body.len() + 1) as u32).await?;
+    writer.write_u8(tag).await?;
+    writer.write_all(body).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Reads one bounded frame from `reader`.
+pub async fn read_ipc_frame<R: AsyncRead + Unpin>(reader: &mut R) -> ChordResult<IpcFrame> {
+    let length = reader.read_u32().await? as usize;
+    if !(1..=MAX_FRAME).contains(&length) {
+        return Err(ChordError::Invalid(
+            "invalid worker IPC frame length".into(),
+        ));
+    }
+    let tag = reader.read_u8().await?;
+    let mut body = vec![0; length - 1];
+    reader.read_exact(&mut body).await?;
+    match tag {
+        0 => Ok(IpcFrame::Control(body)),
+        1 => Ok(IpcFrame::Binary(body)),
+        _ => Err(ChordError::Invalid("invalid worker IPC tag".into())),
+    }
+}
+
+/// Chord `Link` multiplexed over the worker stdio IPC channel.
+pub struct IpcPipeLink {
+    end: LinkEnd,
+    outgoing: mpsc::Sender<IpcFrame>,
+}
+
+impl IpcPipeLink {
+    pub fn new(outgoing: mpsc::Sender<IpcFrame>) -> Arc<Self> {
+        Arc::new(Self {
+            end: LinkEnd::default(),
+            outgoing,
+        })
+    }
+
+    /// Delivers an inbound binary Chord frame from the IPC reader.
+    pub fn deliver(&self, bytes: Vec<u8>) {
+        self.end.deliver(bytes);
+    }
+
+    /// Marks the link ended when the IPC reader/writer terminates.
+    pub fn ended(&self) {
+        self.end.ended();
+    }
+}
+
+impl Link for IpcPipeLink {
+    fn send(&self, bytes: Vec<u8>) -> ChordResult<()> {
+        if self.closed() {
+            return Err(ChordError::Closed);
+        }
+        if bytes.len() >= MAX_FRAME || self.outgoing.try_send(IpcFrame::Binary(bytes)).is_err() {
+            self.close();
+            return Err(ChordError::Invalid("worker IPC backpressure".into()));
+        }
+        Ok(())
+    }
+
+    fn close(&self) {
+        self.end.ended();
+    }
+
+    fn on_message(&self, listener: Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
+        self.end.on_message(listener);
+    }
+
+    fn on_close(&self, listener: Arc<dyn Fn() + Send + Sync>) {
+        self.end.on_close(listener);
+    }
+
+    fn closed(&self) -> bool {
+        self.end.closed()
+    }
+}
 
 /// What the server sends a worker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
