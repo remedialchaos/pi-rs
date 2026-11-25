@@ -64,7 +64,8 @@ pub(crate) fn setup_terminal(settings: &Value) {
     let terminal = &settings["terminal"];
     let images = match &terminal["images"] {
         Value::Bool(false) => Some(None),
-        value => match value.as_str() {
+        value => match value.as_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("none" | "off") => Some(None),
             Some("kitty") => Some(Some(ImageProtocol::Kitty)),
             Some("iterm2") => Some(Some(ImageProtocol::Iterm2)),
             _ => None,

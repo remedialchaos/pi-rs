@@ -21,12 +21,46 @@ use crate::core::session_manager::CURRENT_SESSION_VERSION;
 mod bug;
 pub use bug::{
     BUG_REPORT_DISCLAIMER, BUG_REPORT_TRANSCRIPT_NOTE, BugReportBundle, BugReportOptions,
-    bug_report_gateway, build_bug_report, export_bug_report, summarize_bug_report,
-    upload_bug_report,
+    BugReportUploadOptions, bug_report_gateway, build_bug_report, export_bug_report,
+    summarize_bug_report, upload_bug_report, upload_bug_report_with_options,
 };
 
 const DEFAULT_RADIUS_GATEWAY: &str = "https://radius.pi.dev";
 const RADIUS: &str = "radius";
+
+/// Resolve and validate the Radius gateway URL, honoring an explicit override or `PI_RADIUS_GATEWAY`.
+pub fn radius_gateway(override_url: Option<&str>) -> Result<Url, String> {
+    let value = match override_url {
+        Some(value) => value.to_owned(),
+        None => {
+            std::env::var("PI_RADIUS_GATEWAY").unwrap_or_else(|_| DEFAULT_RADIUS_GATEWAY.to_owned())
+        }
+    };
+    let url = if value
+        .get(..7)
+        .is_some_and(|part| part.eq_ignore_ascii_case("http://"))
+        || value
+            .get(..8)
+            .is_some_and(|part| part.eq_ignore_ascii_case("https://"))
+    {
+        Url::parse(&value)
+    } else {
+        Url::parse(&format!("https://{value}"))
+    }
+    .map_err(|error| format!("Invalid Radius gateway: {error}"))?;
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err("Invalid Radius gateway: expected an HTTP(S) URL without credentials".into());
+    }
+    Ok(url)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ShareOptions {
+    pub destination: ShareDestination,
+    pub consent: bool,
+    pub gateway_override: Option<String>,
+    pub offline_override: Option<bool>,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ShareDestination {
@@ -61,15 +95,37 @@ pub async fn share_session(
     consent: bool,
     signal: &CancellationToken,
 ) -> Result<Option<ShareLinks>, String> {
-    if !consent || signal.is_cancelled() {
+    share_session_with_options(
+        session,
+        agent_dir,
+        &ShareOptions {
+            destination,
+            consent,
+            gateway_override: None,
+            offline_override: None,
+        },
+        signal,
+    )
+    .await
+}
+
+/// Share a session with explicit gateway/offline overrides (primarily for testing).
+pub async fn share_session_with_options(
+    session: &AgentSession,
+    agent_dir: &Path,
+    options: &ShareOptions,
+    signal: &CancellationToken,
+) -> Result<Option<ShareLinks>, String> {
+    if !options.consent || signal.is_cancelled() {
         return Ok(None);
     }
-    if offline() {
+    if options.offline_override.unwrap_or_else(offline) {
         return Err("Sharing sessions requires online mode. Use /export instead.".into());
     }
+    let destination = options.destination;
     let share = async {
         if destination != ShareDestination::Gist {
-            let gateway = Url::parse(DEFAULT_RADIUS_GATEWAY).map_err(|error| error.to_string())?;
+            let gateway = radius_gateway(options.gateway_override.as_deref())?;
             if let Some(token) = radius_token(agent_dir, &gateway, signal).await? {
                 let mut url = gateway
                     .join("/v1/artifacts")
@@ -78,7 +134,7 @@ pub async fn share_session(
                     .append_pair("visibility", "organization")
                     .append_pair("title", "Pi session");
                 let body = serialize_session_branch(&export_snapshot(session)?)?;
-                let response = upload_client()?
+                let response = upload_client_for(&gateway)?
                     .post(url)
                     .bearer_auth(token)
                     .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
@@ -268,12 +324,13 @@ fn auth_token(result: AuthResult) -> Option<String> {
         })
 }
 
-fn upload_client() -> Result<reqwest::Client, String> {
+fn upload_client_for(gateway: &Url) -> Result<reqwest::Client, String> {
     // An automatic cross-host redirect could forward a transcript to an unconfirmed sender.
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| error.to_string())
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if matches!(gateway.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(|error| error.to_string())
 }
 
 fn timestamp() -> String {
@@ -525,6 +582,169 @@ mod tests {
         );
         assert!(!root.path().join("auth.json").exists());
         assert!(!bundle.id().is_empty());
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    pub(super) struct CapturedHttpRequest {
+        pub(super) method: String,
+        pub(super) target: String,
+        pub(super) headers: std::collections::HashMap<String, String>,
+        pub(super) body: Vec<u8>,
+    }
+
+    pub(super) async fn spawn_loopback_json_server(
+        status_line: &str,
+        response_body: Value,
+    ) -> Result<(String, tokio::sync::oneshot::Receiver<CapturedHttpRequest>), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let addr = listener.local_addr().map_err(|error| error.to_string())?;
+        let base_url = format!("http://{addr}");
+        let status_line = status_line.to_owned();
+        let response_json =
+            serde_json::to_vec(&response_body).map_err(|error| error.to_string())?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos;
+                }
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            };
+            let header_text = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+            let mut lines = header_text.split("\r\n");
+            let request_line = lines.next().unwrap_or_default();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_owned();
+            let target = request_parts.next().unwrap_or_default().to_owned();
+            let mut headers = std::collections::HashMap::new();
+            for line in lines {
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+                }
+            }
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            while buffer.len() < body_start + content_length {
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            let body = buffer[body_start..buffer.len().min(body_start + content_length)].to_vec();
+            let _ = tx.send(CapturedHttpRequest {
+                method,
+                target,
+                headers,
+                body,
+            });
+            let reply = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_json.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.write_all(&response_json).await;
+            let _ = stream.shutdown().await;
+        });
+
+        Ok((base_url, rx))
+    }
+
+    #[tokio::test]
+    async fn share_session_loopback_e2e_uploads_only_active_branch_and_extracts_viewer_url()
+    -> Result<(), String> {
+        let (session, manager) = test_session()?;
+        {
+            let mut disk = manager.lock();
+            let root = disk.append_message(
+                json!({"role": "user", "content": "root-prompt", "timestamp": 0}),
+            )?;
+            disk.append_message(
+                json!({"role": "user", "content": "unshared-sibling-secret", "timestamp": 1}),
+            )?;
+            disk.branch(&root)?;
+            disk.append_message(
+                json!({"role": "user", "content": "active-branch-content", "timestamp": 2}),
+            )?;
+        }
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(
+            dir.path().join("auth.json"),
+            br#"{"radius":{"type":"api_key","key":"radius-e2e-token"}}"#,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let (gateway, rx) = spawn_loopback_json_server(
+            "200 OK",
+            json!({"artifact": {"canonical_url": "https://viewer.example.test/sessions/art-42"}}),
+        )
+        .await?;
+        let signal = CancellationToken::new();
+        let links = share_session_with_options(
+            &session,
+            dir.path(),
+            &ShareOptions {
+                destination: ShareDestination::Radius,
+                consent: true,
+                gateway_override: Some(gateway),
+                offline_override: Some(false),
+            },
+            &signal,
+        )
+        .await?
+        .ok_or("expected share links")?;
+
+        assert_eq!(
+            links,
+            ShareLinks {
+                viewer: "https://viewer.example.test/sessions/art-42".into(),
+                gist: None,
+            }
+        );
+
+        let captured = rx.await.map_err(|error| error.to_string())?;
+        assert_eq!(captured.method, "POST");
+        assert_eq!(
+            captured.target,
+            "/v1/artifacts?visibility=organization&title=Pi+session"
+        );
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer radius-e2e-token")
+        );
+        assert_eq!(
+            captured.headers.get("content-type").map(String::as_str),
+            Some("application/x-ndjson")
+        );
+
+        let body = String::from_utf8(captured.body).map_err(|error| error.to_string())?;
+        assert!(body.contains("active-branch-content"));
+        assert!(!body.contains("unshared-sibling-secret"));
+        assert!(body.contains("pi.share"));
+        let snapshot = SessionSnapshot::from_jsonl(&body)?;
+        assert_eq!(snapshot.entries.len(), 3);
         Ok(())
     }
 }

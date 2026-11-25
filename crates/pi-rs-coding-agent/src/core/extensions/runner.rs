@@ -216,10 +216,16 @@ impl ExtensionRunner {
                 .or_insert_with(|| tool.clone());
         }
         for extension in self.extensions() {
-            for tool in extension.registration().tools.values() {
-                tools
-                    .entry(tool.name.clone())
-                    .or_insert_with(|| tool.clone());
+            if let Some(dynamic) = extension.dynamic_tools() {
+                for tool in dynamic {
+                    tools.entry(tool.name.clone()).or_insert(tool);
+                }
+            } else {
+                for tool in extension.registration().tools.values() {
+                    tools
+                        .entry(tool.name.clone())
+                        .or_insert_with(|| tool.clone());
+                }
             }
         }
         tools.into_values().collect()
@@ -233,9 +239,13 @@ impl ExtensionRunner {
             .find(|tool| tool.name == name)
             .cloned()
             .or_else(|| {
-                self.extensions()
-                    .iter()
-                    .find_map(|extension| extension.registration().tools.get(name).cloned())
+                self.extensions().iter().find_map(|extension| {
+                    if let Some(dynamic) = extension.dynamic_tools() {
+                        dynamic.into_iter().find(|tool| tool.name == name)
+                    } else {
+                        extension.registration().tools.get(name).cloned()
+                    }
+                })
             })
     }
 

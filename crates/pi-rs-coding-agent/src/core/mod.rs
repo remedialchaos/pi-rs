@@ -38,3 +38,4 @@ pub mod settings_diagnostics;
 
 pub mod export_html;
 pub mod package_manager;
+pub mod startup;

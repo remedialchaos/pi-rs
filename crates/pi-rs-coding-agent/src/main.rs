@@ -220,6 +220,7 @@ async fn run(argv: &[String]) -> Result<u8, String> {
         )
     };
     let args = Arc::new(args);
+    let startup_cwd = cwd.clone();
     let factory = create_factory(args.clone(), cwd, mode);
     let mut runtime = create_agent_session_runtime(factory, target)
         .await
@@ -271,6 +272,16 @@ async fn run(argv: &[String]) -> Result<u8, String> {
         return Err("PI_STARTUP_BENCHMARK only supports interactive mode".to_owned());
     }
     timings::print_timings();
+    let _catalog_refresh = pi_rs_coding_agent::core::startup::spawn_startup_catalog_refresh(
+        pi_rs_coding_agent::core::startup::StartupRefreshPolicy::from_args(
+            &args,
+            mode,
+            startup_benchmark,
+        ),
+        agent_dir.clone(),
+        startup_cwd,
+        pi_rs_coding_agent::core::startup::default_catalog_refresher(),
+    );
     match mode {
         AppMode::Rpc => modes::rpc::run(&mut runtime)
             .await
@@ -305,6 +316,7 @@ async fn run(argv: &[String]) -> Result<u8, String> {
                     initial: initial.unwrap_or_default(),
                     messages: args.messages.clone(),
                     offline: args.offline,
+                    no_refresh: args.no_refresh,
                     startup_benchmark,
                 },
             )

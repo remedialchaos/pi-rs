@@ -43,6 +43,7 @@ pub struct InteractiveOptions {
     pub initial: InitialMessage,
     pub messages: Vec<String>,
     pub offline: bool,
+    pub no_refresh: bool,
     pub startup_benchmark: bool,
 }
 
@@ -119,7 +120,7 @@ async fn drive(
     bound.refresh_catalog(
         &work,
         controller.events.clone(),
-        options.offline || options.startup_benchmark,
+        options.offline || options.no_refresh || options.startup_benchmark,
     );
     let first = controller.clone();
     let benchmark = options.startup_benchmark;

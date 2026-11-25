@@ -36,26 +36,16 @@ pub struct BugReportBundle {
     crash_log: Option<(PathBuf, Vec<u8>)>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BugReportUploadOptions {
+    pub consent: bool,
+    pub gateway_override: Option<String>,
+    pub offline_override: Option<bool>,
+}
+
 /// Gateway named explicitly by the confirmation dialog before upload.
 pub fn bug_report_gateway() -> Result<Url, String> {
-    let value =
-        std::env::var("PI_RADIUS_GATEWAY").unwrap_or_else(|_| DEFAULT_RADIUS_GATEWAY.to_owned());
-    let url = if value
-        .get(..7)
-        .is_some_and(|part| part.eq_ignore_ascii_case("http://"))
-        || value
-            .get(..8)
-            .is_some_and(|part| part.eq_ignore_ascii_case("https://"))
-    {
-        Url::parse(&value)
-    } else {
-        Url::parse(&format!("https://{value}"))
-    }
-    .map_err(|error| format!("Invalid Radius gateway: {error}"))?;
-    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
-        return Err("Invalid Radius gateway: expected an HTTP(S) URL without credentials".into());
-    }
-    Ok(url)
+    radius_gateway(None)
 }
 
 /// Generate a summary only after the user agrees to send transcript content to the model provider.
@@ -471,9 +461,108 @@ fn redact_json(value: &mut Value) {
             if let Some(redacted) = redact_url(text) {
                 *text = redacted;
             }
+            let inline = redact_inline_secrets(text);
+            if inline != *text {
+                *text = inline;
+            }
         }
         _ => {}
     }
+}
+
+fn redact_inline_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if ["http://", "https://", "ssh://", "git://"]
+            .into_iter()
+            .any(|scheme| {
+                rest.get(..scheme.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            })
+        {
+            let url_len = rest
+                .find(|ch: char| {
+                    ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | ')' | ']' | '>')
+                })
+                .unwrap_or(rest.len());
+            if let Some(redacted) = redact_url(&rest[..url_len]) {
+                out.push_str(&redacted);
+                rest = &rest[url_len..];
+                continue;
+            }
+        }
+
+        let lower_bearer = rest
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "));
+        if lower_bearer {
+            let after_prefix = &rest[7..];
+            let token_len = after_prefix
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';'))
+                .unwrap_or(after_prefix.len());
+            if token_len > 0 {
+                out.push_str(&rest[..7]);
+                out.push_str("<redacted>");
+                rest = &after_prefix[token_len..];
+                continue;
+            }
+        }
+
+        if let Some(prefix) = [
+            "sk-ant-",
+            "sk-proj-",
+            "sk-",
+            "ghp_",
+            "gho_",
+            "github_pat_",
+            "xoxb-",
+            "AIza",
+        ]
+        .into_iter()
+        .find(|prefix| rest.starts_with(prefix))
+        {
+            let tail = &rest[prefix.len()..];
+            let token_len = tail
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+                .unwrap_or(tail.len());
+            if token_len >= 8 {
+                out.push_str("<redacted>");
+                rest = &tail[token_len..];
+                continue;
+            }
+        }
+
+        if let Some(eq_idx) = rest.find('=') {
+            let candidate_key = &rest[..eq_idx];
+            if !candidate_key.is_empty()
+                && candidate_key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                && sensitive_key(candidate_key)
+            {
+                let after_eq = &rest[eq_idx + 1..];
+                let val_len = after_eq
+                    .find(|ch: char| {
+                        ch.is_whitespace() || matches!(ch, '&' | '"' | '\'' | ',' | ';')
+                    })
+                    .unwrap_or(after_eq.len());
+                if val_len > 0 {
+                    out.push_str(candidate_key);
+                    out.push_str("=<redacted>");
+                    rest = &after_eq[val_len..];
+                    continue;
+                }
+            }
+        }
+
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
 }
 
 fn redact_settings(mut value: Value) -> Value {
@@ -581,15 +670,37 @@ pub async fn upload_bug_report(
     consent: bool,
     signal: &CancellationToken,
 ) -> Result<Option<String>, String> {
-    if !consent || signal.is_cancelled() {
+    upload_bug_report_with_options(
+        session,
+        bundle,
+        agent_dir,
+        &BugReportUploadOptions {
+            consent,
+            gateway_override: None,
+            offline_override: None,
+        },
+        signal,
+    )
+    .await
+}
+
+/// Upload a bug report bundle with explicit gateway/offline overrides (primarily for testing).
+pub async fn upload_bug_report_with_options(
+    session: &AgentSession,
+    bundle: &BugReportBundle,
+    agent_dir: &Path,
+    options: &BugReportUploadOptions,
+    signal: &CancellationToken,
+) -> Result<Option<String>, String> {
+    if !options.consent || signal.is_cancelled() {
         return Ok(None);
     }
-    if offline() {
+    if options.offline_override.unwrap_or_else(offline) {
         return Err(
             "Uploading bug reports requires online mode. Use Export as Zip instead.".into(),
         );
     }
-    let gateway = bug_report_gateway()?;
+    let gateway = radius_gateway(options.gateway_override.as_deref())?;
     let url = gateway
         .join("/v1/bug-reports")
         .map_err(|error| error.to_string())?;
@@ -597,7 +708,7 @@ pub async fn upload_bug_report(
         let token = radius_token(agent_dir, &gateway, signal).await?;
         let boundary = format!("pi-report-{}", Uuid::new_v4());
         let body = multipart(&bundle.files()?, &boundary)?;
-        let mut request = upload_client()?
+        let mut request = upload_client_for(&gateway)?
             .post(url)
             .header(
                 reqwest::header::CONTENT_TYPE,
@@ -741,5 +852,188 @@ mod tests {
         assert!(!prompt.contains("earlier messages"));
         assert!(prompt.contains("[User]: latest request"));
         assert!(prompt.contains("<user-report>\nprocess hung\n</user-report>"));
+    }
+
+    #[tokio::test]
+    async fn bug_report_loopback_e2e_uploads_redacted_multipart_bundle() -> Result<(), String> {
+        use crate::core::agent_session::{
+            AgentSessionConfig, InMemoryModelRegistry, InMemorySettings, NoopExtensionRunner,
+            StaticAuth, TailCompactor,
+        };
+        use crate::core::agent_session_services::DiskSession;
+        use crate::core::session_manager::SessionManager;
+        use pi_rs_agent::{Agent, AgentInitialState, AgentOptions};
+        use pi_rs_ai::faux::{FauxOptions, faux_provider};
+        use std::sync::Arc;
+
+        let faux = faux_provider(FauxOptions::default());
+        let model = faux.get_model(None).ok_or("Missing faux model")?.clone();
+        let models = Models::default();
+        models.set_provider(faux.provider);
+        let agent = Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(model.clone()),
+                ..AgentInitialState::default()
+            },
+            stream_fn: Some(pi_rs_agent::models_stream_fn(models)),
+            ..AgentOptions::default()
+        })
+        .map_err(|error| error.to_string())?;
+        let manager = Arc::new(DiskSession::new(SessionManager::in_memory()));
+        {
+            let mut disk = manager.lock();
+            disk.append_message(json!({
+                "role": "user",
+                "content": "please check",
+                "timestamp": 0
+            }))?;
+            disk.append_message(json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "failed"}],
+                "stopReason": "error",
+                "errorMessage": "Authorization: Bearer sk-live-supersecret999999 failed at https://alice:topsecret@api.example.test/v1?api_key=querysecret",
+                "timestamp": 1
+            }))?;
+        }
+        let auth = Arc::new(StaticAuth::allow_all());
+        let session = AgentSession::new(AgentSessionConfig {
+            agent,
+            session_manager: manager.clone(),
+            settings: Arc::new(InMemorySettings::default()),
+            models: Arc::new(InMemoryModelRegistry::new(vec![model], auth.clone())),
+            auth,
+            compactor: Arc::new(TailCompactor { keep_recent: 1 }),
+            extensions: Arc::new(NoopExtensionRunner),
+            cwd: String::new(),
+            retry_prompt: None,
+        })
+        .map_err(|error| error.to_string())?;
+
+        let settings = SettingsManager::in_memory(
+            json!({
+                "apiKey": "global-secret-key",
+                "trackingId": "tracking-123",
+                "deviceId": "device-456",
+                "safeSetting": "keep-me",
+                "customToken": "project-secret-token"
+            }),
+            crate::core::settings_manager::CreateOptions::default(),
+        );
+        let bundle = build_bug_report(
+            &session,
+            &settings,
+            &BugReportOptions {
+                hint: Some("upload failure".into()),
+                include_session: true,
+                include_summary: false,
+            },
+            None,
+        )?;
+
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        std::fs::write(
+            dir.path().join("auth.json"),
+            br#"{"radius":{"type":"api_key","key":"bug-e2e-token"}}"#,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let (gateway, rx) =
+            crate::modes::interactive::utilities::delivery::tests::spawn_loopback_json_server(
+                "200 OK",
+                json!({"ok": true, "bug_report": {"id": "br-e2e-99"}}),
+            )
+            .await?;
+        let signal = CancellationToken::new();
+        let report_id = upload_bug_report_with_options(
+            &session,
+            &bundle,
+            dir.path(),
+            &BugReportUploadOptions {
+                consent: true,
+                gateway_override: Some(gateway),
+                offline_override: Some(false),
+            },
+            &signal,
+        )
+        .await?;
+        assert_eq!(report_id.as_deref(), Some("br-e2e-99"));
+
+        let captured = rx.await.map_err(|error| error.to_string())?;
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.target, "/v1/bug-reports");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer bug-e2e-token")
+        );
+        let content_type = captured
+            .headers
+            .get("content-type")
+            .ok_or("missing content-type")?;
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .ok_or("missing multipart boundary")?;
+        let body = String::from_utf8(captured.body).map_err(|error| error.to_string())?;
+
+        let delimiter = format!("--{boundary}");
+        let mut parts = std::collections::HashMap::new();
+        for segment in body.split(&delimiter) {
+            let trimmed = segment.strip_prefix("\r\n").unwrap_or(segment);
+            if trimmed.is_empty() || trimmed.starts_with("--") {
+                continue;
+            }
+            if let Some((headers, content)) = trimmed.split_once("\r\n\r\n")
+                && let Some(name) = headers
+                    .split("name=\"")
+                    .nth(1)
+                    .and_then(|tail| tail.split('"').next())
+            {
+                let content = content.strip_suffix("\r\n").unwrap_or(content);
+                parts.insert(name.to_owned(), content.to_owned());
+            }
+        }
+        assert!(parts.contains_key("report.json"));
+        assert!(parts.contains_key("diagnostics.json"));
+        assert!(parts.contains_key("session.jsonl"));
+        assert!(!parts.contains_key("summary.md"));
+
+        let report_json: Value =
+            serde_json::from_str(&parts["report.json"]).map_err(|error| error.to_string())?;
+        assert_eq!(report_json["hint"], "upload failure");
+        assert_eq!(report_json["settings"]["global"]["safeSetting"], "keep-me");
+        assert_eq!(
+            report_json["settings"]["global"]["apiKey"],
+            Value::from("<redacted>")
+        );
+        assert_eq!(
+            report_json["settings"]["global"]["customToken"],
+            Value::from("<redacted>")
+        );
+        assert!(
+            report_json["settings"]["global"]
+                .get("trackingId")
+                .is_none()
+        );
+        assert!(report_json["settings"]["global"].get("deviceId").is_none());
+
+        let diagnostics_json: Value =
+            serde_json::from_str(&parts["diagnostics.json"]).map_err(|error| error.to_string())?;
+        let diagnostics_text = diagnostics_json.to_string();
+        assert!(!diagnostics_text.contains("sk-live-supersecret999999"));
+        assert!(!diagnostics_text.contains("topsecret"));
+        assert!(!diagnostics_text.contains("querysecret"));
+        assert!(!diagnostics_text.contains("global-secret-key"));
+        assert!(!diagnostics_text.contains("project-secret-token"));
+        assert!(diagnostics_text.contains("<redacted>"));
+
+        let has_delivery_entry = manager.lock().get_entries().iter().any(|entry| {
+            matches!(
+                entry,
+                crate::core::session_manager::SessionEntry::Custom { custom_type, .. }
+                if custom_type == REPORT_ENTRY
+            )
+        });
+        assert!(has_delivery_entry);
+        Ok(())
     }
 }

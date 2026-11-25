@@ -31,21 +31,35 @@ struct Edge<'a> {
     arrow: bool,
 }
 
+struct Subgraph<'a> {
+    title: &'a str,
+    parent: Option<usize>,
+    depth: usize,
+}
+
 #[derive(Default)]
 struct Graph<'a> {
     nodes: IndexMap<&'a str, Node<'a>>,
+    node_subgraph: Vec<Option<usize>>,
+    subgraphs: Vec<Subgraph<'a>>,
+    subgraph_stack: Vec<usize>,
     edges: Vec<Edge<'a>>,
 }
 
 impl<'a> Graph<'a> {
     fn node(&mut self, id: &'a str, label: Option<&'a str>, shape: Shape) -> usize {
+        let current_sg = self.subgraph_stack.last().copied();
         if let Some((index, _, node)) = self.nodes.get_full_mut(id) {
             if let Some(label) = label {
                 *node = Node { label, shape };
             }
+            if self.node_subgraph[index].is_none() && current_sg.is_some() {
+                self.node_subgraph[index] = current_sg;
+            }
             index
         } else {
-            self.nodes
+            let index = self
+                .nodes
                 .insert_full(
                     id,
                     Node {
@@ -53,7 +67,9 @@ impl<'a> Graph<'a> {
                         shape,
                     },
                 )
-                .0
+                .0;
+            self.node_subgraph.push(current_sg);
+            index
         }
     }
 
@@ -70,9 +86,22 @@ impl<'a> Graph<'a> {
             let id = if target { "\u{0}end" } else { "\u{0}start" };
             return Ok((self.node(id, Some("●"), Shape::Round), rest.trim_start()));
         }
-        let id_end = text
-            .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.')))
-            .unwrap_or(text.len());
+        let mut id_end = 0;
+        for (idx, ch) in text.char_indices() {
+            if ch.is_alphanumeric() || matches!(ch, '_' | '.') {
+                id_end = idx + ch.len_utf8();
+            } else if ch == '-'
+                && id_end > 0
+                && text[idx + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|next| next.is_alphanumeric() || next == '_')
+            {
+                id_end = idx + 1;
+            } else {
+                break;
+            }
+        }
         if id_end == 0 {
             return Err("expected a node identifier");
         }
@@ -117,6 +146,22 @@ impl<'a> Graph<'a> {
         Ok((self.node(id, label, shape), rest))
     }
 
+    fn endpoint_list(
+        &mut self,
+        text: &'a str,
+        target: bool,
+        grammar: Grammar,
+    ) -> Result<(Vec<usize>, &'a str), &'static str> {
+        let (first, mut rest) = self.endpoint(text, target, grammar)?;
+        let mut nodes = vec![first];
+        while let Some(after_amp) = rest.trim_start().strip_prefix('&') {
+            let (next, tail) = self.endpoint(after_amp, target, grammar)?;
+            nodes.push(next);
+            rest = tail;
+        }
+        Ok((nodes, rest))
+    }
+
     fn statement(&mut self, text: &'a str, grammar: Grammar) -> Result<(), &'static str> {
         if text.is_empty() || text.starts_with("%%") {
             return Ok(());
@@ -129,8 +174,25 @@ impl<'a> Graph<'a> {
             // Styling directives do not change node or edge identity.
             return Ok(());
         }
-        if first == "subgraph" || first == "end" {
-            return Err("nested subgraphs are not supported");
+        if first == "subgraph" {
+            if self.subgraph_stack.len() >= 4 {
+                return Err("nested subgraphs deeper than 4 levels are not supported");
+            }
+            let title = parse_subgraph_title(&text["subgraph".len()..])?;
+            let index = self.subgraphs.len();
+            self.subgraphs.push(Subgraph {
+                title,
+                parent: self.subgraph_stack.last().copied(),
+                depth: self.subgraph_stack.len(),
+            });
+            self.subgraph_stack.push(index);
+            return Ok(());
+        }
+        if first == "end" {
+            if self.subgraph_stack.pop().is_none() {
+                return Err("unexpected end without subgraph");
+            }
+            return Ok(());
         }
         let mut text = text;
         if matches!(grammar, Grammar::State)
@@ -153,40 +215,106 @@ impl<'a> Graph<'a> {
         {
             text = class.trim();
         }
-        let (mut from, mut tail) = self.endpoint(text, false, grammar)?;
-        if let Some(label) = tail.strip_prefix(':') {
-            if let Some((_, node)) = self.nodes.get_index_mut(from) {
+        let (mut from_nodes, mut tail) = self.endpoint_list(text, false, grammar)?;
+        if from_nodes.len() == 1
+            && let Some(label) = tail.strip_prefix(':')
+        {
+            if let Some((_, node)) = self.nodes.get_index_mut(from_nodes[0]) {
                 node.label = label.trim();
             }
             return Ok(());
         }
         while !tail.is_empty() {
-            let (operator, mut next) =
-                connector(tail, grammar).ok_or("unsupported graph syntax")?;
-            let mut label = None;
-            if let Some(edge_label) = next.trim_start().strip_prefix('|') {
+            let (operator, inline_label, mut next) =
+                connector_with_inline_label(tail, grammar).ok_or("unsupported graph syntax")?;
+            let mut label = inline_label;
+            if label.is_none()
+                && let Some(edge_label) = next.trim_start().strip_prefix('|')
+            {
                 let (edge_label, rest) =
                     split_label(edge_label, "|").ok_or("unclosed edge label")?;
                 label = Some(edge_label);
                 next = rest;
             }
-            let (to, rest) = self.endpoint(next, true, grammar)?;
+            let (to_nodes, rest) = self.endpoint_list(next, true, grammar)?;
             tail = rest;
             if let Some(edge_label) = rest.strip_prefix(':') {
                 label = Some(edge_label.trim());
                 tail = "";
             }
-            self.edges.push(Edge {
-                from,
-                to,
-                label,
-                dotted: operator.contains('.'),
-                arrow: operator.contains('>'),
-            });
-            from = to;
+            for &from in &from_nodes {
+                for &to in &to_nodes {
+                    self.edges.push(Edge {
+                        from,
+                        to,
+                        label,
+                        dotted: operator.contains('.'),
+                        arrow: operator.contains('>'),
+                    });
+                }
+            }
+            from_nodes = to_nodes;
         }
         Ok(())
     }
+}
+
+fn parse_subgraph_title(rest: &str) -> Result<&str, &'static str> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return Err("missing subgraph title");
+    }
+    if let Some(quoted) = trimmed.strip_prefix('"')
+        && let Some(title) = quoted.strip_suffix('"')
+        && !title.trim().is_empty()
+    {
+        return Ok(title.trim());
+    }
+    if let Some(open) = trimmed.find('[')
+        && let Some(inner) = trimmed[open + 1..].strip_suffix(']')
+    {
+        let inner = inner.trim().trim_matches('"').trim();
+        if !inner.is_empty() {
+            return Ok(inner);
+        }
+    }
+    Ok(trimmed)
+}
+
+fn connector_with_inline_label(text: &str, grammar: Grammar) -> Option<(&str, Option<&str>, &str)> {
+    if !matches!(grammar, Grammar::Er) {
+        if let Some(rest) = text.strip_prefix("-- ") {
+            if let Some(pos) = rest.find(" -->") {
+                let label = rest[..pos].trim();
+                if !label.is_empty() {
+                    return Some(("-->", Some(label), &rest[pos + 4..]));
+                }
+            } else if let Some(pos) = rest.find(" ---") {
+                let label = rest[..pos].trim();
+                if !label.is_empty() {
+                    return Some(("---", Some(label), &rest[pos + 4..]));
+                }
+            }
+        }
+        if let Some(rest) = text.strip_prefix("-. ")
+            && let Some(pos) = rest.find(" .->")
+        {
+            let label = rest[..pos].trim();
+            if !label.is_empty() {
+                return Some(("-.->", Some(label), &rest[pos + 4..]));
+            }
+        }
+        if let Some(rest) = text.strip_prefix("== ")
+            && let Some(pos) = rest.find(" ==>")
+        {
+            let label = rest[..pos].trim();
+            if !label.is_empty() {
+                return Some(("==>", Some(label), &rest[pos + 4..]));
+            }
+        }
+    }
+    let (operator, rest) = connector(text, grammar)?;
+    Some((operator, None, rest))
 }
 
 fn split_label<'a>(text: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
@@ -256,6 +384,9 @@ pub(super) fn render<'a>(
             return Ok(None);
         }
     }
+    if !graph.subgraph_stack.is_empty() {
+        return Err("unclosed subgraph");
+    }
     if graph.nodes.is_empty() {
         return Ok(None);
     }
@@ -273,14 +404,28 @@ struct Position {
     minor: usize,
 }
 
+#[derive(Clone, Copy)]
+struct SubgraphBox {
+    index: usize,
+    depth: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
 struct Layout {
     horizontal: bool,
     reverse: bool,
     major: usize,
-    minor: usize,
+    canvas_width: usize,
+    canvas_height: usize,
+    shift_x: usize,
+    shift_y: usize,
     positions: Vec<Position>,
     rank: Vec<usize>,
     extra_lane: usize,
+    subgraph_boxes: Vec<SubgraphBox>,
 }
 
 impl Layout {
@@ -302,14 +447,25 @@ impl Layout {
             });
             groups[rank[index]].push(index);
         }
+        let has_subgraphs = !graph.subgraphs.is_empty();
+        if has_subgraphs {
+            for group in &mut groups {
+                group.sort_by_key(|&node_idx| graph.node_subgraph[node_idx]);
+            }
+        }
         let widths: Vec<_> = groups
             .iter()
             .map(|items| {
-                items
-                    .iter()
-                    .map(|&item| positions[item].minor)
-                    .sum::<usize>()
-                    + 3 * items.len().saturating_sub(1)
+                let mut used = 0usize;
+                for (pos, &item) in items.iter().enumerate() {
+                    if pos > 0 {
+                        let same_sg = !has_subgraphs
+                            || graph.node_subgraph[items[pos - 1]] == graph.node_subgraph[item];
+                        used += if same_sg { 3 } else { 7 };
+                    }
+                    used += positions[item].minor;
+                }
+                used
             })
             .collect();
         let base_minor = widths.iter().max().copied()?;
@@ -325,34 +481,165 @@ impl Layout {
             2
         };
         let mut axis = usize::from(extra) * 2;
-        for (group, used) in groups.iter().zip(widths) {
+        for (rank_idx, (group, used)) in groups.iter().zip(widths).enumerate() {
             let mut lane = (base_minor - used) / 2;
             let major = group
                 .iter()
                 .map(|&index| positions[index].major)
                 .max()
                 .unwrap_or(0);
-            for &index in group {
+            for (pos, &index) in group.iter().enumerate() {
+                if pos > 0 {
+                    let same_sg = !has_subgraphs
+                        || graph.node_subgraph[group[pos - 1]] == graph.node_subgraph[index];
+                    lane += if same_sg { 3 } else { 7 };
+                }
                 let place = &mut positions[index];
                 place.axis = axis + (major - place.major) / 2;
                 place.lane = lane;
-                lane += place.minor + 3;
+                lane += place.minor;
             }
-            axis += major + gap;
+            let cross_sg_rank = has_subgraphs
+                && groups.get(rank_idx + 1).is_some_and(|next_group| {
+                    group.iter().any(|&a| {
+                        next_group
+                            .iter()
+                            .any(|&b| graph.node_subgraph[a] != graph.node_subgraph[b])
+                    })
+                });
+            axis += major + gap + if cross_sg_rank { 4 } else { 0 };
         }
-        let major = axis - gap + usize::from(extra) * 2;
-        let visible = if horizontal { major } else { minor };
-        if visible > width || major.saturating_mul(minor) > 200_000 {
+        let last_cross_gap = if has_subgraphs && groups.len() >= 2 {
+            // Only the gaps between ranks exist; the final rank did not need trailing cross gap.
+            let prev = &groups[groups.len() - 2];
+            let last = &groups[groups.len() - 1];
+            let _ = (prev, last);
+            0
+        } else {
+            0
+        };
+        let major = axis - gap + last_cross_gap + usize::from(extra) * 2;
+        let (base_width, base_height) = if horizontal {
+            (major, minor)
+        } else {
+            (minor, major)
+        };
+
+        if !has_subgraphs {
+            if base_width > width || major.saturating_mul(minor) > 200_000 {
+                return None;
+            }
+            return Some(Self {
+                horizontal,
+                reverse,
+                major,
+                canvas_width: base_width,
+                canvas_height: base_height,
+                shift_x: 0,
+                shift_y: 0,
+                positions,
+                rank,
+                extra_lane,
+                subgraph_boxes: Vec::new(),
+            });
+        }
+
+        let raw_xy = |a: usize, l: usize| -> (isize, isize) {
+            let a = if reverse { major - 1 - a } else { a };
+            if horizontal {
+                (a as isize, l as isize)
+            } else {
+                (l as isize, a as isize)
+            }
+        };
+
+        let mut sg_bounds: Vec<Option<(isize, isize, isize, isize)>> =
+            vec![None; graph.subgraphs.len()];
+        let extend_bounds = |slot: &mut Option<(isize, isize, isize, isize)>,
+                             rect: (isize, isize, isize, isize)| {
+            *slot = Some(match *slot {
+                Some((x0, y0, x1, y1)) => (
+                    x0.min(rect.0),
+                    y0.min(rect.1),
+                    x1.max(rect.2),
+                    y1.max(rect.3),
+                ),
+                None => rect,
+            });
+        };
+
+        for (node_idx, place) in positions.iter().enumerate() {
+            if let Some(sg_idx) = graph.node_subgraph[node_idx] {
+                let (x0, y0) = raw_xy(place.axis, place.lane);
+                let (x1, y1) = raw_xy(place.axis + place.major - 1, place.lane + place.minor - 1);
+                extend_bounds(
+                    &mut sg_bounds[sg_idx],
+                    (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)),
+                );
+            }
+        }
+
+        let mut order: Vec<usize> = (0..graph.subgraphs.len()).collect();
+        order.sort_by_key(|&idx| std::cmp::Reverse(graph.subgraphs[idx].depth));
+        for &sg_idx in &order {
+            if let Some((x0, y0, x1, y1)) = sg_bounds[sg_idx] {
+                let min_w = visible_width(graph.subgraphs[sg_idx].title) as isize + 6;
+                let expanded_x0 = x0 - 2;
+                let expanded_y0 = y0 - 2;
+                let expanded_x1 = (x1 + 2).max(expanded_x0 + min_w - 1);
+                let expanded_y1 = y1 + 1;
+                let expanded = (expanded_x0, expanded_y0, expanded_x1, expanded_y1);
+                sg_bounds[sg_idx] = Some(expanded);
+                if let Some(parent) = graph.subgraphs[sg_idx].parent {
+                    extend_bounds(&mut sg_bounds[parent], expanded);
+                }
+            }
+        }
+
+        let mut min_x = 0isize;
+        let mut min_y = 0isize;
+        let mut max_x = base_width.saturating_sub(1) as isize;
+        let mut max_y = base_height.saturating_sub(1) as isize;
+        for bounds in sg_bounds.iter().flatten() {
+            min_x = min_x.min(bounds.0);
+            min_y = min_y.min(bounds.1);
+            max_x = max_x.max(bounds.2);
+            max_y = max_y.max(bounds.3);
+        }
+        let shift_x = (-min_x).max(0) as usize;
+        let shift_y = (-min_y).max(0) as usize;
+        let canvas_width = (max_x - min_x + 1) as usize;
+        let canvas_height = (max_y - min_y + 1) as usize;
+        if canvas_width > width || canvas_width.saturating_mul(canvas_height) > 200_000 {
             return None;
         }
+        let mut subgraph_boxes = Vec::new();
+        for (idx, bounds) in sg_bounds.into_iter().enumerate() {
+            if let Some((x0, y0, x1, y1)) = bounds {
+                subgraph_boxes.push(SubgraphBox {
+                    index: idx,
+                    depth: graph.subgraphs[idx].depth,
+                    x0: (x0 + shift_x as isize) as usize,
+                    y0: (y0 + shift_y as isize) as usize,
+                    x1: (x1 + shift_x as isize) as usize,
+                    y1: (y1 + shift_y as isize) as usize,
+                });
+            }
+        }
+        subgraph_boxes.sort_by_key(|sg| sg.depth);
+
         Some(Self {
             horizontal,
             reverse,
             major,
-            minor,
+            canvas_width,
+            canvas_height,
+            shift_x,
+            shift_y,
             positions,
             rank,
             extra_lane,
+            subgraph_boxes,
         })
     }
 
@@ -362,20 +649,19 @@ impl Layout {
         } else {
             axis
         };
-        if self.horizontal {
+        let (x, y) = if self.horizontal {
             (axis, lane)
         } else {
             (lane, axis)
-        }
+        };
+        (x + self.shift_x, y + self.shift_y)
     }
 
     fn draw(&self, graph: &Graph<'_>) -> Art {
-        let (width, height) = if self.horizontal {
-            (self.major, self.minor)
-        } else {
-            (self.minor, self.major)
-        };
-        let mut canvas = Canvas::new(width, height);
+        let mut canvas = Canvas::new(self.canvas_width, self.canvas_height);
+        for sg in &self.subgraph_boxes {
+            canvas.subgraph(sg.x0, sg.y0, sg.x1, sg.y1, graph.subgraphs[sg.index].title);
+        }
         for (node, place) in graph.nodes.values().zip(&self.positions) {
             let (x0, y0) = self.xy(place.axis, place.lane);
             let (x1, y1) = self.xy(place.axis + place.major - 1, place.lane + place.minor - 1);
@@ -514,6 +800,20 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    fn subgraph(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, title: &'a str) {
+        self.path(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], false);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if x == x0 || x == x1 || y == y0 || y == y1 {
+                    let cell = &mut self.grid[y * self.width + x];
+                    cell.border = true;
+                    cell.round = false;
+                }
+            }
+        }
+        self.label(y0, x0 + 2, title, Role::Title);
+    }
+
     fn node(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, node: &Node<'a>) {
         self.path(&[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], false);
         for y in y0..=y1 {
@@ -569,7 +869,8 @@ impl<'a> Canvas<'a> {
                 {
                     let width = visible_width(label);
                     if width != 0
-                        && (role == Role::Text || row[x..x + width].iter().all(|cell| !cell.border))
+                        && (matches!(role, Role::Text | Role::Title)
+                            || row[x..x + width].iter().all(|cell| !cell.border))
                     {
                         spans.push((role, label.to_owned()));
                         x += width;

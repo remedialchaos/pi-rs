@@ -9,8 +9,9 @@ mod status;
 
 pub use delivery::{
     BUG_REPORT_DISCLAIMER, BUG_REPORT_TRANSCRIPT_NOTE, BugReportBundle, BugReportOptions,
-    ShareDestination, ShareLinks, bug_report_gateway, build_bug_report, export_bug_report,
-    share_session, summarize_bug_report, upload_bug_report,
+    BugReportUploadOptions, ShareDestination, ShareLinks, ShareOptions, bug_report_gateway,
+    build_bug_report, export_bug_report, radius_gateway, share_session, share_session_with_options,
+    summarize_bug_report, upload_bug_report, upload_bug_report_with_options,
 };
 pub use easter_egg::{EasterEgg3d, EasterEggAnimation};
 pub use editor::{external_editor, external_editor_with_command};

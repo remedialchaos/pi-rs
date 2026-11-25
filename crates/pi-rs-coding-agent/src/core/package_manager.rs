@@ -709,10 +709,20 @@ impl PackageManager {
                 PackageSource::parse(&entry.source)
                     .map(|candidate| candidate.identity(&self.base_dir(entry.scope)))
                     .ok()
-                    == Some(parsed.identity(&self.base_dir(PackageScope::User)))
+                    == Some(parsed.identity(&self.base_dir(entry.scope)))
             })
             .map(|entry| entry.scope)
             .unwrap_or(PackageScope::User);
+        self.resolve_in_scope(source, scope)
+    }
+
+    /// Parse a source and resolve it to a path and state in an explicit scope without installing.
+    pub fn resolve_in_scope(
+        &self,
+        source: &str,
+        scope: PackageScope,
+    ) -> Result<ResolvedPackage, String> {
+        let parsed = PackageSource::parse(source)?;
         let path = self.install_path(&parsed, scope)?;
         let state = if path.exists() {
             InstallState::Installed
@@ -736,7 +746,7 @@ impl PackageManager {
     pub fn resolve_all(&self) -> ResolveResult {
         let mut result = ResolveResult::default();
         for configured in self.configured_packages() {
-            match self.resolve(&configured.source) {
+            match self.resolve_in_scope(&configured.source, configured.scope) {
                 Ok(resolved) => result.packages.push(resolved),
                 Err(message) => result.failures.push(PackageInstallFailure {
                     source: configured.source,

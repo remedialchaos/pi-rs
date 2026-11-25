@@ -6,8 +6,17 @@
 //! exposure resolution, tool naming, and the `mcp_servers` system-prompt section.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use pi_rs_mcp::{create_mcp_tool_name, mcp_namespace, mcp_server_summary};
+use futures_util::future::BoxFuture;
+use indexmap::IndexMap;
+use pi_rs_mcp::{McpClient, create_mcp_tool_name, mcp_namespace, mcp_server_summary};
+use serde_json::Value;
+
+use crate::core::extensions::types::{
+    ExtensionToolContext, ToolDefinition, ToolExposure as RuntimeToolExposure, ToolOutcome,
+};
 
 use super::{Extension, ExtensionRegistry, ToolExposure, ToolRegistration};
 
@@ -320,6 +329,512 @@ impl Extension for McpExtension {
     }
 }
 
+pub type McpConnector = Arc<
+    dyn Fn(
+            PathBuf,
+            String,
+            Value,
+            PathBuf,
+        ) -> BoxFuture<'static, Result<(McpClient, Vec<pi_rs_mcp::Tool>), String>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpReconnectOutcome {
+    pub server: String,
+    pub tool_count: usize,
+    pub generation: u64,
+}
+
+#[derive(Clone)]
+struct ConnectedMcpServer {
+    client: McpClient,
+    tool_names: Vec<String>,
+    generation: u64,
+}
+
+#[derive(Clone)]
+struct RegisteredMcpTool {
+    server: String,
+    client: McpClient,
+    remote_name: String,
+    definition: ToolDefinition,
+}
+
+#[derive(Default)]
+struct McpManagerState {
+    servers: IndexMap<String, ConnectedMcpServer>,
+    tools: IndexMap<String, RegisteredMcpTool>,
+}
+
+struct McpConnectionManagerInner {
+    connector: McpConnector,
+    reconnect_lock: tokio::sync::Mutex<()>,
+    state: Mutex<McpManagerState>,
+}
+
+#[derive(Clone)]
+pub struct McpConnectionManager {
+    inner: Arc<McpConnectionManagerInner>,
+}
+
+impl Default for McpConnectionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl McpConnectionManager {
+    pub fn new() -> Self {
+        Self::with_connector(Arc::new(|agent_dir, name, config, cwd| {
+            Box::pin(
+                async move { crate::cli::mcp::discover(&agent_dir, &name, &config, &cwd).await },
+            )
+        }))
+    }
+
+    pub fn with_connector(connector: McpConnector) -> Self {
+        Self {
+            inner: Arc::new(McpConnectionManagerInner {
+                connector,
+                reconnect_lock: tokio::sync::Mutex::new(()),
+                state: Mutex::new(McpManagerState::default()),
+            }),
+        }
+    }
+
+    pub async fn connect_all(
+        &self,
+        agent_dir: &Path,
+        cwd: &Path,
+        project_trusted: bool,
+    ) -> Result<(), String> {
+        let _guard = self.inner.reconnect_lock.lock().await;
+        let loaded = crate::cli::mcp::load_config(agent_dir, cwd, project_trusted);
+        for (name, config) in loaded.servers {
+            if config["enabled"] == false {
+                continue;
+            }
+            let Ok((client, tools)) = (self.inner.connector)(
+                agent_dir.to_path_buf(),
+                name.clone(),
+                config.clone(),
+                cwd.to_path_buf(),
+            )
+            .await
+            else {
+                continue;
+            };
+            self.install_server(&name, &config, client, tools, 1)?;
+        }
+        Ok(())
+    }
+
+    pub async fn disconnect_server(&self, server_name: &str) -> bool {
+        let _guard = self.inner.reconnect_lock.lock().await;
+        let removed = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            remove_server_locked(&mut state, server_name)
+        };
+        if let Some(old) = removed {
+            old.client.close().await;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn reconnect_server(
+        &self,
+        server_name: &str,
+        agent_dir: &Path,
+        cwd: &Path,
+        project_trusted: bool,
+    ) -> Result<McpReconnectOutcome, String> {
+        let _guard = self.inner.reconnect_lock.lock().await;
+        let loaded = crate::cli::mcp::load_config(agent_dir, cwd, project_trusted);
+        let Some(config) = loaded.servers.get(server_name).cloned() else {
+            return Err(format!("No MCP server named \"{server_name}\"."));
+        };
+        self.reconnect_server_locked(server_name, &config, agent_dir, cwd)
+            .await
+    }
+
+    pub async fn reconnect_all(
+        &self,
+        agent_dir: &Path,
+        cwd: &Path,
+        project_trusted: bool,
+    ) -> Result<Vec<McpReconnectOutcome>, String> {
+        let _guard = self.inner.reconnect_lock.lock().await;
+        let loaded = crate::cli::mcp::load_config(agent_dir, cwd, project_trusted);
+        if loaded
+            .servers
+            .values()
+            .all(|entry| entry["enabled"] == false)
+        {
+            return Err("No enabled MCP server to reconnect.".to_owned());
+        }
+        let stale: Vec<String> = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state
+                .servers
+                .keys()
+                .filter(|name| {
+                    loaded
+                        .servers
+                        .get(*name)
+                        .is_none_or(|entry| entry["enabled"] == false)
+                })
+                .cloned()
+                .collect()
+        };
+        for name in stale {
+            let removed = {
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                remove_server_locked(&mut state, &name)
+            };
+            if let Some(old) = removed {
+                old.client.close().await;
+            }
+        }
+        let mut outcomes = Vec::new();
+        for (name, config) in loaded.servers {
+            if config["enabled"] == false {
+                continue;
+            }
+            outcomes.push(
+                self.reconnect_server_locked(&name, &config, agent_dir, cwd)
+                    .await?,
+            );
+        }
+        Ok(outcomes)
+    }
+
+    async fn reconnect_server_locked(
+        &self,
+        server_name: &str,
+        config: &Value,
+        agent_dir: &Path,
+        cwd: &Path,
+    ) -> Result<McpReconnectOutcome, String> {
+        let removed = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            remove_server_locked(&mut state, server_name)
+        };
+        let next_generation = removed.as_ref().map_or(1, |old| old.generation + 1);
+        if let Some(old) = removed {
+            old.client.close().await;
+        }
+        if config["enabled"] == false {
+            return Err(format!("MCP server \"{server_name}\" is disabled."));
+        }
+        let (client, tools) = (self.inner.connector)(
+            agent_dir.to_path_buf(),
+            server_name.to_owned(),
+            config.clone(),
+            cwd.to_path_buf(),
+        )
+        .await?;
+        let tool_count =
+            self.install_server(server_name, config, client, tools, next_generation)?;
+        Ok(McpReconnectOutcome {
+            server: server_name.to_owned(),
+            tool_count,
+            generation: next_generation,
+        })
+    }
+
+    fn install_server(
+        &self,
+        server_name: &str,
+        config: &Value,
+        client: McpClient,
+        tools: Vec<pi_rs_mcp::Tool>,
+        generation: u64,
+    ) -> Result<usize, String> {
+        let prepared = tools
+            .into_iter()
+            .map(|tool| {
+                let schema = pi_rs_mcp::normalize_mcp_input_schema(&tool.input_schema)
+                    .map_err(|error| error.to_string())?;
+                Ok((tool, schema))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut registered_names = Vec::with_capacity(prepared.len());
+        for (tool, schema) in prepared {
+            let local =
+                create_mcp_tool_name(server_name, &tool.name, |key| state.tools.contains_key(key));
+            let mut definition = ToolDefinition::new(local.clone(), schema);
+            definition.description = tool.description().unwrap_or_default().to_owned();
+            definition.label = tool.title().unwrap_or(&tool.name).to_owned();
+            definition.exposure = match config["toolExposure"]
+                .get(&tool.name)
+                .or_else(|| config.get("exposure"))
+                .and_then(Value::as_str)
+            {
+                Some("direct") => RuntimeToolExposure::Direct,
+                Some("deferred") => RuntimeToolExposure::Deferred,
+                Some("hidden") => RuntimeToolExposure::Hidden,
+                _ => RuntimeToolExposure::Codemode,
+            };
+            state.tools.insert(
+                local.clone(),
+                RegisteredMcpTool {
+                    server: server_name.to_owned(),
+                    client: client.clone(),
+                    remote_name: tool.name,
+                    definition,
+                },
+            );
+            registered_names.push(local);
+        }
+        let tool_count = registered_names.len();
+        state.servers.insert(
+            server_name.to_owned(),
+            ConnectedMcpServer {
+                client,
+                tool_names: registered_names,
+                generation,
+            },
+        );
+        Ok(tool_count)
+    }
+
+    pub fn close_all(&self) {
+        let clients: Vec<McpClient> = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.tools.clear();
+            state
+                .servers
+                .drain(..)
+                .map(|(_, server)| server.client)
+                .collect()
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            for client in clients {
+                handle.spawn(async move {
+                    client.close().await;
+                });
+            }
+        }
+    }
+
+    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state
+            .tools
+            .values()
+            .map(|entry| entry.definition.clone())
+            .collect()
+    }
+
+    pub fn agent_tools(&self) -> Vec<Arc<dyn pi_rs_agent::AgentTool>> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state
+            .tools
+            .values()
+            .filter(|entry| {
+                matches!(
+                    entry.definition.exposure,
+                    RuntimeToolExposure::Direct | RuntimeToolExposure::ModelOnly
+                )
+            })
+            .map(|entry| {
+                Arc::new(McpAgentTool {
+                    declaration: pi_rs_ai::Tool {
+                        name: entry.definition.name.clone(),
+                        description: entry.definition.description.clone(),
+                        parameters: entry.definition.parameters.clone(),
+                        constrained_sampling: None,
+                    },
+                    label: entry.definition.label.clone(),
+                    client: entry.client.clone(),
+                    remote: entry.remote_name.clone(),
+                }) as Arc<dyn pi_rs_agent::AgentTool>
+            })
+            .collect()
+    }
+
+    pub async fn execute_tool(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &ExtensionToolContext,
+    ) -> Result<ToolOutcome, String> {
+        let (client, remote) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let entry = state
+                .tools
+                .get(name)
+                .ok_or_else(|| format!("Unknown MCP tool {name}"))?;
+            (entry.client.clone(), entry.remote_name.clone())
+        };
+        let reply = client
+            .call_tool(&remote, Some(args.clone()), &Default::default())
+            .await
+            .map_err(|error| error.to_string())?;
+        let failed = reply.is_error.unwrap_or(false);
+        let mut outcome = ToolOutcome::success(
+            serde_json::json!({"type":"toolCall","id":ctx.tool_call_id,"name":name,"arguments":args}),
+            serde_json::to_value(reply).map_err(|error| error.to_string())?,
+        );
+        outcome.is_error = failed;
+        Ok(outcome)
+    }
+
+    pub fn server_client(&self, server_name: &str) -> Option<McpClient> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .servers
+            .get(server_name)
+            .map(|server| server.client.clone())
+    }
+
+    pub fn server_generation(&self, server_name: &str) -> Option<u64> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .servers
+            .get(server_name)
+            .map(|server| server.generation)
+    }
+
+    pub fn server_names(&self) -> Vec<String> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .servers
+            .keys()
+            .cloned()
+            .collect()
+    }
+}
+
+fn remove_server_locked(
+    state: &mut McpManagerState,
+    server_name: &str,
+) -> Option<ConnectedMcpServer> {
+    let removed = state.servers.shift_remove(server_name);
+    if let Some(old) = &removed {
+        for tool_name in &old.tool_names {
+            state.tools.shift_remove(tool_name);
+        }
+    } else {
+        state.tools.retain(|_, entry| entry.server != server_name);
+    }
+    removed
+}
+
+struct McpAgentTool {
+    declaration: pi_rs_ai::Tool,
+    label: String,
+    client: McpClient,
+    remote: String,
+}
+
+impl pi_rs_agent::AgentTool for McpAgentTool {
+    fn declaration(&self) -> &pi_rs_ai::Tool {
+        &self.declaration
+    }
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn execute<'a>(
+        &'a self,
+        _id: &'a str,
+        args: &'a Value,
+        signal: &'a pi_rs_agent::CancellationToken,
+        _update: pi_rs_agent::AgentToolUpdateCallback,
+    ) -> futures_util::future::BoxFuture<'a, pi_rs_agent::Result<pi_rs_agent::AgentToolResult>>
+    {
+        Box::pin(async move {
+            use pi_rs_agent::AgentError;
+            let controller = pi_rs_mcp::AbortController::new();
+            let options = pi_rs_mcp::McpRequestOptions {
+                signal: Some(controller.signal()),
+                ..Default::default()
+            };
+            let call = self
+                .client
+                .call_tool(&self.remote, Some(args.clone()), &options);
+            tokio::pin!(call);
+            let reply = tokio::select! {
+                reply = &mut call => reply,
+                () = signal.cancelled() => {controller.abort(None); call.await}
+            }
+            .map_err(|error| AgentError::Callback(error.to_string()))?;
+            let blocks =
+                pi_rs_mcp::to_mcp_model_content(&self.declaration.name, &reply, Default::default())
+                    .await;
+            let content = blocks
+                .into_iter()
+                .map(|block| match block {
+                    pi_rs_mcp::LlmContent::Text { text } => {
+                        pi_rs_ai::InputContent::Text(text.into())
+                    }
+                    pi_rs_mcp::LlmContent::Image { data, mime_type } => {
+                        pi_rs_ai::InputContent::Image(pi_rs_ai::ImageContent {
+                            kind: Default::default(),
+                            data,
+                            mime_type,
+                        })
+                    }
+                })
+                .collect();
+            Ok(pi_rs_agent::AgentToolResult {
+                content,
+                structured_content: reply.structured_content,
+                is_error: reply.is_error,
+                ..Default::default()
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +925,319 @@ mod tests {
     #[test]
     fn startup_wait_default_matches_upstream() {
         assert_eq!(McpExtensionOptions::default().startup_wait_ms(), 10_000);
+    }
+
+    async fn spawn_test_mcp_http_server(
+        server_name: &'static str,
+        tools_by_init: Vec<Vec<&'static str>>,
+    ) -> Result<
+        (
+            String,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicUsize>,
+            tokio::task::JoinHandle<()>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/mcp", listener.local_addr()?);
+        let init_count = Arc::new(AtomicUsize::new(0));
+        let delete_count = Arc::new(AtomicUsize::new(0));
+        let inits = init_count.clone();
+        let deletes = delete_count.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let inits = inits.clone();
+                let deletes = deletes.clone();
+                let tools_by_init = tools_by_init.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(socket);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    if request_line.starts_with("DELETE ") {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                        let _ = reader
+                            .get_mut()
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let mut bytes = vec![0; length];
+                    if reader.read_exact(&mut bytes).await.is_err() {
+                        return;
+                    }
+                    let Ok(request) = serde_json::from_slice::<Value>(&bytes) else {
+                        return;
+                    };
+                    let Some(method) = request["method"].as_str() else {
+                        return;
+                    };
+                    let result = match method {
+                        "initialize" => {
+                            inits.fetch_add(1, Ordering::SeqCst);
+                            serde_json::json!({
+                                "protocolVersion": pi_rs_mcp::LATEST_PROTOCOL_VERSION,
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": server_name, "version": "1" }
+                            })
+                        }
+                        "notifications/initialized" => {
+                            let _ = reader
+                                .get_mut()
+                                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                            return;
+                        }
+                        "tools/list" => {
+                            let current = inits.load(Ordering::SeqCst).saturating_sub(1);
+                            let tool_names = tools_by_init
+                                .get(current)
+                                .or_else(|| tools_by_init.last())
+                                .cloned()
+                                .unwrap_or_default();
+                            let tools: Vec<Value> = tool_names
+                                .into_iter()
+                                .map(|name| {
+                                    serde_json::json!({
+                                        "name": name,
+                                        "inputSchema": { "type": "object", "properties": {} }
+                                    })
+                                })
+                                .collect();
+                            serde_json::json!({ "tools": tools })
+                        }
+                        "tools/call" => {
+                            let name = request["params"]["name"].as_str().unwrap_or("unknown");
+                            let generation = inits.load(Ordering::SeqCst);
+                            serde_json::json!({
+                                "content": [{ "type": "text", "text": format!("{server_name}:{name}:gen{generation}") }]
+                            })
+                        }
+                        _ => return,
+                    };
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": result
+                    })
+                    .to_string();
+                    let _ = reader
+                        .get_mut()
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response}",
+                                response.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        Ok((url, init_count, delete_count, handle))
+    }
+
+    #[tokio::test]
+    async fn single_server_reconnect_refreshes_only_target_server_and_preserves_other()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::core::{
+            event_bus::EventBus,
+            extensions::{
+                context::UiInject,
+                runner::ExtensionRunner,
+                types::{
+                    ExtensionCommandContext, ExtensionContext, ExtensionHost, ExtensionMode,
+                    ExtensionUi,
+                },
+            },
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (alpha_url, alpha_inits, _alpha_deletes, alpha_task) =
+            spawn_test_mcp_http_server("alpha", vec![vec!["ping_v1"], vec!["ping_v2"]]).await?;
+        let (beta_url, beta_inits, beta_deletes, beta_task) =
+            spawn_test_mcp_http_server("beta", vec![vec!["echo_b"]]).await?;
+
+        let dir = tempfile::tempdir()?;
+        let config = serde_json::json!({
+            "mcpServers": {
+                "alpha": { "url": alpha_url, "exposure": "direct", "headers": { "Authorization": "Bearer alpha-token" } },
+                "beta": { "url": beta_url, "exposure": "direct", "headers": { "Authorization": "Bearer beta-token" } }
+            }
+        });
+        std::fs::write(dir.path().join("mcp.json"), serde_json::to_vec(&config)?)?;
+
+        let bus = Arc::new(EventBus::new());
+        let host = Arc::new(ExtensionHost::new(bus.clone()));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_counter = refresh_calls.clone();
+        host.set_refresh_tools(Arc::new(move || {
+            refresh_counter.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let runner = Arc::new(ExtensionRunner::new(
+            Vec::new(),
+            host.clone(),
+            bus.clone(),
+            dir.path().to_string_lossy(),
+        ));
+        let factory = crate::extensions::headless::factory("builtin:mcp", dir.path(), false)
+            .ok_or("Missing builtin:mcp factory")?;
+        let loaded = runner.load_extensions(&[factory]).await;
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+
+        assert_eq!(alpha_inits.load(Ordering::SeqCst), 1);
+        assert_eq!(beta_inits.load(Ordering::SeqCst), 1);
+        let initial_names: Vec<String> = runner
+            .get_all_registered_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(initial_names.contains(&"mcp__alpha__ping_v1".to_owned()));
+        assert!(initial_names.contains(&"mcp__beta__echo_b".to_owned()));
+
+        let reload_calls = Arc::new(AtomicUsize::new(0));
+        let reload_counter = reload_calls.clone();
+        let notices = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let notice_log = notices.clone();
+        let ui = ExtensionUi::from_inject(
+            ExtensionMode::Tui,
+            UiInject {
+                notify: Arc::new(move |msg, kind| {
+                    notice_log
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((msg, kind));
+                }),
+                ..UiInject::default()
+            },
+        );
+        let cmd_ctx = ExtensionCommandContext {
+            base: ExtensionContext {
+                host: host.clone(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                mode: ExtensionMode::Tui,
+                ui,
+                bus: Some(bus),
+                is_idle: Arc::new(|| true),
+                is_project_trusted: Arc::new(|| false),
+                has_pending_messages: Arc::new(|| false),
+                get_context_usage: Arc::new(|| None),
+                get_system_prompt: Arc::new(String::new),
+                abort: Arc::new(|| {}),
+                shutdown: Arc::new(|| {}),
+                compact: Arc::new(|_| {}),
+            },
+            wait_for_idle: Arc::new(|| Box::pin(async {})),
+            new_session: Arc::new(|_| Box::pin(async { Ok(Value::Null) })),
+            fork: Arc::new(|_, _| Box::pin(async { Ok(Value::Null) })),
+            navigate_tree: Arc::new(|_, _| Box::pin(async { Ok(Value::Null) })),
+            switch_session: Arc::new(|_, _| Box::pin(async { Ok(Value::Null) })),
+            reload: Arc::new(move || {
+                let reload_counter = reload_counter.clone();
+                Box::pin(async move {
+                    reload_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        };
+
+        // Reconnect ONLY alpha.
+        runner
+            .execute_command("mcp", "reconnect alpha", &cmd_ctx)
+            .await?;
+
+        assert_eq!(
+            reload_calls.load(Ordering::SeqCst),
+            0,
+            "single-server reconnect must not trigger full session reload"
+        );
+        assert!(refresh_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            alpha_inits.load(Ordering::SeqCst),
+            2,
+            "alpha must reconnect once"
+        );
+        assert_eq!(
+            beta_inits.load(Ordering::SeqCst),
+            1,
+            "beta must NOT reconnect"
+        );
+        assert_eq!(
+            beta_deletes.load(Ordering::SeqCst),
+            0,
+            "beta must NOT be closed/deleted"
+        );
+
+        let updated_names: Vec<String> = runner
+            .get_all_registered_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(!updated_names.contains(&"mcp__alpha__ping_v1".to_owned()));
+        assert!(updated_names.contains(&"mcp__alpha__ping_v2".to_owned()));
+        assert!(updated_names.contains(&"mcp__beta__echo_b".to_owned()));
+
+        let agent_tools = runner.extensions()[0].agent_tools();
+        let alpha_tool = agent_tools
+            .iter()
+            .find(|tool| tool.declaration().name == "mcp__alpha__ping_v2")
+            .ok_or("missing refreshed alpha tool")?;
+        let beta_tool = agent_tools
+            .iter()
+            .find(|tool| tool.declaration().name == "mcp__beta__echo_b")
+            .ok_or("missing untouched beta tool")?;
+
+        let cancel = pi_rs_agent::CancellationToken::new();
+        let alpha_res = alpha_tool
+            .execute("call-a", &serde_json::json!({}), &cancel, Arc::new(|_| {}))
+            .await?;
+        let beta_res = beta_tool
+            .execute("call-b", &serde_json::json!({}), &cancel, Arc::new(|_| {}))
+            .await?;
+        assert!(matches!(
+            alpha_res.content.first(),
+            Some(pi_rs_ai::InputContent::Text(t)) if t.text == "alpha:ping_v2:gen2"
+        ));
+        assert!(matches!(
+            beta_res.content.first(),
+            Some(pi_rs_ai::InputContent::Text(t)) if t.text == "beta:echo_b:gen1"
+        ));
+
+        let recorded_notices = notices.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            recorded_notices.iter().any(|(msg, kind)| msg
+                .contains("Reconnected MCP server \"alpha\"")
+                && kind == "info"),
+            "{recorded_notices:?}"
+        );
+
+        runner.invalidate();
+        alpha_task.abort();
+        beta_task.abort();
+        Ok(())
     }
 }
