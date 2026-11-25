@@ -26,8 +26,8 @@ pub use process::{ProcessOptions, RemoteProcess, open_process};
 pub use ssh::{
     HostKeyChangedError, HostKeyUnknownError, RemoteArch, RemotePlatform, RemotePlatformKind,
     RemoteShell, SshConnectOptions, SshError, SshFailure, SshTarget, connect_ssh, deploy_daemon,
-    detect_platform, forget_host_key, local_daemon, packaged_daemon, scan_host_key, ssh_arguments,
-    ssh_connection,
+    detect_platform, forget_host_key, local_daemon, packaged_daemon, packaged_daemon_in,
+    scan_host_key, ssh_arguments, ssh_connection,
 };
 pub use terminal::{RemoteTerminal, TerminalForeground, TerminalOptions, open_terminal};
 pub use watch::{
