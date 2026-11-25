@@ -1,0 +1,207 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            exe_ext: ""
+            include_pi_mac: false
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+            exe_ext: ""
+            include_pi_mac: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+            exe_ext: ""
+            include_pi_mac: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            exe_ext: ".exe"
+            include_pi_mac: false
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}, wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read pinned wasm-bindgen version
+        id: wbg-version
+        run: |
+          version="$(awk '
+            { sub(/\r$/, "") }
+            /^\[\[package\]\]$/ { in_pkg = 1; matched = 0; next }
+            in_pkg && /^name = "wasm-bindgen"$/ { matched = 1; next }
+            in_pkg && matched && /^version = "/ {
+              v = $0
+              sub(/^version = "/, "", v)
+              sub(/"$/, "", v)
+              print v
+              exit
+            }
+            /^$/ { in_pkg = 0; matched = 0 }
+          ' Cargo.lock)"
+          if [[ -z "$version" ]]; then
+            echo "Failed to read wasm-bindgen version from Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache wasm-bindgen-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/wasm-bindgen-cli
+          key: wasm-bindgen-cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.wbg-version.outputs.version }}
+
+      - name: Ensure wasm-bindgen-cli matches Cargo.lock
+        env:
+          WBG_VERSION: ${{ steps.wbg-version.outputs.version }}
+        run: |
+          wbg_root="$HOME/.local/wasm-bindgen-cli"
+          wbg_root_host="$wbg_root"
+          wbg_bin_host="$wbg_root/bin"
+          if command -v cygpath >/dev/null 2>&1; then
+            wbg_root_host="$(cygpath -m "$wbg_root")"
+            wbg_bin_host="$(cygpath -w "$wbg_root/bin")"
+          fi
+          echo "$wbg_bin_host" >> "$GITHUB_PATH"
+          export PATH="$wbg_root/bin:$PATH"
+          installed=""
+          if command -v wasm-bindgen >/dev/null 2>&1; then
+            installed="$(wasm-bindgen --version | awk '{print $2}' | tr -d '\r')"
+          fi
+          if [[ "$installed" != "$WBG_VERSION" ]]; then
+            cargo install wasm-bindgen-cli --version "$WBG_VERSION" --locked --root "$wbg_root_host"
+          fi
+          wasm-bindgen --version
+
+      - name: Build core release binaries
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p pi-rs-coding-agent --bin pi \
+            -p pi-rs-ai --bin pi-ai \
+            -p pi-rs-env --bin pi-env \
+            -p pi-rs-evals --bin pi-evals \
+            -p pi-rs-p3 --bin p3 \
+            -p pi-rs-voice-server --bin pi-voice-server
+
+      - name: Build pi-mac release binary
+        if: ${{ matrix.include_pi_mac }}
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p pi-rs-p2-mac --bin pi-mac
+
+      - name: Build packaged p2 release binary
+        run: |
+          ./scripts/package-p2.sh --release --locked --target "${{ matrix.target }}"
+
+      - name: Package release archive
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          EXE_EXT: ${{ matrix.exe_ext }}
+          INCLUDE_PI_MAC: ${{ matrix.include_pi_mac }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="dev-${GITHUB_SHA:0:7}"
+          fi
+          stage_name="pi-rs-${version}-${TARGET}"
+          stage_dir="staging/${stage_name}"
+          bin_dir="target/${TARGET}/release"
+
+          rm -rf staging dist
+          mkdir -p "$stage_dir" dist
+
+          bins=(pi pi-ai pi-env pi-evals p3 p2 pi-voice-server)
+          if [[ "$INCLUDE_PI_MAC" == "true" ]]; then
+            bins+=(pi-mac)
+          fi
+
+          for bin in "${bins[@]}"; do
+            src="${bin_dir}/${bin}${EXE_EXT}"
+            if [[ ! -f "$src" ]]; then
+              echo "Missing built release binary: $src" >&2
+              exit 1
+            fi
+            cp "$src" "$stage_dir/"
+          done
+
+          for doc in LICENSE README.md; do
+            if [[ -f "$doc" ]]; then
+              cp "$doc" "$stage_dir/"
+            fi
+          done
+
+          if [[ "$ARCHIVE_EXT" == "tar.gz" ]]; then
+            tar -C staging -czf "dist/${stage_name}.tar.gz" "$stage_name"
+          else
+            pwsh -NoProfile -Command "Compress-Archive -Path 'staging/${stage_name}' -DestinationPath 'dist/${stage_name}.zip' -Force"
+          fi
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd dist
+          LC_ALL=C sha256sum pi-rs-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-checksums
+          path: dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=(--title "${GITHUB_REF_NAME}" --generate-notes)
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" "${flags[@]}" dist/pi-rs-* dist/SHA256SUMS.txt
