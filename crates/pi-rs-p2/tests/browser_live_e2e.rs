@@ -123,6 +123,19 @@ async fn packaged_p2_chromium_e2e() -> TestResult {
     tokio::time::timeout(Duration::from_secs(120), run_chromium_e2e(&p2_bin)).await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_share_admission_and_expiration_chromium_e2e() -> TestResult {
+    if !Path::new(CHROMIUM_BIN).exists() {
+        return Err(format!("missing Chromium binary at {CHROMIUM_BIN}").into());
+    }
+    let p2_bin = tokio::task::spawn_blocking(resolve_packaged_p2_binary).await??;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_guest_share_expiration_e2e(&p2_bin),
+    )
+    .await?
+}
+
 async fn run_chromium_e2e(p2_bin: &Path) -> TestResult {
     let data_dir = tempfile::tempdir()?;
     let chromium_profile = tempfile::tempdir()?;
@@ -432,6 +445,466 @@ async fn run_chromium_e2e(p2_bin: &Path) -> TestResult {
     // 7. Clean teardown: close Chromium and SIGTERM p2 server.
     drop(cdp);
     chromium.close();
+    p2_guard.terminate_and_wait()?;
+    Ok(())
+}
+
+async fn connect_browser_chord(
+    address: std::net::SocketAddr,
+    cookie_header: &str,
+) -> TestResult<(
+    pi_rs_chord::remote::RemotePeer,
+    Arc<dyn pi_rs_chord::link::Link>,
+)> {
+    use pi_rs_chord::{
+        node::http::connect_websocket,
+        remote::{RemoteOptions, RemotePeer},
+        state::Batch,
+    };
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::COOKIE, cookie_header.parse()?);
+    let link = connect_websocket(
+        &format!("ws://{address}/chord?client=script"),
+        headers,
+        1024 * 1024,
+        4 * 1024 * 1024,
+    )
+    .await?;
+    let peer = RemotePeer::connect(
+        link.clone(),
+        RemoteOptions::new(json!({ "kind": "server" })),
+        Batch::new(|_| {}),
+    )?;
+    Ok((peer, link))
+}
+
+async fn install_csp_tracker(cdp: &CdpClient, session_id: &str) -> TestResult {
+    cdp.call(
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({
+            "source": r#"
+                window.__cspViolations = [];
+                document.addEventListener('securitypolicyviolation', (e) => {
+                    window.__cspViolations.push({
+                        directive: e.violatedDirective,
+                        blockedURI: e.blockedURI
+                    });
+                });
+            "#
+        }),
+        Some(session_id),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn run_guest_share_expiration_e2e(p2_bin: &Path) -> TestResult {
+    use pi_rs_chord::{context::Context, json::JsonValue};
+    use pi_rs_p2::api::v1::p2_contracts::lookup;
+
+    let data_dir = tempfile::tempdir()?;
+    let owner_profile = tempfile::tempdir()?;
+    let guest_profile = tempfile::tempdir()?;
+
+    let mut p2_proc = spawn_p2_server(p2_bin, data_dir.path())?;
+    let mut p2_guard = ChildGuard::new(&mut p2_proc.child);
+    let origin = format!("http://{}", p2_proc.address);
+    let port = p2_proc.address.port();
+
+    let owner_chromium = ChromiumProcess::spawn(owner_profile.path())?;
+    let owner_cdp = CdpClient::connect(&owner_chromium.ws_url).await?;
+    let owner_sid = owner_cdp.attach_page().await?;
+    owner_cdp.enable_page_domains(&owner_sid).await?;
+
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let (cookie_name, cookie_value, _) =
+        claim_local_owner_cookie(&http, &origin, port, data_dir.path()).await?;
+    let owner_cookie = format!("{cookie_name}={cookie_value}");
+
+    install_csp_tracker(&owner_cdp, &owner_sid).await?;
+    owner_cdp
+        .call(
+            "Network.setCookie",
+            json!({
+                "name": cookie_name,
+                "value": cookie_value,
+                "url": origin,
+                "path": "/",
+                "httpOnly": true,
+                "sameSite": "Lax"
+            }),
+            Some(&owner_sid),
+        )
+        .await?;
+    owner_cdp.navigate(&owner_sid, &origin).await?;
+    wait_for_connected(&owner_cdp, &owner_sid).await?;
+    assert_no_errors_and_assets_ok(&owner_cdp, &owner_sid).await?;
+
+    // Owner creates Session 1 and sends a message before sharing.
+    let clicked = owner_cdp
+        .eval_json(
+            &owner_sid,
+            r#"(() => {
+                const btn = Array.from(document.querySelectorAll('button'))
+                    .find((b) => b.textContent.trim() === 'New session' && !b.disabled);
+                if (!btn) return false;
+                btn.click();
+                return true;
+            })()"#,
+        )
+        .await?;
+    assert_eq!(clicked, json!(true), "New session button must be clickable");
+
+    wait_until("owner session ready", Duration::from_secs(15), || async {
+        let ready = owner_cdp
+            .eval_json(
+                &owner_sid,
+                r#"(() => {
+                    const sidebarButtons = document.querySelectorAll('.sidebar-content button');
+                    const fieldset = document.querySelector('fieldset');
+                    const textarea = document.querySelector('textarea.composer-input');
+                    return (sidebarButtons.length >= 2 && fieldset && !fieldset.disabled && textarea && !textarea.disabled) ? true : null;
+                })()"#,
+            )
+            .await?;
+        Ok(ready.as_bool())
+    })
+    .await?;
+
+    owner_cdp
+        .eval_json(
+            &owner_sid,
+            r#"(() => {
+                const textarea = document.querySelector('textarea.composer-input');
+                const send = document.querySelector('button.composer-send');
+                textarea.focus();
+                textarea.value = 'owner secret before share';
+                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                send.click();
+                return true;
+            })()"#,
+        )
+        .await?;
+    wait_until(
+        "owner echo before share",
+        Duration::from_secs(20),
+        || async {
+            let text = owner_cdp
+                .eval_json(
+                    &owner_sid,
+                    r#"document.querySelector('[data-testid="chat"]')?.innerText ?? ''"#,
+                )
+                .await?;
+            let s = text.as_str().unwrap_or_default();
+            Ok((s.contains("owner secret before share") && s.contains("Echo:")).then_some(true))
+        },
+    )
+    .await?;
+
+    // Use owner Chord peer to discover Session 1 ID, create unshared Session 2, and mint a view share link.
+    let ctx = Context::background();
+    let (owner_peer, _owner_link) = connect_browser_chord(p2_proc.address, &owner_cookie).await?;
+    let sessions_contract = Arc::new(lookup("p2.sessions")?);
+    let sessions_held =
+        owner_peer.hold(sessions_contract, JsonValue::from_serde(json!({})), &ctx)?;
+    tokio::time::timeout(Duration::from_secs(5), sessions_held.wait(&ctx)).await??;
+    let sessions_val = sessions_held
+        .member("sessions")?
+        .value()?
+        .to_json()
+        .to_serde()?;
+    let session1_id = sessions_val
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|row| row["id"].as_str())
+        .ok_or("missing owner session1 id")?
+        .to_owned();
+    let default_cwd = sessions_held
+        .member("defaultCwd")?
+        .value()?
+        .to_json()
+        .to_serde()?;
+    let session2_val = sessions_held
+        .call(
+            "create",
+            JsonValue::from_serde(json!({ "cwd": default_cwd })),
+            &ctx,
+        )
+        .await?
+        .to_serde()?;
+    let session2_id = session2_val["id"]
+        .as_str()
+        .ok_or("missing session2 id")?
+        .to_owned();
+
+    let sharing_contract = Arc::new(lookup("p2.sharing")?);
+    let sharing_held = owner_peer.hold(
+        sharing_contract,
+        JsonValue::from_serde(json!({ "session": session1_id })),
+        &ctx,
+    )?;
+    tokio::time::timeout(Duration::from_secs(5), sharing_held.wait(&ctx)).await??;
+    sharing_held
+        .call(
+            "link",
+            JsonValue::from_serde(json!({ "mode": "view", "reset": false })),
+            &ctx,
+        )
+        .await?;
+    let share_token = wait_until("view share link token", Duration::from_secs(5), || async {
+        owner_peer.fence().await?;
+        let links = sharing_held
+            .member("links")?
+            .value()?
+            .to_json()
+            .to_serde()?;
+        let tok = links
+            .as_array()
+            .and_then(|arr| arr.iter().find(|l| l["mode"] == "view"))
+            .and_then(|l| l["token"].as_str())
+            .map(str::to_owned);
+        Ok(tok)
+    })
+    .await?;
+
+    // Guest Chromium joins via /join/{token} under production CSP.
+    let guest_chromium = ChromiumProcess::spawn(guest_profile.path())?;
+    let guest_cdp = CdpClient::connect(&guest_chromium.ws_url).await?;
+    let guest_sid = guest_cdp.attach_page().await?;
+    guest_cdp.enable_page_domains(&guest_sid).await?;
+    install_csp_tracker(&guest_cdp, &guest_sid).await?;
+
+    guest_cdp
+        .navigate(&guest_sid, &format!("{origin}/join/{share_token}"))
+        .await?;
+    wait_until("guest join form", Duration::from_secs(10), || async {
+        let ready = guest_cdp
+            .eval_json(
+                &guest_sid,
+                r#"Boolean(document.getElementById('join') && document.getElementById('name'))"#,
+            )
+            .await?;
+        Ok((ready.as_bool() == Some(true)).then_some(()))
+    })
+    .await?;
+    guest_cdp
+        .eval_json(
+            &guest_sid,
+            r#"(() => {
+                const input = document.getElementById('name');
+                const form = document.getElementById('join');
+                input.value = 'Guest Viewer';
+                form.requestSubmit();
+                return true;
+            })()"#,
+        )
+        .await?;
+
+    wait_until(
+        "guest redirected to shared session",
+        Duration::from_secs(15),
+        || async {
+            let href = guest_cdp.eval_json(&guest_sid, "location.pathname").await?;
+            Ok(href
+                .as_str()
+                .is_some_and(|p| p == format!("/s/{session1_id}"))
+                .then_some(()))
+        },
+    )
+    .await?;
+    wait_for_connected(&guest_cdp, &guest_sid).await?;
+    wait_until(
+        "guest sees shared transcript",
+        Duration::from_secs(15),
+        || async {
+            let text = guest_cdp
+                .eval_json(
+                    &guest_sid,
+                    r#"document.querySelector('[data-testid="chat"]')?.innerText ?? ''"#,
+                )
+                .await?;
+            let s = text.as_str().unwrap_or_default();
+            Ok((s.contains("owner secret before share") && s.contains("Echo:")).then_some(true))
+        },
+    )
+    .await?;
+    let guest_readonly = guest_cdp
+        .eval_json(
+            &guest_sid,
+            r#"(() => ({
+                fieldsetDisabled: document.querySelector('fieldset')?.disabled ?? false,
+                newBtnDisabled: Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'New session')?.disabled ?? false
+            }))()"#,
+        )
+        .await?;
+    assert_eq!(guest_readonly["fieldsetDisabled"], json!(true));
+    assert_eq!(guest_readonly["newBtnDisabled"], json!(true));
+    assert_no_errors_and_assets_ok(&guest_cdp, &guest_sid).await?;
+
+    // Verify guest cannot access unshared Session 2 via HTTP or Chord.
+    let cookies_resp = guest_cdp
+        .call(
+            "Network.getCookies",
+            json!({ "urls": [origin] }),
+            Some(&guest_sid),
+        )
+        .await?;
+    let guest_cookie_name = format!("p2_guest_{port}");
+    let guest_cookie_val = cookies_resp["cookies"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|c| c["name"] == guest_cookie_name))
+        .and_then(|c| c["value"].as_str())
+        .ok_or("missing p2_guest cookie in Chromium")?
+        .to_owned();
+    let guest_cookie = format!("{guest_cookie_name}={guest_cookie_val}");
+
+    let unshared_http = http
+        .get(format!("{origin}/s/{session2_id}"))
+        .header(reqwest::header::COOKIE, &guest_cookie)
+        .send()
+        .await?;
+    assert_eq!(unshared_http.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let (guest_peer, _guest_link) = connect_browser_chord(p2_proc.address, &guest_cookie).await?;
+    let chat_contract = Arc::new(lookup("p2.chat")?);
+    let unshared_hold = guest_peer.hold(
+        chat_contract,
+        JsonValue::from_serde(json!({ "session": session2_id, "conversation": 1 })),
+        &ctx,
+    )?;
+    let unshared_res =
+        tokio::time::timeout(Duration::from_secs(5), unshared_hold.wait(&ctx)).await?;
+    assert!(
+        matches!(unshared_res, Err(pi_rs_chord::Error::Chord(ref e)) if e.code == "forbidden"),
+        "guest hold on unshared session must be forbidden: {unshared_res:?}"
+    );
+    guest_peer.close();
+
+    // Expire / revoke the guest share by resetting the view link.
+    sharing_held
+        .call(
+            "link",
+            JsonValue::from_serde(json!({ "mode": "view", "reset": true })),
+            &ctx,
+        )
+        .await?;
+
+    // Guest Chromium must transition to "Share ended" and clear session/transcript state.
+    wait_until(
+        "guest sees Share ended",
+        Duration::from_secs(15),
+        || async {
+            let state = guest_cdp
+                .eval_json(
+                    &guest_sid,
+                    r#"(() => ({
+                    status: document.querySelector('p[role="status"]')?.textContent?.trim() ?? '',
+                    rows: document.querySelectorAll('[data-testid="chat"] .chat-row').length
+                }))()"#,
+                )
+                .await?;
+            let ok = state["status"].as_str() == Some("Share ended")
+                && state["rows"].as_u64() == Some(0);
+            Ok(ok.then_some(()))
+        },
+    )
+    .await?;
+
+    // Old join link returns 410 Gone; old guest cookie fails HTTP (401) and WebSocket upgrade.
+    let expired_join = http
+        .get(format!("{origin}/join/{share_token}"))
+        .send()
+        .await?;
+    assert_eq!(expired_join.status(), reqwest::StatusCode::GONE);
+    let expired_session_http = http
+        .get(format!("{origin}/s/{session1_id}"))
+        .header(reqwest::header::COOKIE, &guest_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        expired_session_http.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let revoked_ws = connect_browser_chord(p2_proc.address, &guest_cookie).await;
+    assert!(
+        revoked_ws.is_err(),
+        "revoked guest WebSocket must be rejected"
+    );
+
+    // Reloading Guest Chromium lands on Sign-in page under CSP.
+    guest_cdp.clear_telemetry();
+    guest_cdp
+        .navigate(&guest_sid, &format!("{origin}/s/{session1_id}"))
+        .await?;
+    wait_until(
+        "guest lands on sign-in page",
+        Duration::from_secs(10),
+        || async {
+            let ready = guest_cdp
+                .eval_json(
+                    &guest_sid,
+                    r#"(() => ({
+                    hasForm: Boolean(document.getElementById('sign-in')),
+                    hasRoot: Boolean(document.getElementById('root')),
+                    text: document.body ? document.body.innerText : ''
+                }))()"#,
+                )
+                .await?;
+            let ok = ready["hasForm"].as_bool() == Some(true)
+                && ready["hasRoot"].as_bool() == Some(false)
+                && ready["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("Sign in to Pi"));
+            Ok(ok.then_some(()))
+        },
+    )
+    .await?;
+    let guest_csp = guest_cdp
+        .eval_json(&guest_sid, "window.__cspViolations || []")
+        .await?;
+    assert_eq!(guest_csp, json!([]));
+
+    // Owner remains connected and unaffected.
+    owner_cdp.clear_telemetry();
+    owner_cdp
+        .eval_json(
+            &owner_sid,
+            r#"(() => {
+                const textarea = document.querySelector('textarea.composer-input');
+                const send = document.querySelector('button.composer-send');
+                if (!textarea || !send || textarea.disabled) return false;
+                textarea.focus();
+                textarea.value = 'owner after share expired';
+                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                send.click();
+                return true;
+            })()"#,
+        )
+        .await?;
+    wait_until(
+        "owner echo after share expired",
+        Duration::from_secs(20),
+        || async {
+            let text = owner_cdp
+                .eval_json(
+                    &owner_sid,
+                    r#"document.querySelector('[data-testid="chat"]')?.innerText ?? ''"#,
+                )
+                .await?;
+            let s = text.as_str().unwrap_or_default();
+            Ok((s.contains("owner after share expired") && s.contains("Echo:")).then_some(true))
+        },
+    )
+    .await?;
+
+    owner_peer.close();
+    drop(guest_cdp);
+    drop(owner_cdp);
+    guest_chromium.close();
+    owner_chromium.close();
     p2_guard.terminate_and_wait()?;
     Ok(())
 }

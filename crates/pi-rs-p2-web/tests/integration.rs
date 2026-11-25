@@ -168,7 +168,7 @@ fn all_builtin_contracts_encode_canonical_hold_frames() {
     use pi_rs_p2_web::browser_plugins::{ALL_CONTRACTS, hold_for_contract};
     use pi_rs_p2_web::chord_bridge::decode_varint;
 
-    assert_eq!(ALL_CONTRACTS.len(), 14);
+    assert_eq!(ALL_CONTRACTS.len(), 16);
     for (idx, spec) in ALL_CONTRACTS.iter().enumerate() {
         let hold_id = (idx + 1) as u64;
         let frame = hold_for_contract(hold_id, spec, Some("s-1"), Some(2), Some("web"));

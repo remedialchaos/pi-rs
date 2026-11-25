@@ -9,10 +9,14 @@ use crate::activity::label::Described;
 use crate::activity::model::{Step, StepStatus, ToolActivityTable, call_status};
 use crate::chord_bridge::{encode_part, encode_string, encode_varint};
 use crate::cost::AssistantCost;
-use crate::state::composer_state::{PickedFile, pick_files, referenced_files};
+use crate::state::attachments::UploadEntry;
+use crate::state::composer_state::{
+    PickedFile, decode_draft, encode_draft, pick_files, referenced_files, rename_references,
+};
 use crate::ui::command_menu::CommandItem;
 use crate::ui::terminal::{TerminalStatus, VoiceState};
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -140,6 +144,28 @@ pub const P2_VOICE_MODE: ContractSpec = ContractSpec {
     address_kind: ContractAddressKind::Session,
 };
 
+pub const P2_SESSION_FILES: ContractSpec = ContractSpec {
+    name: "p2.session-files",
+    version: 1,
+    fingerprint: 0x19375d910d567914,
+    address_kind: ContractAddressKind::Session,
+};
+
+pub const P2_PLUGIN_RELOAD: ContractSpec = ContractSpec {
+    name: "p2.plugin-reload",
+    version: 1,
+    fingerprint: 0xea4fb3b08c01ee95,
+    address_kind: ContractAddressKind::Server,
+};
+
+/// Local worker contract descriptor for `p2.attachments`.
+pub const P2_ATTACHMENTS: ContractSpec = ContractSpec {
+    name: "p2.attachments",
+    version: 3,
+    fingerprint: 0xee56778497e803af,
+    address_kind: ContractAddressKind::Server,
+};
+
 /// All built-in contracts used by the browser host.
 pub const ALL_CONTRACTS: &[ContractSpec] = &[
     P2_ACCESS,
@@ -156,6 +182,8 @@ pub const ALL_CONTRACTS: &[ContractSpec] = &[
     P2_TREE,
     P2_TERMINALS,
     P2_VOICE_MODE,
+    P2_SESSION_FILES,
+    P2_PLUGIN_RELOAD,
 ];
 
 /// Looks up a built-in contract descriptor by canonical name.
@@ -271,6 +299,24 @@ pub mod indexes {
         pub const STATE_FAILURE: u64 = 0;
         pub const STATE_VOICES: u64 = 1;
     }
+
+    pub mod session_files {
+        pub const VARIANT_SERVER: u64 = 0;
+        pub const METHOD_APPEND: u64 = 0;
+        pub const METHOD_BEGIN: u64 = 1;
+        pub const METHOD_CANCEL: u64 = 2;
+        pub const METHOD_DOWNLOAD: u64 = 3;
+        pub const METHOD_FINISH: u64 = 4;
+        pub const METHOD_READ: u64 = 5;
+    }
+
+    pub mod attachments {
+        pub const METHOD_RESOLVE: u64 = 0;
+    }
+
+    pub mod plugin_reload {
+        pub const METHOD_RELOAD: u64 = 0;
+    }
 }
 
 /// Encodes a Chord `Hold` frame (kind = 1).
@@ -299,13 +345,39 @@ pub fn encode_release_frame(hold_id: u64) -> Vec<u8> {
     buf
 }
 
-/// Encodes a Chord `Call` frame (kind = 3).
+/// Encodes a Chord `Call` frame (kind = 3) with JSON-only payload (flags = 1).
 pub fn encode_call_frame(call_id: u64, hold_id: u64, method: u64, args: &Value) -> Vec<u8> {
     let mut buf = vec![3];
     for field in [call_id, hold_id, method, 1] {
         encode_varint(field, &mut buf);
     }
     buf.extend(encode_part(args.to_string().as_bytes(), false));
+    buf
+}
+
+/// Encodes a Chord `Call` frame (kind = 3) carrying binary byte segments (flags = 3).
+pub fn encode_call_frame_with_segments(
+    call_id: u64,
+    hold_id: u64,
+    method: u64,
+    args: &Value,
+    segments: &[&[u8]],
+) -> Vec<u8> {
+    if segments.is_empty() {
+        return encode_call_frame(call_id, hold_id, method, args);
+    }
+    let mut buf = vec![3];
+    for field in [call_id, hold_id, method, 3] {
+        encode_varint(field, &mut buf);
+    }
+    buf.extend(encode_part(args.to_string().as_bytes(), false));
+    encode_varint(segments.len() as u64, &mut buf);
+    for seg in segments {
+        encode_varint(seg.len() as u64, &mut buf);
+    }
+    for seg in segments {
+        buf.extend_from_slice(seg);
+    }
     buf
 }
 
@@ -326,7 +398,7 @@ pub fn hold_for_contract(
                 json!({ "id": sid }),
             )
         }
-        "p2.tree" => {
+        "p2.tree" | "p2.session-files" => {
             let sid = session.unwrap_or("");
             (json!({ "session": sid }), json!({ "id": sid }))
         }
@@ -578,6 +650,21 @@ impl SidePanel {
             Self::Sharing => "Sharing",
             Self::Tree => "Session Tree",
             Self::Voice => "Voice",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "none" => Some(Self::None),
+            "cost" => Some(Self::Cost),
+            "artifacts" => Some(Self::Artifacts),
+            "models" => Some(Self::Models),
+            "settings" => Some(Self::Settings),
+            "mcp" => Some(Self::Mcp),
+            "sharing" => Some(Self::Sharing),
+            "tree" => Some(Self::Tree),
+            "voice" => Some(Self::Voice),
+            _ => None,
         }
     }
 }
@@ -1129,11 +1216,13 @@ pub fn decode_voice_view(
     }
 }
 
-/// Composer attachment manager backed by `crate::state::composer_state`.
+/// Composer attachment manager backed by `crate::state::composer_state` and `crate::state::attachments`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ComposerAttachments {
     pub files: Vec<PickedFile>,
     pub last_too_large: Option<String>,
+    pub uploads: IndexMap<String, UploadEntry>,
+    pub last_error: Option<String>,
 }
 
 impl ComposerAttachments {
@@ -1149,16 +1238,372 @@ impl ComposerAttachments {
 
     pub fn remove(&mut self, key: &str) {
         self.files.retain(|f| f.key != key);
+        self.uploads.shift_remove(key);
     }
 
     pub fn clear(&mut self) {
         self.files.clear();
         self.last_too_large = None;
+        self.uploads.clear();
+        self.last_error = None;
     }
 
     pub fn referenced_for_draft(&self, draft: &str) -> Vec<PickedFile> {
         referenced_files(draft, &self.files)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Browser-side dynamic plugin hot-reload & draft preservation.
+// ---------------------------------------------------------------------------
+
+/// WebSocket close code sent by `p2` when the browser's web bundle is stale (`p2: stale page, reload`).
+pub const RELOAD_CLOSE_CODE: u16 = 4001;
+/// `localStorage` key for preserving the active composer draft across reloads.
+pub const DRAFT_STORAGE_KEY: &str = "p2-draft";
+/// `localStorage` key for preserving active session/panel/draft metadata across hot-reload.
+pub const RELOAD_STATE_STORAGE_KEY: &str = "p2-reload-state";
+/// Window `CustomEvent` name for dynamic browser plugin manifest hot-swaps.
+pub const PLUGIN_RELOAD_EVENT: &str = "pi-plugin-reload";
+
+/// Reason a browser reload or plugin hot-swap was triggered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReloadTrigger {
+    None,
+    CloseFrame { code: u16, reason: String },
+    AssetRevisionChanged { current: String, remote: String },
+    PluginRevisionChanged { previous: String, next: String },
+}
+
+/// Whether a WebSocket close code/reason signals a server-initiated reload.
+pub fn is_reload_close_frame(code: u16, reason: &str) -> bool {
+    if code == RELOAD_CLOSE_CODE {
+        return true;
+    }
+    let lower = reason.to_ascii_lowercase();
+    if (4000..=4999).contains(&code) && lower.contains("reload") {
+        return true;
+    }
+    lower == "reload" || lower.contains("stale page")
+}
+
+/// Classifies a WebSocket close frame into a `ReloadTrigger`.
+pub fn detect_close_reload(code: u16, reason: &str) -> ReloadTrigger {
+    if is_reload_close_frame(code, reason) {
+        ReloadTrigger::CloseFrame {
+            code,
+            reason: reason.to_owned(),
+        }
+    } else {
+        ReloadTrigger::None
+    }
+}
+
+/// Detects whether `/_chord/web/base` reports a different asset bundle hash than the loaded page.
+pub fn detect_asset_revision_change(loaded_base: &str, remote_base: &str) -> ReloadTrigger {
+    let loaded = loaded_base.trim();
+    let remote = remote_base.trim().trim_matches('"');
+    if !loaded.is_empty() && !remote.is_empty() && loaded != remote {
+        ReloadTrigger::AssetRevisionChanged {
+            current: loaded.to_owned(),
+            remote: remote.to_owned(),
+        }
+    } else {
+        ReloadTrigger::None
+    }
+}
+
+/// Canonical draft storage key for `(session_id, conversation)`.
+pub fn draft_key_for(session_id: &str, conversation: u64) -> String {
+    format!("{session_id}#{conversation}")
+}
+
+/// State preserved across a browser-triggered reload.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadSnapshot {
+    pub session_id: Option<String>,
+    pub conversation: Option<u64>,
+    pub panel_id: Option<String>,
+    pub draft_key: Option<String>,
+    pub draft_text: String,
+    pub asset_revision: String,
+    pub plugin_revision: Option<String>,
+}
+
+pub fn encode_reload_snapshot(snapshot: &ReloadSnapshot) -> String {
+    serde_json::to_string(snapshot).unwrap_or_else(|_| "{}".into())
+}
+
+pub fn decode_reload_snapshot(raw: &str) -> Option<ReloadSnapshot> {
+    serde_json::from_str::<ReloadSnapshot>(raw).ok()
+}
+
+/// Restores a saved `p2-draft` JSON string for `expected_key`, stripping stale attachment keys.
+pub fn restore_draft_for_conversation(
+    raw_draft: Option<&str>,
+    expected_key: &str,
+) -> Option<String> {
+    let (key, text) = decode_draft(raw_draft?)?;
+    if key != expected_key {
+        return None;
+    }
+    Some(rename_references(&text))
+}
+
+/// Formats `p2-draft` JSON for `(session_id, conversation)` and `text`.
+pub fn format_draft_storage(session_id: &str, conversation: u64, text: &str) -> String {
+    encode_draft(&draft_key_for(session_id, conversation), text)
+}
+
+/// Dynamic descriptor for a browser plugin panel/command entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginDescriptor {
+    pub id: String,
+    pub title: String,
+    pub revision: String,
+    #[serde(default)]
+    pub contract: Option<String>,
+    #[serde(default)]
+    pub panel: Option<String>,
+    #[serde(default)]
+    pub command_id: Option<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub section: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Outcome of applying a hot-swap plugin descriptor update.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HotSwapReport {
+    pub added: Vec<String>,
+    pub updated: Vec<String>,
+    pub removed: Vec<String>,
+    pub revision_changed: bool,
+    pub closed_active_panel: bool,
+}
+
+/// Registry of active browser plugin descriptors supporting live hot-swap updates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginRegistryState {
+    pub revision: String,
+    pub plugins: IndexMap<String, PluginDescriptor>,
+}
+
+impl Default for PluginRegistryState {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+impl PluginRegistryState {
+    pub fn builtin() -> Self {
+        let entries = [
+            (
+                "models",
+                "Models",
+                Some(P2_MODELS.name),
+                "models",
+                "panel-models",
+                &["provider", "default"][..],
+                "Settings",
+            ),
+            (
+                "settings",
+                "Settings",
+                Some(P2_SETTINGS.name),
+                "settings",
+                "panel-settings",
+                &["preferences", "config"][..],
+                "Settings",
+            ),
+            (
+                "mcp",
+                "MCP Servers",
+                Some(P2_MCP.name),
+                "mcp",
+                "panel-mcp",
+                &["tools", "oauth"][..],
+                "Settings",
+            ),
+            (
+                "sharing",
+                "Sharing",
+                Some(P2_SHARING.name),
+                "sharing",
+                "panel-sharing",
+                &["guests", "links"][..],
+                "Session",
+            ),
+            (
+                "cost",
+                "Cost",
+                Some(P2_CHAT_COSTS.name),
+                "cost",
+                "panel-cost",
+                &["usage", "spend", "tokens"][..],
+                "Panels",
+            ),
+            (
+                "artifacts",
+                "Artifacts",
+                Some(P2_ARTIFACTS.name),
+                "artifacts",
+                "panel-artifacts",
+                &["files", "preview"][..],
+                "Panels",
+            ),
+            (
+                "tree",
+                "Session Tree",
+                Some(P2_TREE.name),
+                "tree",
+                "panel-tree",
+                &["branches", "navigate"][..],
+                "Session",
+            ),
+            (
+                "voice",
+                "Voice",
+                Some(P2_VOICE_MODE.name),
+                "voice",
+                "panel-voice",
+                &["audio", "tts", "mic"][..],
+                "Session",
+            ),
+        ];
+        let mut plugins = IndexMap::new();
+        for (id, title, contract, panel, cmd, kw, section) in entries {
+            plugins.insert(
+                id.to_owned(),
+                PluginDescriptor {
+                    id: id.to_owned(),
+                    title: title.to_owned(),
+                    revision: "builtin-1".to_owned(),
+                    contract: contract.map(str::to_owned),
+                    panel: Some(panel.to_owned()),
+                    command_id: Some(cmd.to_owned()),
+                    keywords: kw.iter().map(|s| (*s).to_owned()).collect(),
+                    section: section.to_owned(),
+                    enabled: true,
+                },
+            );
+        }
+        Self {
+            revision: "builtin-1".to_owned(),
+            plugins,
+        }
+    }
+
+    /// Hot-swaps the active plugin descriptors to `descriptors` at `next_revision`.
+    /// Preserves session selection and draft; only signals `closed_active_panel` if the
+    /// currently open `active_panel_id` was removed or disabled.
+    pub fn hot_swap(
+        &mut self,
+        next_revision: String,
+        descriptors: Vec<PluginDescriptor>,
+        active_panel_id: Option<&str>,
+    ) -> HotSwapReport {
+        let mut report = HotSwapReport {
+            revision_changed: self.revision != next_revision,
+            ..HotSwapReport::default()
+        };
+        let mut next = IndexMap::new();
+        for desc in descriptors {
+            if let Some(prev) = self.plugins.get(&desc.id) {
+                if prev != &desc {
+                    report.updated.push(desc.id.clone());
+                }
+            } else {
+                report.added.push(desc.id.clone());
+            }
+            next.insert(desc.id.clone(), desc);
+        }
+        for id in self.plugins.keys() {
+            if !next.contains_key(id) {
+                report.removed.push(id.clone());
+            }
+        }
+        if let Some(active) = active_panel_id {
+            let still_open = next
+                .values()
+                .any(|d| d.enabled && d.panel.as_deref() == Some(active));
+            report.closed_active_panel = !still_open;
+        }
+        self.revision = next_revision;
+        self.plugins = next;
+        report
+    }
+
+    /// Returns enabled plugin descriptors that expose a side panel.
+    pub fn active_panels(&self) -> Vec<&PluginDescriptor> {
+        self.plugins
+            .values()
+            .filter(|d| d.enabled && d.panel.is_some())
+            .collect()
+    }
+
+    /// Returns command-menu items combining core navigation with currently active plugins.
+    pub fn dynamic_commands(&self) -> Vec<CommandItem> {
+        let mut items = vec![
+            CommandItem {
+                id: "new-session".into(),
+                title: "New session".into(),
+                keywords: vec!["create".into(), "chat".into()],
+                section: "Sessions".into(),
+            },
+            CommandItem {
+                id: "pane-chat".into(),
+                title: "Show chat".into(),
+                keywords: vec!["conversation".into(), "transcript".into()],
+                section: "Panes".into(),
+            },
+            CommandItem {
+                id: "pane-terminal".into(),
+                title: "Open terminal".into(),
+                keywords: vec!["shell".into(), "pty".into()],
+                section: "Panes".into(),
+            },
+            CommandItem {
+                id: "toggle-theme".into(),
+                title: "Toggle theme".into(),
+                keywords: vec!["light".into(), "dark".into(), "appearance".into()],
+                section: "Appearance".into(),
+            },
+        ];
+        for desc in self.plugins.values().filter(|d| d.enabled) {
+            if let Some(cmd_id) = &desc.command_id {
+                items.push(CommandItem {
+                    id: cmd_id.clone(),
+                    title: desc.title.clone(),
+                    keywords: desc.keywords.clone(),
+                    section: if desc.section.is_empty() {
+                        "Plugins".into()
+                    } else {
+                        desc.section.clone()
+                    },
+                });
+            }
+        }
+        items
+    }
+}
+
+/// Decodes a `pi-plugin-reload` JSON manifest (`{ "revision": "...", "plugins": [...] }`).
+pub fn decode_plugin_manifest(value: &Value) -> Option<(String, Vec<PluginDescriptor>)> {
+    let revision = value.get("revision")?.as_str()?.to_owned();
+    let plugins_val = value.get("plugins")?.as_array()?;
+    let plugins = plugins_val
+        .iter()
+        .filter_map(|item| serde_json::from_value::<PluginDescriptor>(item.clone()).ok())
+        .collect();
+    Some((revision, plugins))
 }
 
 /// Lifecycle state of an active or failed Chord contract hold.
@@ -1417,5 +1862,115 @@ mod tests {
             Some("denied".into()),
             "required core hold failure must propagate"
         );
+    }
+
+    #[test]
+    fn reload_triggers_detect_close_frames_and_asset_revision_changes() {
+        assert!(is_reload_close_frame(4001, ""));
+        assert!(is_reload_close_frame(4002, "plugin reload required"));
+        assert!(is_reload_close_frame(1000, "p2: stale page, reload"));
+        assert!(!is_reload_close_frame(1000, "normal closure"));
+        assert!(!is_reload_close_frame(1006, "abnormal"));
+
+        assert_eq!(
+            detect_close_reload(4001, "p2: stale page, reload"),
+            ReloadTrigger::CloseFrame {
+                code: 4001,
+                reason: "p2: stale page, reload".into()
+            }
+        );
+        assert_eq!(
+            detect_asset_revision_change("abc", "def"),
+            ReloadTrigger::AssetRevisionChanged {
+                current: "abc".into(),
+                remote: "def".into()
+            }
+        );
+        assert_eq!(
+            detect_asset_revision_change("abc", "\"abc\""),
+            ReloadTrigger::None
+        );
+    }
+
+    #[test]
+    fn reload_snapshot_and_draft_preserve_text_across_reload() {
+        let snap = ReloadSnapshot {
+            session_id: Some("sess-1".into()),
+            conversation: Some(2),
+            panel_id: Some("models".into()),
+            draft_key: Some(draft_key_for("sess-1", 2)),
+            draft_text: "in progress".into(),
+            asset_revision: "rev-1".into(),
+            plugin_revision: Some("plug-1".into()),
+        };
+        let raw = encode_reload_snapshot(&snap);
+        assert_eq!(decode_reload_snapshot(&raw), Some(snap));
+
+        let saved_draft = format_draft_storage("sess-1", 2, "see [pic.png](attachment:k1) now");
+        assert_eq!(
+            restore_draft_for_conversation(Some(&saved_draft), "sess-1#2"),
+            Some("see pic.png now".into())
+        );
+        assert_eq!(
+            restore_draft_for_conversation(Some(&saved_draft), "sess-2#1"),
+            None
+        );
+    }
+
+    #[test]
+    fn plugin_registry_hot_swap_updates_panels_and_commands() {
+        let mut reg = PluginRegistryState::builtin();
+        let mut next: Vec<PluginDescriptor> = reg.plugins.values().cloned().collect();
+        // Update models title and add a new custom panel while keeping "models" open.
+        next[0].title = "Models v2".into();
+        next[0].revision = "rev-2".into();
+        next.push(PluginDescriptor {
+            id: "custom-metrics".into(),
+            title: "Metrics".into(),
+            revision: "rev-2".into(),
+            contract: None,
+            panel: Some("custom-metrics".into()),
+            command_id: Some("panel-custom-metrics".into()),
+            keywords: vec!["perf".into()],
+            section: "Plugins".into(),
+            enabled: true,
+        });
+        let report = reg.hot_swap("rev-2".into(), next.clone(), Some("models"));
+        assert!(report.revision_changed);
+        assert_eq!(report.added, vec!["custom-metrics"]);
+        assert_eq!(report.updated, vec!["models"]);
+        assert!(report.removed.is_empty());
+        assert!(!report.closed_active_panel);
+        assert!(
+            reg.dynamic_commands()
+                .iter()
+                .any(|c| c.id == "panel-custom-metrics")
+        );
+
+        // Removing the currently open panel flags `closed_active_panel`.
+        let without_custom: Vec<PluginDescriptor> = next
+            .into_iter()
+            .filter(|d| d.id != "custom-metrics")
+            .collect();
+        let report2 = reg.hot_swap("rev-3".into(), without_custom, Some("custom-metrics"));
+        assert_eq!(report2.removed, vec!["custom-metrics"]);
+        assert!(report2.closed_active_panel);
+
+        let manifest = json!({
+            "revision": "rev-4",
+            "plugins": [{
+                "id": "models",
+                "title": "Models",
+                "revision": "rev-4",
+                "panel": "models",
+                "command_id": "panel-models",
+                "keywords": [],
+                "section": "Settings",
+                "enabled": true
+            }]
+        });
+        let (rev, parsed) = decode_plugin_manifest(&manifest).expect("manifest");
+        assert_eq!(rev, "rev-4");
+        assert_eq!(parsed.len(), 1);
     }
 }

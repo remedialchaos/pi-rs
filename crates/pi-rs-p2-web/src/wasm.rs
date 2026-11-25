@@ -4,21 +4,40 @@ mod wire;
 
 use crate::activity::model::ToolActivityTable;
 use crate::browser_plugins::{
-    ArtifactsView, ComposerAttachments, ContractSpec, HoldTracker, McpServersView, ModelsView,
-    P2_ACCESS, P2_ARTIFACTS, P2_CHAT, P2_CHAT_COSTS, P2_MCP, P2_MODELS, P2_SESSION_STATUS,
-    P2_SESSIONS, P2_SETTINGS, P2_SHARING, P2_TERMINALS, P2_TREE, P2_VOICE_MODE, P2_VOICE_SERVICE,
-    ProjectedRole, SessionStatusView, SettingsView, SharingView, SidePanel, TerminalsView,
-    TreeView, VoiceView, builtin_commands, decode_artifact_content, decode_artifacts_view,
-    decode_costs_view, decode_mcp_view, decode_models_view, decode_session_status_view,
+    ArtifactsView, ComposerAttachments, ContractSpec, DRAFT_STORAGE_KEY, HoldTracker,
+    McpServersView, ModelsView, P2_ACCESS, P2_ARTIFACTS, P2_CHAT, P2_CHAT_COSTS, P2_MCP, P2_MODELS,
+    P2_SESSION_FILES, P2_SESSION_STATUS, P2_SESSIONS, P2_SETTINGS, P2_SHARING, P2_TERMINALS,
+    P2_TREE, P2_VOICE_MODE, P2_VOICE_SERVICE, PLUGIN_RELOAD_EVENT, PluginRegistryState,
+    ProjectedMessage, ProjectedRole, RELOAD_STATE_STORAGE_KEY, ReloadSnapshot, ReloadTrigger,
+    SessionStatusView, SettingsView, SharingView, SidePanel, TerminalsView, TreeView, VoiceView,
+    decode_artifact_content, decode_artifacts_view, decode_costs_view, decode_mcp_view,
+    decode_models_view, decode_plugin_manifest, decode_reload_snapshot, decode_session_status_view,
     decode_settings_view, decode_sharing_view, decode_terminals_list, decode_tree_view,
-    decode_voice_view, encode_release_frame, hold_for_contract, indexes, project_chat_transcript,
+    decode_voice_view, detect_asset_revision_change, detect_close_reload, draft_key_for,
+    encode_release_frame, encode_reload_snapshot, format_draft_storage, hold_for_contract, indexes,
+    project_chat_transcript, restore_draft_for_conversation,
+};
+use crate::chord_bridge::{
+    HOST_MENU_EVENT, HOST_THEME_EVENT, HostAnswer, HostMenuEvent, HtmlThemeAttributes,
+    PI_HOST_HANDLER, ShellBridgeMessage, THEME_STORAGE_KEY, ThemeBridgeState, ThemePreference,
+    format_document_title, is_native_host,
 };
 use crate::cost::AssistantCost;
+use crate::state::attachments::{
+    MAX_ATTACHMENTS_PER_MESSAGE, UPLOAD_CHUNK_BYTES, UploadChunk, decode_begin_upload_result,
+    decode_finish_upload_result, encode_append_upload_call, encode_begin_upload_call,
+    encode_cancel_upload_call, encode_finish_upload_call, rewrite_attachment_reference,
+    split_upload_chunks,
+};
+use crate::state::conversation_cache::{
+    MAX_CONVERSATIONS, MAX_PERSISTED_STORE_BYTES, PersistedTranscriptStore,
+    STORAGE_KEY_TRANSCRIPTS, projected_from_cached, reconcile_live_snapshot,
+};
 use crate::ui::{
     app::{AppLayout, MainPane},
     chat::{Chat, ChatMessage, MessageRole},
     command_menu::CommandMenu,
-    composer::Composer,
+    composer::{Composer, SelectedUploadFile},
     cost_ui::CostPanel,
     terminal::{Terminal, TerminalStatus, Voice, VoiceState},
 };
@@ -30,7 +49,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
-use web_sys::{HtmlElement, KeyboardEvent, Url};
+use web_sys::{HtmlElement, KeyboardEvent, MediaQueryList, Url};
 use wire::{Reader, Result};
 
 #[derive(Clone, PartialEq)]
@@ -46,6 +65,7 @@ enum Command {
     Send(String),
     Create,
     OpenPanel(SidePanel),
+    OpenCustomPanel(String),
     OpenPane(MainPane),
     ReadArtifact(String),
     RefreshCosts,
@@ -54,6 +74,12 @@ enum Command {
     SetDefaultModel(String, String, String),
     OpenTerminal,
     ToggleVoice,
+    UploadFile {
+        key: String,
+        name: String,
+        bytes: Vec<u8>,
+    },
+    CancelUpload(String),
 }
 
 #[derive(Clone)]
@@ -61,6 +87,22 @@ struct Submission {
     destination: (String, u64),
     text: String,
     id: String,
+}
+
+#[derive(Clone)]
+enum UploadRpc {
+    Begin { key: String },
+    Append { key: String, next_index: usize },
+    Finish { key: String },
+    Cancel,
+}
+
+struct ActiveUpload {
+    hold_id: u64,
+    total_bytes: u64,
+    chunks: Vec<UploadChunk>,
+    upload_token: Option<String>,
+    cancelled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -79,6 +121,7 @@ struct Ui {
     commands: StoredValue<Option<UnboundedSender<Command>>>,
     pane: RwSignal<MainPane>,
     panel: RwSignal<SidePanel>,
+    custom_panel: RwSignal<Option<String>>,
     command_menu_open: RwSignal<bool>,
     command_query: RwSignal<String>,
     command_recents: RwSignal<Vec<String>>,
@@ -96,6 +139,11 @@ struct Ui {
     voice_state: RwSignal<VoiceState>,
     attachments: RwSignal<ComposerAttachments>,
     plugin_errors: RwSignal<HashMap<String, String>>,
+    transcript_cache: StoredValue<PersistedTranscriptStore>,
+    plugin_registry: RwSignal<PluginRegistryState>,
+    asset_revision: StoredValue<String>,
+    theme: StoredValue<ThemeBridgeState>,
+    theme_label: RwSignal<&'static str>,
 }
 
 impl Ui {
@@ -106,7 +154,176 @@ impl Ui {
     }
 }
 
-fn endpoint(root: &HtmlElement) -> Result<(String, bool)> {
+fn storage_get(key: &str) -> Option<String> {
+    let storage = window().local_storage().ok().flatten()?;
+    storage.get_item(key).ok().flatten()
+}
+
+fn storage_set(key: &str, value: &str) -> bool {
+    let Ok(Some(storage)) = window().local_storage() else {
+        return false;
+    };
+    storage.set_item(key, value).is_ok()
+}
+
+fn storage_remove(key: &str) {
+    if let Ok(Some(storage)) = window().local_storage() {
+        let _ = storage.remove_item(key);
+    }
+}
+
+fn persist_transcript_cache(store: &PersistedTranscriptStore) {
+    let json = store.to_bounded_json(MAX_PERSISTED_STORE_BYTES);
+    if !storage_set(STORAGE_KEY_TRANSCRIPTS, &json) {
+        let smaller = store.to_bounded_json(MAX_PERSISTED_STORE_BYTES / 2);
+        let _ = storage_set(STORAGE_KEY_TRANSCRIPTS, &smaller);
+    }
+}
+
+fn chat_messages_from_projected(rows: Vec<ProjectedMessage>) -> Vec<ChatMessage> {
+    rows.into_iter()
+        .map(|row| ChatMessage {
+            id: row.id,
+            role: match row.role {
+                ProjectedRole::User => MessageRole::User,
+                ProjectedRole::Assistant => MessageRole::Assistant,
+                ProjectedRole::Tool => MessageRole::Tool,
+            },
+            text: row.text,
+            streaming: row.streaming,
+            activities: row.activities,
+        })
+        .collect()
+}
+
+fn hydrate_messages_from_cache(ui: Ui, session_id: &str, conversation: u64) {
+    let cached = ui
+        .transcript_cache
+        .with_value(|store| store.get(session_id, conversation).cloned());
+    if let Some(conv) = cached {
+        let projected = projected_from_cached(&conv.messages);
+        ui.messages.set(chat_messages_from_projected(projected));
+    } else {
+        ui.messages.set(vec![]);
+    }
+}
+
+fn save_reload_state(ui: Ui) {
+    let selected = ui.selected.get_untracked();
+    let draft = ui.draft.get_untracked();
+    if let Some((ref sid, conv)) = selected {
+        let _ = storage_set(DRAFT_STORAGE_KEY, &format_draft_storage(sid, conv, &draft));
+    }
+    let panel_id = if let Some(custom) = ui.custom_panel.get_untracked() {
+        Some(custom)
+    } else {
+        let p = ui.panel.get_untracked();
+        p.is_open().then(|| p.id().to_owned())
+    };
+    let snap = ReloadSnapshot {
+        session_id: selected.as_ref().map(|(s, _)| s.clone()),
+        conversation: selected.as_ref().map(|(_, c)| *c),
+        panel_id,
+        draft_key: selected.as_ref().map(|(s, c)| draft_key_for(s, *c)),
+        draft_text: draft,
+        asset_revision: ui.asset_revision.get_value(),
+        plugin_revision: Some(ui.plugin_registry.with_untracked(|r| r.revision.clone())),
+    };
+    let _ = storage_set(RELOAD_STATE_STORAGE_KEY, &encode_reload_snapshot(&snap));
+}
+
+fn webkit_handler(name: &str) -> Option<JsValue> {
+    let webkit = js_sys::Reflect::get(&window(), &"webkit".into()).ok()?;
+    if webkit.is_undefined() || webkit.is_null() {
+        return None;
+    }
+    let handlers = js_sys::Reflect::get(&webkit, &"messageHandlers".into()).ok()?;
+    if handlers.is_undefined() || handlers.is_null() {
+        return None;
+    }
+    let handler = js_sys::Reflect::get(&handlers, &JsValue::from_str(name)).ok()?;
+    if handler.is_undefined() || handler.is_null() {
+        None
+    } else {
+        Some(handler)
+    }
+}
+
+fn post_shell_message(msg: &ShellBridgeMessage) -> Option<js_sys::Promise> {
+    let handler = webkit_handler(msg.handler_name())?;
+    let post = js_sys::Reflect::get(&handler, &"postMessage".into())
+        .ok()?
+        .dyn_into::<js_sys::Function>()
+        .ok()?;
+    let payload = js_sys::JSON::parse(&msg.to_json()).ok()?;
+    let result = post.call1(&handler, &payload).ok()?;
+    result.dyn_into::<js_sys::Promise>().ok()
+}
+
+fn apply_html_theme(attrs: HtmlThemeAttributes) {
+    if let Some(el) = document().document_element() {
+        let _ = el.set_attribute("data-theme", attrs.data_theme);
+        let _ = el.set_attribute("data-color-scheme", attrs.data_color_scheme);
+    }
+}
+
+fn sync_theme_dom_and_shell(ui: Ui) {
+    let (attrs, label, pref, resolved) = ui.theme.with_value(|state| {
+        (
+            state.html_attributes(),
+            state.preference().label(),
+            state.preference(),
+            state.resolved(),
+        )
+    });
+    apply_html_theme(attrs);
+    ui.theme_label.set(label);
+    let _ = post_shell_message(&ShellBridgeMessage::Appearance {
+        preference: pref,
+        resolved,
+    });
+}
+
+fn send_pi_host_theme_request(ui: Ui, turn: u64, msg: crate::chord_bridge::PiHostMessage) {
+    let is_set_reply = matches!(msg, crate::chord_bridge::PiHostMessage::SetTheme(_));
+    let Some(promise) = post_shell_message(&ShellBridgeMessage::Host(msg)) else {
+        return;
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        let Ok(val) = wasm_bindgen_futures::JsFuture::from(promise).await else {
+            return;
+        };
+        let text = js_sys::JSON::stringify(&val)
+            .ok()
+            .and_then(|s| s.as_string());
+        let answer = text.as_deref().and_then(HostAnswer::from_json);
+        let changed = ui
+            .theme
+            .try_update_value(|state| state.handle_host_answer(turn, is_set_reply, answer))
+            .unwrap_or(false);
+        if changed {
+            sync_theme_dom_and_shell(ui);
+        }
+    });
+}
+
+fn cycle_theme(ui: Ui) {
+    let next = ui.theme.with_value(|state| state.preference().cycle());
+    let native = is_native_host(webkit_handler(PI_HOST_HANDLER).is_some());
+    if !native {
+        let _ = storage_set(THEME_STORAGE_KEY, next.as_str());
+    }
+    let req = ui
+        .theme
+        .try_update_value(|state| state.user_select(next))
+        .flatten();
+    sync_theme_dom_and_shell(ui);
+    if let Some((turn, msg)) = req {
+        send_pi_host_theme_request(ui, turn, msg);
+    }
+}
+
+fn endpoint(root: &HtmlElement) -> Result<(String, bool, String)> {
     let loc = window().location();
     if let Some(raw) = root.get_attribute("data-pi-bootstrap") {
         let data: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -118,7 +335,7 @@ fn endpoint(root: &HtmlElement) -> Result<(String, bool)> {
         )
         .map_err(js_error)?;
         url.search_params().set("client", "cloud");
-        return Ok((url.href(), true));
+        return Ok((url.href(), true, String::new()));
     }
     let existing_base = js_sys::Reflect::get(&window(), &"chordPage".into())
         .ok()
@@ -149,6 +366,7 @@ fn endpoint(root: &HtmlElement) -> Result<(String, bool)> {
             js_sys::encode_uri_component(&base)
         ),
         false,
+        base,
     ))
 }
 
@@ -160,21 +378,8 @@ fn uuid() -> Result<String> {
     Ok(window().crypto().map_err(js_error)?.random_uuid())
 }
 
-fn transcript(view: &Value) -> Vec<ChatMessage> {
+fn transcript(view: &Value) -> Vec<ProjectedMessage> {
     project_chat_transcript(view, &ToolActivityTable::new())
-        .into_iter()
-        .map(|row| ChatMessage {
-            id: row.id,
-            role: match row.role {
-                ProjectedRole::User => MessageRole::User,
-                ProjectedRole::Assistant => MessageRole::Assistant,
-                ProjectedRole::Tool => MessageRole::Tool,
-            },
-            text: row.text,
-            streaming: row.streaming,
-            activities: row.activities,
-        })
-        .collect()
 }
 
 struct Link {
@@ -189,6 +394,8 @@ struct Link {
     next_call: u64,
     pending_primary: Option<(u64, Command)>,
     pending_plugin: HashMap<u64, Command>,
+    pending_uploads: HashMap<u64, UploadRpc>,
+    active_uploads: HashMap<String, ActiveUpload>,
     greeted: bool,
 }
 
@@ -236,9 +443,12 @@ impl Link {
             P2_TERMINALS.name,
             P2_VOICE_MODE.name,
             P2_SHARING.name,
+            P2_SESSION_FILES.name,
         ] {
             self.release_contract(name, out);
         }
+        self.active_uploads.clear();
+        self.pending_uploads.clear();
     }
 
     fn send_plugin_call(
@@ -315,7 +525,7 @@ impl Link {
         self.contract_holds.insert(P2_CHAT.name, hold_id);
         self.tracker.register(hold_id, P2_CHAT.name, true);
         self.ui.write.set(false);
-        self.ui.messages.set(vec![]);
+        hydrate_messages_from_cache(self.ui, &id, conversation);
         self.ui.costs.set(vec![]);
         self.ui.artifacts.set(ArtifactsView::default());
         self.ui.tree.set(TreeView::default());
@@ -393,7 +603,39 @@ impl Link {
                 }
             }
             "p2.chat" if h == self.chat && m == indexes::chat::STATE_VIEW => {
-                self.ui.messages.set(transcript(value));
+                let live_rows = transcript(value);
+                let reconciled = if let Some((sid, conv)) = self.ui.selected.get_untracked() {
+                    let preserve_prefix =
+                        value["before"].is_u64() || value["more"].as_bool() == Some(true);
+                    let cached_rows = self.ui.transcript_cache.with_value(|store| {
+                        store
+                            .get(&sid, conv)
+                            .map(|c| c.messages.clone())
+                            .unwrap_or_default()
+                    });
+                    let merged = reconcile_live_snapshot(&cached_rows, &live_rows, preserve_prefix);
+                    let now = js_sys::Date::now().max(0.0) as u64;
+                    let snapshot = self.ui.transcript_cache.try_update_value(|store| {
+                        store.put(
+                            &sid,
+                            conv,
+                            &merged,
+                            now,
+                            MAX_CONVERSATIONS,
+                            MAX_PERSISTED_STORE_BYTES,
+                        );
+                        store.clone()
+                    });
+                    if let Some(store) = snapshot {
+                        persist_transcript_cache(&store);
+                    }
+                    merged
+                } else {
+                    live_rows
+                };
+                self.ui
+                    .messages
+                    .set(chat_messages_from_projected(reconciled));
             }
             "p2.models" => {
                 let view = decode_models_view(
@@ -451,6 +693,174 @@ impl Link {
             }
             _ => {}
         }
+    }
+
+    fn handle_upload_reply(
+        &mut self,
+        call_id: u64,
+        ok: bool,
+        value: &Value,
+        out: &mut Vec<Vec<u8>>,
+    ) -> bool {
+        let Some(rpc) = self.pending_uploads.remove(&call_id) else {
+            return false;
+        };
+        if !ok {
+            let reason = value.to_string();
+            match rpc {
+                UploadRpc::Begin { key }
+                | UploadRpc::Append { key, .. }
+                | UploadRpc::Finish { key } => {
+                    if let Some(active) = self.active_uploads.remove(&key)
+                        && let Some(token) = active.upload_token
+                    {
+                        self.next_call += 1;
+                        out.push(encode_cancel_upload_call(
+                            self.next_call,
+                            active.hold_id,
+                            &token,
+                        ));
+                        self.pending_uploads
+                            .insert(self.next_call, UploadRpc::Cancel);
+                    }
+                    self.ui
+                        .attachments
+                        .update(|att| att.mark_failed(&key, reason));
+                }
+                UploadRpc::Cancel => {}
+            }
+            return true;
+        }
+
+        match rpc {
+            UploadRpc::Begin { key } => match decode_begin_upload_result(value) {
+                Ok((_, upload_token)) => {
+                    let Some(active) = self.active_uploads.get_mut(&key) else {
+                        return true;
+                    };
+                    if active.cancelled {
+                        let hold_id = active.hold_id;
+                        self.active_uploads.remove(&key);
+                        self.next_call += 1;
+                        out.push(encode_cancel_upload_call(
+                            self.next_call,
+                            hold_id,
+                            &upload_token,
+                        ));
+                        self.pending_uploads
+                            .insert(self.next_call, UploadRpc::Cancel);
+                        return true;
+                    }
+                    active.upload_token = Some(upload_token.clone());
+                    let hold_id = active.hold_id;
+                    let total = active.total_bytes;
+                    if let Some(chunk) = active.chunks.first() {
+                        self.ui.attachments.update(|att| {
+                            att.mark_uploading(&key, upload_token.clone(), 0, total);
+                        });
+                        self.next_call += 1;
+                        out.push(encode_append_upload_call(
+                            self.next_call,
+                            hold_id,
+                            &upload_token,
+                            chunk.offset,
+                            &chunk.bytes,
+                        ));
+                        self.pending_uploads
+                            .insert(self.next_call, UploadRpc::Append { key, next_index: 1 });
+                    } else {
+                        self.ui.attachments.update(|att| att.mark_finishing(&key));
+                        self.next_call += 1;
+                        out.push(encode_finish_upload_call(
+                            self.next_call,
+                            hold_id,
+                            &upload_token,
+                        ));
+                        self.pending_uploads
+                            .insert(self.next_call, UploadRpc::Finish { key });
+                    }
+                }
+                Err(err) => {
+                    self.active_uploads.remove(&key);
+                    self.ui.attachments.update(|att| att.mark_failed(&key, err));
+                }
+            },
+            UploadRpc::Append { key, next_index } => {
+                let Some(active) = self.active_uploads.get(&key) else {
+                    return true;
+                };
+                let Some(upload_token) = active.upload_token.clone() else {
+                    return true;
+                };
+                let hold_id = active.hold_id;
+                if active.cancelled {
+                    self.active_uploads.remove(&key);
+                    self.next_call += 1;
+                    out.push(encode_cancel_upload_call(
+                        self.next_call,
+                        hold_id,
+                        &upload_token,
+                    ));
+                    self.pending_uploads
+                        .insert(self.next_call, UploadRpc::Cancel);
+                    return true;
+                }
+                let sent = active
+                    .chunks
+                    .get(next_index.saturating_sub(1))
+                    .map_or(0, |c| c.offset + c.bytes.len() as u64);
+                let total = active.total_bytes;
+                if let Some(chunk) = active.chunks.get(next_index) {
+                    self.ui.attachments.update(|att| {
+                        att.mark_uploading(&key, upload_token.clone(), sent, total);
+                    });
+                    self.next_call += 1;
+                    out.push(encode_append_upload_call(
+                        self.next_call,
+                        hold_id,
+                        &upload_token,
+                        chunk.offset,
+                        &chunk.bytes,
+                    ));
+                    self.pending_uploads.insert(
+                        self.next_call,
+                        UploadRpc::Append {
+                            key,
+                            next_index: next_index + 1,
+                        },
+                    );
+                } else {
+                    self.ui.attachments.update(|att| att.mark_finishing(&key));
+                    self.next_call += 1;
+                    out.push(encode_finish_upload_call(
+                        self.next_call,
+                        hold_id,
+                        &upload_token,
+                    ));
+                    self.pending_uploads
+                        .insert(self.next_call, UploadRpc::Finish { key });
+                }
+            }
+            UploadRpc::Finish { key } => {
+                self.active_uploads.remove(&key);
+                match decode_finish_upload_result(value) {
+                    Ok(uploaded) => {
+                        let new_id = uploaded.id.clone();
+                        self.ui.draft.update(|d| {
+                            *d = rewrite_attachment_reference(d, &key, &new_id);
+                        });
+                        self.ui
+                            .attachments
+                            .update(|att| att.mark_uploaded(&key, uploaded));
+                    }
+                    Err(err) => {
+                        self.ui.attachments.update(|att| att.mark_failed(&key, err));
+                    }
+                }
+            }
+            UploadRpc::Cancel => {}
+        }
+        true
     }
 
     fn frame(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -571,7 +981,9 @@ impl Link {
                         _ => return Err("unexpected Chat result segments".into()),
                     }
                 };
-                if self
+                if self.handle_upload_reply(id, kind == 8, &value, &mut out) {
+                    // handled upload call
+                } else if self
                     .pending_primary
                     .as_ref()
                     .is_some_and(|(call, _)| *call == id)
@@ -584,6 +996,7 @@ impl Link {
                             if kind == 8 && self.ui.draft.get_untracked() == text {
                                 self.ui.draft.set(String::new());
                                 self.ui.attachments.update(ComposerAttachments::clear);
+                                storage_remove(DRAFT_STORAGE_KEY);
                             }
                         }
                         Command::Create if kind == 8 => {
@@ -695,10 +1108,16 @@ impl Link {
                 return Ok(out);
             }
             Command::OpenPanel(panel) => {
+                self.ui.custom_panel.set(None);
                 self.ui.panel.set(panel);
                 if panel.is_open() {
                     self.ensure_plugin_hold_for_panel(panel, &mut out);
                 }
+                return Ok(out);
+            }
+            Command::OpenCustomPanel(id) => {
+                self.ui.panel.set(SidePanel::None);
+                self.ui.custom_panel.set(Some(id));
                 return Ok(out);
             }
             Command::OpenPane(pane) => {
@@ -831,13 +1250,65 @@ impl Link {
                 }
                 return Ok(out);
             }
+            Command::UploadFile { key, name, bytes } => {
+                let Some((sid, _)) = self.ui.selected.get_untracked() else {
+                    self.ui
+                        .attachments
+                        .update(|att| att.mark_failed(&key, "No active session".into()));
+                    return Ok(out);
+                };
+                let hold_id =
+                    self.hold_contract(&P2_SESSION_FILES, false, Some(&sid), None, &mut out);
+                let total_bytes = bytes.len() as u64;
+                let chunks = split_upload_chunks(&bytes, UPLOAD_CHUNK_BYTES);
+                self.active_uploads.insert(
+                    key.clone(),
+                    ActiveUpload {
+                        hold_id,
+                        total_bytes,
+                        chunks,
+                        upload_token: None,
+                        cancelled: false,
+                    },
+                );
+                self.ui.attachments.update(|att| att.mark_beginning(&key));
+                self.next_call += 1;
+                out.push(encode_begin_upload_call(
+                    self.next_call,
+                    hold_id,
+                    &name,
+                    "web",
+                ));
+                self.pending_uploads
+                    .insert(self.next_call, UploadRpc::Begin { key });
+                return Ok(out);
+            }
+            Command::CancelUpload(key) => {
+                let token = self
+                    .ui
+                    .attachments
+                    .with_untracked(|att| att.upload_token_for(&key).map(str::to_owned));
+                let hold_id = self.active_uploads.get(&key).map(|a| a.hold_id);
+                if let Some(active) = self.active_uploads.get_mut(&key) {
+                    active.cancelled = true;
+                }
+                if let (Some(h), Some(tok)) = (hold_id, token) {
+                    self.active_uploads.remove(&key);
+                    self.next_call += 1;
+                    out.push(encode_cancel_upload_call(self.next_call, h, &tok));
+                    self.pending_uploads
+                        .insert(self.next_call, UploadRpc::Cancel);
+                }
+                self.ui.attachments.update(|att| att.remove(&key));
+                return Ok(out);
+            }
             Command::Send(_) | Command::Create => {}
         }
 
         if self.pending_primary.is_some() {
             return Ok(out);
         }
-        let (hold, method, args) = match &cmd {
+        let (hold, method, args, cmd_to_store) = match cmd {
             Command::Send(text) if self.ui.write.get_untracked() => {
                 let destination = self
                     .ui
@@ -846,28 +1317,40 @@ impl Link {
                     .ok_or("no selected conversation")?;
                 let previous = self.ui.last_submission.get_value();
                 let id = match previous {
-                    Some(prior) if prior.destination == destination && prior.text == *text => {
+                    Some(prior) if prior.destination == destination && prior.text == text => {
                         prior.id
                     }
                     _ => uuid()?,
                 };
-                self.ui.last_submission.set_value(Some(Submission {
-                    destination,
-                    text: text.clone(),
-                    id: id.clone(),
-                }));
-                let attachment_keys: Vec<String> = self
+                let assembled = self
                     .ui
                     .attachments
-                    .with_untracked(|a| a.referenced_for_draft(text))
-                    .into_iter()
-                    .map(|f| f.key)
-                    .collect();
-                let mut payload = json!({"text": text, "requestId": id, "whenBusy": "steer"});
-                if !attachment_keys.is_empty() {
-                    payload["attachments"] = json!(attachment_keys);
+                    .with_untracked(|a| a.assemble_send_payload(&text, &id, "steer"));
+                let payload = match assembled {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let msg = err.to_string();
+                        self.ui
+                            .attachments
+                            .update(|a| a.last_error = Some(msg.clone()));
+                        self.ui.status.set(msg);
+                        return Ok(out);
+                    }
+                };
+                self.ui.last_submission.set_value(Some(Submission {
+                    destination,
+                    text: payload.text.clone(),
+                    id,
+                }));
+                if payload.text != text {
+                    self.ui.draft.set(payload.text.clone());
                 }
-                (self.chat, indexes::chat::METHOD_SEND, payload)
+                (
+                    self.chat,
+                    indexes::chat::METHOD_SEND,
+                    payload.wire_args,
+                    Command::Send(payload.text),
+                )
             }
             Command::Create if self.ui.create.get_untracked() => {
                 let cwd = self
@@ -882,6 +1365,7 @@ impl Link {
                         "cwd": cwd,
                         "env": self.members.get(&(2, indexes::sessions::STATE_OWNER_DEFAULT_ENV)).map(|m| &m.value)
                     }),
+                    Command::Create,
                 )
             }
             _ => return Ok(out),
@@ -889,7 +1373,7 @@ impl Link {
         self.next_call += 1;
         out.push(wire::call(self.next_call, hold, method, args));
         self.ui.busy.set(true);
-        self.pending_primary = Some((self.next_call, cmd));
+        self.pending_primary = Some((self.next_call, cmd_to_store));
         Ok(out)
     }
 }
@@ -920,6 +1404,8 @@ async fn connected(url: &str, ui: Ui, mut commands: UnboundedReceiver<Command>) 
         next_call: 0,
         pending_primary: None,
         pending_plugin: HashMap::new(),
+        pending_uploads: HashMap::new(),
+        active_uploads: HashMap::new(),
         greeted: false,
         members: HashMap::new(),
     };
@@ -927,9 +1413,13 @@ async fn connected(url: &str, ui: Ui, mut commands: UnboundedReceiver<Command>) 
         let out = futures_util::select! {
             msg = socket.next().fuse() => match msg {
                 Some(Ok(Message::Bytes(bytes))) => link.frame(&bytes)?,
-                Some(Err(gloo_net::websocket::WebSocketError::ConnectionClose(event))) if event.code == 4001 => {
-                    window().location().reload().map_err(js_error)?;
-                    return Ok(());
+                Some(Err(gloo_net::websocket::WebSocketError::ConnectionClose(event))) => {
+                    if !matches!(detect_close_reload(event.code, &event.reason), ReloadTrigger::None) {
+                        save_reload_state(ui);
+                        window().location().reload().map_err(js_error)?;
+                        return Ok(());
+                    }
+                    return Err(format!("Chord closed ({}): {}", event.code, event.reason));
                 }
                 Some(Err(error)) => return Err(error.to_string()),
                 _ => return Err("Chord disconnected".into()),
@@ -949,7 +1439,8 @@ async fn connected(url: &str, ui: Ui, mut commands: UnboundedReceiver<Command>) 
 }
 
 async fn run(root: HtmlElement, ui: Ui) -> Result<()> {
-    let (url, cloud) = endpoint(&root)?;
+    let (url, cloud, base) = endpoint(&root)?;
+    ui.asset_revision.set_value(base);
     if !cloud
         && js_sys::Reflect::has(&window().navigator(), &"serviceWorker".into()).unwrap_or(false)
     {
@@ -970,18 +1461,51 @@ async fn run(root: HtmlElement, ui: Ui) -> Result<()> {
         ui.busy.set(false);
         ui.status
             .set(ended.err().unwrap_or_else(|| "Disconnected".into()));
-        if ui.guest.get_untracked()
-            && let Ok(r) = gloo_net::http::Request::get("/")
+        if ui.guest.get_untracked() {
+            let check_path = ui
+                .selected
+                .get_untracked()
+                .map(|(sid, _)| format!("/s/{sid}"))
+                .unwrap_or_else(|| "/".to_owned());
+            if let Ok(r) = gloo_net::http::Request::get(&check_path)
                 .method(gloo_net::http::Method::HEAD)
                 .cache(web_sys::RequestCache::NoStore)
                 .send()
                 .await
-            && matches!(r.status(), 401 | 403)
+                && matches!(r.status(), 401 | 403)
+            {
+                if let Some((sid, _)) = ui.selected.get_untracked() {
+                    let updated = ui.transcript_cache.try_update_value(|store| {
+                        store.remove_session(&sid);
+                        store.clone()
+                    });
+                    if let Some(store) = updated {
+                        persist_transcript_cache(&store);
+                    }
+                }
+                ui.sessions.set(vec![]);
+                ui.messages.set(vec![]);
+                ui.selected.set(None);
+                return Err("Share ended".into());
+            }
+        }
+        if !cloud
+            && let loaded_base = ui.asset_revision.get_value()
+            && !loaded_base.is_empty()
+            && let Ok(resp) = gloo_net::http::Request::get("/_chord/web/base")
+                .cache(web_sys::RequestCache::NoStore)
+                .send()
+                .await
+            && resp.ok()
+            && let Ok(remote_base) = resp.text().await
+            && !matches!(
+                detect_asset_revision_change(&loaded_base, &remote_base),
+                ReloadTrigger::None
+            )
         {
-            ui.sessions.set(vec![]);
-            ui.messages.set(vec![]);
-            ui.selected.set(None);
-            return Err("Share ended".into());
+            save_reload_state(ui);
+            window().location().reload().map_err(js_error)?;
+            return Ok(());
         }
         if js_sys::Date::now() - start >= 10000.0 {
             failures = 0
@@ -996,7 +1520,24 @@ fn render_side_panel(ui: Ui) -> AnyView {
     let close = Callback::new(move |_| ui.command(Command::OpenPanel(SidePanel::None)));
     view! {
         <div class="plugin-side-panel" data-testid="side-panel">
-            {move || match ui.panel.get() {
+            {move || {
+                if let Some(custom_id) = ui.custom_panel.get() {
+                    let title = ui
+                        .plugin_registry
+                        .with(|reg| reg.plugins.get(&custom_id).map(|d| d.title.clone()))
+                        .unwrap_or_else(|| custom_id.clone());
+                    let rev = ui
+                        .plugin_registry
+                        .with(|reg| reg.plugins.get(&custom_id).map(|d| d.revision.clone()))
+                        .unwrap_or_default();
+                    return view! {
+                        <div class="sheet" role="dialog" aria-label=title.clone() data-testid=format!("panel-{custom_id}")>
+                            <button type="button" class="sheet-head" data-testid="side-panel-close" on:click=move |_| close.run(())>{format!("{title} ×")}</button>
+                            <p class="muted small">{format!("Dynamic plugin active (revision {rev})")}</p>
+                        </div>
+                    }.into_any();
+                }
+                match ui.panel.get() {
                 SidePanel::None => ().into_any(),
                 SidePanel::Cost => {
                     let costs = ui.costs.get();
@@ -1137,6 +1678,7 @@ fn render_side_panel(ui: Ui) -> AnyView {
                         </div>
                     }.into_any()
                 }
+            }
             }}
         </div>
     }.into_any()
@@ -1151,25 +1693,85 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
     let app = move || {
         let path = window().location().pathname().unwrap_or_default();
         let route: Vec<_> = path.trim_matches('/').split('/').collect();
-        let selected = match route.as_slice() {
+        let url_selected = match route.as_slice() {
             ["s", id] => Some((id.to_string(), 1)),
             ["s", id, "c", c] => c.parse().ok().map(|c| (id.to_string(), c)),
             _ => None,
         };
+        let reload_snap =
+            storage_get(RELOAD_STATE_STORAGE_KEY).and_then(|raw| decode_reload_snapshot(&raw));
+        if reload_snap.is_some() {
+            storage_remove(RELOAD_STATE_STORAGE_KEY);
+        }
+        let selected = url_selected.or_else(|| {
+            reload_snap
+                .as_ref()
+                .and_then(|s| s.session_id.clone().zip(s.conversation))
+        });
+        let restored_draft = selected
+            .as_ref()
+            .and_then(|(sid, conv)| {
+                let key = draft_key_for(sid, *conv);
+                let raw_draft = storage_get(DRAFT_STORAGE_KEY);
+                restore_draft_for_conversation(raw_draft.as_deref(), &key).or_else(|| {
+                    reload_snap
+                        .as_ref()
+                        .filter(|s| s.draft_key.as_deref() == Some(key.as_str()))
+                        .map(|s| crate::state::composer_state::rename_references(&s.draft_text))
+                })
+            })
+            .unwrap_or_default();
+        let (restored_panel, restored_custom_panel) =
+            match reload_snap.as_ref().and_then(|s| s.panel_id.as_deref()) {
+                Some(pid) => match SidePanel::from_id(pid) {
+                    Some(p) => (p, None),
+                    None => (SidePanel::None, Some(pid.to_owned())),
+                },
+                None => (SidePanel::None, None),
+            };
+
+        let transcript_store = PersistedTranscriptStore::from_json_or_empty(
+            storage_get(STORAGE_KEY_TRANSCRIPTS).as_deref(),
+        );
+        let initial_messages = selected
+            .as_ref()
+            .and_then(|(sid, conv)| transcript_store.get(sid, *conv))
+            .map(|conv| chat_messages_from_projected(projected_from_cached(&conv.messages)))
+            .unwrap_or_default();
+
+        let native = is_native_host(webkit_handler(PI_HOST_HANDLER).is_some());
+        let media_query: Option<MediaQueryList> = window()
+            .match_media("(prefers-color-scheme: dark)")
+            .ok()
+            .flatten();
+        let system_dark = media_query.as_ref().is_some_and(MediaQueryList::matches);
+        let initial_pref = if native {
+            ThemePreference::System
+        } else {
+            storage_get(THEME_STORAGE_KEY)
+                .as_deref()
+                .and_then(ThemePreference::parse)
+                .unwrap_or(ThemePreference::System)
+        };
+        let initial_theme_state = ThemeBridgeState::new(initial_pref, system_dark, native);
+        let initial_label = initial_pref.label();
+        apply_html_theme(initial_theme_state.html_attributes());
+
         let ui = Ui {
             sessions: RwSignal::new(vec![]),
-            messages: RwSignal::new(vec![]),
+            messages: RwSignal::new(initial_messages),
             selected: RwSignal::new(selected),
             status: RwSignal::new("Connecting".into()),
             write: RwSignal::new(false),
             create: RwSignal::new(false),
-            draft: RwSignal::new(String::new()),
+            draft: RwSignal::new(restored_draft),
             guest: RwSignal::new(false),
             commands: StoredValue::new(None),
             busy: RwSignal::new(false),
             last_submission: StoredValue::new(None),
             pane: RwSignal::new(MainPane::Chat),
-            panel: RwSignal::new(SidePanel::None),
+            panel: RwSignal::new(restored_panel),
+            custom_panel: RwSignal::new(restored_custom_panel),
             command_menu_open: RwSignal::new(false),
             command_query: RwSignal::new(String::new()),
             command_recents: RwSignal::new(vec![]),
@@ -1187,7 +1789,136 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
             voice_state: RwSignal::new(VoiceState::Idle),
             attachments: RwSignal::new(ComposerAttachments::default()),
             plugin_errors: RwSignal::new(HashMap::new()),
+            transcript_cache: StoredValue::new(transcript_store),
+            plugin_registry: RwSignal::new(PluginRegistryState::builtin()),
+            asset_revision: StoredValue::new(String::new()),
+            theme: StoredValue::new(initial_theme_state),
+            theme_label: RwSignal::new(initial_label),
         };
+
+        sync_theme_dom_and_shell(ui);
+        if let Some((turn, msg)) = ui
+            .theme
+            .try_update_value(|state| state.start_sync())
+            .flatten()
+        {
+            send_pi_host_theme_request(ui, turn, msg);
+        }
+
+        if let Some(mql) = media_query {
+            let mql_ref = mql.clone();
+            let on_media = Closure::<dyn FnMut(web_sys::Event)>::new(move |_ev: web_sys::Event| {
+                let dark = mql_ref.matches();
+                let changed = ui
+                    .theme
+                    .try_update_value(|state| state.handle_system_media_change(dark))
+                    .unwrap_or(false);
+                if changed {
+                    sync_theme_dom_and_shell(ui);
+                }
+            });
+            let _ =
+                mql.add_event_listener_with_callback("change", on_media.as_ref().unchecked_ref());
+            on_media.forget();
+        }
+
+        let on_host_theme =
+            Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |ev: web_sys::CustomEvent| {
+                let detail_val = js_sys::JSON::stringify(&ev.detail())
+                    .ok()
+                    .and_then(|s| s.as_string())
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+                let changed = ui
+                    .theme
+                    .try_update_value(|state| state.handle_host_event(detail_val.as_ref()))
+                    .unwrap_or(false);
+                if changed {
+                    sync_theme_dom_and_shell(ui);
+                }
+            });
+        let _ = window().add_event_listener_with_callback(
+            HOST_THEME_EVENT,
+            on_host_theme.as_ref().unchecked_ref(),
+        );
+        on_host_theme.forget();
+
+        let on_host_menu =
+            Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |ev: web_sys::CustomEvent| {
+                let detail_val = js_sys::JSON::stringify(&ev.detail())
+                    .ok()
+                    .and_then(|s| s.as_string())
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+                if matches!(
+                    HostMenuEvent::from_value(detail_val.as_ref()),
+                    Some(HostMenuEvent::Settings)
+                ) {
+                    ui.command(Command::OpenPanel(SidePanel::Settings));
+                }
+            });
+        let _ = window().add_event_listener_with_callback(
+            HOST_MENU_EVENT,
+            on_host_menu.as_ref().unchecked_ref(),
+        );
+        on_host_menu.forget();
+
+        let on_plugin_reload =
+            Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |ev: web_sys::CustomEvent| {
+                let Some((rev, descriptors)) = js_sys::JSON::stringify(&ev.detail())
+                    .ok()
+                    .and_then(|s| s.as_string())
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .and_then(|v| decode_plugin_manifest(&v))
+                else {
+                    return;
+                };
+                let active_panel = ui.custom_panel.get_untracked().or_else(|| {
+                    let p = ui.panel.get_untracked();
+                    p.is_open().then(|| p.id().to_owned())
+                });
+                let mut closed_active = false;
+                ui.plugin_registry.update(|reg| {
+                    let report = reg.hot_swap(rev, descriptors, active_panel.as_deref());
+                    closed_active = report.closed_active_panel;
+                });
+                if closed_active {
+                    ui.panel.set(SidePanel::None);
+                    ui.custom_panel.set(None);
+                }
+            });
+        let _ = window().add_event_listener_with_callback(
+            PLUGIN_RELOAD_EVENT,
+            on_plugin_reload.as_ref().unchecked_ref(),
+        );
+        on_plugin_reload.forget();
+
+        let on_beforeunload =
+            Closure::<dyn FnMut(web_sys::Event)>::new(move |_ev: web_sys::Event| {
+                save_reload_state(ui);
+            });
+        let _ = window().add_event_listener_with_callback(
+            "beforeunload",
+            on_beforeunload.as_ref().unchecked_ref(),
+        );
+        on_beforeunload.forget();
+
+        Effect::new(move |_| {
+            let selected_id = ui.selected.get().map(|(s, _)| s);
+            let sessions = ui.sessions.get();
+            let title = selected_id
+                .as_deref()
+                .and_then(|sid| sessions.iter().find(|s| s.id == sid))
+                .map(|s| s.title.as_str());
+            let statuses = ui.session_status.get();
+            let busy_count: usize = statuses
+                .statuses
+                .values()
+                .filter(|s| !s.busy_conversations.is_empty() || s.running)
+                .count();
+            let formatted = format_document_title(title, busy_count);
+            document().set_title(&formatted);
+            let _ = post_shell_message(&ShellBridgeMessage::Title(formatted));
+            let _ = post_shell_message(&ShellBridgeMessage::Badge(busy_count as u64));
+        });
 
         let on_keydown = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
             if (ev.ctrl_key() || ev.meta_key()) && ev.key().eq_ignore_ascii_case("k") {
@@ -1233,19 +1964,73 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
                     }).collect_view()
                 }}
                 <div class="sidebar-tools" data-testid="sidebar-panels">
-                    <button type="button" data-testid="panel-btn-models" on:click=move |_| ui.command(Command::OpenPanel(SidePanel::Models))>"Models"</button>
-                    <button type="button" data-testid="panel-btn-settings" on:click=move |_| ui.command(Command::OpenPanel(SidePanel::Settings))>"Settings"</button>
-                    <button type="button" data-testid="panel-btn-mcp" on:click=move |_| ui.command(Command::OpenPanel(SidePanel::Mcp))>"MCP"</button>
-                    <button type="button" data-testid="panel-btn-sharing" on:click=move |_| ui.command(Command::OpenPanel(SidePanel::Sharing))>"Sharing"</button>
-                    <button type="button" data-testid="panel-btn-cost" on:click=move |_| ui.command(Command::OpenPanel(SidePanel::Cost))>"Cost"</button>
-                    <button type="button" data-testid="panel-btn-artifacts" on:click=move |_| ui.command(Command::OpenPanel(SidePanel::Artifacts))>"Artifacts"</button>
-                    <button type="button" data-testid="panel-btn-tree" on:click=move |_| ui.command(Command::OpenPanel(SidePanel::Tree))>"Tree"</button>
+                    {move || {
+                        ui.plugin_registry.get().active_panels().into_iter().map(|desc| {
+                            let panel_id = desc.panel.clone().unwrap_or_else(|| desc.id.clone());
+                            let testid = format!("panel-btn-{}", desc.id);
+                            let label = match desc.id.as_str() {
+                                "mcp" => "MCP".to_owned(),
+                                "tree" => "Tree".to_owned(),
+                                _ => desc.title.clone(),
+                            };
+                            view! {
+                                <button type="button" data-testid=testid on:click=move |_| {
+                                    if let Some(p) = SidePanel::from_id(&panel_id) {
+                                        ui.command(Command::OpenPanel(p));
+                                    } else {
+                                        ui.command(Command::OpenCustomPanel(panel_id.clone()));
+                                    }
+                                }>{label}</button>
+                            }
+                        }).collect_view()
+                    }}
                     <button type="button" data-testid="pane-btn-terminal" on:click=move |_| ui.command(Command::OpenPane(MainPane::Terminal))>"Terminal"</button>
-                    <button type="button" data-testid="panel-btn-voice" on:click=move |_| ui.command(Command::OpenPanel(SidePanel::Voice))>"Voice"</button>
+                    <button type="button" class="theme-toggle" data-testid="theme-toggle" title=move || ui.theme_label.get() on:click=move |_| cycle_theme(ui)>
+                        {move || ui.theme_label.get()}
+                    </button>
                     <button type="button" data-testid="command-menu-btn" on:click=move |_| ui.command_menu_open.update(|o| *o = !*o)>"Commands"</button>
                 </div>
             </div>
         }.into_any();
+
+        let can_send_empty =
+            Signal::derive(move || ui.attachments.with(|a| a.has_ready_attachments()));
+        let on_attach_files = Callback::new(move |files: Vec<SelectedUploadFile>| {
+            if files.is_empty() {
+                return;
+            }
+            let sid = ui.selected.get_untracked().map(|(s, _)| s);
+            let chosen: Vec<(String, u64)> =
+                files.iter().map(|f| (f.name.clone(), f.size)).collect();
+            let mut keys = Vec::with_capacity(files.len());
+            for _ in 0..files.len() {
+                keys.push(uuid().unwrap_or_else(|_| format!("att-{}", js_sys::Date::now() as u64)));
+            }
+            let mut accepted = Vec::new();
+            ui.attachments.update(|att| {
+                let res = att.enqueue_files(sid.as_deref(), &chosen, |i| keys[i].clone());
+                accepted = res.accepted_keys;
+            });
+            for file in files {
+                if accepted.is_empty() {
+                    break;
+                }
+                if let Some(pos) = chosen
+                    .iter()
+                    .position(|(n, s)| n == &file.name && *s == file.size)
+                    && pos < MAX_ATTACHMENTS_PER_MESSAGE
+                {
+                    let key = keys[pos].clone();
+                    if accepted.contains(&key) {
+                        ui.command(Command::UploadFile {
+                            key,
+                            name: file.name,
+                            bytes: file.bytes,
+                        });
+                    }
+                }
+            }
+        });
 
         let main = view! {
             <div class="main-content">
@@ -1265,15 +2050,27 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
                     view! {
                         <Chat messages=ui.messages />
                         {move || {
-                            let files = ui.attachments.get().files;
-                            (!files.is_empty()).then(|| view! {
+                            let att = ui.attachments.get();
+                            (!att.files.is_empty() || att.last_error.is_some()).then(|| view! {
                                 <div class="composer-attachments" data-testid="composer-attachments">
-                                    {files.into_iter().map(|f| {
+                                    {att.last_error.map(|err| view! {
+                                        <span class="notice error small" data-testid="attachment-error">{err}</span>
+                                    })}
+                                    {att.files.into_iter().map(|f| {
                                         let key = f.key.clone();
+                                        let status_text = att.uploads.get(&key).map(|u| match &u.phase {
+                                            crate::state::attachments::UploadPhase::Queued => "queued".to_owned(),
+                                            crate::state::attachments::UploadPhase::Beginning => "starting...".to_owned(),
+                                            crate::state::attachments::UploadPhase::Uploading { .. } => format!("{}%", u.phase.progress_percent()),
+                                            crate::state::attachments::UploadPhase::Finishing => "finishing...".to_owned(),
+                                            crate::state::attachments::UploadPhase::Uploaded { .. } => "ready".to_owned(),
+                                            crate::state::attachments::UploadPhase::Failed(e) => format!("failed: {e}"),
+                                        });
                                         view! {
-                                            <span class="attachment-chip">
+                                            <span class="attachment-chip" data-testid="attachment-chip">
                                                 {f.name}
-                                                <button type="button" on:click=move |_| ui.attachments.update(|a| a.remove(&key))>"×"</button>
+                                                {status_text.map(|st| view! { <span class="muted small">{format!(" ({st})")}</span> })}
+                                                <button type="button" on:click=move |_| ui.command(Command::CancelUpload(key.clone()))>"×"</button>
                                             </span>
                                         }
                                     }).collect_view()}
@@ -1281,13 +2078,18 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
                             })
                         }}
                         <fieldset disabled=move || !ui.write.get() || ui.busy.get()>
-                            <Composer draft=ui.draft clear_on_send=false
-                                on_send=Callback::new(move |text| ui.command(Command::Send(text))) />
+                            <Composer
+                                draft=ui.draft
+                                clear_on_send=false
+                                on_send=Callback::new(move |text| ui.command(Command::Send(text)))
+                                on_attach_files=on_attach_files
+                                can_send_empty=can_send_empty
+                            />
                         </fieldset>
                     }.into_any()
                 }}
                 {move || ui.command_menu_open.get().then(|| {
-                    let commands = builtin_commands();
+                    let commands = ui.plugin_registry.get().dynamic_commands();
                     let recents = ui.command_recents.get();
                     view! {
                         <CommandMenu
@@ -1304,6 +2106,7 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
                                     "new-session" => ui.command(Command::Create),
                                     "pane-chat" => ui.command(Command::OpenPane(MainPane::Chat)),
                                     "pane-terminal" => ui.command(Command::OpenPane(MainPane::Terminal)),
+                                    "toggle-theme" => cycle_theme(ui),
                                     "panel-cost" => ui.command(Command::OpenPanel(SidePanel::Cost)),
                                     "panel-artifacts" => ui.command(Command::OpenPanel(SidePanel::Artifacts)),
                                     "panel-models" => ui.command(Command::OpenPanel(SidePanel::Models)),
@@ -1312,7 +2115,11 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
                                     "panel-sharing" => ui.command(Command::OpenPanel(SidePanel::Sharing)),
                                     "panel-tree" => ui.command(Command::OpenPanel(SidePanel::Tree)),
                                     "panel-voice" => ui.command(Command::OpenPanel(SidePanel::Voice)),
-                                    _ => {}
+                                    other => {
+                                        if let Some(pid) = other.strip_prefix("panel-") {
+                                            ui.command(Command::OpenCustomPanel(pid.to_owned()));
+                                        }
+                                    }
                                 }
                             })
                             on_close=Callback::new(move |_| ui.command_menu_open.set(false))

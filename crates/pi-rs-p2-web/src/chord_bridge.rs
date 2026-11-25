@@ -336,6 +336,40 @@ impl ReconnectState {
 // p2-mac host bridge (`window.webkit.messageHandlers.piHost` / `pi-host-theme`).
 // ---------------------------------------------------------------------------
 
+/// `WKScriptMessageHandlerWithReply` name registered by `pi-rs-p2-mac`.
+pub const PI_HOST_HANDLER: &str = "piHost";
+/// Optional extended native shell handler name (`title`, `badge`, `appearance`).
+pub const PI_SHELL_HANDLER: &str = "piShell";
+/// CustomEvent dispatched by `pi-rs-p2-mac` when host appearance changes.
+pub const HOST_THEME_EVENT: &str = "pi-host-theme";
+/// CustomEvent dispatched by `pi-rs-p2-mac` when a native menu item is triggered.
+pub const HOST_MENU_EVENT: &str = "pi-host-menu";
+/// `localStorage` key for browser theme preference when not hosted in `p2-mac`.
+pub const THEME_STORAGE_KEY: &str = "p2-theme";
+
+/// Resolved concrete color scheme applied to `<html data-theme="..." data-color-scheme="...">`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedTheme {
+    Light,
+    Dark,
+}
+
+impl ResolvedTheme {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+/// Attributes synchronized onto `document.documentElement` (`<html>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HtmlThemeAttributes {
+    pub data_theme: &'static str,
+    pub data_color_scheme: &'static str,
+}
+
 /// A theme preference (upstream `ThemePreference`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemePreference {
@@ -354,12 +388,228 @@ impl ThemePreference {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::System => "system",
             Self::Light => "light",
             Self::Dark => "dark",
         }
+    }
+
+    /// Resolves `System` against OS `prefers-color-scheme: dark`.
+    pub const fn resolve(self, system_prefers_dark: bool) -> ResolvedTheme {
+        match self {
+            Self::System => {
+                if system_prefers_dark {
+                    ResolvedTheme::Dark
+                } else {
+                    ResolvedTheme::Light
+                }
+            }
+            Self::Light => ResolvedTheme::Light,
+            Self::Dark => ResolvedTheme::Dark,
+        }
+    }
+
+    /// Returns synchronized `data-theme` and `data-color-scheme` attributes for `<html>`.
+    pub const fn html_attributes(self, system_prefers_dark: bool) -> HtmlThemeAttributes {
+        let resolved = self.resolve(system_prefers_dark).as_str();
+        HtmlThemeAttributes {
+            data_theme: resolved,
+            data_color_scheme: resolved,
+        }
+    }
+
+    /// Cycles `System -> Light -> Dark -> System` for the `.theme-toggle` control.
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::System => Self::Light,
+            Self::Light => Self::Dark,
+            Self::Dark => Self::System,
+        }
+    }
+
+    /// Human-readable label for the `.theme-toggle` button title.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::System => "Theme: System",
+            Self::Light => "Theme: Light",
+            Self::Dark => "Theme: Dark",
+        }
+    }
+}
+
+/// A `pi-host-menu` custom event's detail (`{ "item": "settings" }`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostMenuEvent {
+    Settings,
+    Unknown(String),
+}
+
+impl HostMenuEvent {
+    pub fn from_value(value: Option<&serde_json::Value>) -> Option<Self> {
+        let item = value?.get("item")?.as_str()?;
+        Some(match item {
+            "settings" => Self::Settings,
+            other => Self::Unknown(other.to_owned()),
+        })
+    }
+}
+
+/// A message the page posts to `window.webkit.messageHandlers.*`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShellBridgeMessage {
+    /// Posted to `window.webkit.messageHandlers.piHost`.
+    Host(PiHostMessage),
+    /// Posted to optional `window.webkit.messageHandlers.piShell`.
+    Title(String),
+    /// Posted to optional `window.webkit.messageHandlers.piShell`.
+    Badge(u64),
+    /// Posted to optional `window.webkit.messageHandlers.piShell`.
+    Appearance {
+        preference: ThemePreference,
+        resolved: ResolvedTheme,
+    },
+}
+
+impl ShellBridgeMessage {
+    pub const fn handler_name(&self) -> &'static str {
+        match self {
+            Self::Host(_) => PI_HOST_HANDLER,
+            Self::Title(_) | Self::Badge(_) | Self::Appearance { .. } => PI_SHELL_HANDLER,
+        }
+    }
+
+    pub fn to_value(&self) -> serde_json::Value {
+        match self {
+            Self::Host(PiHostMessage::Theme) => serde_json::json!({ "type": "theme" }),
+            Self::Host(PiHostMessage::SetTheme(pref)) => {
+                serde_json::json!({ "type": "set-theme", "preference": pref.as_str() })
+            }
+            Self::Title(title) => serde_json::json!({ "type": "title", "title": title }),
+            Self::Badge(count) => serde_json::json!({ "type": "badge", "count": count }),
+            Self::Appearance {
+                preference,
+                resolved,
+            } => serde_json::json!({
+                "type": "appearance",
+                "preference": preference.as_str(),
+                "resolved": resolved.as_str(),
+            }),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        self.to_value().to_string()
+    }
+}
+
+/// Pure-Rust coordinator for theme preference, `prefers-color-scheme`, and `piHost` sync.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThemeBridgeState {
+    preference: ThemePreference,
+    system_prefers_dark: bool,
+    native_host: bool,
+    latest_turn: u64,
+    unanswered_set: u32,
+}
+
+impl ThemeBridgeState {
+    pub const fn new(
+        preference: ThemePreference,
+        system_prefers_dark: bool,
+        native_host: bool,
+    ) -> Self {
+        Self {
+            preference,
+            system_prefers_dark,
+            native_host,
+            latest_turn: 0,
+            unanswered_set: 0,
+        }
+    }
+
+    pub const fn preference(&self) -> ThemePreference {
+        self.preference
+    }
+
+    pub const fn resolved(&self) -> ResolvedTheme {
+        self.preference.resolve(self.system_prefers_dark)
+    }
+
+    pub const fn html_attributes(&self) -> HtmlThemeAttributes {
+        self.preference.html_attributes(self.system_prefers_dark)
+    }
+
+    /// Initiates a `{"type":"theme"}` sync request when running under `piHost`.
+    pub fn start_sync(&mut self) -> Option<(u64, PiHostMessage)> {
+        if !self.native_host {
+            return None;
+        }
+        self.latest_turn += 1;
+        Some((self.latest_turn, PiHostMessage::Theme))
+    }
+
+    /// Updates local preference immediately and emits a `set-theme` request if hosted natively.
+    pub fn user_select(&mut self, preference: ThemePreference) -> Option<(u64, PiHostMessage)> {
+        self.preference = preference;
+        if !self.native_host {
+            return None;
+        }
+        self.latest_turn += 1;
+        self.unanswered_set = self.unanswered_set.saturating_add(1);
+        Some((self.latest_turn, PiHostMessage::SetTheme(preference)))
+    }
+
+    /// Applies a `piHost.postMessage(...)` reply if it matches the latest turn.
+    pub fn handle_host_answer(
+        &mut self,
+        answer_turn: u64,
+        is_set_reply: bool,
+        answer: Option<HostAnswer>,
+    ) -> bool {
+        if is_set_reply {
+            self.unanswered_set = self.unanswered_set.saturating_sub(1);
+        }
+        if let Some(pref) = applies_host_answer(
+            self.latest_turn,
+            answer_turn,
+            self.native_host,
+            answer.map(|a| a.preference),
+        ) {
+            self.preference = pref;
+            return true;
+        }
+        false
+    }
+
+    /// Applies a `pi-host-theme` window event when no `set-theme` call is in flight.
+    pub fn handle_host_event(&mut self, detail: Option<&serde_json::Value>) -> bool {
+        if let Some(ev) = applies_host_event(self.native_host, self.unanswered_set, detail) {
+            self.preference = ev.preference;
+            return true;
+        }
+        false
+    }
+
+    /// Updates OS `prefers-color-scheme: dark` state; returns whether resolved theme changed.
+    pub fn handle_system_media_change(&mut self, system_prefers_dark: bool) -> bool {
+        let before = self.resolved();
+        self.system_prefers_dark = system_prefers_dark;
+        self.resolved() != before
+    }
+}
+
+/// Formats the browser/native window title from active session title and busy count.
+pub fn format_document_title(session_title: Option<&str>, busy_count: usize) -> String {
+    let base = session_title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("Pi");
+    if busy_count > 0 {
+        format!("{base} ({busy_count} running)")
+    } else {
+        base.to_owned()
     }
 }
 
@@ -607,5 +857,116 @@ mod tests {
     fn native_host_detection() {
         assert!(is_native_host(true));
         assert!(!is_native_host(false));
+    }
+
+    #[test]
+    fn theme_resolution_syncs_data_theme_and_color_scheme() {
+        assert_eq!(
+            ThemePreference::Light.html_attributes(true),
+            HtmlThemeAttributes {
+                data_theme: "light",
+                data_color_scheme: "light",
+            }
+        );
+        assert_eq!(
+            ThemePreference::Dark.html_attributes(false),
+            HtmlThemeAttributes {
+                data_theme: "dark",
+                data_color_scheme: "dark",
+            }
+        );
+        assert_eq!(
+            ThemePreference::System.html_attributes(false),
+            HtmlThemeAttributes {
+                data_theme: "light",
+                data_color_scheme: "light",
+            }
+        );
+        assert_eq!(
+            ThemePreference::System.html_attributes(true),
+            HtmlThemeAttributes {
+                data_theme: "dark",
+                data_color_scheme: "dark",
+            }
+        );
+        assert_eq!(ThemePreference::System.cycle(), ThemePreference::Light);
+        assert_eq!(ThemePreference::Light.cycle(), ThemePreference::Dark);
+        assert_eq!(ThemePreference::Dark.cycle(), ThemePreference::System);
+        assert_eq!(ThemePreference::Dark.label(), "Theme: Dark");
+    }
+
+    #[test]
+    fn shell_bridge_messages_format_exact_handler_and_payloads() {
+        let host_msg = ShellBridgeMessage::Host(PiHostMessage::SetTheme(ThemePreference::Dark));
+        assert_eq!(host_msg.handler_name(), PI_HOST_HANDLER);
+        assert_eq!(
+            host_msg.to_value(),
+            serde_json::json!({"type": "set-theme", "preference": "dark"})
+        );
+
+        let title_msg = ShellBridgeMessage::Title("Pi — Session".into());
+        assert_eq!(title_msg.handler_name(), PI_SHELL_HANDLER);
+        assert_eq!(
+            title_msg.to_value(),
+            serde_json::json!({"type": "title", "title": "Pi — Session"})
+        );
+
+        let badge_msg = ShellBridgeMessage::Badge(2);
+        assert_eq!(badge_msg.handler_name(), PI_SHELL_HANDLER);
+        assert_eq!(
+            badge_msg.to_value(),
+            serde_json::json!({"type": "badge", "count": 2})
+        );
+
+        let app_msg = ShellBridgeMessage::Appearance {
+            preference: ThemePreference::System,
+            resolved: ResolvedTheme::Dark,
+        };
+        assert_eq!(
+            app_msg.to_value(),
+            serde_json::json!({"type": "appearance", "preference": "system", "resolved": "dark"})
+        );
+
+        assert_eq!(
+            HostMenuEvent::from_value(Some(&serde_json::json!({"item": "settings"}))),
+            Some(HostMenuEvent::Settings)
+        );
+        assert_eq!(format_document_title(Some("Demo"), 2), "Demo (2 running)");
+        assert_eq!(format_document_title(None, 0), "Pi");
+    }
+
+    #[test]
+    fn theme_bridge_state_respects_in_flight_set_and_media_changes() {
+        let mut bridge = ThemeBridgeState::new(ThemePreference::System, false, true);
+        let (t1, msg1) = bridge.start_sync().expect("sync");
+        assert_eq!(msg1, PiHostMessage::Theme);
+
+        // User changes theme before initial `theme` reply arrives; stale reply is ignored.
+        let (t2, msg2) = bridge
+            .user_select(ThemePreference::Dark)
+            .expect("set-theme");
+        assert_eq!(msg2, PiHostMessage::SetTheme(ThemePreference::Dark));
+        assert!(!bridge.handle_host_answer(
+            t1,
+            false,
+            Some(HostAnswer {
+                preference: ThemePreference::Light
+            })
+        ));
+        assert_eq!(bridge.preference(), ThemePreference::Dark);
+
+        // Stale pi-host-theme event while set-theme is unanswered is ignored.
+        assert!(!bridge.handle_host_event(Some(&serde_json::json!({"preference": "light"}))));
+        assert!(bridge.handle_host_answer(
+            t2,
+            true,
+            Some(HostAnswer {
+                preference: ThemePreference::Dark
+            })
+        ));
+        assert!(bridge.handle_host_event(Some(&serde_json::json!({"preference": "system"}))));
+        assert_eq!(bridge.preference(), ThemePreference::System);
+        assert!(bridge.handle_system_media_change(true));
+        assert_eq!(bridge.resolved(), ResolvedTheme::Dark);
     }
 }

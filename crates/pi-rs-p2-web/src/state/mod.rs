@@ -3,6 +3,7 @@
 
 pub mod anchor;
 pub mod artifact_kinds;
+pub mod attachments;
 pub mod chat_context;
 pub mod composer_state;
 pub mod conversation_cache;
