@@ -59,6 +59,11 @@ mod tests {
     fn rejects_non_web_urls() {
         assert_eq!(web_url("mailto:user@example.com"), None);
         assert_eq!(web_url("file:///tmp/x"), None);
+        assert_eq!(web_url("file:///etc/passwd"), None);
+        assert_eq!(web_url("javascript:alert(1)"), None);
+        assert_eq!(web_url("JAVASCRIPT:alert(1)"), None);
+        assert_eq!(web_url("data:text/html,<script>"), None);
+        assert_eq!(web_url("vbscript:msgbox(1)"), None);
         assert_eq!(web_url("not a url"), None);
         assert_eq!(web_url("/relative/path"), None);
     }
@@ -71,5 +76,7 @@ mod tests {
             "https://example.com/a"
         );
         assert_eq!(display_url("file:///tmp/a\u{0001}b"), "file:///tmp/a b");
+        let sanitized = display_url("https://example.com/auth\x1b[31m\r\n\x00\u{009b}");
+        assert!(!sanitized.chars().any(|c| c.is_control()));
     }
 }

@@ -185,8 +185,11 @@ pub(crate) async fn login(
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(timeout), async {
         if let McpSignInStart::Redirect(auth) = start_mcp_sign_in(options.clone()).await? {
-            eprintln!("Open this URL to sign in: {}", auth.authorization_url);
-            let _ = crate::utils::open_browser::try_open_browser(&auth.authorization_url);
+            eprintln!(
+                "Open this URL to sign in: {}",
+                crate::utils::web_url::display_url(&auth.authorization_url)
+            );
+            let _ = crate::utils::open_browser::try_open_web_url(&auth.authorization_url);
             let response = wait_for_loopback_sign_in(WaitForLoopbackOptions {
                 callback: listener.callback.clone(),
                 authorization: auth.clone(),

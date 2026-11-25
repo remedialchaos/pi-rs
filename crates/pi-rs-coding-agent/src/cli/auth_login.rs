@@ -71,7 +71,7 @@ pub(super) async fn run(args: &[&str], cwd: &Path, agent_dir: &Path, offline: bo
     code
 }
 
-pub(crate) async fn run_with_terminal(
+pub async fn run_with_terminal(
     args: &[&str],
     cwd: &Path,
     agent_dir: &Path,
@@ -408,7 +408,8 @@ impl AuthInteraction for Interaction<'_> {
                     display_url(&url)
                 ));
                 if let Some(instructions) = instructions.filter(|value| !value.is_empty()) {
-                    self.terminal.write(&instructions);
+                    self.terminal
+                        .write(&replace_control_characters(&instructions));
                 }
                 if self.open_browser
                     && let Some(target) = web_url(&url)
@@ -442,8 +443,9 @@ impl AuthInteraction for Interaction<'_> {
                 ..
             } => {
                 self.terminal.write(&format!(
-                    "Open {} and enter code: {user_code}",
-                    display_url(&verification_uri)
+                    "Open {} and enter code: {}",
+                    display_url(&verification_uri),
+                    replace_control_characters(&user_code)
                 ));
                 if self.open_browser
                     && open_browser_on_confirm
@@ -454,17 +456,20 @@ impl AuthInteraction for Interaction<'_> {
                 self.terminal.write("Waiting for authentication...");
             }
             AuthEvent::Info { message, links } => {
-                self.terminal.write(&message);
+                self.terminal.write(&replace_control_characters(&message));
                 for (url, label) in links {
                     let url = display_url(&url);
                     if let Some(label) = label.filter(|value| !value.is_empty()) {
-                        self.terminal.write(&format!("  {label}: {url}"));
+                        self.terminal
+                            .write(&format!("  {}: {url}", replace_control_characters(&label)));
                     } else {
                         self.terminal.write(&format!("  {url}"));
                     }
                 }
             }
-            AuthEvent::Progress(message) => self.terminal.write(&message),
+            AuthEvent::Progress(message) => {
+                self.terminal.write(&replace_control_characters(&message));
+            }
         }
     }
 }
@@ -749,6 +754,68 @@ mod tests {
             json!({"url": RADIUS_MCP_URL,"auth":{"provider":"radius"}})
         );
         assert_eq!(configure_radius_mcp(&path, "radius")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn auth_url_refuses_unsafe_schemes_and_honors_no_browser()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let signal = CancellationToken::new();
+        let browser_terminal = ScriptedTerminal::default();
+        let browser_interaction = Interaction {
+            terminal: &browser_terminal,
+            open_browser: true,
+            method: Method::Browser,
+            provider: "radius",
+            skipped: Mutex::default(),
+            signal: &signal,
+        };
+        browser_interaction.notify(AuthEvent::AuthUrl {
+            url: "javascript:alert(1)".into(),
+            instructions: Some("Sign\x1b[31m in".into()),
+        });
+        browser_interaction.notify(AuthEvent::AuthUrl {
+            url: "file:///etc/passwd".into(),
+            instructions: None,
+        });
+        assert!(
+            browser_terminal
+                .urls
+                .lock()
+                .map_err(|e| e.to_string())?
+                .is_empty()
+        );
+        browser_interaction.notify(AuthEvent::AuthUrl {
+            url: "https://example.test/authorize?state=abc".into(),
+            instructions: None,
+        });
+        assert_eq!(
+            *browser_terminal.urls.lock().map_err(|e| e.to_string())?,
+            vec!["https://example.test/authorize?state=abc".to_owned()]
+        );
+        let lines = browser_terminal.lines.lock().map_err(|e| e.to_string())?;
+        assert!(lines.iter().any(|line| line == "Sign [31m in"));
+
+        let no_browser_terminal = ScriptedTerminal::default();
+        let no_browser_interaction = Interaction {
+            terminal: &no_browser_terminal,
+            open_browser: false,
+            method: Method::Other,
+            provider: "radius",
+            skipped: Mutex::default(),
+            signal: &signal,
+        };
+        no_browser_interaction.notify(AuthEvent::AuthUrl {
+            url: "https://example.test/authorize?state=abc".into(),
+            instructions: None,
+        });
+        assert!(
+            no_browser_terminal
+                .urls
+                .lock()
+                .map_err(|e| e.to_string())?
+                .is_empty()
+        );
         Ok(())
     }
 }

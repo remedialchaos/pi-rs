@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 use crate::{
     cli::auth_terminal::LoginTerminal,
     core::extensions::types::{ExtensionUiHost, UiAnswer, UiDialog, UiDialogOptions},
-    utils::open_browser::open_browser,
+    utils::open_browser::open_web_url,
 };
 
 use super::{UiEvent, extension_ui::UiHost};
@@ -31,7 +31,7 @@ impl LoginTerminal for LoginUi {
             .send(UiEvent::Notice(line.to_owned(), "error"));
     }
     fn open_url(&self, url: &str) {
-        open_browser(url);
+        open_web_url(url);
     }
     async fn prompt(
         &self,
