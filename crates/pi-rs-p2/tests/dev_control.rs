@@ -282,3 +282,200 @@ async fn standalone_process_exposes_private_commands_only_in_dev_mode()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn dev_reload_runs_rebuild_hook_and_reloads_dirty_wasm_plugins()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_chord::{
+        context::Context,
+        contracts::{
+            Contract, Member,
+            schema::{int, method},
+        },
+        json::JsonValue,
+    };
+    use pi_rs_p2::hosts::{
+        dev::DevRebuildHook,
+        server::{ServerOptions, start_server},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const V1: &[u8] = include_bytes!("../../pi-rs-chord/tests/fixtures/b3/v1.wasm");
+    const DOUBLE: &[u8] = include_bytes!("../../pi-rs-chord/tests/fixtures/b3/double.wasm");
+
+    let dir = tempfile::tempdir()?;
+    let plugins_dir = dir.path().join("plugins");
+    std::fs::create_dir_all(&plugins_dir)?;
+    std::fs::write(plugins_dir.join("counter.server.wasm"), V1)?;
+
+    // Mode 0: write DOUBLE; Mode 1: fail rebuild; Mode 2: no-op (use on-disk dirty artifact).
+    let mode = Arc::new(AtomicUsize::new(0));
+    let hook_mode = mode.clone();
+    let hook: DevRebuildHook = Arc::new(move |req| {
+        let mode = hook_mode.load(Ordering::SeqCst);
+        Box::pin(async move {
+            match mode {
+                0 => {
+                    std::fs::write(req.plugins_dir.join("counter.server.wasm"), DOUBLE)
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                }
+                1 => Err("simulated build failure".into()),
+                _ => Ok(()),
+            }
+        })
+    });
+
+    let mut options = ServerOptions::new(dir.path().to_owned());
+    options.port = 0;
+    options.dev = true;
+    options.fake = true;
+    options.dev_rebuild = Some(hook);
+    let server = start_server(options).await?;
+
+    let ctx = Context::background();
+    let contract = Arc::new(Contract::local(
+        "guest-counter",
+        1,
+        vec![],
+        indexmap::IndexMap::from([
+            ("total".into(), Member::State(int())),
+            ("add".into(), method(Some(int()), Some(int()))),
+        ]),
+    )?);
+    let local = server
+        .host
+        .hold(contract, JsonValue::Object(Default::default()), &ctx)?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), local.wait(&ctx)).await??;
+    assert_eq!(
+        local.call("add", JsonValue::Number(2.), &ctx).await?,
+        JsonValue::Number(2.)
+    );
+
+    // 1. Rebuild hook writes updated WASM and `server.reload` reports the rebuilt plugin.
+    let reloaded = channel::send(dir.path(), &DevCommand::Reload { plugins: None }).await?;
+    assert!(reloaded.ok, "{}", reloaded.message);
+    assert_eq!(reloaded.plugins, Some(vec!["counter".to_owned()]));
+    assert_eq!(reloaded.message, "Reloaded counter");
+    assert_eq!(
+        local.call("add", JsonValue::Number(3.), &ctx).await?,
+        JsonValue::Number(6.)
+    );
+
+    // 2. Failing rebuild hook refuses reload and leaves the previous good plugin live.
+    mode.store(1, Ordering::SeqCst);
+    let refused = channel::send(dir.path(), &DevCommand::Reload { plugins: None }).await?;
+    assert!(!refused.ok);
+    assert!(
+        refused.message.contains("simulated build failure"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        local.call("add", JsonValue::Number(3.), &ctx).await?,
+        JsonValue::Number(12.)
+    );
+
+    // 3. Direct on-disk dirty WASM update with no-op hook is detected and reloaded.
+    mode.store(2, Ordering::SeqCst);
+    std::fs::write(plugins_dir.join("counter.server.wasm"), V1)?;
+    let dirty_reloaded = channel::send(dir.path(), &DevCommand::Reload { plugins: None }).await?;
+    assert!(dirty_reloaded.ok, "{}", dirty_reloaded.message);
+    assert_eq!(dirty_reloaded.plugins, Some(vec!["counter".to_owned()]));
+    assert_eq!(
+        local.call("add", JsonValue::Number(3.), &ctx).await?,
+        JsonValue::Number(3.)
+    );
+
+    local.release();
+    server.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn supervised_dev_server_restarts_cleanly_and_supports_rebuild_cmd()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_p2::hosts::dev::supervisor::{DevSupervisor, SupervisorOptions};
+    use tokio::time::{Duration, timeout};
+
+    const V1: &[u8] = include_bytes!("../../pi-rs-chord/tests/fixtures/b3/v1.wasm");
+    const DOUBLE: &[u8] = include_bytes!("../../pi-rs-chord/tests/fixtures/b3/double.wasm");
+
+    let dir = tempfile::tempdir()?;
+    let plugins_dir = dir.path().join("plugins");
+    std::fs::create_dir_all(&plugins_dir)?;
+    std::fs::write(plugins_dir.join("counter.server.wasm"), V1)?;
+    let replacement = dir.path().join("double.wasm");
+    std::fs::write(&replacement, DOUBLE)?;
+
+    let rebuild_cmd = format!(
+        "cp '{}' \"$P2_PLUGINS_DIR/counter.server.wasm\"",
+        replacement.display()
+    );
+
+    let supervisor = DevSupervisor::start(SupervisorOptions {
+        binary: env!("CARGO_BIN_EXE_p2").into(),
+        data_dir: dir.path().to_owned(),
+        port: 0,
+        fake: true,
+        rebuild_cmd: Some(rebuild_cmd),
+        extra_env: Vec::new(),
+        extra_args: Vec::new(),
+    })
+    .await?;
+
+    let mut state = supervisor.state();
+    let gen1 = state.borrow().clone();
+    assert_eq!(gen1.generation, 1);
+    assert!(gen1.running);
+    let pid1 = gen1.pid.ok_or("missing generation 1 pid")?;
+    let addr1 = gen1.address.clone().ok_or("missing generation 1 address")?;
+
+    // Generation 1 serves /health and executes P2_DEV_REBUILD_CMD on reload.
+    assert!(health_ok(&addr1).await?);
+    let reload = channel::send(dir.path(), &DevCommand::Reload { plugins: None }).await?;
+    assert!(reload.ok, "{}", reload.message);
+    assert_eq!(reload.plugins, Some(vec!["counter".to_owned()]));
+
+    // Trigger coordinated supervisor restart over dev.sock.
+    let restart = channel::send(dir.path(), &DevCommand::Restart).await?;
+    assert!(restart.ok, "{}", restart.message);
+    assert_eq!(restart.message, "Restarting server");
+
+    let gen2 = timeout(Duration::from_secs(30), async {
+        loop {
+            let current = state.borrow_and_update().clone();
+            if current.generation == 2 && current.running {
+                return Ok::<_, tokio::sync::watch::error::RecvError>(current);
+            }
+            state.changed().await?;
+        }
+    })
+    .await??;
+    let pid2 = gen2.pid.ok_or("missing generation 2 pid")?;
+    let addr2 = gen2.address.ok_or("missing generation 2 address")?;
+    assert_ne!(pid1, pid2);
+    assert!(health_ok(&addr2).await?);
+
+    let after_restart = channel::send(dir.path(), &DevCommand::Reload { plugins: None }).await?;
+    assert!(after_restart.ok, "{}", after_restart.message);
+
+    supervisor.stop().await?;
+    assert!(!dir.path().join("dev.sock").exists());
+    Ok(())
+}
+
+async fn health_ok(url: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let host_port = url.strip_prefix("http://").unwrap_or(url);
+    let mut stream = tokio::net::TcpStream::connect(host_port).await?;
+    stream
+        .write_all(
+            format!("GET /health HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    Ok(response.starts_with("HTTP/1.1 200") && response.contains(r#""ok":true"#))
+}

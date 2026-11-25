@@ -305,19 +305,40 @@ impl CatalogTable {
             })
         })?;
         for method in ["create", "update", "activity"] {
-            let (table, store, state, scope) =
-                (self.clone(), store.clone(), state.clone(), scope.clone());
+            let (table, store, state, scope, host) = (
+                self.clone(),
+                store.clone(),
+                state.clone(),
+                scope.clone(),
+                object.host().downgrade(),
+            );
             members.method(method, move |args, ctx| {
-                let (table, store, state, scope) =
-                    (table.clone(), store.clone(), state.clone(), scope.clone());
+                let (table, store, state, scope, host) = (
+                    table.clone(),
+                    store.clone(),
+                    state.clone(),
+                    scope.clone(),
+                    host.clone(),
+                );
                 Box::pin(async move {
                     let args = args.to_serde()?;
-                    let _permit = scope.lock().await;
+                    let archived_id = (method == "update"
+                        && args["archived"].as_bool() == Some(true))
+                    .then(|| args["id"].as_str().map(str::to_owned))
+                    .flatten();
+                    let permit = scope.lock().await;
                     let change = table.clone();
                     let result = store
                         .transact(move |step| change.change(step, method, args))
                         .await?;
                     table.publish(&store, &state, &ctx.context).await?;
+                    drop(permit);
+                    if let Some(id) = archived_id
+                        && let Some(host) = host.upgrade()
+                    {
+                        crate::api::v1::server::run_session_archived(&host, &id, &ctx.context)
+                            .await?;
+                    }
                     Ok(wire(result))
                 })
             })?;

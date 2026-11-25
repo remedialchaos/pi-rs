@@ -1,10 +1,8 @@
 //! The `ports` plugin's server facet: the `ForwardStore` the server keeps, and `p2.ports`
 //! for the owner's Ports sheet and a session worker's `ports` tool.
 //!
-//! Upstream also contributes a `SessionArchived` cleanup (the sessions plugin's keyed native
-//! registry) so a session's forwards close the moment it is archived, next to the sweep of
-//! archived sessions the store runs at open. The native keyed-registry seam is owned by the
-//! server-registry runtime; until it lands, the open-time sweep covers archived sessions.
+//! Contributes a `p2.session-archived` cleanup hook so a session's forwards close the moment it
+//! is archived, alongside the open-time sweep of archived sessions.
 
 use std::{
     path::Path,
@@ -101,6 +99,35 @@ pub fn server_facet() -> Result<Facet> {
             report,
         )?;
         let store_for_store = store.clone();
+        let archived_forwards = forwards.clone();
+        let archived_host = host.host();
+        let archived_store = store.clone();
+        let session_archived = crate::api::v1::server::contribute_session_archived(
+            host,
+            "ports",
+            Arc::new(move |session_id, ctx| {
+                let forwards = archived_forwards.clone();
+                let host = archived_host.clone();
+                let store_contract = archived_store.clone();
+                Box::pin(async move {
+                    let open = lock(&forwards).clone();
+                    if let Some(open) = open {
+                        return open.close_session(&session_id, &ctx).await;
+                    }
+                    if let Ok(held) = host.get(store_contract, params(), &ctx).await {
+                        let open = lock(&forwards).clone();
+                        let result = if let Some(open) = open {
+                            open.close_session(&session_id, &ctx).await
+                        } else {
+                            Ok(())
+                        };
+                        held.release();
+                        return result;
+                    }
+                    Ok(())
+                })
+            }),
+        )?;
         let (forwards_store, revision_store, server_store, catalog_store, changes_store) = (
             forwards.clone(),
             revision.clone(),
@@ -111,6 +138,7 @@ pub fn server_facet() -> Result<Facet> {
         host.serve(
             store_for_store,
             move |_, _, object| {
+                let _keep = &session_archived;
                 forward_store_members(
                     object,
                     &forwards_store,

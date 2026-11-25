@@ -437,16 +437,16 @@ impl Focusable for EditorDock {
 
 async fn mount(
     view: view::View,
-    prefs: preferences::Preferences,
+    mut prefs: preferences::Preferences,
     mut plugins: Option<plugins::Plugins>,
     origin: String,
     role: &str,
 ) -> Result<(), Box<dyn Error>> {
     let mode = prefs.theme.color_mode;
     let terminal = prefs.theme.terminal.clone();
-    let theme = pi_rs_p2_tui::ThemeRef::new(prefs.theme);
+    let theme = pi_rs_p2_tui::ThemeRef::new(prefs.theme.clone());
 
-    let hint_theme = theme.current();
+    let hints_theme = theme.clone();
     let header_component = BuiltInHeader::new(HeaderSource {
         ctx: Box::new(HeaderRenderCtx(theme.clone())),
         origin: Some(origin),
@@ -454,6 +454,7 @@ async fn mount(
         connected: true,
         expanded: false,
         hints: Box::new(move || {
+            let hint_theme = hints_theme.current();
             vec![
                 format!(
                     "{} {}",
@@ -508,8 +509,8 @@ async fn mount(
     });
     let mut client =
         TuiClient::mount_panel(ProcessTerminal::new(), header, root, field, prefs.mouse);
-    if let Some(path) = prefs.theme_path
-        && let Err(error) = client.watch_theme(&path, theme.clone(), mode, terminal)
+    if let Some(ref path) = prefs.theme_path
+        && let Err(error) = client.watch_theme(path, theme.clone(), mode, terminal)
     {
         eprintln!("Live theme reload unavailable: {error}");
     }
@@ -524,6 +525,10 @@ async fn mount(
     let mut drafts = std::collections::HashMap::new();
     let mut destination = None;
     let mut builtin_panels = builtin_panels::BuiltinPanels::default();
+    builtin_panels.set_theme_info(
+        prefs.current_theme_name().to_owned(),
+        prefs.available_themes(),
+    );
     let shortcuts = Rc::new(std::cell::RefCell::new(
         plugins
             .as_ref()
@@ -585,6 +590,7 @@ async fn mount(
         }
     }));
     client.screen.start()?;
+    let mut last_theme_version = theme.version();
     let result = loop {
         if let Some(write) = grants.borrow_mut().take() {
             client.screen.base.terminal.write(&write);
@@ -620,6 +626,28 @@ async fn mount(
                 builtin_panels.close();
                 *command.borrow_mut() = Some((id.to_owned(), args.to_owned()));
                 editor.borrow_mut().set_value(String::new());
+            } else if let Some((_, args)) =
+                slash.filter(|(name, args)| *name == "theme" && !args.is_empty())
+            {
+                match prefs.switch_theme(args, &theme, &mut client) {
+                    Ok(applied) => {
+                        builtin_panels.set_theme_info(
+                            prefs.current_theme_name().to_owned(),
+                            prefs.available_themes(),
+                        );
+                        if let Some(frame) = builtin_panels.refresh(&view.borrow(), &theme) {
+                            client.open_side_panel(frame);
+                        }
+                        client
+                            .screen
+                            .flash(pi_rs_p2_tui::line_text(&format!("Theme: {applied}")), None);
+                    }
+                    Err(err) => {
+                        client.screen.flash(pi_rs_p2_tui::line_text(&err), None);
+                    }
+                }
+                editor.borrow_mut().set_value(String::new());
+                client.screen.base.request_render(true);
             } else {
                 let outcome = slash.map(|(name, args)| {
                     let mut v = view.borrow_mut();
@@ -748,6 +776,13 @@ async fn mount(
         }
         if let Err(e) = client.step(Duration::from_millis(100)) {
             break Err(e.into());
+        }
+        if theme.version() != last_theme_version {
+            last_theme_version = theme.version();
+            if let Some(frame) = builtin_panels.refresh(&view.borrow(), &theme) {
+                client.open_side_panel(frame);
+            }
+            client.screen.base.request_render(true);
         }
     };
     client.screen.stop(Default::default())?;

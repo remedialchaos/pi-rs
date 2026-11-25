@@ -41,8 +41,8 @@ pub struct HeaderSource {
     pub role: Option<String>,
     pub connected: bool,
     pub expanded: bool,
-    pub hints: Box<dyn Fn() -> Vec<String> + Send + Sync>,
-    pub expanded_hints: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    pub hints: Box<dyn Fn() -> Vec<String>>,
+    pub expanded_hints: Box<dyn Fn() -> Vec<String>>,
 }
 
 pub struct BuiltInHeader {

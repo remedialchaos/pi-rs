@@ -185,6 +185,26 @@ impl PluginSources {
         self.reload_named(runtime, &[], ctx).await
     }
 
+    /// Return non-builtin plugin names whose on-disk facet digest differs from `runtime`,
+    /// or that were added/removed on disk since the last load/reload.
+    pub fn dirty_plugins(&self, runtime: &PluginRuntime) -> Result<BTreeSet<String>> {
+        let scan = self.scan(&self.origins)?;
+        let mut dirty = BTreeSet::new();
+        for (name, script) in &scan.scripts {
+            if !self.builtins.contains(name)
+                && runtime.digest(name).as_deref() != Some(script.digest())
+            {
+                dirty.insert(name.clone());
+            }
+        }
+        for name in self.active.keys() {
+            if !self.builtins.contains(name) && !scan.scripts.contains_key(name) {
+                dirty.insert(name.clone());
+            }
+        }
+        Ok(dirty)
+    }
+
     pub async fn reload_named(
         &mut self,
         runtime: &PluginRuntime,

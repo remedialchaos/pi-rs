@@ -31,7 +31,7 @@ use crate::{
         p2_contracts::lookup,
         server::{
             ServerNatives, SessionSuspendGuard, SessionWorkers, WORKER_INIT_PROVIDER_SERVICE,
-            WorkerInitProvider, install_service, server_of, service_of,
+            WorkerInitProvider, install_service, run_session_archived, server_of, service_of,
         },
         worker::worker_boundary_contract,
     },
@@ -259,6 +259,9 @@ pub(super) fn serve(host: &mut FacetHost, catalog: Arc<Contract>) -> Result<()> 
                                     .catalog
                                     .call("update", wire(json!({"id":id,"archived":true})), context)
                                     .await?;
+                                if let Some(host) = service.host.upgrade() {
+                                    run_session_archived(&host, id, context).await?;
+                                }
                                 jobs.2
                                     .get()?
                                     .start(wire(args.clone()), Some(id.to_owned()), context)
@@ -808,6 +811,7 @@ impl Lifecycle {
         match name {
             "archive" => {
                 let server = self.server()?;
+                run_session_archived(server.host(), id, context).await?;
                 self.suspended.suspend(&server.workers, id).await?;
                 Ok(JsonValue::Null)
             }
@@ -985,6 +989,7 @@ impl Lifecycle {
             .call("update", wire(json!({"id":id,"archived":true})), context)
             .await?;
         let server = self.server()?;
+        run_session_archived(server.host(), id, context).await?;
         self.suspended.suspend(&server.workers, id).await?;
         let data = Path::new(&server.info.data_dir);
         copy::remove(&session_directory(data, id)?).await?;

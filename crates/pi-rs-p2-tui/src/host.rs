@@ -260,6 +260,14 @@ impl<S: Tui> TuiClient<S> {
         }
         true
     }
+    pub fn set_theme(&mut self, target: &ThemeRef, theme: Theme) {
+        target.set(theme);
+        pi_rs_tui::Component::invalidate(&mut self.screen);
+        self.screen.base_mut().request_render(true);
+    }
+    pub fn clear_theme_watch(&mut self) {
+        self.theme_watch = None;
+    }
     fn apply_theme_changes(&mut self) {
         if let Some(ThemeWatch {
             target, changes, ..
