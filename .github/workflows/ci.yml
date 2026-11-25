@@ -40,8 +40,11 @@ jobs:
       - name: Verify workspace metadata
         run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
 
-      - name: Check packaging script syntax
-        run: bash -n scripts/package-p2.sh
+      - name: Check packaging and installer scripts
+        run: |
+          bash -n scripts/package-p2.sh
+          sh -n install.sh
+          ./scripts/test-install.sh
 
   test:
     name: Test Workspace (Linux x86_64)
@@ -146,6 +149,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      - name: Check Windows installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.ToString() }
+            exit 1
+          }
 
       - name: Check workspace
         run: cargo check --workspace --locked
