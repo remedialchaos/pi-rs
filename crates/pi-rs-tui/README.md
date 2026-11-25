@@ -39,9 +39,9 @@ terminal key parsing.
 ## Verification
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo clippy -p pi-rs-tui --all-targets --locked -- -D warnings
+cargo test -p pi-rs-tui --locked
 ```
 
 Fixtures under `tests/fixtures/` are outputs captured from the unchanged TypeScript reference:

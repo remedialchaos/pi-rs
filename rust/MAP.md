@@ -1,6 +1,6 @@
 # `pi-rs` Whole-App Port Map
 
-**Goal**: Port the entire `earendil-works/pi` monorepo (v1.6.0, baseline commit `780bf31fc`) to 100% Rust with maximalist drop-in compatibility at every external edge, using `rust-anything` for differential verification and keeping upstream code as reference until lifted.
+**Goal**: Historical port map for rewriting the `earendil-works/pi` monorepo (v1.6.0, baseline commit `780bf31fc`) to 100% Rust with drop-in compatibility at external edges. All 18 crates are ported, lifted to the root Cargo workspace (`Cargo.toml`, `crates/pi-rs-*`), and verified with upstream TypeScript/Swift/Python trees retired (ADR-012).
 
 **Core references**:
 - Decisions: [DECISIONS.md](DECISIONS.md)
@@ -34,6 +34,7 @@ All Wave 1 and Wave 2 claims are complete and merged onto `main`.
 | ADR-009 | Checkpoint Cadence and Session Handoff | accepted |
 | ADR-010 | Host QuickJS-WASM Inside Pure-Rust `wasmtime` for `pi-rs-codemode` | accepted |
 | ADR-011 | Use `leptos` (`0.8.x`, CSR) for Rust-to-WASM Web Frontends | accepted |
+| ADR-012 | Lift Rust Workspace to Root and Retire Upstream Trees | accepted |
 
 ## Pre-Work Prerequisite
 

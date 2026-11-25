@@ -24,7 +24,7 @@ Every route except `GET /health` requires `Authorization: Bearer $VOICE_TOKEN`, 
 | `ORT_DYLIB_PATH` | platform library name | Path to a CPU ONNX Runtime shared library exposing the 1.24 API or later. |
 | `PHONEMIZER_ESPEAK_LIBRARY` | platform library name | Optional path to eSpeak NG's shared library (Kokoro also needs the eSpeak NG voice data). |
 
-Model layout matches the [upstream Dockerfile](../../../apps/p2/voice-server/Dockerfile):
+Model layout matches upstream `earendil-works/pi`'s `apps/p2/voice-server/Dockerfile` (fork commit `780bf31fc`):
 
 - `silero_vad.onnx`: sherpa-onnx's Silero V4 export.
 - `parakeet/{encoder.int8.onnx,decoder.int8.onnx,joiner.int8.onnx,tokens.txt}`: sherpa-onnx's NeMo Parakeet TDT 0.6B v3 int8 export.
@@ -34,30 +34,30 @@ Model layout matches the [upstream Dockerfile](../../../apps/p2/voice-server/Doc
 
 **Pocket:** `Config::load` loads `PocketOnnx` automatically whenever `<models>/pocket/<onnx_model>` (default `pocket_tts.onnx`) is present alongside `<voice>.safetensors` prompt states, and skips `pocket` with a diagnostic only when the ONNX model file is not installed. Optional `pocket.json` configures `sample_rate` (default `24000`), `chunk_samples` (default `4800`), `onnx_model`, `vocab`, `token_encoding` (`auto` | `codepoints` | `utf8_bytes` | `vocab`), `tokens_input`, `state_input`, `state_tensor`, `speed_input`, `steps_input`, `default_speed`, and `audio_output`. This crate does not shell out to Python.
 
-Build and run from this directory:
+Build and run from the repository root:
 
 ```sh
-cargo build --locked --release -j 2
-VOICE_TOKEN=local-secret VOICE_MODELS=/models VOICE_ENGINES=supertonic,kokoro \
+cargo build --locked --release -p pi-rs-voice-server
+VOICE_TOKEN=local-secret VOICE_MODELS=/models VOICE_ENGINES=supertonic,pocket,kokoro \
   ORT_DYLIB_PATH=/path/to/libonnxruntime.so ./target/release/pi-voice-server
 ```
 
 ## Verification
 
-The transport tests exercise real loopback HTTP and WebSocket connections with deterministic inference. The suite does not need model weights, ONNX Runtime, or eSpeak NG. With the Cargo dependencies cached:
+The offline transport and Pocket TTS tests exercise real loopback HTTP/WebSocket connections and `.safetensors` loading with deterministic inference. They do not require model weights, ONNX Runtime, or eSpeak NG. With Cargo dependencies cached:
 
 ```sh
-cargo fmt --check
-cargo clippy --offline --locked -j 2 --all-targets -- -D warnings
-cargo test --offline --locked -j 2
+cargo fmt --all -- --check
+cargo clippy --offline --locked -p pi-rs-voice-server --all-targets -- -D warnings
+cargo test --offline --locked -p pi-rs-voice-server
 ```
 
 To also run the real ONNX Runtime end-to-end tests:
 
 ```sh
-ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo test --offline --locked -j 2 -- --include-ignored
+ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo test --offline --locked -p pi-rs-voice-server -- --include-ignored
 ```
 
-Verified: formatting and Clippy are clean, and all 17 offline tests pass. Removing the previous-utterance clamp made the pre-roll regression fail; restoring it made the suite pass.
+Verified: formatting and Clippy are clean, 27 offline tests pass, and the 2 `#[ignore]` Pocket TTS ONNX Runtime tests pass with `libonnxruntime.so.1.31.1` (8/8 in `pocket_onnx -- --include-ignored`). Removing the previous-utterance clamp made the pre-roll regression fail; restoring it made the suite pass.
 
 With the upstream weights and ONNX Runtime 1.28.2, the native executable returned non-silent PCM WAVs from Supertonic (44.1 kHz) and Kokoro (24 kHz). `/listen` detected and transcribed generated speech and returned the same transcript as sherpa-onnx 1.13.8 for the upstream Parakeet English reference clip.

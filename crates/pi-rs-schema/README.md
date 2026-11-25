@@ -42,8 +42,8 @@ precision, exactly as the upstream package sees them.
 
 ## Verification
 
-- `tests/conformance.rs` runs the official JSON-Schema-Test-Suite of drafts 2020-12 and 7 from
-  `packages/schema/test/fixtures`: every one of the 4,213 cases passes, and the errors of every case agree with
+- `tests/conformance.rs` runs the vendored official JSON-Schema-Test-Suite of drafts 2020-12 and 7 from
+  `tests/fixtures/` (originally from upstream `packages/schema/test/fixtures`): every one of the 4,213 cases passes, and the errors of every case agree with
   its check. The ten cases the upstream package does not pass either are listed in the test.
 - `tests/coerce_typebox.rs` replays the 204 cases of TypeBox 1.3.27's `Value.Convert` tests, recorded from the
   upstream TypeScript test file.
@@ -51,9 +51,9 @@ precision, exactly as the upstream package sees them.
   upstream unit tests.
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo clippy -p pi-rs-schema --all-targets --locked -- -D warnings
+cargo test -p pi-rs-schema --locked
 ```
 
 ## Known differences from the upstream package

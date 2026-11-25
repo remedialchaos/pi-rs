@@ -130,6 +130,6 @@ Changing the fixture root made both comparisons fail. The formal gate passed
 with a Cargo audit advisory warning. Upstream line coverage was 765/1,808
 (42%). On the unoptimized verification build the five-operation scenarios
 averaged 30.62 ms upstream and 23.91 ms in Rust, including connection setup.
-The retained fixture, corpus and [reproduction recipe](../../verification/env-listing/README.md)
+The retained fixture, corpus and [reproduction recipe](../../rust/verification/env-listing/README.md)
 cover ordered entries, truncation, invalid limits, filesystem and cancellation
 errors. This proof adds two recorded scenarios and zero native tests.

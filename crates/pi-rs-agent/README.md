@@ -9,16 +9,14 @@ Native Rust port of `@earendil-works/pi-agent-core` (`packages/agent`). The crat
 
 ## Verification
 
-Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` from this crate. The native suite uses scripted streams, the real `pi-rs-ai` faux provider, and a loopback Axum SSE server; no API keys or external services are needed. It covers exact event and transcript ordering, asynchronous settlement, queues, argument coercion and hooks, cancellation, terminal failures, and proxy framing/partial tool arguments. TypeScript declaration merging and TypeBox static inference are not Rust interfaces; custom messages and runtime JSON Schemas cover the corresponding runtime contracts.
+Run `cargo fmt --all -- --check`, `cargo clippy -p pi-rs-agent --all-targets --locked -- -D warnings`, and `cargo test -p pi-rs-agent --locked` from the repository root. The native suite uses scripted streams, the real `pi-rs-ai` faux provider, and a loopback Axum SSE server; no API keys or external services are needed. It covers exact event and transcript ordering, asynchronous settlement, queues, argument coercion and hooks, cancellation, terminal failures, and proxy framing/partial tool arguments. TypeScript declaration merging and TypeBox static inference are not Rust interfaces; custom messages and runtime JSON Schemas cover the corresponding runtime contracts.
 
-The unmodified upstream suite passed 96/96 (`NODE_OPTIONS=--conditions=source ../../node_modules/.bin/vitest run` from `packages/agent`).
+Historically at fork baseline `780bf31fc`, the unmodified upstream suite passed 96/96.
 
 | Gate | Result |
 | --- | --- |
-| `cargo fmt --check` | Passed |
-| `cargo clippy --all-targets -- -D warnings` | Passed offline |
-| `cargo test` | 32/32 passed offline in 0.93 s (test execution only) |
-
-Verification used the standalone lockfile and a single build job. The test build omitted this crate's debug information to reduce linker memory usage.
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy -p pi-rs-agent --all-targets --locked -- -D warnings` | Passed offline |
+| `cargo test -p pi-rs-agent --locked` | 32/32 passed offline in 0.93 s (test execution only) |
 
 Reversing parallel tool-result persistence made the ordering regression fail; restoring source order made it pass.

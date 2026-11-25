@@ -4,16 +4,18 @@ Rust companion for p2. The portable library owns process supervision, login-shel
 
 ## Run
 
-On Linux, exercise the real portable executable with the same p2 checkout it will supervise on macOS:
+Note: `pi-mac` is compile-checked on macOS in CI, while live macOS AppKit/`WKWebView` verification and migration of its supervisor launcher from the upstream `apps/p2` layout to the native Rust `p2` binary are currently deferred (see [ADR-005](../../rust/DECISIONS.md)).
+
+On Linux, you can exercise the portable executable against an upstream `p2` checkout:
 
 ```sh
-cargo build --locked -j 2
-P2MAC_CHECKOUT=/path/to/pi-rs/apps/p2 P2MAC_DATA_DIR=/path/to/private-test-data \
+cargo build --locked -p pi-rs-p2-mac --bin pi-mac
+P2MAC_CHECKOUT=/path/to/upstream-pi/apps/p2 P2MAC_DATA_DIR=/path/to/private-test-data \
   P2MAC_PORT=8798 P2MAC_FAKE=1 target/debug/pi-mac --serve
 P2MAC_ATTACH=8798 P2MAC_DATA_DIR=/path/to/private-test-data target/debug/pi-mac --diag
 ```
 
-`--check-config` prints effective settings without starting p2. `--diag` probes the selected server and, when `P2MAC_DIAG_DIR` and `P2MAC_DIAG_BRIDGE` are set, records the portable bridge. `--serve` watches or runs p2, stopping only a server it owns when interrupted. For upstream p2, the checkout needs its Node dependencies. This crate starts that p2; it does not embed or port the p2 server itself.
+`--check-config` prints effective settings without starting p2. `--diag` probes the selected server and, when `P2MAC_DIAG_DIR` and `P2MAC_DIAG_BRIDGE` are set, records the portable bridge. `--serve` watches or runs p2, stopping only a server it owns when interrupted. In its current form, `--serve` launches an upstream `apps/p2` checkout via Node; the standalone Rust `p2` server lives in `crates/pi-rs-p2`.
 
 For a macOS development bundle, build the Rust binary and put it at `Pi.app/Contents/MacOS/pi-mac` with [Info.plist](resources/Info.plist) at `Pi.app/Contents/Info.plist`. Launch the bundle without arguments. It uses the `com.earendil.pi` defaults domain and supports the upstream bundled layout under `Contents/Resources`: `p2/apps/p2` and `node/bin/node`. Set `SUFeedURL` and `SUPublicEDKey` in signed builds to enable update checks. Manual checks verify the Sparkle enclosure's exact length and Ed25519 signature before opening the downloaded DMG; the Rust updater does not replace a running application bundle.
 
@@ -35,9 +37,9 @@ On macOS, diagnostics record WebKit page and chrome state, theme replies and ref
 ## Verify
 
 ```sh
-cargo fmt --check
-cargo clippy --offline --locked -j 2 --all-targets -- -D warnings
-cargo test --offline --locked -j 2
+cargo fmt --all -- --check
+cargo clippy --offline --locked -p pi-rs-p2-mac --all-targets -- -D warnings
+cargo test --offline --locked -p pi-rs-p2-mac
 ```
 
 The Linux tests require cached Cargo dependencies, Node for the child-process fixture, and `lsof` for Unix listener discovery. They use temporary directories, local sockets, and loopback HTTP servers, not an external service. macOS AppKit/WKWebView linking, bundle signing, and live UI testing require a macOS machine and are not part of the Linux gate.

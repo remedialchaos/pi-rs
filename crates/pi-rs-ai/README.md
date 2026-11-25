@@ -1,6 +1,6 @@
 # pi-rs-ai
 
-Native Rust model catalog, request routing, and provider adapters. The crate is a standalone Cargo workspace; it does not load Node, SDK JavaScript, or the upstream model tree at runtime.
+Native Rust model catalog, request routing, and provider adapters. The crate is a member of the root `pi-rs` Cargo workspace; it does not load Node, SDK JavaScript, or any upstream TypeScript tree at runtime.
 
 - `Models::builtin(ModelsOptions::default())` registers the embedded providers. Use `Models::from_catalog` with `Catalog::from_hydrated_dir` to load a local catalog snapshot instead.
 - `Models::stream` and `Models::stream_simple` normalize the transcript, resolve provider auth, and return an `AssistantMessageEventStream`. Consume events with `StreamExt::next`, or await `result()` without draining the events.
@@ -10,12 +10,12 @@ Native Rust model catalog, request routing, and provider adapters. The crate is 
 
 ## Verification
 
-From this directory:
+From the repository root:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo clippy -p pi-rs-ai --all-targets --locked -- -D warnings
+cargo test -p pi-rs-ai --locked
 ```
 
 The integration suite uses loopback HTTP, SSE, WebSocket, and AWS EventStream fixtures. OAuth endpoints are remapped to loopback during tests. Credentials and model histories are synthetic; no provider account or network catalog is needed.

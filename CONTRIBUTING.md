@@ -1,6 +1,6 @@
 # Contributing to pi-rs
 
-`pi-rs` is a 100% Rust rewrite of [earendil-works/pi](https://github.com/earendil-works/pi) focused on reaching full drop-in parity across the monorepo.
+`pi-rs` is a 100% Rust rewrite of [earendil-works/pi](https://github.com/earendil-works/pi) that maintains drop-in compatibility with upstream external contracts across the standalone 18-crate Cargo workspace.
 
 ## Before You Start
 
@@ -25,10 +25,11 @@ cargo clippy --target wasm32-unknown-unknown -p pi-rs-p2-web --lib --locked -- -
 cargo test --workspace --locked
 ```
 
-For packaged `p2` browser asset builds:
+For packaged `p2` browser asset builds and installer checks:
 
 ```bash
 ./scripts/package-p2.sh --locked
+./scripts/test-install.sh
 ```
 
 ## Issues
