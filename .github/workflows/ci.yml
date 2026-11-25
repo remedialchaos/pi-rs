@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy p2-web wasm32
+        run: cargo clippy --target wasm32-unknown-unknown -p pi-rs-p2-web --lib --locked -- -D warnings
+
+      - name: Verify workspace metadata
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
+      - name: Check packaging script syntax
+        run: bash -n scripts/package-p2.sh
+
+  test:
+    name: Test Workspace (Linux x86_64)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tmux and ensure Chromium binary
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tmux
+          if [[ ! -x /usr/bin/chromium ]]; then
+            chrome_bin=""
+            for candidate in /usr/bin/google-chrome /usr/bin/google-chrome-stable /usr/bin/chromium-browser; do
+              if [[ -x "$candidate" ]]; then
+                chrome_bin="$candidate"
+                break
+              fi
+            done
+            if [[ -z "$chrome_bin" ]]; then
+              sudo apt-get install -y --no-install-recommends chromium || sudo apt-get install -y --no-install-recommends chromium-browser
+            else
+              sudo ln -sf "$chrome_bin" /usr/bin/chromium
+            fi
+          fi
+          tmux -V
+          /usr/bin/chromium --version
+
+      - name: Read pinned wasm-bindgen version
+        id: wbg-version
+        run: |
+          version="$(awk '
+            { sub(/\r$/, "") }
+            /^\[\[package\]\]$/ { in_pkg = 1; matched = 0; next }
+            in_pkg && /^name = "wasm-bindgen"$/ { matched = 1; next }
+            in_pkg && matched && /^version = "/ {
+              v = $0
+              sub(/^version = "/, "", v)
+              sub(/"$/, "", v)
+              print v
+              exit
+            }
+            /^$/ { in_pkg = 0; matched = 0 }
+          ' Cargo.lock)"
+          if [[ -z "$version" ]]; then
+            echo "Failed to read wasm-bindgen version from Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache wasm-bindgen-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/wasm-bindgen-cli
+          key: wasm-bindgen-cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.wbg-version.outputs.version }}
+
+      - name: Ensure wasm-bindgen-cli matches Cargo.lock
+        env:
+          WBG_VERSION: ${{ steps.wbg-version.outputs.version }}
+        run: |
+          wbg_root="$HOME/.local/wasm-bindgen-cli"
+          echo "$wbg_root/bin" >> "$GITHUB_PATH"
+          export PATH="$wbg_root/bin:$PATH"
+          installed=""
+          if command -v wasm-bindgen >/dev/null 2>&1; then
+            installed="$(wasm-bindgen --version | awk '{print $2}' | tr -d '\r')"
+          fi
+          if [[ "$installed" != "$WBG_VERSION" ]]; then
+            cargo install wasm-bindgen-cli --version "$WBG_VERSION" --locked --root "$wbg_root"
+          fi
+          wasm-bindgen --version
+
+      - name: Build packaged p2 binary
+        run: |
+          p2_bin="$(./scripts/package-p2.sh --locked)"
+          echo "P2_PACKAGED_BIN=$p2_bin" >> "$GITHUB_ENV"
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+  cross-check:
+    name: Cross-Platform Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
