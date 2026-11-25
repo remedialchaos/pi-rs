@@ -921,20 +921,23 @@ pub fn packaged_daemon(remote: &RemotePlatform) -> PathBuf {
 /// The daemon this package ships for the machine it runs on, e.g. for terminals of local sessions.
 pub fn local_daemon() -> Result<PathBuf, SshFailure> {
     let local = std::env::current_exe()?;
-    let candidates = [
-        local.with_file_name("pi-env"),
-        local
-            .parent()
-            .and_then(Path::parent)
-            .map(|directory| directory.join("pi-env"))
-            .unwrap_or_default(),
-    ];
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| {
-            SshFailure::Invalid("No pi-env daemon found next to this binary".to_string())
-        })
+    let bin_name = if cfg!(windows) {
+        "pi-env.exe"
+    } else {
+        "pi-env"
+    };
+    // Walk up a bounded number of ancestor directories so `local_daemon` works
+    // beside the executable, under Cargo's `target/<profile>/deps/`, and under
+    // Cargo 1.100+'s `target/<profile>/build/<crate>/<hash>/out/`.
+    for ancestor in local.ancestors().skip(1).take(6) {
+        let candidate = ancestor.join(bin_name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(SshFailure::Invalid(
+        "No pi-env daemon found next to this binary".to_string(),
+    ))
 }
 
 fn quote_posix(text: &str) -> String {

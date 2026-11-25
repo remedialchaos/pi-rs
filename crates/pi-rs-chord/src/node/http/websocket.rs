@@ -32,11 +32,21 @@ impl WebSocketPort for Port {
     }
     fn send_binary(&self, bytes: Vec<u8>) -> Result<()> {
         let len = bytes.len().max(1);
-        self.buffered
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                n.checked_add(len).filter(|n| *n <= self.maximum)
-            })
-            .map_err(|_| Error::Invalid("websocket output exceeds bound".into()))?;
+        let mut current = self.buffered.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(len).filter(|n| *n <= self.maximum) else {
+                return Err(Error::Invalid("websocket output exceeds bound".into()));
+            };
+            match self.buffered.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         if self.sender.send(Out::Bytes(bytes)).is_err() {
             self.buffered.fetch_sub(len, Ordering::AcqRel);
             return Err(Error::Closed);

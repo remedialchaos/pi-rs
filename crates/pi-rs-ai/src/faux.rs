@@ -384,13 +384,24 @@ impl Core {
                                 handle.id
                             )));
                         }
-                        if entry
-                            .pending
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                                n.checked_sub(1)
-                            })
-                            .is_ok()
-                        {
+                        let decremented = {
+                            let mut current = entry.pending.load(Ordering::Relaxed);
+                            loop {
+                                let Some(next) = current.checked_sub(1) else {
+                                    break false;
+                                };
+                                match entry.pending.compare_exchange_weak(
+                                    current,
+                                    next,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => break true,
+                                    Err(observed) => current = observed,
+                                }
+                            }
+                        };
+                        if decremented {
                             deferred(&model, entry.handle.clone())
                         } else {
                             entry

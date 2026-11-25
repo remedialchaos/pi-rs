@@ -204,4 +204,4 @@ jobs:
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             flags+=(--prerelease)
           fi
-          gh release create "${GITHUB_REF_NAME}" "${flags[@]}" dist/pi-rs-* dist/SHA256SUMS.txt
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" "${flags[@]}" dist/pi-rs-* dist/SHA256SUMS.txt
