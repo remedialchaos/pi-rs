@@ -215,37 +215,78 @@ impl Tool {
             });
         }
         if !images.is_empty() {
-            static REGISTER: Once = Once::new();
-            REGISTER.call_once(|| {
-                set_image_transcoder(Some(Arc::new(|data, mime| {
-                    convert_to_png(data, mime)
-                        .ok()
-                        .flatten()
-                        .map(|png| png.data)
-                })))
-            });
-            self.image_ids.resize_with(images.len(), allocate_image_id);
-            for (image, &id) in images.into_iter().zip(&self.image_ids) {
-                let theme = theme.clone();
-                let component = Image::new(
-                    Arc::<str>::from(image.data.as_str()),
-                    clean(&image.mime_type).into_owned(),
-                    ImageTheme {
-                        fallback_color: Rc::new(move |text| theme.fg("toolOutput", text)),
-                    },
-                    ImageOptions {
-                        max_width_cells: Some(ctx.image_width),
-                        image_id: Some(id),
-                        ..ImageOptions::default()
-                    },
-                    None,
-                );
-                rows.push(String::new());
-                rows.extend(component.render(ctx.width));
-            }
+            let owned: Vec<pi_rs_ai::ImageContent> = images.into_iter().cloned().collect();
+            rows.extend(render_inline_images(
+                &owned,
+                &mut self.image_ids,
+                ctx,
+                "toolOutput",
+            ));
         }
         rows
     }
+}
+
+pub(super) fn render_inline_images(
+    images: &[pi_rs_ai::ImageContent],
+    image_ids: &mut Vec<u32>,
+    ctx: &RenderContext<'_>,
+    fallback_token: &'static str,
+) -> Vec<String> {
+    if images.is_empty() {
+        return Vec::new();
+    }
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        set_image_transcoder(Some(Arc::new(|data, mime| {
+            convert_to_png(data, mime)
+                .ok()
+                .flatten()
+                .map(|png| png.data)
+        })))
+    });
+    let max_width = ctx
+        .width
+        .saturating_sub(ctx.pad * 2)
+        .min(ctx.image_width)
+        .max(1);
+    let mut rows = Vec::new();
+    image_ids.resize_with(images.len(), allocate_image_id);
+    for (image, &id) in images.iter().zip(image_ids.iter()) {
+        let mime = clean(&image.mime_type);
+        if !ctx.show_images
+            || ctx.capabilities.images.is_none()
+            || ctx.width <= 2
+            || image.data.is_empty()
+        {
+            let fallback = image_fallback(&mime, get_image_dimensions(&image.data, &mime), None);
+            rows.push(truncate_with_ellipsis(
+                &ctx.theme.fg(fallback_token, &fallback),
+                ctx.width,
+                "…",
+                false,
+            ));
+            continue;
+        }
+        let theme = ctx.theme.clone();
+        let component = Image::new(
+            Arc::<str>::from(image.data.as_str()),
+            mime.into_owned(),
+            ImageTheme {
+                fallback_color: Rc::new(move |text| theme.fg(fallback_token, text)),
+            },
+            ImageOptions {
+                max_width_cells: Some(max_width),
+                max_height_cells: ctx.image_height,
+                image_id: Some(id),
+                ..ImageOptions::default()
+            },
+            None,
+        );
+        rows.push(String::new());
+        rows.extend(component.render(ctx.width));
+    }
+    rows
 }
 
 fn styled_call(theme: &Theme, call: &str) -> String {

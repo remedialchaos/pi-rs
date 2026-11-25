@@ -387,3 +387,146 @@ fn persisted_edit_result_is_paired_with_original_call_and_highlights_changes()
     assert!(styled.contains("\x1b[7mold\x1b[27m") && styled.contains("\x1b[7mnew\x1b[27m"));
     Ok(())
 }
+
+struct CapabilityGuard(std::sync::MutexGuard<'static, ()>);
+
+impl CapabilityGuard {
+    fn lock() -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        Self(LOCK.lock().unwrap_or_else(|error| error.into_inner()))
+    }
+}
+
+impl Drop for CapabilityGuard {
+    fn drop(&mut self) {
+        let _ = &self.0;
+        pi_rs_tui::set_capability_overrides(
+            pi_rs_tui::terminal_image::CapabilityOverrides::default(),
+        );
+        pi_rs_tui::set_cell_dimensions(pi_rs_tui::CellDimensions::default());
+    }
+}
+
+fn png_base64(width: u32, height: u32) -> Result<String, Box<dyn Error>> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use image::{ImageEncoder, codecs::png::PngEncoder};
+
+    let mut bytes = Vec::new();
+    let pixels = vec![255u8; (width * height * 4) as usize];
+    PngEncoder::new(&mut bytes).write_image(
+        &pixels,
+        width,
+        height,
+        image::ExtendedColorType::Rgba8,
+    )?;
+    Ok(STANDARD.encode(bytes))
+}
+
+#[test]
+fn terminal_image_protocols_emit_kitty_and_iterm2_with_bounds_and_fallback()
+-> Result<(), Box<dyn Error>> {
+    let _guard = CapabilityGuard::lock();
+    let png = png_base64(180, 90)?;
+    pi_rs_tui::set_cell_dimensions(pi_rs_tui::CellDimensions {
+        width_px: 9,
+        height_px: 18,
+    });
+
+    let mut transcript = Transcript::new(dark()?);
+    transcript.configure(&json!({
+        "terminal": {
+            "showImages": true,
+            "imageWidthCells": 12,
+            "imageHeightCells": 8
+        }
+    }));
+
+    let user_msg = AgentMessage::User(
+        pi_rs_ai::UserMessage {
+            role: pi_rs_ai::UserRole::User,
+            content: StringOrBlocks::Blocks(serde_json::from_value(json!([
+                {"type": "image", "data": png, "mimeType": "image/png"}
+            ]))?),
+            timestamp: 0,
+        }
+        .into(),
+    );
+    core(
+        &mut transcript,
+        AgentEvent::MessageStart {
+            message: user_msg.clone(),
+        },
+    );
+    core(
+        &mut transcript,
+        AgentEvent::MessageEnd { message: user_msg },
+    );
+
+    let tool_content = serde_json::from_value(json!([
+        {"type": "image", "data": png, "mimeType": "image/png"}
+    ]))?;
+    core(
+        &mut transcript,
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id: "img-tool".into(),
+            tool_name: "read".into(),
+            result: Arc::new(AgentToolResult {
+                content: tool_content,
+                ..AgentToolResult::default()
+            }),
+            is_error: false,
+            duration_ms: None,
+        },
+    );
+
+    crate::cli::startup_ui::setup_terminal(&json!({
+        "terminal": { "images": "Kitty" }
+    }));
+    let kitty_lines = transcript.render(80);
+    let kitty_joined = kitty_lines.join("\n");
+    assert!(
+        kitty_joined.contains("\x1b_G"),
+        "expected Kitty APC sequence"
+    );
+    assert!(
+        kitty_joined.contains("c=12"),
+        "expected bounded cell width c=12 in Kitty sequence: {kitty_joined}"
+    );
+    let kitty_escapes = kitty_joined.matches("\x1b_G").count();
+    assert_eq!(
+        kitty_escapes, 2,
+        "expected both user and tool images to render"
+    );
+
+    crate::cli::startup_ui::setup_terminal(&json!({
+        "terminal": { "images": "iterm2" }
+    }));
+    transcript.configure(&json!({
+        "terminal": {
+            "showImages": true,
+            "imageWidthCells": 10
+        }
+    }));
+    let iterm_joined = transcript.render(80).join("\n");
+    assert!(
+        iterm_joined.contains("\x1b]1337;File="),
+        "expected iTerm2 OSC 1337 sequence"
+    );
+    assert!(iterm_joined.contains("inline=1"));
+    assert!(iterm_joined.contains("width=10"));
+    assert!(iterm_joined.contains('\x07'));
+
+    crate::cli::startup_ui::setup_terminal(&json!({
+        "terminal": { "images": "none" }
+    }));
+    let disabled_joined = transcript.render(80).join("\n");
+    assert!(!disabled_joined.contains("\x1b_G"));
+    assert!(!disabled_joined.contains("\x1b]1337;File="));
+    assert_eq!(
+        disabled_joined
+            .matches("[Image: [image/png] 180x90]")
+            .count(),
+        2
+    );
+    Ok(())
+}

@@ -300,4 +300,51 @@ mod tests {
         code_span("   A `` B", &mut row);
         assert_eq!(row, "```    A `` B ```  \n");
     }
+
+    #[test]
+    fn subgraph_flowchart_renders_grouped_nodes_and_falls_back_when_narrow()
+    -> Result<(), &'static str> {
+        let diagram = concat!(
+            "flowchart LR\n",
+            "  subgraph Edge\n",
+            "    api-gw[API Gateway]\n",
+            "  end\n",
+            "  subgraph Core\n",
+            "    svc[Worker] & cache[Cache]\n",
+            "  end\n",
+            "  api-gw -- route --> svc & cache\n",
+        );
+        let wide = render(diagram, 80)?
+            .map(plain)
+            .ok_or("expected wide subgraph diagram to render")?;
+        assert!(wide.contains("Edge"), "{wide}");
+        assert!(wide.contains("Core"), "{wide}");
+        assert!(wide.contains("API Gateway"), "{wide}");
+        assert!(wide.contains("Worker"), "{wide}");
+        assert!(wide.contains("Cache"), "{wide}");
+        assert!(wide.contains('▶'), "{wide}");
+        assert!(
+            wide.lines().all(|line| visible_width(line) <= 80),
+            "wide diagram exceeded viewport width:\n{wide}"
+        );
+
+        assert!(
+            render(diagram, 20)?.is_none(),
+            "diagram wider than 20 cells must fall back"
+        );
+
+        let fenced = format!("```mermaid\n{diagram}```");
+        let theme = Theme::load(std::path::Path::new("."), Some("dark"))
+            .map_err(|_| "failed to load dark theme")?;
+        let narrow = transform(&theme, &fenced, 20, MermaidMode::Final, false);
+        assert_eq!(narrow.as_ref(), fenced);
+
+        let unclosed = "flowchart LR\n  subgraph Unclosed\n    A --> B\n";
+        assert_eq!(render(unclosed, 80).err(), Some("unclosed subgraph"));
+        let fenced_unclosed = format!("```mermaid\n{unclosed}```");
+        let fallback_unclosed = transform(&theme, &fenced_unclosed, 80, MermaidMode::Final, false);
+        assert!(fallback_unclosed.contains("subgraph Unclosed"));
+        assert!(fallback_unclosed.contains("unclosed subgraph"));
+        Ok(())
+    }
 }

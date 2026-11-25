@@ -1051,6 +1051,10 @@ pub trait Extension: Send + Sync {
         Vec::new()
     }
 
+    fn dynamic_tools(&self) -> Option<Vec<ToolDefinition>> {
+        None
+    }
+
     fn name(&self) -> &str;
     fn path(&self) -> &str {
         self.name()

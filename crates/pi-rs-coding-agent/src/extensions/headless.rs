@@ -6,14 +6,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use indexmap::IndexMap;
-use pi_rs_mcp::McpClient;
 use serde_json::Value;
 
 use crate::core::extensions::types::{
     CommandDefinition, Extension, ExtensionFactory, ExtensionInitContext, ExtensionRegistration,
-    ExtensionToolContext, ToolDefinition, ToolExposure, ToolOutcome,
+    ExtensionToolContext, ToolDefinition, ToolOutcome,
 };
+use crate::extensions::mcp::McpConnectionManager;
 
 pub(crate) const COMMANDS: &[&str] = &["builtin:llama.cpp", "builtin:mcp"];
 
@@ -32,8 +31,7 @@ pub(crate) fn factory(
     };
     Some(Arc::new(move || {
         Ok(Box::new(HeadlessExtension {
-            tools: IndexMap::new(),
-            clients: Vec::new(),
+            mcp: McpConnectionManager::new(),
             registration: ExtensionRegistration::new(command.path()),
             command: command.clone(),
         }))
@@ -58,75 +56,8 @@ impl Command {
     }
 }
 
-struct McpAgentTool {
-    declaration: pi_rs_ai::Tool,
-    label: String,
-    client: McpClient,
-    remote: String,
-}
-
-impl pi_rs_agent::AgentTool for McpAgentTool {
-    fn declaration(&self) -> &pi_rs_ai::Tool {
-        &self.declaration
-    }
-    fn label(&self) -> &str {
-        &self.label
-    }
-    fn execute<'a>(
-        &'a self,
-        _id: &'a str,
-        args: &'a Value,
-        signal: &'a pi_rs_agent::CancellationToken,
-        _update: pi_rs_agent::AgentToolUpdateCallback,
-    ) -> futures_util::future::BoxFuture<'a, pi_rs_agent::Result<pi_rs_agent::AgentToolResult>>
-    {
-        Box::pin(async move {
-            use pi_rs_agent::AgentError;
-            let controller = pi_rs_mcp::AbortController::new();
-            let options = pi_rs_mcp::McpRequestOptions {
-                signal: Some(controller.signal()),
-                ..Default::default()
-            };
-            let call = self
-                .client
-                .call_tool(&self.remote, Some(args.clone()), &options);
-            tokio::pin!(call);
-            let reply = tokio::select! {
-                reply = &mut call => reply,
-                () = signal.cancelled() => {controller.abort(None); call.await}
-            }
-            .map_err(|e| AgentError::Callback(e.to_string()))?;
-            let blocks =
-                pi_rs_mcp::to_mcp_model_content(&self.declaration.name, &reply, Default::default())
-                    .await;
-            let content = blocks
-                .into_iter()
-                .map(|block| match block {
-                    pi_rs_mcp::LlmContent::Text { text } => {
-                        pi_rs_ai::InputContent::Text(text.into())
-                    }
-                    pi_rs_mcp::LlmContent::Image { data, mime_type } => {
-                        pi_rs_ai::InputContent::Image(pi_rs_ai::ImageContent {
-                            kind: Default::default(),
-                            data,
-                            mime_type,
-                        })
-                    }
-                })
-                .collect();
-            Ok(pi_rs_agent::AgentToolResult {
-                content,
-                structured_content: reply.structured_content,
-                is_error: reply.is_error,
-                ..Default::default()
-            })
-        })
-    }
-}
-
 struct HeadlessExtension {
-    tools: IndexMap<String, (McpClient, String)>,
-    clients: Vec<McpClient>,
+    mcp: McpConnectionManager,
     command: Command,
     registration: ExtensionRegistration,
 }
@@ -134,25 +65,17 @@ struct HeadlessExtension {
 #[async_trait]
 impl Extension for HeadlessExtension {
     fn agent_tools(&self) -> Vec<Arc<dyn pi_rs_agent::AgentTool>> {
-        self.registration
-            .tools
-            .values()
-            .filter(|def| matches!(def.exposure, ToolExposure::Direct | ToolExposure::ModelOnly))
-            .filter_map(|def| {
-                let (client, remote) = self.tools.get(&def.name)?;
-                Some(Arc::new(McpAgentTool {
-                    declaration: pi_rs_ai::Tool {
-                        name: def.name.clone(),
-                        description: def.description.clone(),
-                        parameters: def.parameters.clone(),
-                        constrained_sampling: None,
-                    },
-                    label: def.label.clone(),
-                    client: client.clone(),
-                    remote: remote.clone(),
-                }) as Arc<dyn pi_rs_agent::AgentTool>)
-            })
-            .collect()
+        match self.command {
+            Command::Mcp { .. } => self.mcp.agent_tools(),
+            Command::Llama => Vec::new(),
+        }
+    }
+
+    fn dynamic_tools(&self) -> Option<Vec<ToolDefinition>> {
+        match self.command {
+            Command::Mcp { .. } => Some(self.mcp.tool_definitions()),
+            Command::Llama => None,
+        }
     }
 
     fn name(&self) -> &str {
@@ -162,12 +85,7 @@ impl Extension for HeadlessExtension {
         matches!(self.command, Command::Mcp { .. })
     }
     fn invalidate(&self) {
-        for client in &self.clients {
-            let client = client.clone();
-            tokio::spawn(async move {
-                client.close().await;
-            });
-        }
+        self.mcp.close_all();
     }
 
     async fn execute_tool(
@@ -176,21 +94,7 @@ impl Extension for HeadlessExtension {
         args: Value,
         ctx: &ExtensionToolContext,
     ) -> Result<ToolOutcome, String> {
-        let (client, remote) = self
-            .tools
-            .get(name)
-            .ok_or_else(|| format!("Unknown MCP tool {name}"))?;
-        let reply = client
-            .call_tool(remote, Some(args.clone()), &Default::default())
-            .await
-            .map_err(|e| e.to_string())?;
-        let failed = reply.is_error.unwrap_or(false);
-        let mut outcome = ToolOutcome::success(
-            serde_json::json!({"type":"toolCall","id":ctx.tool_call_id,"name":name,"arguments":args}),
-            serde_json::to_value(reply).map_err(|e| e.to_string())?,
-        );
-        outcome.is_error = failed;
-        Ok(outcome)
+        self.mcp.execute_tool(name, args, ctx).await
     }
 
     fn hidden(&self) -> bool {
@@ -210,39 +114,11 @@ impl Extension for HeadlessExtension {
         } = &self.command
         {
             let cwd = Path::new(context.cwd);
-            let loaded = crate::cli::mcp::load_config(agent_dir, cwd, *project_trusted);
-            for (name, config) in loaded.servers {
-                if config["enabled"] == false {
-                    continue;
-                }
-                let Ok((client, tools)) =
-                    crate::cli::mcp::discover(agent_dir, &name, &config, cwd).await
-                else {
-                    continue;
-                };
-                for tool in tools {
-                    let local = pi_rs_mcp::create_mcp_tool_name(&name, &tool.name, |key| {
-                        self.tools.contains_key(key)
-                    });
-                    let schema = pi_rs_mcp::normalize_mcp_input_schema(&tool.input_schema)
-                        .map_err(|e| e.to_string())?;
-                    let mut definition = ToolDefinition::new(local.clone(), schema);
-                    definition.description = tool.description().unwrap_or_default().to_owned();
-                    definition.label = tool.title().unwrap_or(&tool.name).to_owned();
-                    definition.exposure = match config["toolExposure"]
-                        .get(&tool.name)
-                        .or_else(|| config.get("exposure"))
-                        .and_then(Value::as_str)
-                    {
-                        Some("direct") => ToolExposure::Direct,
-                        Some("deferred") => ToolExposure::Deferred,
-                        Some("hidden") => ToolExposure::Hidden,
-                        _ => ToolExposure::Codemode,
-                    };
-                    context.register_tool(definition)?;
-                    self.tools.insert(local, (client.clone(), tool.name));
-                }
-                self.clients.push(client);
+            self.mcp
+                .connect_all(agent_dir, cwd, *project_trusted)
+                .await?;
+            for definition in self.mcp.tool_definitions() {
+                context.register_tool(definition)?;
             }
         }
         let (name, description) = match self.command {
@@ -253,11 +129,13 @@ impl Extension for HeadlessExtension {
             ),
         };
         let command = self.command.clone();
+        let mcp = self.mcp.clone();
         context.register_command(CommandDefinition {
             name: name.to_owned(),
             description: Some(description.to_owned()),
             handler: Arc::new(move |args, context| {
                 let command = command.clone();
+                let mcp = mcp.clone();
                 Box::pin(async move {
                     match command {
                         Command::Llama => context
@@ -269,9 +147,15 @@ impl Extension for HeadlessExtension {
                             project_trusted,
                         } => {
                             let cwd = PathBuf::from(&context.base.cwd);
-                            let (message, kind) =
-                                mcp_command(&agent_dir, &cwd, project_trusted, &args, &context)
-                                    .await;
+                            let (message, kind) = mcp_command(
+                                &agent_dir,
+                                &cwd,
+                                project_trusted,
+                                &args,
+                                &context,
+                                &mcp,
+                            )
+                            .await;
                             context.base.ui.notify(message, kind);
                         }
                     }
@@ -288,6 +172,7 @@ async fn mcp_command(
     project_trusted: bool,
     args: &str,
     context: &crate::core::extensions::types::ExtensionCommandContext,
+    mcp: &McpConnectionManager,
 ) -> (String, &'static str) {
     const USAGE: &str =
         "Usage: /mcp, /mcp login [server], /mcp logout [server], /mcp reconnect [server]";
@@ -348,16 +233,40 @@ async fn mcp_command(
         };
     }
     if let ["reconnect", rest @ ..] = args.as_slice() {
-        if let [name] = rest
-            && !servers.contains_key(*name)
-        {
-            return (format!("No MCP server named \"{name}\"."), "warning");
+        if let [name] = rest {
+            let Some(entry) = servers.get(*name) else {
+                return (format!("No MCP server named \"{name}\"."), "warning");
+            };
+            if entry["enabled"] == false {
+                mcp.disconnect_server(name).await;
+                context.base.host.refresh_tools();
+                return (format!("MCP server \"{name}\" is disabled."), "warning");
+            }
+            let result = mcp
+                .reconnect_server(name, agent_dir, cwd, project_trusted)
+                .await;
+            context.base.host.refresh_tools();
+            return match result {
+                Ok(outcome) => (
+                    format!(
+                        "Reconnected MCP server \"{name}\" ({} tools).",
+                        outcome.tool_count
+                    ),
+                    "info",
+                ),
+                Err(error) => (
+                    format!("Failed to reconnect MCP server \"{name}\": {error}"),
+                    "error",
+                ),
+            };
         }
         if servers.values().all(|entry| entry["enabled"] == false) {
             return ("No enabled MCP server to reconnect.".into(), "warning");
         }
-        return match (context.reload)().await {
-            Ok(()) => ("Reloaded MCP connections and tools.".into(), "info"),
+        let result = mcp.reconnect_all(agent_dir, cwd, project_trusted).await;
+        context.base.host.refresh_tools();
+        return match result {
+            Ok(_) => ("Reloaded MCP connections and tools.".into(), "info"),
             Err(error) => (error, "error"),
         };
     }

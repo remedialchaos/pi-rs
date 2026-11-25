@@ -687,6 +687,34 @@ async fn stdout(mut command: Command) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+async fn run_captured(
+    program: &str,
+    args: &[impl AsRef<std::ffi::OsStr>],
+    cwd: &Path,
+) -> Result<(), String> {
+    let mut cmd = command(program, cwd);
+    cmd.args(args);
+    let output = captured(cmd).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim()
+    } else {
+        "command failed"
+    };
+    let display_args = args
+        .iter()
+        .map(|arg| arg.as_ref().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(format!("{program} {display_args}: {detail}"))
+}
+
 async fn inherited(
     program: &str,
     args: &[impl AsRef<std::ffi::OsStr>],
@@ -777,6 +805,72 @@ fn ensure_npm_root(root: &Path) -> io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub(crate) async fn install_package_captured(
+    manager: &PackageManager,
+    source: &str,
+    parsed: &PackageSource,
+    scope: PackageScope,
+) -> Result<(), String> {
+    match parsed {
+        PackageSource::Local { .. } => {
+            let target = manager.install_path(parsed, scope)?;
+            if !target.exists() {
+                return Err(format!("Path does not exist: {}", target.display()));
+            }
+            Ok(())
+        }
+        PackageSource::Npm { spec, .. } => {
+            manager.install_path(parsed, scope)?;
+            if spec.starts_with('-') {
+                return Err(format!("Invalid npm package spec: {spec}"));
+            }
+            ensure_npm_root(&manager.install_root(parsed, scope))
+                .map_err(|error| error.to_string())?;
+            let plan = manager.install_plan(source, scope)?;
+            run_captured(&plan.command, &plan.args, manager.cwd()).await
+        }
+        PackageSource::Git { git_ref, .. } => {
+            let root = manager.install_root(parsed, scope);
+            let target = manager.install_path(parsed, scope)?;
+            ensure_managed_parent(&root, &target)?;
+            if let Some(reference) = git_ref
+                .as_deref()
+                .filter(|reference| reference.starts_with('-'))
+            {
+                return Err(format!("Invalid git ref: {reference}"));
+            }
+            if target.exists() {
+                return Ok(());
+            }
+            ensure_ignore(&root).map_err(|error| error.to_string())?;
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            remove_file_if_present(&git_marker(&target)).map_err(|error| error.to_string())?;
+            let plan = manager.install_plan(source, scope)?;
+            let result = async {
+                run_captured(&plan.command, &plan.args, manager.cwd()).await?;
+                if let Some(reference) = git_ref {
+                    run_captured("git", &["checkout", reference], &target).await?;
+                }
+                if target.join("package.json").exists() {
+                    let npm = manager.npm_command();
+                    let mut full_args = npm.args;
+                    full_args.extend(manager.git_dependency_install_args());
+                    run_captured(&npm.command, &full_args, &target).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if result.is_err() {
+                let _ = remove_dir_if_present(&target);
+                prune_git_parents(&root, &target);
+            }
+            result
+        }
+    }
 }
 
 async fn install(
@@ -2228,7 +2322,22 @@ fn unix_millis() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
+pub(crate) async fn refresh_model_catalogs_background(
+    agent_dir: &Path,
+    settings: &SettingsManager,
+) -> Result<(), String> {
+    refresh_model_catalogs_inner(agent_dir, settings, false).await
+}
+
 async fn refresh_models(agent_dir: &Path, settings: &SettingsManager) -> Result<(), String> {
+    refresh_model_catalogs_inner(agent_dir, settings, true).await
+}
+
+async fn refresh_model_catalogs_inner(
+    agent_dir: &Path,
+    settings: &SettingsManager,
+    emit_output: bool,
+) -> Result<(), String> {
     use crate::core::{auth_storage::AuthStorage, model_registry::ModelRegistry};
     use pi_rs_ai::{auth::FileCredentialStore, models_store::InMemoryModelsStore};
     use std::sync::Arc;
@@ -2280,9 +2389,13 @@ async fn refresh_models(agent_dir: &Path, settings: &SettingsManager) -> Result<
                 updated.insert(id, entry);
             }
             Ok(None) => {}
-            Err(pi_rs_ai::Error::OAuth(error)) => eprintln!(
-                "Warning: skipped model catalog for {id}: {error}\nLog in again with `pi auth login {id}` to refresh it."
-            ),
+            Err(pi_rs_ai::Error::OAuth(error)) => {
+                if emit_output {
+                    eprintln!(
+                        "Warning: skipped model catalog for {id}: {error}\nLog in again with `pi auth login {id}` to refresh it."
+                    );
+                }
+            }
             Err(error) => failures.push(format!("{id}: {error}")),
         }
     }
@@ -2293,7 +2406,9 @@ async fn refresh_models(agent_dir: &Path, settings: &SettingsManager) -> Result<
             failures.join("; ")
         ));
     }
-    println!("Model catalogs refreshed");
+    if emit_output {
+        println!("Model catalogs refreshed");
+    }
     Ok(())
 }
 

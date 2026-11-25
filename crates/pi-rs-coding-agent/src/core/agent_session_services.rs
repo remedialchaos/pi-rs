@@ -680,6 +680,16 @@ async fn create_services(
     )
     .map_err(|error| error.to_string())?;
     settings.set_project_trusted(trusted);
+    if !args.help && args.list_models.is_none() {
+        let auto_install = crate::core::startup::auto_install_missing_packages(
+            &settings,
+            &cwd,
+            &agent_dir,
+            args.offline,
+        )
+        .await;
+        diagnostics.extend(auto_install.diagnostics);
+    }
     let resources_config =
         crate::modes::interactive::selectors::ConfiguredResources::new(&settings, &cwd, &agent_dir);
     let mut post_paths = configured_extensions(
@@ -820,21 +830,8 @@ async fn create_services(
         &mut model_runtime,
         &mut diagnostics,
     );
-    let mut tools = selected_tools(&cwd, args, &settings);
-    if !args.no_tools {
-        for extension in runner.extensions() {
-            tools.extend(extension.agent_tools().into_iter().filter(|tool| {
-                let name = &tool.declaration().name;
-                args.tools
-                    .as_ref()
-                    .is_none_or(|patterns| patterns.iter().any(|p| tool_name_matches(p, name)))
-                    && args
-                        .exclude_tools
-                        .as_ref()
-                        .is_none_or(|patterns| !patterns.iter().any(|p| tool_name_matches(p, name)))
-            }));
-        }
-    }
+    let builtin_tools = selected_tools(&cwd, args, &settings);
+    let tools = collect_session_tools(&builtin_tools, &runner, args);
     let system_prompt = build_system_prompt_sections(&SystemPromptOptions {
         cwd: cwd.clone(),
         custom_prompt: resources.system_prompt.clone(),
@@ -887,6 +884,16 @@ async fn create_services(
     .map_err(|error| error.to_string())?;
     // Declare the initial loadout on the first prompt, not as hidden history.
     agent.set_tools(tools);
+    {
+        let agent = agent.clone();
+        let runner_weak = Arc::downgrade(&runner);
+        let args = args.clone();
+        runner.host.set_refresh_tools(Arc::new(move || {
+            if let Some(runner) = runner_weak.upgrade() {
+                agent.set_tools(collect_session_tools(&builtin_tools, &runner, &args));
+            }
+        }));
+    }
     let compactor = Arc::new(ModelCompactor {
         runtime: model_runtime.clone(),
         keep_recent_tokens: settings_value["compaction"]["keepRecentTokens"]
@@ -1110,6 +1117,29 @@ fn select_model(
     diagnostics.extend(fallback.as_ref().map(RuntimeDiagnostic::warning));
     runtime.set_scope(scope.scoped_models);
     (model, thinking, fallback)
+}
+
+fn collect_session_tools(
+    builtin_tools: &[Arc<dyn AgentTool>],
+    runner: &ExtensionRunner,
+    args: &Args,
+) -> Vec<Arc<dyn AgentTool>> {
+    let mut tools = builtin_tools.to_vec();
+    if !args.no_tools {
+        for extension in runner.extensions() {
+            tools.extend(extension.agent_tools().into_iter().filter(|tool| {
+                let name = &tool.declaration().name;
+                args.tools
+                    .as_ref()
+                    .is_none_or(|patterns| patterns.iter().any(|p| tool_name_matches(p, name)))
+                    && args
+                        .exclude_tools
+                        .as_ref()
+                        .is_none_or(|patterns| !patterns.iter().any(|p| tool_name_matches(p, name)))
+            }));
+        }
+    }
+    tools
 }
 
 fn tool_name_matches(pattern: &str, name: &str) -> bool {

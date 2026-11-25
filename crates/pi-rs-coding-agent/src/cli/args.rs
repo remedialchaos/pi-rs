@@ -74,6 +74,7 @@ pub struct Args {
     pub no_context_files: bool,
     pub list_models: Option<ListModels>,
     pub offline: bool,
+    pub no_refresh: bool,
     pub tui_mode: Option<TuiMode>,
     pub verbose: bool,
     pub project_trust_override: Option<bool>,
@@ -287,6 +288,7 @@ pub fn parse_args(args: &[String]) -> Args {
             "--approve" | "-a" => result.project_trust_override = Some(true),
             "--no-approve" | "-na" => result.project_trust_override = Some(false),
             "--offline" => result.offline = true,
+            "--no-refresh" => result.no_refresh = true,
             _ if arg.starts_with('@') => result.positional(arg),
             _ if arg.starts_with("--") => {
                 let flag = &arg[2..];
@@ -407,6 +409,7 @@ Options:
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
+  --no-refresh                   Disable startup background model catalog refresh
   --                             End option parsing; treat remaining arguments as messages/files
   --help, -h                     Show this help
   --version, -v                  Show version number

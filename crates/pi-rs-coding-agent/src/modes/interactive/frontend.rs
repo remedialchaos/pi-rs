@@ -810,8 +810,11 @@ impl Frontend {
                 self.close_dialogs();
                 self.bound = bound;
                 self.refreshed_models.clear();
-                self.bound
-                    .refresh_catalog(work, self.send.clone(), self.options.offline);
+                self.bound.refresh_catalog(
+                    work,
+                    self.send.clone(),
+                    self.options.offline || self.options.no_refresh,
+                );
                 self.settings = load_settings(&self.options, &self.bound);
                 self.editor.borrow_mut().keys.reload();
                 self.widgets.clear();

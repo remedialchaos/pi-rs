@@ -59,8 +59,14 @@ struct Row {
     cache: Option<CachedRow>,
 }
 
+struct UserMessageRow {
+    text: String,
+    images: Vec<pi_rs_ai::ImageContent>,
+    image_ids: Vec<u32>,
+}
+
 enum Body {
-    User(String),
+    User(UserMessageRow),
     Assistant(Assistant),
     Card(Card),
     Tool(Tool),
@@ -88,6 +94,7 @@ struct Options {
     show_thinking: bool,
     show_images: bool,
     image_width: usize,
+    image_height: Option<usize>,
     code_block_indent: Option<String>,
     mermaid: MermaidMode,
 }
@@ -103,6 +110,10 @@ impl Options {
                 .and_then(|width| usize::try_from(width).ok())
                 .unwrap_or(60)
                 .max(1),
+            image_height: settings["terminal"]["imageHeightCells"]
+                .as_u64()
+                .and_then(|height| usize::try_from(height).ok())
+                .map(|height| height.max(1)),
             code_block_indent: Some(
                 settings["markdown"]["codeBlockIndent"]
                     .as_str()
@@ -126,6 +137,7 @@ struct RenderContext<'a> {
     show_thinking: bool,
     show_images: bool,
     image_width: usize,
+    image_height: Option<usize>,
     code_block_indent: &'a Option<String>,
     mermaid: MermaidMode,
     expand_key: &'a str,
@@ -322,6 +334,7 @@ impl Transcript {
             show_thinking: self.options.show_thinking,
             show_images: self.options.show_images,
             image_width: self.options.image_width,
+            image_height: self.options.image_height,
             code_block_indent: &self.options.code_block_indent,
             mermaid: self.options.mermaid,
             expand_key: "ctrl+o",
@@ -483,11 +496,21 @@ impl Transcript {
         let role = message.role();
         match message {
             AgentMessage::User(user) => {
-                let text = match &user.content {
-                    StringOrBlocks::String(text) => text.clone(),
-                    StringOrBlocks::Blocks(blocks) => pi_rs_ai::transcript::input_text(blocks, ""),
+                let (text, images) = match &user.content {
+                    StringOrBlocks::String(text) => (text.clone(), Vec::new()),
+                    StringOrBlocks::Blocks(blocks) => {
+                        let text = pi_rs_ai::transcript::input_text(blocks, "");
+                        let images = blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                pi_rs_ai::InputContent::Image(image) => Some(image.clone()),
+                                pi_rs_ai::InputContent::Text(_) => None,
+                            })
+                            .collect::<Vec<_>>();
+                        (text, images)
+                    }
                 };
-                if text.trim().is_empty() {
+                if text.trim().is_empty() && images.is_empty() {
                     return;
                 }
                 if let Some(skill) = parse_skill_block(&text) {
@@ -498,11 +521,34 @@ impl Transcript {
                         }),
                         metadata.clone(),
                     );
-                    if let Some(user) = skill.user_message {
-                        self.push(Body::User(user), metadata);
+                    if let Some(user_text) = skill.user_message {
+                        self.push(
+                            Body::User(UserMessageRow {
+                                text: user_text,
+                                images,
+                                image_ids: Vec::new(),
+                            }),
+                            metadata,
+                        );
+                    } else if !images.is_empty() {
+                        self.push(
+                            Body::User(UserMessageRow {
+                                text: String::new(),
+                                images,
+                                image_ids: Vec::new(),
+                            }),
+                            metadata,
+                        );
                     }
                 } else {
-                    self.push(Body::User(text), metadata);
+                    self.push(
+                        Body::User(UserMessageRow {
+                            text,
+                            images,
+                            image_ids: Vec::new(),
+                        }),
+                        metadata,
+                    );
                 }
             }
             AgentMessage::Custom(message) => match role {
@@ -886,11 +932,21 @@ impl Row {
         let expanded = self.expanded.unwrap_or(default_expanded);
         let mut thinking = Vec::new();
         let lines = match &mut self.body {
-            Body::User(text) => {
-                let mut lines = message::markdown(ctx, &self.metadata, text, MarkdownSurface::User);
+            Body::User(user) => {
+                let mut lines = if user.text.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    message::markdown(ctx, &self.metadata, &user.text, MarkdownSurface::User)
+                };
                 if !lines.is_empty() {
                     lines.insert(0, String::new());
                 }
+                lines.extend(execution::render_inline_images(
+                    &user.images,
+                    &mut user.image_ids,
+                    ctx,
+                    "userMessageText",
+                ));
                 lines
             }
             Body::Assistant(assistant) => {
