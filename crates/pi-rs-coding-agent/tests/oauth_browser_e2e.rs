@@ -27,6 +27,10 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const CHROMIUM_BIN: &str = "/usr/bin/chromium";
 
+// Serialize headless Chromium launches within this test binary so concurrent
+// browser startups cannot starve each other on 2-4 core CI runners.
+static CHROMIUM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn ensure_chromium_exists() -> TestResult {
     if !Path::new(CHROMIUM_BIN).exists() {
         return Err(format!("missing Chromium binary at {CHROMIUM_BIN}").into());
@@ -509,6 +513,10 @@ impl ChromiumLoginTerminal {
                         "--disable-dev-shm-usage",
                         "--no-first-run",
                         "--no-default-browser-check",
+                        "--password-store=basic",
+                        "--disable-background-networking",
+                        "--disable-extensions",
+                        "--disable-sync",
                     ])
                     .arg(format!("--user-data-dir={}", profile.display()))
                     .arg("--dump-dom")
@@ -602,6 +610,7 @@ fn assert_owner_only_mode(path: &Path) -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pi_auth_login_radius_chromium_pkce_e2e() -> TestResult {
     ensure_chromium_exists()?;
+    let _chromium_guard = CHROMIUM_LOCK.lock().await;
     let server = MockOAuthServer::start().await?;
     let root = tempfile::tempdir()?;
     let agent_dir = root.path().join("agent");
@@ -705,6 +714,7 @@ async fn pi_mcp_login_chromium_pkce_via_pi_browser_cmd_e2e() -> TestResult {
     use std::os::unix::fs::PermissionsExt;
 
     ensure_chromium_exists()?;
+    let _chromium_guard = CHROMIUM_LOCK.lock().await;
     let server = MockOAuthServer::start().await?;
     let root = tempfile::tempdir()?;
     let agent_dir = root.path().join("agent");
@@ -716,7 +726,7 @@ async fn pi_mcp_login_chromium_pkce_via_pi_browser_cmd_e2e() -> TestResult {
     let err_out = root.path().join("chromium.stderr.log");
     let opener_script = root.path().join("open-chromium.sh");
     let script_body = format!(
-        "#!/bin/sh\nset -eu\n\"{CHROMIUM_BIN}\" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run --no-default-browser-check \"--user-data-dir={}\" --dump-dom \"$1\" > \"{}\" 2> \"{}\"\nmv \"{}\" \"{}\"\n",
+        "#!/bin/sh\nset -eu\n\"{CHROMIUM_BIN}\" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run --no-default-browser-check --password-store=basic --disable-background-networking --disable-extensions --disable-sync \"--user-data-dir={}\" --dump-dom \"$1\" > \"{}\" 2> \"{}\"\nmv \"{}\" \"{}\"\n",
         chrome_profile.display(),
         dom_tmp.display(),
         err_out.display(),
@@ -743,26 +753,34 @@ async fn pi_mcp_login_chromium_pkce_via_pi_browser_cmd_e2e() -> TestResult {
         String::from_utf8_lossy(&add_out.stderr)
     );
 
+    let host_path =
+        std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
     let login_out = tokio::time::timeout(
-        Duration::from_secs(45),
+        Duration::from_secs(60),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_pi"))
             .current_dir(root.path())
             .env_clear()
+            .env("PATH", &host_path)
             .env("HOME", root.path())
             .env("USERPROFILE", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+            .env("XDG_CACHE_HOME", root.path().join("xdg-cache"))
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
             .env("PI_CODING_AGENT_DIR", &agent_dir)
             .env("PI_BROWSER_CMD", &opener_script)
-            .args(["mcp", "login", "loopback-oauth", "--timeout", "30"])
+            .args(["mcp", "login", "loopback-oauth", "--timeout", "45"])
             .stdin(Stdio::null())
             .output(),
     )
     .await??;
 
+    let chromium_err = std::fs::read_to_string(&err_out).unwrap_or_default();
     assert_eq!(
         login_out.status.code(),
         Some(0),
-        "mcp login stderr: {}",
-        String::from_utf8_lossy(&login_out.stderr)
+        "mcp login stderr: {}\nchromium stderr: {}",
+        String::from_utf8_lossy(&login_out.stderr),
+        chromium_err
     );
     let stdout = String::from_utf8_lossy(&login_out.stdout);
     assert!(

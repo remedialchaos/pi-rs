@@ -106,10 +106,7 @@ pub fn satisfies_bidi_rule(value: &str) -> bool {
         }
     }
     // 4. If an EN is present, no AN may be present, and vice versa.
-    if is_rtl && saw_european_number && saw_arabic_number {
-        return false;
-    }
-    true
+    !(is_rtl && saw_european_number && saw_arabic_number)
 }
 
 #[cfg(test)]

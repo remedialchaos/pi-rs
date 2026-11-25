@@ -165,10 +165,7 @@ pub fn is_unicode_label(value: &str) -> bool {
     }
     // 4. Global Context Validations (Post-loop)
     // RFC 5892 Appendix A.7 - Katakana Middle Dot requirement
-    if value.contains('\u{30fb}') && !has_japanese {
-        return false;
-    }
-    true
+    !(value.contains('\u{30fb}') && !has_japanese)
 }
 
 #[cfg(test)]
