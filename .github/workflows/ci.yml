@@ -121,10 +121,10 @@ jobs:
           fi
           wasm-bindgen --version
 
-      - name: Build packaged p2 binary
+      - name: Build p2 browser assets
         run: |
-          p2_bin="$(./scripts/package-p2.sh --locked)"
-          echo "P2_PACKAGED_BIN=$p2_bin" >> "$GITHUB_ENV"
+          assets_dir="$(./scripts/package-p2.sh --assets-only --locked)"
+          echo "P2_BROWSER_ASSETS=$assets_dir" >> "$GITHUB_ENV"
 
       - name: Run workspace tests
         run: cargo test --workspace --locked
