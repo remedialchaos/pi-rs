@@ -56,10 +56,10 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install tmux and ensure Chromium binary
+      - name: Install tmux, openssh-server, and ensure Chromium binary
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends tmux
+          sudo apt-get install -y --no-install-recommends tmux openssh-server
           if [[ ! -x /usr/bin/chromium ]]; then
             chrome_bin=""
             for candidate in /usr/bin/google-chrome /usr/bin/google-chrome-stable /usr/bin/chromium-browser; do
@@ -75,6 +75,7 @@ jobs:
             fi
           fi
           tmux -V
+          test -x /usr/sbin/sshd
           /usr/bin/chromium --version
 
       - name: Read pinned wasm-bindgen version
