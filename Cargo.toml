@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pi-rs-schema",
+    "crates/pi-rs-telemetry",
+    "crates/pi-rs-mcp",
+    "crates/pi-rs-codemode",
+    "crates/pi-rs-tui",
+    "crates/pi-rs-ai",
+    "crates/pi-rs-agent",
+    "crates/pi-rs-coding-agent",
+    "crates/pi-rs-chord",
+    "crates/pi-rs-durable",
+    "crates/pi-rs-env",
+    "crates/pi-rs-evals",
+    "crates/pi-rs-p3",
+    "crates/pi-rs-p2",
+    "crates/pi-rs-p2-web",
+    "crates/pi-rs-p2-tui",
+    "crates/pi-rs-p2-mac",
+    "crates/pi-rs-voice-server",
+]

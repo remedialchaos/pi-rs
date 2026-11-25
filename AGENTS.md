@@ -7,11 +7,9 @@
 Before planning or editing code, read:
 
 1. [rust/HANDOFF.md](rust/HANDOFF.md) — current milestone, gate table, and hazards.
-2. [rust/MAP.md](rust/MAP.md) — full port plan, active claims, and dependency research queue.
-3. [rust/DECISIONS.md](rust/DECISIONS.md) — binding ADRs (ADR-001 through ADR-011 and any later ADRs).
+2. [rust/MAP.md](rust/MAP.md) — full port record, crate verification evidence, and research history.
+3. [rust/DECISIONS.md](rust/DECISIONS.md) — binding ADRs (ADR-001 through ADR-012 and any later ADRs).
 4. [rust/GLOSSARY.md](rust/GLOSSARY.md) — canonical crate, binary, and domain symbol names.
-
-When porting units or wiring front doors, follow the `rust-anything` skill (`SKILL.md` and `whole-app.md`).
 
 ## Conversational Style
 
@@ -23,13 +21,11 @@ When porting units or wiring front doors, follow the `rust-anything` skill (`SKI
 - When the user asks a question, answer it first before making edits or running implementation commands.
 - When responding to user feedback or an analysis, explicitly state whether you agree or disagree before describing changes.
 
-## Strangler & Compatibility Rules
+## Repository Layout & Compatibility Rules
 
-- **Upstream trees are read-only reference**: Do not edit files under `packages/` or `apps/` unless the user explicitly asks (or when wiring a temporary `rust-anything` shadow module per `whole-app.md`). All new Rust code, research notes, recorded cases, and port tracking live under `rust/`.
-- **Drop-in compatibility (ADR-003)**: Match upstream external contracts strictly (CLI flags, exit codes, `~/.pi/agent/` files, JSONL v3 sessions, `--mode json` and `--mode rpc` framing, HTTP routes, SQLite schemas) until full parity is reached. Normalize only verified run-to-run noise in recorded cases, never in ports.
-- **Research before porting (ADR-007)**: Before porting a package that relies on an unverified crate replacement, write its primary-source research note in `rust/research/<topic>.md` and read it before coding.
-- **Claim before editing**: Claim each unit in `rust/MAP.md` before starting work, and record `gate` and `diff`/`replay` results when marking it done.
-- **Checkpoints (ADR-009)**: Pause at each package/wave milestone, run `rust-anything map --write` (once crates exist), and rewrite `rust/HANDOFF.md` (<150 lines).
+- **100% Rust lifted workspace (ADR-012)**: Upstream TypeScript, Swift, and Python reference trees (`packages/`, `apps/`) have been retired. The Cargo workspace lives at root `Cargo.toml` with all 18 crates under `crates/pi-rs-*`. Architecture records, port history, and research notes live under `rust/`.
+- **Drop-in compatibility (ADR-003)**: Preserve upstream external contracts strictly (CLI flags, exit codes, `~/.pi/agent/` files, JSONL v3 sessions, `--mode json` and `--mode rpc` framing, HTTP routes, SQLite schemas).
+- **Checkpoints (ADR-009)**: Rewrite `rust/HANDOFF.md` (<150 lines) at each milestone.
 
 ## Rust Code Quality
 
@@ -53,30 +49,16 @@ When porting units or wiring front doors, follow the `rust-anything` skill (`SKI
 For every Rust crate change:
 
 ```bash
-cargo fmt --manifest-path rust/crates/Cargo.toml --all -- --check
-cargo clippy --manifest-path rust/crates/Cargo.toml --workspace --all-targets -- -D warnings
-cargo test --manifest-path rust/crates/Cargo.toml --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --target wasm32-unknown-unknown -p pi-rs-p2-web --lib --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-For `rust-anything` unit ports:
+For packaged `p2` browser UI builds:
 
 ```bash
-rust-anything build <crate>
-rust-anything diff <crate>
-rust-anything bench <crate>
-rust-anything gate <crate>
-```
-
-For whole-app front doors:
-
-```bash
-rust-anything app replay <target>
-```
-
-For running the untouched upstream TS oracle (recording cases only):
-
-```bash
-npm install --ignore-scripts
+./scripts/package-p2.sh --locked
 ```
 
 - Never commit unless the user asks.

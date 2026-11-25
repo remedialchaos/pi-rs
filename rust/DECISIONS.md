@@ -116,3 +116,13 @@ Status: accepted (2026-11-22) — resolves Open Question #2 from [rust/research/
 Context: Upstream `apps/p2` (and future `apps/p3` pages) serve pure client-side rendered (CSR) browser apps over Chord binary WebSocket links, reusing upstream CSS design tokens (`elanor.css`, etc.) and raw DOM/WebKit hooks (`p2-mac` `WKWebView`, `ResizeObserver`, Web Audio). Under ADR-002, all web UI code is Rust compiled to `wasm32-unknown-unknown`.
 Decision: Adopt `leptos` (`0.8.x`, CSR mode) with `wasm-bindgen` and `web-sys` for all Rust-to-WASM browser UIs, sharing `pi-rs-chord`'s `wasm32`-clean protocol, delta, contract, and surface types directly with the server.
 Consequences: Chord's reactive `Readable`/`Document`/`LiveQuery` deltas map 1:1 onto fine-grained Leptos signals with zero VDOM diffing on streaming transcripts, upstream CSS and `p2-mac` DOM/WebKit contracts work verbatim for drop-in compatibility, and server/client wire types stay in a single Rust crate.
+
+## ADR-012: Retire Upstream Reference Trees, Vendor Runtime Assets, and Promote Cargo Workspace to Repo Root
+Status: accepted (2026-11-24) — completes the lift phase of ADR-004.
+Context: All 18 Rust workspace crates, 8 binaries, 49 built-in `p2` plugins, `p2 tui`, and the Leptos WASM browser UI have passed differential and live E2E gates. Remaining build-time dependencies on upstream trees were limited to static assets in `pi-rs-coding-agent`, JSON Schema test fixtures in `pi-rs-schema`, Elanor CSS/WOFF2 fonts bundled via `esbuild` in `pi-rs-p2-web`, and two upstream-oracle tests in `pi-rs-p2`.
+Decision:
+1. Vendor all required static assets, conformance fixtures, and permissively licensed Elanor CSS/WOFF2 files (OFL-1.1, ISC, MIT) directly inside their owning Rust crates.
+2. Replace `esbuild` with a pure-Rust, zero-extra-dependency CSS and font bundler (`p2-bundle-assets` in `pi-rs-p2-web`), orchestrated by `scripts/package-p2.sh`.
+3. Retire `packages/`, `apps/`, and legacy Node/TS/Nix root files, and promote `Cargo.toml`, `Cargo.lock`, and `crates/pi-rs-*` to the repository root while retaining `rust/` for ADRs, port history, research notes, and recorded cases.
+4. Add GitHub Actions CI (`.github/workflows/ci.yml`) and tag-driven release packaging (`.github/workflows/release.yml`) targeting the root Cargo workspace with zero Node.js/npm dependencies.
+Consequences: Standard `cargo fmt`, `cargo clippy`, `cargo test`, and `./scripts/package-p2.sh` run directly from the repository root with zero Node.js, npm, or `esbuild` dependencies. Upstream `earendil-works/pi` commit `780bf31fc` remains accessible in git history whenever historical comparison is needed.

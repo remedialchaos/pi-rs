@@ -4,31 +4,31 @@
 
 ## Before You Start
 
-1. Read [rust/DECISIONS.md](rust/DECISIONS.md) for settled architectural decisions (ADR-001 through ADR-011).
-2. Read [rust/MAP.md](rust/MAP.md) to see what is planned, claimed, or already ported.
+1. Read [rust/DECISIONS.md](rust/DECISIONS.md) for settled architectural decisions (ADR-001 through ADR-012).
+2. Read [rust/MAP.md](rust/MAP.md) to see the ported crates, verification evidence, and architecture history.
 3. Read [AGENTS.md](AGENTS.md) for coding standards, error handling, and workflow rules.
 
-## Scope During the Port
+## Scope & Compatibility
 
-- Keep changes focused on porting planned milestones cleanly without drifting from upstream external behavior (CLI flags, `~/.pi/agent/` files, JSONL v3 sessions, `--mode json`/`--mode rpc`, HTTP/SQLite contracts).
-- Do not modify upstream TypeScript, Swift, or Python reference files under `packages/` or `apps/` unless required by a temporary `rust-anything` shadow step or explicitly agreed in an issue.
-- You must understand any code you submit and be able to explain how it preserves or verifies upstream behavior.
+- Keep changes focused and preserve drop-in compatibility with upstream external contracts (CLI flags, `~/.pi/agent/` files, JSONL v3 sessions, `--mode json`/`--mode rpc`, HTTP/SQLite contracts).
+- Keep the repository 100% Rust with zero Node.js, npm, or `esbuild` build dependencies (ADR-002, ADR-012).
+- You must understand any code you submit and be able to explain how it preserves or verifies behavior.
 
 ## Verification
 
 Before opening a pull request, ensure the relevant checks pass:
 
 ```bash
-cargo fmt --manifest-path rust/crates/Cargo.toml --all -- --check
-cargo clippy --manifest-path rust/crates/Cargo.toml --workspace --all-targets -- -D warnings
-cargo test --manifest-path rust/crates/Cargo.toml --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --target wasm32-unknown-unknown -p pi-rs-p2-web --lib --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-For ported units verified against the upstream oracle:
+For packaged `p2` browser asset builds:
 
 ```bash
-rust-anything diff <crate>
-rust-anything gate <crate>
+./scripts/package-p2.sh --locked
 ```
 
 ## Issues
