@@ -541,6 +541,22 @@ impl SystemEvalDockerOps {
         }
     }
 
+    /// Construct docker ops using an explicit OCI container runtime binary or path.
+    pub fn with_container_runtime(
+        package_root: &Path,
+        context: DockerContext,
+        runtime: impl Into<String>,
+    ) -> Self {
+        Self {
+            context,
+            runner: SystemCommandRunner::with_container_runtime(
+                package_root.to_path_buf(),
+                runtime,
+            ),
+            built_images: std::cell::RefCell::new(None),
+        }
+    }
+
     pub fn context(&self) -> &DockerContext {
         &self.context
     }

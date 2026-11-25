@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use pi_rs_evals::docker::{
-    BuiltImage, BuiltImages, CommandOutput, CommandRunner, DockerContext, build_images,
-    create_docker_context, docker_args, escape_regex, process_uid_gid, require_eval_auth_file,
-    run_task, task_directory_name,
+    BuiltImage, BuiltImages, CommandOutput, CommandRunner, DockerContext, SystemCommandRunner,
+    build_images, create_docker_context, docker_args, escape_regex, process_uid_gid,
+    require_eval_auth_file, resolve_container_runtime, run_task, task_directory_name,
 };
 use pi_rs_evals::plan::{DocumentationVariant, EvalTask};
 use serde_json::json;
@@ -255,4 +255,132 @@ fn build_images_uses_both_variants_and_inspects_ids() {
     assert!(calls[1].2);
     assert_eq!(calls[2].1[2], "with_docs");
     assert_eq!(calls[3].1[3], "{{.Id}}");
+}
+
+fn create_executable(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod executable");
+    }
+    path
+}
+
+#[test]
+fn resolve_container_runtime_honors_env_override_and_trims_whitespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_executable(dir.path(), "docker");
+    create_executable(dir.path(), "podman");
+    let path = std::env::join_paths([dir.path()]).expect("join path");
+
+    assert_eq!(
+        resolve_container_runtime(Some(" /custom/bin/podman "), Some(&path))
+            .expect("override runtime"),
+        "/custom/bin/podman"
+    );
+    assert_eq!(
+        resolve_container_runtime(Some("   "), Some(&path)).expect("blank override falls back"),
+        "docker"
+    );
+    assert_eq!(
+        resolve_container_runtime(Some(""), Some(&path)).expect("empty override falls back"),
+        "docker"
+    );
+}
+
+#[test]
+fn resolve_container_runtime_prefers_docker_over_podman_regardless_of_path_order() {
+    let podman_dir = tempfile::tempdir().expect("podman tempdir");
+    let docker_dir = tempfile::tempdir().expect("docker tempdir");
+    create_executable(podman_dir.path(), "podman");
+    create_executable(docker_dir.path(), "docker");
+    let path = std::env::join_paths([podman_dir.path(), docker_dir.path()]).expect("join path");
+
+    assert_eq!(
+        resolve_container_runtime(None, Some(&path)).expect("docker preferred"),
+        "docker"
+    );
+}
+
+#[test]
+fn resolve_container_runtime_falls_back_to_podman_when_docker_absent_or_non_executable() {
+    let podman_dir = tempfile::tempdir().expect("podman tempdir");
+    create_executable(podman_dir.path(), "podman");
+    let only_podman = std::env::join_paths([podman_dir.path()]).expect("join path");
+    assert_eq!(
+        resolve_container_runtime(None, Some(&only_podman)).expect("podman fallback"),
+        "podman"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let non_exec_dir = tempfile::tempdir().expect("non-exec tempdir");
+        let non_exec_docker = non_exec_dir.path().join("docker");
+        std::fs::write(&non_exec_docker, "not executable").expect("write non-exec file");
+        std::fs::set_permissions(&non_exec_docker, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+
+        let dir_docker_dir = tempfile::tempdir().expect("dir tempdir");
+        std::fs::create_dir(dir_docker_dir.path().join("docker")).expect("mkdir docker");
+
+        let path = std::env::join_paths([
+            non_exec_dir.path(),
+            dir_docker_dir.path(),
+            podman_dir.path(),
+        ])
+        .expect("join path");
+        assert_eq!(
+            resolve_container_runtime(None, Some(&path))
+                .expect("skips non-executable and directory"),
+            "podman"
+        );
+    }
+}
+
+#[test]
+fn resolve_container_runtime_errors_when_no_runtime_found() {
+    let empty_dir = tempfile::tempdir().expect("empty tempdir");
+    let empty_dir_path = std::env::join_paths([empty_dir.path()]).expect("join path");
+    for path in [
+        Some(empty_dir_path.as_os_str()),
+        Some(std::ffi::OsStr::new("")),
+        None,
+    ] {
+        let error =
+            resolve_container_runtime(None, path).expect_err("missing runtime should error");
+        let message = error.to_string();
+        assert!(message.contains("docker"), "message: {message}");
+        assert!(message.contains("podman"), "message: {message}");
+        assert!(
+            message.contains("PI_EVALS_CONTAINER_BIN"),
+            "message: {message}"
+        );
+    }
+}
+
+#[test]
+fn system_command_runner_with_container_runtime_overrides_default_command_only() {
+    let custom = SystemCommandRunner::with_container_runtime(PathBuf::from("."), "/opt/bin/podman");
+    assert_eq!(custom.container_runtime(), Some("/opt/bin/podman"));
+    assert_eq!(
+        custom.resolve_command("docker").expect("resolve docker"),
+        "/opt/bin/podman"
+    );
+    assert_eq!(
+        custom.resolve_command("git").expect("resolve non-docker"),
+        "git"
+    );
+
+    let default_runner = SystemCommandRunner::new(PathBuf::from("."));
+    assert_eq!(default_runner.container_runtime(), None);
+    assert_eq!(
+        default_runner
+            .resolve_command("git")
+            .expect("resolve non-docker"),
+        "git"
+    );
 }

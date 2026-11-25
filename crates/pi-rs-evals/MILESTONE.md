@@ -73,3 +73,30 @@ the source was restored byte-for-byte, and the test binary was rerun.
   five ported source modules, so they are outside this milestone's scope.
 - No live Docker build/run was performed (offline verification only); the
   argument vector is verified with an injectable command runner.
+
+## Configurable OCI Container Runtime & Live Rootless Container E2E
+
+- **Configurable OCI runtime (`src/docker.rs`, `src/cli.rs`)**:
+  - Preserved `"docker"` as the default command name passed to injectable
+    `CommandRunner` mocks (100% drop-in compatibility with existing tests).
+  - Added `resolve_container_runtime` / `resolve_host_container_runtime`
+    (`PI_EVALS_CONTAINER_BIN` override -> `docker` on `PATH` -> `podman`
+    fallback on `PATH`), `SystemCommandRunner::with_container_runtime`, and
+    `SystemEvalDockerOps::with_container_runtime`.
+  - Documented rootless `podman` 4.9.3 (`crun`) compatibility on `docker_args`.
+- **Unit & live E2E tests (`tests/docker.rs`, `tests/docker_live.rs`)**:
+  - Added 5 unit tests in `tests/docker.rs` (11/11 total) covering env
+    override precedence, `docker` preference, `podman` fallback (including
+    skipping non-executable files and directories), missing-runtime errors,
+    and `SystemCommandRunner::with_container_runtime`.
+  - Added 2 live container E2E tests in `tests/docker_live.rs` (`#[cfg(target_os = "linux")]`):
+    100% offline `FROM scratch` images with a pure-Rust static entrypoint
+    driven through `execute_eval_run` + `SystemEvalDockerOps` against host
+    rootless `podman` 4.9.3 (`crun`), verifying `--read-only` rootfs,
+    `--tmpfs` mounts, readonly `auth.json` bind mount, `/artifacts` output,
+    session persistence, `Drop`-based `rmi -f` cleanup, and
+    `PI_EVALS_CONTAINER_BIN` handling in `pi-evals`.
+- **Mutation checks (3)**:
+  - `resolve_container_runtime`: bypassed `env_override` -> `resolve_container_runtime_honors_env_override_and_trims_whitespace` FAILED -> restored PASS.
+  - `resolve_container_runtime`: removed `podman` fallback -> `resolve_container_runtime_falls_back_to_podman_when_docker_absent_or_non_executable` FAILED -> restored PASS.
+  - `docker_args`: removed `--read-only` -> `live_container_eval_run_end_to_end` FAILED (`root filesystem was unexpectedly writable`) -> restored PASS.

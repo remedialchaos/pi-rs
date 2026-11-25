@@ -3,6 +3,7 @@
 //! All process execution goes through [`CommandRunner`] so offline tests can
 //! record and assert the exact argument vector.
 
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -11,6 +12,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{EvalError, EvalResult};
 use crate::plan::{DOCUMENTATION_VARIANTS, DocumentationVariant, EvalTask};
 use crate::report::sha256_hex;
+
+/// Default OCI container runtime binary name (`docker`).
+pub const DEFAULT_CONTAINER_RUNTIME: &str = "docker";
+/// Automatic fallback OCI container runtime binary name (`podman`).
+pub const FALLBACK_CONTAINER_RUNTIME: &str = "podman";
+/// Environment variable overriding the OCI container runtime binary.
+pub const CONTAINER_RUNTIME_ENV: &str = "PI_EVALS_CONTAINER_BIN";
 
 /// A built documentation-variant image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,21 +69,126 @@ pub trait CommandRunner {
     fn execute(&self, command: &str, args: &[String], capture: bool) -> EvalResult<CommandOutput>;
 }
 
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn find_on_path(binary: &str, path_env: Option<&OsStr>) -> Option<PathBuf> {
+    let path_env = path_env?;
+    for directory in std::env::split_paths(path_env) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = directory.join(binary);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe_candidate = directory.join(format!("{binary}.exe"));
+            if is_executable_file(&exe_candidate) {
+                return Some(exe_candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the OCI container runtime executable name or path.
+///
+/// Precedence:
+/// 1. Non-empty `PI_EVALS_CONTAINER_BIN` override (`env_override`), trimmed.
+/// 2. `docker` when an executable `docker` binary is found on `PATH`.
+/// 3. `podman` fallback when `docker` is absent and `podman` is found on `PATH`.
+pub fn resolve_container_runtime(
+    env_override: Option<&str>,
+    path_env: Option<&OsStr>,
+) -> EvalResult<String> {
+    if let Some(override_bin) = env_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(override_bin.to_owned());
+    }
+    if find_on_path(DEFAULT_CONTAINER_RUNTIME, path_env).is_some() {
+        return Ok(DEFAULT_CONTAINER_RUNTIME.to_owned());
+    }
+    if find_on_path(FALLBACK_CONTAINER_RUNTIME, path_env).is_some() {
+        return Ok(FALLBACK_CONTAINER_RUNTIME.to_owned());
+    }
+    Err(EvalError::message(
+        "No OCI container runtime found on PATH (checked docker, podman); set PI_EVALS_CONTAINER_BIN to override.",
+    ))
+}
+
+/// Resolve the host OCI container runtime from `PI_EVALS_CONTAINER_BIN` and `PATH`.
+pub fn resolve_host_container_runtime() -> EvalResult<String> {
+    let env_override = std::env::var(CONTAINER_RUNTIME_ENV).ok();
+    let path_env = std::env::var_os("PATH");
+    resolve_container_runtime(env_override.as_deref(), path_env.as_deref())
+}
+
 /// Runs real processes from the eval package root.
+#[derive(Debug, Clone)]
 pub struct SystemCommandRunner {
     pub cwd: PathBuf,
+    container_runtime: Option<String>,
 }
 
 impl SystemCommandRunner {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            container_runtime: None,
+        }
+    }
+
+    /// Construct a runner with an explicit OCI container runtime binary or path.
+    pub fn with_container_runtime(cwd: PathBuf, runtime: impl Into<String>) -> Self {
+        Self {
+            cwd,
+            container_runtime: Some(runtime.into()),
+        }
+    }
+
+    /// Configured container runtime override, if any.
+    pub fn container_runtime(&self) -> Option<&str> {
+        self.container_runtime.as_deref()
+    }
+
+    /// Resolve the executable used for `command`.
+    ///
+    /// Non-container commands pass through unchanged; `DEFAULT_CONTAINER_RUNTIME`
+    /// resolves via `container_runtime` when set or `resolve_host_container_runtime`.
+    pub fn resolve_command(&self, command: &str) -> EvalResult<String> {
+        if command != DEFAULT_CONTAINER_RUNTIME {
+            return Ok(command.to_owned());
+        }
+        if let Some(runtime) = self
+            .container_runtime
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(runtime.to_owned());
+        }
+        resolve_host_container_runtime()
     }
 }
 
 impl CommandRunner for SystemCommandRunner {
     fn execute(&self, command: &str, args: &[String], capture: bool) -> EvalResult<CommandOutput> {
+        let executable = self.resolve_command(command)?;
         if capture {
-            let output = Command::new(command)
+            let output = Command::new(&executable)
                 .args(args)
                 .current_dir(&self.cwd)
                 .stdin(Stdio::null())
@@ -86,7 +199,7 @@ impl CommandRunner for SystemCommandRunner {
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             })
         } else {
-            let status = Command::new(command)
+            let status = Command::new(&executable)
                 .args(args)
                 .current_dir(&self.cwd)
                 .stdin(Stdio::null())
@@ -207,6 +320,13 @@ fn create_output_directory(path: &Path) -> EvalResult<()> {
 ///
 /// `artifact_uid_gid` mirrors `process.getuid()`/`getgid()` on POSIX; tests pass
 /// fixed values to keep the vector deterministic.
+///
+/// Verified compatible with rootless `podman` 4.9.3 (`crun`): `--read-only`,
+/// `--tmpfs`, and `--mount type=bind,...,readonly` behave identically. Under
+/// rootless user namespaces, container UID `0` maps to the host invoking UID
+/// (so artifacts written by UID `0` are host-user-owned without `chown` to
+/// `PI_EVAL_ARTIFACT_UID`), while `PI_EVAL_SANDBOX_UID=65532` requires a
+/// subordinate UID mapping range of at least 65532 IDs.
 pub fn docker_args(
     context: &DockerContext,
     variant: DocumentationVariant,
@@ -313,7 +433,7 @@ pub fn build_images(
                 .into_owned(),
             repository_root.to_string_lossy().into_owned(),
         ];
-        let built = runner.execute("docker", &build_args, false)?;
+        let built = runner.execute(DEFAULT_CONTAINER_RUNTIME, &build_args, false)?;
         if built.status != 0 {
             return Err(EvalError::message(format!(
                 "docker exited with status {}.",
@@ -327,7 +447,7 @@ pub fn build_images(
             "{{.Id}}".to_owned(),
             image.name.clone(),
         ];
-        let inspected = runner.execute("docker", &inspect_args, true)?;
+        let inspected = runner.execute(DEFAULT_CONTAINER_RUNTIME, &inspect_args, true)?;
         if inspected.status != 0 || inspected.stdout.trim().is_empty() {
             return Err(EvalError::message(format!(
                 "Cannot inspect {}.",
@@ -366,7 +486,7 @@ pub fn discover_cases(
         &entrypoint_args,
         artifact_uid_gid,
     )?;
-    let result = runner.execute("docker", &args, false)?;
+    let result = runner.execute(DEFAULT_CONTAINER_RUNTIME, &args, false)?;
     if result.status != 0 {
         return Err(EvalError::message(format!(
             "{variant} eval discovery failed."
@@ -425,7 +545,7 @@ pub fn run_task(
         &entrypoint_args,
         artifact_uid_gid,
     )?;
-    runner.execute("docker", &args, false)?;
+    runner.execute(DEFAULT_CONTAINER_RUNTIME, &args, false)?;
     let report_path = output_directory.join("vitest.json");
     Ok(report_path.is_file().then_some(report_path))
 }
