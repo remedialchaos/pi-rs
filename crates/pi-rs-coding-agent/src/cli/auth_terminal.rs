@@ -10,10 +10,13 @@ use pi_rs_ai::{Error, Result};
 use pi_rs_tui::keys::{decode_printable_key, is_key_release_data, matches_key_data};
 use pi_rs_tui::terminal::{ProcessTerminal, TerminalEvent};
 
-use crate::utils::open_browser::open_browser;
+use crate::utils::open_browser::try_open_web_url;
+use crate::utils::web_url::web_url;
+
+pub type BrowserOpener = Arc<dyn Fn(&str) -> std::result::Result<(), String> + Send + Sync>;
 
 #[async_trait]
-pub(crate) trait LoginTerminal: Send + Sync {
+pub trait LoginTerminal: Send + Sync {
     fn interactive(&self) -> bool;
     fn write(&self, line: &str);
     fn error(&self, line: &str);
@@ -27,9 +30,10 @@ pub(crate) trait LoginTerminal: Send + Sync {
     async fn settle(&self);
 }
 
-pub(super) struct ProcessLoginTerminal {
+pub struct ProcessLoginTerminal {
     interrupt: CancellationToken,
     prompt_lock: Arc<tokio::sync::Mutex<()>>,
+    browser_opener: BrowserOpener,
 }
 
 impl ProcessLoginTerminal {
@@ -37,7 +41,13 @@ impl ProcessLoginTerminal {
         Self {
             interrupt,
             prompt_lock: Arc::default(),
+            browser_opener: Arc::new(try_open_web_url),
         }
+    }
+
+    pub fn with_browser_opener(mut self, opener: BrowserOpener) -> Self {
+        self.browser_opener = opener;
+        self
     }
 }
 
@@ -56,7 +66,10 @@ impl LoginTerminal for ProcessLoginTerminal {
     }
 
     fn open_url(&self, url: &str) {
-        open_browser(url);
+        let Some(target) = web_url(url) else {
+            return;
+        };
+        let _ = (self.browser_opener)(&target);
     }
 
     async fn prompt(
@@ -173,4 +186,37 @@ fn read_input(
         }
     }
     Err(Error::Aborted)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn process_login_terminal_injectable_opener_validates_web_url()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&opened);
+        let terminal = ProcessLoginTerminal::new(CancellationToken::new()).with_browser_opener(
+            Arc::new(move |url| {
+                seen.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(url.to_owned());
+                Ok(())
+            }),
+        );
+        terminal.open_url("javascript:alert(1)");
+        terminal.open_url("file:///etc/passwd");
+        terminal.open_url("data:text/html,hi");
+        terminal.open_url("HTTPS://Example.COM/oauth/authorize?state=1");
+
+        let urls = opened.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            *urls,
+            vec!["https://example.com/oauth/authorize?state=1".to_owned()]
+        );
+        Ok(())
+    }
 }
