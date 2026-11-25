@@ -91,6 +91,23 @@ impl TmuxSession {
         Ok(())
     }
 
+    fn send_raw(&self, bytes: &[u8]) -> TestResult {
+        let mut args = vec![
+            "send-keys".to_owned(),
+            "-t".to_owned(),
+            self.name.clone(),
+            "-H".to_owned(),
+        ];
+        for byte in bytes {
+            args.push(format!("{byte:02x}"));
+        }
+        let status = Command::new("tmux").args(&args).status()?;
+        if !status.success() {
+            return Err(format!("tmux send-keys -H failed for {}", self.name).into());
+        }
+        Ok(())
+    }
+
     fn capture(&self, ansi: bool) -> TestResult<String> {
         let mut args = vec!["capture-pane", "-t", &self.name];
         if ansi {
@@ -483,6 +500,188 @@ async fn side_panel_3_to_2_split_and_resize_cell_grid_parity() -> TestResult {
         );
     }
 
+    sessions.release();
+    server.close().await?;
+    Ok(())
+}
+
+fn wait_for_turn_echo(tmux: &TmuxSession, marker: &str, timeout: Duration) -> TestResult<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let plain = tmux.capture(false)?;
+        if plain.contains("Echo:") && plain.matches(marker).count() >= 2 {
+            return Ok(plain);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for assistant echo of {marker:?} in tmux {}.\nLast screen:\n{plain}",
+                tmux.name
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mouse_scroll_and_live_theme_switch_with_integrated_worker() -> TestResult {
+    require_tool("tmux")?;
+
+    let dir = tempfile::tempdir()?;
+    let home_dir = dir.path().join("home");
+    let cfg_dir = dir.path().join("cfg");
+    let agent_dir = dir.path().join("agent");
+    for p in [&home_dir, &cfg_dir, &agent_dir] {
+        fs::create_dir_all(p)?;
+    }
+
+    let server = start_native_server(dir.path()).await?;
+    let context = Context::background();
+    let sessions = server.host.hold_as(
+        Arc::new(lookup("p2.sessions")?),
+        json!({}).into(),
+        owner_caller(),
+        &context,
+    )?;
+    sessions.wait(&context).await?;
+    let _created: Value = sessions
+        .call(
+            "create",
+            json!({
+                "cwd": &home_dir,
+                "title": "Scroll Theme E2E",
+                "thinkingLevel": "off",
+                "model": {"provider": "faux", "modelId": "faux-1"},
+            })
+            .into(),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+
+    let url = format!("http://{}", server.address);
+    let cmd = format!(
+        "env HOME='{}' P2_DATA_DIR='{}' P2_TUI_CONFIG_DIR='{}' PI_CODING_AGENT_DIR='{}' TERM=xterm-256color '{}' tui '{}' --theme dark",
+        home_dir.display(),
+        dir.path().display(),
+        cfg_dir.display(),
+        agent_dir.display(),
+        env!("CARGO_BIN_EXE_p2"),
+        url
+    );
+    let tmux = TmuxSession::spawn("p2-parity-scroll-theme", 100, 24, &cmd)?;
+    tmux.wait_for("Scroll Theme E2E", Duration::from_secs(15))?;
+
+    // Drive enough multi-line turns against the real integrated worker to overflow the 24-row viewport.
+    for turn in 1..=6 {
+        let marker = format!("SCROLL_TURN_{turn:02}");
+        let prompt = format!(
+            "{marker} padding words to ensure each user and assistant turn wraps across multiple terminal rows cleanly."
+        );
+        tmux.send_literal(&prompt)?;
+        tmux.send_key("Enter")?;
+        wait_for_turn_echo(&tmux, &marker, Duration::from_secs(15))?;
+    }
+    thread::sleep(Duration::from_millis(250));
+
+    let at_bottom = tmux.capture(false)?;
+    assert_frame_bounds(&at_bottom, 24, 100);
+    assert!(
+        at_bottom.contains("SCROLL_TURN_06") && !at_bottom.contains("SCROLL_TURN_01"),
+        "expected overflowed transcript anchored at bottom:\n{at_bottom}"
+    );
+    let dark_ansi = tmux.capture(true)?;
+    assert!(
+        dark_ansi.contains("48;2;33;59;73"),
+        "expected dark theme userMessageBg ANSI sequence"
+    );
+
+    // Send SGR mouse wheel up sequences and verify the viewport scrolls up cleanly.
+    for _ in 0..12 {
+        tmux.send_raw(b"\x1b[<64;20;10M")?;
+        thread::sleep(Duration::from_millis(25));
+    }
+    let scrolled_up = tmux.wait_for("SCROLL_TURN_01", Duration::from_secs(5))?;
+    let up_rows = assert_frame_bounds(&scrolled_up, 24, 100);
+    assert!(
+        !scrolled_up.contains("SCROLL_TURN_06"),
+        "expected bottom turn to scroll off-screen after wheel up:\n{scrolled_up}"
+    );
+    assert!(
+        up_rows[1].contains("▀▀█") && up_rows.iter().any(|r| r.contains("Scroll Theme E2E")),
+        "header/footer did not remain pinned while scrolling:\n{scrolled_up}"
+    );
+
+    // Send SGR mouse wheel down sequences and verify the viewport returns cleanly to the bottom.
+    for _ in 0..15 {
+        tmux.send_raw(b"\x1b[<65;20;10M")?;
+        thread::sleep(Duration::from_millis(25));
+    }
+    let scrolled_back = tmux.wait_for("SCROLL_TURN_06", Duration::from_secs(5))?;
+    assert_frame_bounds(&scrolled_back, 24, 100);
+    assert!(
+        !scrolled_back.contains("SCROLL_TURN_01"),
+        "expected top turn to scroll off-screen after wheel down:\n{scrolled_back}"
+    );
+
+    // Trigger live theme switch via `/theme light` and verify ANSI/vt100 theme state updates.
+    tmux.send_literal("/theme light")?;
+    tmux.send_key("Enter")?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (light_plain, light_ansi) = loop {
+        let plain = tmux.capture(false)?;
+        let ansi = tmux.capture(true)?;
+        if !ansi.contains("48;2;33;59;73") && ansi.contains("48;2;") {
+            break (plain, ansi);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for light theme ANSI colors after /theme light.\nPlain:\n{plain}\nANSI:\n{ansi}"
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let light_rows = assert_frame_bounds(&light_plain, 24, 100);
+    let light_screen = parse_vt100_rows(&light_ansi, 24, 100);
+    let border_row = light_rows
+        .iter()
+        .position(|r| r.contains(&"─".repeat(80)))
+        .ok_or("missing editor border row after theme switch")?;
+    let border_fg = light_screen
+        .cell(border_row as u16, 0)
+        .ok_or("missing border cell")?
+        .fgcolor();
+    assert!(
+        matches!(border_fg, vt100::Color::Rgb(r, g, b) if r > 140 && g > 140 && b > 140),
+        "expected light theme borderMuted fg color after /theme light, got {border_fg:?}"
+    );
+    let user_row = light_rows
+        .iter()
+        .position(|r| r.contains("SCROLL_TURN_06"))
+        .ok_or("missing user message row after theme switch")?;
+    let user_bg = light_screen
+        .cell(user_row as u16, 2)
+        .ok_or("missing user message cell")?
+        .bgcolor();
+    assert!(
+        matches!(user_bg, vt100::Color::Rgb(r, g, b) if r > 200 && g > 200 && b > 200),
+        "expected light theme userMessageBg color after /theme light, got {user_bg:?}"
+    );
+    let prefs_text = fs::read_to_string(cfg_dir.join("prefs.json"))?;
+    assert!(
+        prefs_text.contains("\"theme\": \"light\""),
+        "expected prefs.json to persist light theme: {prefs_text}"
+    );
+
+    // Live session continues working seamlessly after scrolling and switching themes.
+    tmux.send_literal("AFTER_THEME_SWITCH_OK")?;
+    tmux.send_key("Enter")?;
+    wait_for_turn_echo(&tmux, "AFTER_THEME_SWITCH_OK", Duration::from_secs(15))?;
+
+    tmux.send_key("C-c")?;
+    thread::sleep(Duration::from_millis(200));
     sessions.release();
     server.close().await?;
     Ok(())

@@ -153,7 +153,10 @@ pub mod server {
         http::*,
         local_owner::*,
         server::{
-            ServerInfo, ServerNatives, install_service, server_contract, server_of, service_of,
+            SESSION_ARCHIVED_REGISTRY, ServerInfo, ServerNatives, SessionArchivedContribution,
+            SessionArchivedHandler, contribute_session_archived, install_service,
+            run_session_archived, serve_session_archived_registry, server_contract, server_of,
+            service_of,
         },
     };
     pub use pi_rs_chord::node::{http::*, workers::ProcessLock};

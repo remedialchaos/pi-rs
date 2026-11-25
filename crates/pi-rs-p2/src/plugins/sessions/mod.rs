@@ -29,6 +29,7 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
         "sessions",
         FacetKind::Server,
         define_facet(move |host| {
+            crate::api::v1::server::serve_session_archived_registry(host)?;
             preferences.serve(host)?;
             let table = table.clone();
             host.serve(

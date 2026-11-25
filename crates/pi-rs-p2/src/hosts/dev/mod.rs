@@ -3,9 +3,72 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 
 #[cfg(unix)]
 pub mod channel;
+#[cfg(unix)]
+pub mod supervisor;
+
+pub const DEV_REBUILD_CMD_ENV: &str = "P2_DEV_REBUILD_CMD";
+pub const DEV_SUPERVISOR_ENV: &str = "P2_DEV_SUPERVISOR";
+pub const DEV_RESTART_EXIT_CODE: u8 = 75;
+
+#[derive(Clone, Debug)]
+pub struct DevRebuildRequest {
+    pub data_dir: PathBuf,
+    pub plugins_dir: PathBuf,
+    pub plugins: Vec<String>,
+}
+
+pub type DevRebuildHook = Arc<
+    dyn Fn(DevRebuildRequest) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Build a shell-based rebuild hook for `P2_DEV_REBUILD_CMD`, passing `P2_DATA_DIR`,
+/// `P2_PLUGINS_DIR`, and `P2_RELOAD_PLUGINS`.
+pub fn shell_rebuild_hook(command: String) -> DevRebuildHook {
+    Arc::new(move |request| {
+        let command = command.clone();
+        Box::pin(async move {
+            #[cfg(unix)]
+            let mut cmd = {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-c").arg(&command);
+                cmd
+            };
+            #[cfg(not(unix))]
+            let mut cmd = {
+                let mut cmd = tokio::process::Command::new("cmd");
+                cmd.arg("/C").arg(&command);
+                cmd
+            };
+            let output = cmd
+                .env("P2_DATA_DIR", &request.data_dir)
+                .env("P2_PLUGINS_DIR", &request.plugins_dir)
+                .env("P2_RELOAD_PLUGINS", request.plugins.join(","))
+                .output()
+                .await
+                .map_err(|error| format!("Rebuild command failed to start: {error}"))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("exit status {}", output.status)
+            };
+            Err(format!("Rebuild command failed: {detail}"))
+        })
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "lowercase")]
@@ -267,6 +330,65 @@ impl DevControl {
                         ok: false,
                         message: format!("Reload refused: {error}"),
                         plugins: Some(names),
+                    },
+                    redact,
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+    pub async fn restart<Fut>(
+        &self,
+        trigger: impl FnOnce() -> Fut,
+        redact: impl FnOnce(&str) -> String,
+    ) -> Result<(), String>
+    where
+        Fut: Future<Output = Result<(), String>>,
+    {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Dev server is closing".into());
+        }
+        let Ok(_active) = self.active.try_lock() else {
+            let message = "A dev command is already running";
+            self.notify(
+                &DevResult {
+                    ok: false,
+                    message: format!("Restart refused: {message}"),
+                    plugins: None,
+                },
+                redact,
+            )
+            .await;
+            return Err(message.into());
+        };
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Dev server is closing".into());
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.phase = Phase::Reloading;
+            state.revision += 1;
+        }
+        match trigger().await {
+            Ok(()) => {
+                self.notify(
+                    &DevResult {
+                        ok: true,
+                        message: "Restarting server".into(),
+                        plugins: None,
+                    },
+                    redact,
+                )
+                .await;
+                Ok(())
+            }
+            Err(error) => {
+                self.notify(
+                    &DevResult {
+                        ok: false,
+                        message: format!("Restart refused: {error}"),
+                        plugins: None,
                     },
                     redact,
                 )

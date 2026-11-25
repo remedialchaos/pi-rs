@@ -7,7 +7,12 @@ use std::{
 };
 
 #[cfg(unix)]
-use super::dev::{DevCommand, DevControl, DevResult, channel};
+use super::dev::{
+    DEV_REBUILD_CMD_ENV, DEV_SUPERVISOR_ENV, DevCommand, DevControl, DevRebuildHook,
+    DevRebuildRequest, DevResult, channel, shell_rebuild_hook,
+};
+#[cfg(not(unix))]
+use super::dev::{DEV_REBUILD_CMD_ENV, DEV_SUPERVISOR_ENV, DevRebuildHook, shell_rebuild_hook};
 use pi_rs_chord::{
     context::Context,
     contracts::Contract,
@@ -64,6 +69,8 @@ pub struct ServerOptions {
     pub port: u16,
     pub fake: bool,
     pub dev: bool,
+    pub dev_supervised: bool,
+    pub dev_rebuild: Option<DevRebuildHook>,
     pub allowed_hosts: Vec<String>,
     pub registry: PluginRegistry,
     pub plugins: Option<Vec<String>>,
@@ -81,6 +88,11 @@ impl ServerOptions {
             port: 8788,
             fake: false,
             dev: std::env::var("P2_DEV").as_deref() == Ok("1"),
+            dev_supervised: std::env::var(DEV_SUPERVISOR_ENV).as_deref() == Ok("1"),
+            dev_rebuild: std::env::var(DEV_REBUILD_CMD_ENV)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(shell_rebuild_hook),
             allowed_hosts: Vec::new(),
             registry: PluginRegistry::new(),
             plugins: None,
@@ -112,6 +124,8 @@ pub struct P2Server {
     _lock: ProcessLock,
     #[cfg(unix)]
     dev: Option<(Arc<StandaloneDev>, channel::Channel)>,
+    #[cfg(unix)]
+    restart: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[cfg(unix)]
@@ -121,34 +135,112 @@ struct StandaloneDev {
     data_dir: PathBuf,
     tui_bundles: super::tui_bundles::SharedTuiBundles,
     loading: Arc<tokio::sync::Mutex<RunningPlugins>>,
+    rebuild: Option<DevRebuildHook>,
+    supervised: bool,
 }
 
 #[cfg(unix)]
 impl StandaloneDev {
     async fn execute(&self, command: DevCommand) -> DevResult {
         let DevCommand::Reload { plugins } = command else {
-            let result = DevResult {
-                ok: false,
-                message: "Restart refused: Restart needs the npm run dev supervisor".into(),
-                plugins: None,
+            if !self.supervised {
+                let result = DevResult {
+                    ok: false,
+                    message: "Restart refused: Restart needs the npm run dev supervisor".into(),
+                    plugins: None,
+                };
+                self.control.notify(&result, str::to_owned).await;
+                return result;
+            }
+            return match self
+                .control
+                .restart(|| async { Ok(()) }, str::to_owned)
+                .await
+            {
+                Ok(()) => DevResult {
+                    ok: true,
+                    message: "Restarting server".into(),
+                    plugins: None,
+                },
+                Err(error) => DevResult {
+                    ok: false,
+                    message: format!("Restart refused: {error}"),
+                    plugins: None,
+                },
             };
-            self.control.notify(&result, str::to_owned).await;
-            return result;
         };
+        let (dirty, reserved) = {
+            let loading = self.loading.lock().await;
+            let dirty = loading
+                .sources
+                .dirty_plugins(&loading.runtime)
+                .unwrap_or_default();
+            let reserved: BTreeSet<String> = loading
+                .registry
+                .select(None)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            (dirty, reserved)
+        };
+        let mut dirty = dirty;
+        let prev_tui = self
+            .tui_bundles
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .manifest()
+            .plugins
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.digest.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if let Ok(scanned_tui) =
+            super::tui_bundles::TuiBundleIndex::build(&self.data_dir, &reserved)
+        {
+            let next_tui = scanned_tui
+                .manifest()
+                .plugins
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.digest.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for (name, digest) in &next_tui {
+                if prev_tui.get(name) != Some(digest) {
+                    dirty.insert(name.clone());
+                }
+            }
+            for name in prev_tui.keys() {
+                if !next_tui.contains_key(name) {
+                    dirty.insert(name.clone());
+                }
+            }
+        }
+        let requested_non_empty = plugins.as_ref().is_some_and(|p| !p.is_empty());
         let result = self
             .control
             .reload(
                 plugins,
-                Default::default(),
+                dirty,
                 |names| async move {
+                    if let Some(rebuild) = &self.rebuild {
+                        rebuild(DevRebuildRequest {
+                            data_dir: self.data_dir.clone(),
+                            plugins_dir: host_dirs::user_plugins_directory(&self.data_dir),
+                            plugins: names.clone(),
+                        })
+                        .await?;
+                    }
                     let mut loading = self.loading.lock().await;
                     let RunningPlugins {
                         sources,
                         runtime,
                         registry,
                     } = &mut *loading;
+                    let reload_targets = if requested_non_empty {
+                        names
+                    } else {
+                        Vec::new()
+                    };
                     let update = sources
-                        .reload_named(runtime, &names, &Context::background())
+                        .reload_named(runtime, &reload_targets, &Context::background())
                         .await
                         .map_err(|error| error.to_string())?;
                     update.log_problems();
@@ -161,6 +253,12 @@ impl StandaloneDev {
                     let next_bundles =
                         super::tui_bundles::TuiBundleIndex::build(&self.data_dir, &reserved)
                             .map_err(|error| error.to_string())?;
+                    let next_tui = next_bundles
+                        .manifest()
+                        .plugins
+                        .iter()
+                        .map(|entry| (entry.name.clone(), entry.digest.clone()))
+                        .collect::<BTreeMap<_, _>>();
                     *self.tui_bundles.write().unwrap_or_else(|e| e.into_inner()) = next_bundles;
                     self.workers.update_authorizers(
                         registry.session_authorizers(&update.selected),
@@ -169,12 +267,27 @@ impl StandaloneDev {
                     if let Some(failure) = report.failed.first() {
                         return Err(format!("{} (server): {}", failure.plugin, failure.error));
                     }
-                    let changed: Vec<_> = report
+                    let mut changed: BTreeSet<String> = report
                         .changed
                         .into_iter()
                         .chain(report.added)
                         .chain(report.removed)
                         .collect();
+                    for (name, digest) in &next_tui {
+                        if prev_tui.get(name) != Some(digest)
+                            && (reload_targets.is_empty() || reload_targets.contains(name))
+                        {
+                            changed.insert(name.clone());
+                        }
+                    }
+                    for name in prev_tui.keys() {
+                        if !next_tui.contains_key(name)
+                            && (reload_targets.is_empty() || reload_targets.contains(name))
+                        {
+                            changed.insert(name.clone());
+                        }
+                    }
+                    let changed: Vec<String> = changed.into_iter().collect();
                     Ok((changed.clone(), changed))
                 },
                 str::to_owned,
@@ -231,6 +344,19 @@ impl P2Server {
         self.workers
             .update_authorizers(registry.session_authorizers(&self.plugins), &report.failed);
         Ok(report)
+    }
+
+    pub async fn wait_for_restart(&self) {
+        #[cfg(unix)]
+        if let Some(mut restart) = self.restart.clone() {
+            while !*restart.borrow_and_update() {
+                if restart.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            return;
+        }
+        std::future::pending::<()>().await;
     }
 
     pub async fn close(self) -> Result<()> {
@@ -466,6 +592,8 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         _lock: lock,
         #[cfg(unix)]
         dev: None,
+        #[cfg(unix)]
+        restart: None,
     };
     let load = async {
         install_natives(&server.host, &server.natives)?;
@@ -520,19 +648,31 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         if options.dev {
             #[cfg(unix)]
             {
+                let (restart_tx, restart_rx) = tokio::sync::watch::channel(false);
                 let dev = Arc::new(StandaloneDev {
                     control: DevControl::default(),
                     workers: server.workers.clone(),
                     data_dir: server.data_dir.clone(),
                     tui_bundles: server.tui_bundles.clone(),
                     loading,
+                    rebuild: options.dev_rebuild,
+                    supervised: options.dev_supervised,
                 });
                 let handler = dev.clone();
-                let channel = channel::serve(&server.data_dir, move |cmd| {
-                    let handler = handler.clone();
-                    async move { handler.execute(cmd).await }
-                })
+                let channel = channel::serve_with_after(
+                    &server.data_dir,
+                    move |cmd| {
+                        let handler = handler.clone();
+                        async move { handler.execute(cmd).await }
+                    },
+                    move |cmd, result| {
+                        if matches!(cmd, DevCommand::Restart) && result.ok {
+                            restart_tx.send_replace(true);
+                        }
+                    },
+                )
                 .await?;
+                server.restart = Some(restart_rx);
                 let reload_dev = dev.clone();
                 let reload_handler: Arc<Arc<crate::plugins::dev_tools::ReloadHandler>> = Arc::new(
                     Arc::new(move |plugins| {

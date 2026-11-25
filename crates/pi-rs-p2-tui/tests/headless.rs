@@ -535,3 +535,94 @@ fn mounted_side_panel_keeps_focus_and_scroll_on_update_and_releases_on_close() -
     );
     Ok(())
 }
+
+#[test]
+fn mouse_wheel_up_down_and_live_theme_switch_preserve_layout()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_p2_tui::theme::{DARK_THEME, LIGHT_THEME, TerminalState, create_theme};
+    use pi_rs_tui::{Component, TerminalColorMode, Text, Tui};
+
+    struct ThemedRows(ThemeRef);
+    impl Component for ThemedRows {
+        fn render(&self, _: usize) -> Vec<String> {
+            let theme = self.0.current();
+            (0..30)
+                .map(|i| theme.fg("accent", &format!("row-{i:02}")))
+                .collect()
+        }
+    }
+
+    let dark = create_theme(
+        &DARK_THEME,
+        TerminalColorMode::Truecolor,
+        TerminalState::default(),
+    )?;
+    let light = create_theme(
+        &LIGHT_THEME,
+        TerminalColorMode::Truecolor,
+        TerminalState::default(),
+    )?;
+    let dark_sample = dark.fg("accent", "row-00");
+    let light_sample = light.fg("accent", "row-00");
+    assert_ne!(dark_sample, light_sample);
+
+    let theme_ref = ThemeRef::new(dark);
+    let text = |value: &str| ComponentRef::new(Text::new(value, 0, 0, None));
+    let mut client = TuiClient::mount_panel(
+        VirtualTerminal {
+            input: Vec::new(),
+            output: Default::default(),
+        },
+        text("heading"),
+        ComponentRef::new(ThemedRows(theme_ref.clone())),
+        text("editor"),
+        true,
+    );
+    client.screen.start()?;
+    client.screen.render_now(true)?;
+    let bottom_top = client.screen.viewport_top();
+    assert!(bottom_top > 0);
+    let initial_frame = client.screen.screen_lines().join("\n");
+    assert!(initial_frame.contains("row-29"), "{initial_frame}");
+
+    // SGR mouse wheel up scrolls the viewport upward while keeping header and editor pinned.
+    for _ in 0..5 {
+        client.screen.handle_input("\x1b[<64;10;4M");
+    }
+    client.screen.render_now(false)?;
+    let scrolled_top = client.screen.viewport_top();
+    assert!(scrolled_top < bottom_top);
+    let scrolled_frame = client.screen.screen_lines();
+    assert!(
+        scrolled_frame
+            .first()
+            .is_some_and(|l| l.contains("heading"))
+    );
+    assert!(scrolled_frame.last().is_some_and(|l| l.contains("editor")));
+
+    // Live theme switch recolors rendered output without resetting scroll position.
+    let dark_ansi = dark_sample
+        .split("row-00")
+        .next()
+        .ok_or("missing dark ansi")?;
+    let light_ansi = light_sample
+        .split("row-00")
+        .next()
+        .ok_or("missing light ansi")?;
+    assert!(scrolled_frame.join("\n").contains(dark_ansi));
+    client.set_theme(&theme_ref, light);
+    client.screen.render_now(false)?;
+    assert_eq!(client.screen.viewport_top(), scrolled_top);
+    let rethemed = client.screen.screen_lines().join("\n");
+    assert!(rethemed.contains(light_ansi), "{rethemed:?}");
+    assert!(!rethemed.contains(dark_ansi), "{rethemed:?}");
+
+    // SGR mouse wheel down returns cleanly to the bottom of the transcript.
+    for _ in 0..10 {
+        client.screen.handle_input("\x1b[<65;10;4M");
+    }
+    client.screen.render_now(false)?;
+    assert_eq!(client.screen.viewport_top(), bottom_top);
+    assert!(client.screen.screen_lines().join("\n").contains("row-29"));
+    Ok(())
+}

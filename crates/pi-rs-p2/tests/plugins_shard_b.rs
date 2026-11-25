@@ -505,3 +505,130 @@ async fn ports_archived_sessions_sweep_at_open() -> Result<(), Box<dyn StdError>
 async fn peer_close(host: Host) {
     let _ = host.close(&Context::background()).await;
 }
+
+/// Archiving a session immediately closes and deletes only that session's forwards, both when
+/// `ForwardStore` is already live and when it is opened on demand.
+#[tokio::test]
+async fn ports_session_archived_immediately_closes_session_forwards_only()
+-> Result<(), Box<dyn StdError>> {
+    use pi_rs_chord::host::Caller;
+    use pi_rs_p2::hosts::server::{ServerOptions, start_server};
+
+    let directory = tempfile::tempdir()?;
+    let s1 = uuid::Uuid::new_v4().to_string();
+    let s2 = uuid::Uuid::new_v4().to_string();
+    tokio::fs::write(
+        directory.path().join("forwards.json"),
+        serde_json::to_string_pretty(&json!({
+            "fwdowner01": {"port": 5170, "name": "manual"},
+            "fwdsess001": {"port": 5173, "name": "s1-web", "session": s1},
+            "fwdsess002": {"port": 5174, "name": "s2-web", "session": s2},
+        }))?,
+    )
+    .await?;
+
+    let mut options = ServerOptions::new(directory.path().to_owned());
+    options.port = 0;
+    options.fake = true;
+    options.dev = false;
+    pi_rs_p2::plugins::register_builtins(&mut options.registry)?;
+    let server = start_server(options).await?;
+
+    let context = Context::background();
+    let owner = || Caller {
+        principal: Some(json!({"kind": "owner", "access": "local"})),
+        incarnation: uuid::Uuid::new_v4().to_string(),
+    };
+    let sessions = server.host.hold_as(
+        Arc::new(lookup("p2.sessions")?),
+        JsonValue::from_serde(json!({})),
+        owner(),
+        &context,
+    )?;
+    sessions.wait(&context).await?;
+
+    sessions
+        .call(
+            "create",
+            JsonValue::from_serde(json!({
+                "id": s1,
+                "cwd": directory.path(),
+                "title": "Session One",
+                "thinkingLevel": "off",
+                "model": {"provider": "faux", "modelId": "faux-1"},
+            })),
+            &context,
+        )
+        .await?;
+    sessions
+        .call(
+            "create",
+            JsonValue::from_serde(json!({
+                "id": s2,
+                "cwd": directory.path(),
+                "title": "Session Two",
+                "thinkingLevel": "off",
+                "model": {"provider": "faux", "modelId": "faux-1"},
+            })),
+            &context,
+        )
+        .await?;
+
+    let ports = server.host.hold_as(
+        Arc::new(lookup("p2.ports")?),
+        JsonValue::from_serde(json!({})),
+        owner(),
+        &context,
+    )?;
+    ports.wait(&context).await?;
+    let initial = ports.member("forwards")?.value()?.to_json().to_serde()?;
+    let initial_ports: Vec<u64> = initial
+        .as_array()
+        .ok_or("expected forwards array")?
+        .iter()
+        .filter_map(|row| row["port"].as_u64())
+        .collect();
+    assert_eq!(initial_ports, vec![5170, 5173, 5174]);
+
+    // Archiving s1 immediately closes s1's forward while keeping s2 and manual forwards intact.
+    sessions
+        .call(
+            "archive",
+            JsonValue::from_serde(json!({"id": s1})),
+            &context,
+        )
+        .await?;
+
+    let after_s1 = ports.member("forwards")?.value()?.to_json().to_serde()?;
+    let after_s1_ports: Vec<u64> = after_s1
+        .as_array()
+        .ok_or("expected forwards array")?
+        .iter()
+        .filter_map(|row| row["port"].as_u64())
+        .collect();
+    assert_eq!(after_s1_ports, vec![5170, 5174]);
+    let disk_after_s1 = tokio::fs::read_to_string(directory.path().join("forwards.json")).await?;
+    assert!(!disk_after_s1.contains(&s1), "{disk_after_s1}");
+    assert!(!disk_after_s1.contains("5173"), "{disk_after_s1}");
+    assert!(disk_after_s1.contains(&s2), "{disk_after_s1}");
+    assert!(disk_after_s1.contains("5170"), "{disk_after_s1}");
+
+    // Even when ForwardStore is no longer held open, archiving s2 still closes s2's forward.
+    ports.release();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    sessions
+        .call(
+            "archive",
+            JsonValue::from_serde(json!({"id": s2})),
+            &context,
+        )
+        .await?;
+    let disk_after_s2 = tokio::fs::read_to_string(directory.path().join("forwards.json")).await?;
+    assert!(!disk_after_s2.contains(&s2), "{disk_after_s2}");
+    assert!(!disk_after_s2.contains("5174"), "{disk_after_s2}");
+    assert!(disk_after_s2.contains("5170"), "{disk_after_s2}");
+
+    sessions.release();
+    server.close().await?;
+    Ok(())
+}

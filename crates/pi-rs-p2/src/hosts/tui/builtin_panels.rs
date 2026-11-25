@@ -15,6 +15,7 @@ enum ActivePanel {
     Models,
     Cost,
     Status,
+    Themes,
 }
 
 pub(super) struct SlashOutcome {
@@ -49,9 +50,16 @@ impl RenderContext for Style {
 #[derive(Default)]
 pub(super) struct BuiltinPanels {
     active: Option<ActivePanel>,
+    current_theme: String,
+    available_themes: Vec<String>,
 }
 
 impl BuiltinPanels {
+    pub(super) fn set_theme_info(&mut self, current: String, available: Vec<String>) {
+        self.current_theme = current;
+        self.available_themes = available;
+    }
+
     pub(super) fn close(&mut self) {
         self.active = None;
     }
@@ -117,6 +125,9 @@ impl BuiltinPanels {
                 }
                 self.active = Some(ActivePanel::Status);
             }
+            "theme" => {
+                self.active = Some(ActivePanel::Themes);
+            }
             _ => {
                 return SlashOutcome {
                     handled: false,
@@ -148,6 +159,11 @@ impl BuiltinPanels {
                 "Session Status",
                 render_status(view, theme),
             ),
+            ActivePanel::Themes => (
+                "builtin.themes",
+                "Themes",
+                render_themes(&self.current_theme, &self.available_themes, theme),
+            ),
         };
         let title = title.to_owned();
         Some(PanelFrame::new(
@@ -169,6 +185,7 @@ fn render_help(theme_ref: &ThemeRef) -> Vec<String> {
         ("/models", "List configured models"),
         ("/cost", "Show token & cost breakdown"),
         ("/status", "Show active workers & session status"),
+        ("/theme [name]", "List or switch TUI color theme"),
         ("/help", "Show this help panel"),
         ("/close-panel", "Close the side panel"),
     ] {
@@ -486,5 +503,28 @@ fn render_status(view: &View, theme_ref: &ThemeRef) -> Vec<String> {
         };
         lines.push(format!("{marker}{session_id}: {state} (tasks: {tasks})"));
     }
+    lines
+}
+
+fn render_themes(current: &str, available: &[String], theme_ref: &ThemeRef) -> Vec<String> {
+    let theme = theme_ref.current();
+    let mut lines = vec![theme.bold(&theme.fg("accent", "Available Themes"))];
+    lines.push(String::new());
+    for name in available {
+        let is_current = name == current;
+        let marker = if is_current {
+            theme.fg("accent", "● ")
+        } else {
+            "  ".to_owned()
+        };
+        let label = if is_current {
+            theme.bold(&theme.fg("accent", name))
+        } else {
+            theme.fg("text", name)
+        };
+        lines.push(format!("{marker}{label}"));
+    }
+    lines.push(String::new());
+    lines.push(theme.fg("dim", "Use /theme <name> to switch."));
     lines
 }

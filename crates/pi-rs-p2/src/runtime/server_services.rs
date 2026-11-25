@@ -139,6 +139,95 @@ pub fn install_service<T: Send + Sync + 'static>(
         .set(ServiceSlot(Arc::downgrade(value)), &Context::background())
 }
 
+pub const SESSION_ARCHIVED_REGISTRY: &str = "p2.session-archived";
+
+pub type SessionArchivedHandler =
+    Arc<dyn Fn(String, Context) -> pi_rs_chord::sync::SyncFuture<()> + Send + Sync>;
+
+/// Handle keeping a facet's `p2.session-archived` contribution alive until the facet unloads.
+pub struct SessionArchivedContribution {
+    id: String,
+    entries: IndexMap<String, SessionArchivedHandler>,
+}
+
+impl Drop for SessionArchivedContribution {
+    fn drop(&mut self) {
+        with_session_archived(|entries| entries.remove(&self.id));
+    }
+}
+
+fn with_session_archived<T>(
+    f: impl FnOnce(&mut HashMap<String, Weak<SessionArchivedContribution>>) -> T,
+) -> T {
+    static ENTRIES: LazyLock<Mutex<HashMap<String, Weak<SessionArchivedContribution>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    f(&mut ENTRIES.lock().unwrap_or_else(|error| error.into_inner()))
+}
+
+/// Serve the keyed `p2.session-archived` registry so plugins can register archive cleanup hooks.
+pub fn serve_session_archived_registry(facet: &mut FacetHost) -> Result<()> {
+    facet.serve_registry(
+        token(SESSION_ARCHIVED_REGISTRY)?,
+        RegistryProvider::<JsonValue, JsonValue>::new(|entries, _| {
+            Ok(JsonValue::Array(
+                entries.iter().map(|entry| entry.value.clone()).collect(),
+            ))
+        }),
+    )
+}
+
+/// Contribute a keyed `p2.session-archived` cleanup handler for the lifetime of the returned handle.
+pub fn contribute_session_archived(
+    facet: &mut FacetHost,
+    key: impl Into<String>,
+    handler: SessionArchivedHandler,
+) -> Result<Arc<SessionArchivedContribution>> {
+    let contribution = Arc::new(SessionArchivedContribution {
+        id: Uuid::new_v4().to_string(),
+        entries: IndexMap::from([(key.into(), handler)]),
+    });
+    with_session_archived(|entries| {
+        entries.insert(contribution.id.clone(), Arc::downgrade(&contribution))
+    });
+    facet.contribute(
+        token(SESSION_ARCHIVED_REGISTRY)?,
+        JsonValue::String(contribution.id.clone().into()),
+    )?;
+    Ok(contribution)
+}
+
+/// Invoke all active `p2.session-archived` handlers for `session_id` in registration order.
+pub async fn run_session_archived(host: &Host, session_id: &str, context: &Context) -> Result<()> {
+    let ids = match host.registry(token(SESSION_ARCHIVED_REGISTRY)?).value(1) {
+        Ok(JsonValue::Array(ids)) => ids,
+        Ok(JsonValue::Null) => return Ok(()),
+        Ok(_) => return Err(Error::Invalid("invalid session-archived registry".into())),
+        Err(Error::Chord(error)) if error.code == "unavailable" => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let contributions = with_session_archived(|entries| {
+        ids.iter()
+            .filter_map(|id| {
+                let JsonValue::String(id) = id else {
+                    return None;
+                };
+                entries.get(&id.to_utf8().ok()?)?.upgrade()
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut seen = HashSet::new();
+    let handlers: Vec<SessionArchivedHandler> = contributions
+        .iter()
+        .flat_map(|entry| entry.entries.iter())
+        .filter(|(key, _)| seen.insert((*key).clone()))
+        .map(|(_, handler)| handler.clone())
+        .collect();
+    for handler in handlers {
+        handler(session_id.to_owned(), context.clone()).await?;
+    }
+    Ok(())
+}
+
 /// Retrieve a host-lifetime native service previously published via `install_service`.
 pub fn service_of<T: Send + Sync + 'static>(host: &Host, name: &str) -> Result<Arc<T>> {
     host.page_state(name, ServiceSlot::<T>::default())?

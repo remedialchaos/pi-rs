@@ -44,6 +44,19 @@ where
     F: Fn(DevCommand) -> Fut + Send + Sync + Clone + 'static,
     Fut: Future<Output = DevResult> + Send + 'static,
 {
+    serve_with_after(directory, execute, |_, _| {}).await
+}
+
+pub(crate) async fn serve_with_after<F, Fut, A>(
+    directory: &Path,
+    execute: F,
+    after: A,
+) -> io::Result<Channel>
+where
+    F: Fn(DevCommand) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = DevResult> + Send + 'static,
+    A: Fn(DevCommand, DevResult) + Send + Sync + Clone + 'static,
+{
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -103,55 +116,6 @@ where
         path,
     };
     fs::set_permissions(&owned.path, fs::Permissions::from_mode(0o600))?;
-    let service = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
-        let execute = execute.clone();
-        async move {
-            let parsed = if req.method() != Method::POST || req.uri() != "/" {
-                Err("POST / required")
-            } else {
-                match tokio::time::timeout(
-                    Duration::from_secs(120),
-                    to_bytes(Body::new(req.into_body()), 16384),
-                )
-                .await
-                {
-                    Ok(Ok(body)) => read_command(&body),
-                    Ok(Err(_)) => Err("Dev command too large"),
-                    Err(_) => Err("Dev command timed out"),
-                }
-            };
-            let response = match parsed {
-                Ok(cmd) => {
-                    // Closing the requesting socket must not cancel a reload halfway through.
-                    let result =
-                        tokio::spawn(execute(cmd))
-                            .await
-                            .unwrap_or_else(|error| DevResult {
-                                ok: false,
-                                message: error.to_string(),
-                                plugins: None,
-                            });
-                    (
-                        if result.ok {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::CONFLICT
-                        },
-                        Json(result),
-                    )
-                }
-                Err(message) => (
-                    StatusCode::BAD_REQUEST,
-                    Json(DevResult {
-                        ok: false,
-                        message: message.into(),
-                        plugins: None,
-                    }),
-                ),
-            };
-            Ok::<_, std::convert::Infallible>(response.into_response())
-        }
-    });
     let (stop, mut stopping) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let _lock = lock;
@@ -164,10 +128,85 @@ where
                 Some(_) = connections.join_next(), if !connections.is_empty() => {},
                 accepted = listener.accept() => {
                     let Ok((socket, _)) = accepted else { break };
-                    let service = service.clone();
+                    let execute = execute.clone();
+                    let after = after.clone();
                     connections.spawn(async move {
+                        let deferred = std::sync::Arc::new(std::sync::Mutex::new(None));
+                        let service = hyper::service::service_fn({
+                            let execute = execute.clone();
+                            let deferred = deferred.clone();
+                            move |req: http::Request<hyper::body::Incoming>| {
+                                let execute = execute.clone();
+                                let deferred = deferred.clone();
+                                async move {
+                                    let parsed = if req.method() != Method::POST || req.uri() != "/" {
+                                        Err("POST / required")
+                                    } else {
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(120),
+                                            to_bytes(Body::new(req.into_body()), 16384),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(body)) => read_command(&body),
+                                            Ok(Err(_)) => Err("Dev command too large"),
+                                            Err(_) => Err("Dev command timed out"),
+                                        }
+                                    };
+                                    let mut close_after = false;
+                                    let response = match parsed {
+                                        Ok(cmd) => {
+                                            // Closing the requesting socket must not cancel a reload halfway through.
+                                            let result = tokio::spawn(execute(cmd.clone()))
+                                                .await
+                                                .unwrap_or_else(|error| DevResult {
+                                                    ok: false,
+                                                    message: error.to_string(),
+                                                    plugins: None,
+                                                });
+                                            if matches!(cmd, DevCommand::Restart) && result.ok {
+                                                close_after = true;
+                                                *deferred
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) =
+                                                    Some((cmd, result.clone()));
+                                            }
+                                            (
+                                                if result.ok {
+                                                    StatusCode::OK
+                                                } else {
+                                                    StatusCode::CONFLICT
+                                                },
+                                                Json(result),
+                                            )
+                                        }
+                                        Err(message) => (
+                                            StatusCode::BAD_REQUEST,
+                                            Json(DevResult {
+                                                ok: false,
+                                                message: message.into(),
+                                                plugins: None,
+                                            }),
+                                        ),
+                                    };
+                                    let mut http_res = response.into_response();
+                                    if close_after {
+                                        http_res.headers_mut().insert(
+                                            http::header::CONNECTION,
+                                            http::HeaderValue::from_static("close"),
+                                        );
+                                    }
+                                    Ok::<_, std::convert::Infallible>(http_res)
+                                }
+                            }
+                        });
                         let _ = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(hyper_util::rt::TokioIo::new(socket), service).await;
+                            .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                            .await;
+                        let item = deferred.lock().unwrap_or_else(|e| e.into_inner()).take();
+                        if let Some((cmd, result)) = item {
+                            after(cmd, result);
+                        }
                     });
                 }
             }
