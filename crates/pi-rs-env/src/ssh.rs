@@ -800,26 +800,121 @@ pub fn detect_platform(target: &SshTarget) -> Result<RemotePlatform, SshFailure>
     }
 }
 
-fn executable_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().and_then(Path::parent).map(Path::to_path_buf))
-        .unwrap_or_default()
+const DAEMON_DIR_ENV: &str = "PI_ENV_DAEMON_DIR";
+
+fn host_platform() -> Option<RemotePlatformKind> {
+    match std::env::consts::OS {
+        "linux" => Some(RemotePlatformKind::Linux),
+        "android" => Some(RemotePlatformKind::Android),
+        "macos" => Some(RemotePlatformKind::Darwin),
+        "windows" => Some(RemotePlatformKind::Windows),
+        _ => None,
+    }
 }
 
-/// The daemon binary shipped for `remote`, when one is bundled next to the host binary.
-pub fn packaged_daemon(remote: &RemotePlatform) -> PathBuf {
-    let name = format!(
+fn host_arch() -> Option<RemoteArch> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some(RemoteArch::X64),
+        "aarch64" => Some(RemoteArch::Arm64),
+        _ => None,
+    }
+}
+
+fn push_daemon_candidates(
+    candidates: &mut Vec<PathBuf>,
+    dir: &Path,
+    target_name: &str,
+    flat_target_name: &str,
+    binary_name: &str,
+    matches_host: bool,
+) {
+    candidates.push(dir.join(target_name).join(binary_name));
+    candidates.push(dir.join(flat_target_name));
+    if matches_host {
+        candidates.push(dir.join(binary_name));
+    }
+}
+
+/// Pure, testable daemon path resolver for `packaged_daemon`.
+///
+/// Checks in order:
+/// 1. `env_daemon_dir` (`PI_ENV_DAEMON_DIR`), supporting `<dir>/pi-env-<platform>-<arch>/pi-env[.exe]`,
+///    `<dir>/pi-env-<platform>-<arch>[.exe]`, and `<dir>/pi-env[.exe]` when `remote` matches the host.
+/// 2. Native Cargo / release layout beside `exe_path`: `<exe_dir>/pi-env-<platform>-<arch>/pi-env[.exe]`,
+///    `<exe_dir>/pi-env-<platform>-<arch>[.exe]`, and `<exe_dir>/pi-env[.exe]` when `remote` matches the host.
+/// 3. Legacy npm `bin/` layout: `<exe_dir>/../bin/pi-env-<platform>-<arch>/pi-env[.exe]`.
+///
+/// Returns the first existing file, or the preferred native/override path if none exist.
+pub fn packaged_daemon_in(
+    exe_path: Option<&Path>,
+    env_daemon_dir: Option<&Path>,
+    host_platform: Option<RemotePlatformKind>,
+    host_arch: Option<RemoteArch>,
+    remote: &RemotePlatform,
+) -> PathBuf {
+    let is_windows = remote.platform == RemotePlatformKind::Windows;
+    let binary_name = if is_windows { "pi-env.exe" } else { "pi-env" };
+    let target_name = format!(
         "pi-env-{}-{}",
         remote.platform.as_str(),
         remote.arch.as_str()
     );
-    executable_dir().join("bin").join(name).join(
-        if remote.platform == RemotePlatformKind::Windows {
-            "pi-env.exe"
-        } else {
-            "pi-env"
-        },
+    let flat_target_name = if is_windows {
+        format!("{target_name}.exe")
+    } else {
+        target_name.clone()
+    };
+    let matches_host = host_platform == Some(remote.platform) && host_arch == Some(remote.arch);
+
+    let mut candidates = Vec::new();
+    if let Some(dir) = env_daemon_dir.filter(|path| !path.as_os_str().is_empty()) {
+        push_daemon_candidates(
+            &mut candidates,
+            dir,
+            &target_name,
+            &flat_target_name,
+            binary_name,
+            matches_host,
+        );
+    }
+    if let Some(exe_dir) = exe_path
+        .and_then(Path::parent)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        push_daemon_candidates(
+            &mut candidates,
+            exe_dir,
+            &target_name,
+            &flat_target_name,
+            binary_name,
+            matches_host,
+        );
+        if let Some(parent_dir) = exe_dir.parent() {
+            candidates.push(parent_dir.join("bin").join(&target_name).join(binary_name));
+        }
+    }
+
+    if let Some(found) = candidates.iter().find(|candidate| candidate.is_file()) {
+        return found.clone();
+    }
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from(&target_name).join(binary_name))
+}
+
+/// The daemon binary shipped for `remote`, checking `PI_ENV_DAEMON_DIR`, native layout beside the host binary, and legacy `../bin/`.
+pub fn packaged_daemon(remote: &RemotePlatform) -> PathBuf {
+    let exe_path = std::env::current_exe().ok();
+    let env_dir = std::env::var_os(DAEMON_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    packaged_daemon_in(
+        exe_path.as_deref(),
+        env_dir.as_deref(),
+        host_platform(),
+        host_arch(),
+        remote,
     )
 }
 
@@ -1291,6 +1386,243 @@ mod tests {
         assert!(
             launch_command(&remote, "C:\\a b\\pi-env.exe", false)
                 .contains("\"C:\\a b\\pi-env.exe\"")
+        );
+    }
+
+    fn remote(platform: RemotePlatformKind, arch: RemoteArch) -> RemotePlatform {
+        RemotePlatform {
+            platform,
+            arch,
+            home: "/home/pi".into(),
+            shell: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn touch_file(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, b"daemon").unwrap();
+    }
+
+    #[test]
+    fn packaged_daemon_prefers_env_override_over_native_and_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let override_dir = dir.path().join("override");
+        let exe_path = dir.path().join("dist").join("p2");
+        let exe_dir = exe_path.parent().unwrap();
+        let legacy_bin = dir
+            .path()
+            .join("bin")
+            .join("pi-env-linux-x64")
+            .join("pi-env");
+
+        touch_file(&legacy_bin);
+        touch_file(&exe_dir.join("pi-env"));
+        touch_file(&exe_dir.join("pi-env-linux-x64").join("pi-env"));
+        touch_file(&override_dir.join("pi-env"));
+        touch_file(&override_dir.join("pi-env-linux-x64"));
+        let override_nested = override_dir.join("pi-env-linux-x64").join("pi-env");
+        // Note: on Unix a file and dir cannot share the exact same path `pi-env-linux-x64`;
+        // test nested dir first in its own subdir, then flat in another subdir.
+        drop(override_nested);
+        let override_nested_dir = dir.path().join("override_nested");
+        let nested_file = override_nested_dir.join("pi-env-linux-x64").join("pi-env");
+        touch_file(&nested_file);
+        touch_file(&override_nested_dir.join("pi-env"));
+
+        let target = remote(RemotePlatformKind::Linux, RemoteArch::X64);
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                Some(&override_nested_dir),
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &target,
+            ),
+            nested_file
+        );
+
+        // An empty directory `<override>/pi-env-linux-x64/` must not match as a flat binary.
+        fs::remove_file(&nested_file).unwrap();
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                Some(&override_nested_dir),
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &target,
+            ),
+            override_nested_dir.join("pi-env")
+        );
+
+        // Flat `<override>/pi-env-linux-x64` works when present.
+        let flat_dir = dir.path().join("override_flat");
+        let flat_file = flat_dir.join("pi-env-linux-x64");
+        touch_file(&flat_file);
+        touch_file(&flat_dir.join("pi-env"));
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                Some(&flat_dir),
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &target,
+            ),
+            flat_file
+        );
+
+        // Empty env override is ignored and falls back to native layout.
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                Some(Path::new("")),
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &target,
+            ),
+            exe_dir.join("pi-env-linux-x64").join("pi-env")
+        );
+    }
+
+    #[test]
+    fn packaged_daemon_uses_native_sibling_only_when_remote_matches_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("release").join("p2");
+        let exe_dir = exe_path.parent().unwrap();
+        let sibling = exe_dir.join("pi-env");
+        let sibling_exe = exe_dir.join("pi-env.exe");
+        touch_file(&sibling);
+        touch_file(&sibling_exe);
+
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                None,
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &remote(RemotePlatformKind::Linux, RemoteArch::X64),
+            ),
+            sibling
+        );
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                None,
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &remote(RemotePlatformKind::Linux, RemoteArch::Arm64),
+            ),
+            exe_dir.join("pi-env-linux-arm64").join("pi-env")
+        );
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                None,
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &remote(RemotePlatformKind::Windows, RemoteArch::X64),
+            ),
+            exe_dir.join("pi-env-windows-x64").join("pi-env.exe")
+        );
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                None,
+                Some(RemotePlatformKind::Windows),
+                Some(RemoteArch::X64),
+                &remote(RemotePlatformKind::Windows, RemoteArch::X64),
+            ),
+            sibling_exe
+        );
+    }
+
+    #[test]
+    fn packaged_daemon_resolves_cross_arch_native_bundles_and_flat_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("dist").join("p2");
+        let exe_dir = exe_path.parent().unwrap();
+
+        let arm64_native = exe_dir.join("pi-env-linux-arm64").join("pi-env");
+        let arm64_legacy = dir
+            .path()
+            .join("bin")
+            .join("pi-env-linux-arm64")
+            .join("pi-env");
+        touch_file(&arm64_native);
+        touch_file(&arm64_legacy);
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                None,
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &remote(RemotePlatformKind::Linux, RemoteArch::Arm64),
+            ),
+            arm64_native
+        );
+
+        let win_flat = exe_dir.join("pi-env-windows-x64.exe");
+        touch_file(&win_flat);
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                None,
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &remote(RemotePlatformKind::Windows, RemoteArch::X64),
+            ),
+            win_flat
+        );
+    }
+
+    #[test]
+    fn packaged_daemon_falls_back_to_legacy_bin_layout_and_returns_preferred_native_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("dist").join("p2");
+        let exe_dir = exe_path.parent().unwrap();
+        let legacy = dir
+            .path()
+            .join("bin")
+            .join("pi-env-darwin-arm64")
+            .join("pi-env");
+        touch_file(&legacy);
+
+        let target = remote(RemotePlatformKind::Darwin, RemoteArch::Arm64);
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                None,
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &target,
+            ),
+            legacy
+        );
+
+        fs::remove_file(&legacy).unwrap();
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                None,
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &target,
+            ),
+            exe_dir.join("pi-env-darwin-arm64").join("pi-env")
+        );
+
+        let override_dir = dir.path().join("custom");
+        assert_eq!(
+            packaged_daemon_in(
+                Some(&exe_path),
+                Some(&override_dir),
+                Some(RemotePlatformKind::Linux),
+                Some(RemoteArch::X64),
+                &target,
+            ),
+            override_dir.join("pi-env-darwin-arm64").join("pi-env")
         );
     }
 }
