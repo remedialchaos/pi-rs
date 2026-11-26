@@ -27,6 +27,10 @@ type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const CHROMIUM_BIN: &str = "/usr/bin/chromium";
 
+// Serialize Chromium E2E tests so 3 headless browsers + 2 p2 servers do not
+// compete for CPU simultaneously on 2-4 core CI runners.
+static CHROMIUM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_csp_local_auth_and_all_48_plugins_work() -> TestResult {
     let dir = tempfile::tempdir()?;
@@ -119,6 +123,7 @@ async fn packaged_p2_chromium_e2e() -> TestResult {
     if !Path::new(CHROMIUM_BIN).exists() {
         return Err(format!("missing Chromium binary at {CHROMIUM_BIN}").into());
     }
+    let _chromium_guard = CHROMIUM_LOCK.lock().await;
     let p2_bin = tokio::task::spawn_blocking(resolve_packaged_p2_binary).await??;
     tokio::time::timeout(Duration::from_secs(120), run_chromium_e2e(&p2_bin)).await?
 }
@@ -128,6 +133,7 @@ async fn guest_share_admission_and_expiration_chromium_e2e() -> TestResult {
     if !Path::new(CHROMIUM_BIN).exists() {
         return Err(format!("missing Chromium binary at {CHROMIUM_BIN}").into());
     }
+    let _chromium_guard = CHROMIUM_LOCK.lock().await;
     let p2_bin = tokio::task::spawn_blocking(resolve_packaged_p2_binary).await??;
     tokio::time::timeout(
         Duration::from_secs(120),
@@ -924,7 +930,7 @@ async fn run_guest_share_expiration_e2e(p2_bin: &Path) -> TestResult {
 }
 
 async fn wait_for_connected(cdp: &CdpClient, session_id: &str) -> TestResult {
-    let res = wait_until("Connected status", Duration::from_secs(20), || async {
+    let res = wait_until("Connected status", Duration::from_secs(30), || async {
         let state = cdp
             .eval_json(
                 session_id,
