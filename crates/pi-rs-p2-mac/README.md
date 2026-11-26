@@ -42,7 +42,7 @@ cargo clippy --offline --locked -p pi-rs-p2-mac --all-targets -- -D warnings
 cargo test --offline --locked -p pi-rs-p2-mac
 ```
 
-The Linux tests require cached Cargo dependencies, Node for the child-process fixture, and `lsof` for Unix listener discovery. They use temporary directories, local sockets, and loopback HTTP servers, not an external service. macOS AppKit/WKWebView linking, bundle signing, and live UI testing require a macOS machine and are not part of the Linux gate.
+The Linux tests require cached Cargo dependencies and Node for the child-process fixture (Linux listener discovery reads `/proc/net/tcp` and `/proc/<pid>/fd` directly). They use temporary directories, local sockets, and loopback HTTP servers, not an external service. macOS AppKit/WKWebView linking, bundle signing, and live UI testing require a macOS machine and are not part of the Linux gate.
 
 Linux x86_64: fmt and Clippy passed; all 16 offline tests passed (3 network, 9 portable, 4 supervisor).
 The AppKit/WebKit shell also passed `cargo check --target aarch64-apple-darwin -j 2` from Linux using the Apple target standard library.
