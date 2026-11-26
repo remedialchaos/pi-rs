@@ -114,7 +114,12 @@ async fn real_child_is_ready_only_after_p2_health_and_stops_with_sigterm() -> Te
     let scanned = info
         .iter()
         .find(|s| s.port == server.config.port)
-        .ok_or("unsuccessful scan of real p2 child listener")?;
+        .ok_or_else(|| {
+            format!(
+                "unsuccessful scan of real p2 child listener on port {} (pid {pid}); found={info:?}",
+                server.config.port
+            )
+        })?;
     assert_eq!(scanned.pid, i32::try_from(pid)?);
     assert_eq!(scanned.data_dir, server.config.data_dir);
     assert_eq!(scanned.checkout.as_ref(), server.config.checkout.as_ref());

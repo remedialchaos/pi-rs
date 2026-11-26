@@ -193,6 +193,32 @@ fn proc_listening_inodes(
 }
 
 #[cfg(target_os = "linux")]
+fn is_p2_candidate_process(proc_dir: &Path) -> bool {
+    let name_matches =
+        |name: &str| name == "p2" || name == "node" || name == "nodejs" || name.starts_with("node");
+    if let Ok(exe) = std::fs::read_link(proc_dir.join("exe"))
+        && let Some(file_name) = exe.file_name().and_then(|s| s.to_str())
+    {
+        // Linux appends " (deleted)" if the binary was replaced while running.
+        let clean = file_name.strip_suffix(" (deleted)").unwrap_or(file_name);
+        if name_matches(clean) {
+            return true;
+        }
+    }
+    if let Ok(cmdline) = std::fs::read(proc_dir.join("cmdline"))
+        && let Some(argv0) = cmdline.split(|&b| b == 0).next()
+        && let Ok(argv0_str) = std::str::from_utf8(argv0)
+        && let Some(file_name) = Path::new(argv0_str).file_name().and_then(|s| s.to_str())
+        && name_matches(file_name)
+    {
+        return true;
+    }
+    std::fs::read_to_string(proc_dir.join("comm"))
+        .ok()
+        .is_some_and(|comm| name_matches(comm.trim()))
+}
+
+#[cfg(target_os = "linux")]
 async fn neighbors() -> Vec<(i32, u16)> {
     use std::os::unix::fs::MetadataExt;
     let uid = nix::unistd::getuid().as_raw();
@@ -217,10 +243,9 @@ async fn neighbors() -> Vec<(i32, u16)> {
         if std::fs::metadata(&proc_dir).ok().map(|meta| meta.uid()) != Some(uid) {
             continue;
         }
-        let Ok(comm) = std::fs::read_to_string(proc_dir.join("comm")) else {
-            continue;
-        };
-        if !comm.trim().starts_with("node") {
+        // Node 22/24 sets /proc/<pid>/comm to "MainThread", so check /proc/<pid>/exe
+        // and argv[0] rather than relying solely on `comm`.
+        if !is_p2_candidate_process(&proc_dir) {
             continue;
         }
         let Ok(fds) = std::fs::read_dir(proc_dir.join("fd")) else {
@@ -443,5 +468,23 @@ mod tests {
         assert!(!found.contains_key(&1005));
         assert_eq!(parse_socket_inode(Path::new("socket:[1001]")), Some(1001));
         assert_eq!(parse_socket_inode(Path::new("pipe:[1001]")), None);
+    }
+
+    #[test]
+    fn candidate_process_matches_cmdline_even_when_comm_is_main_thread()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("comm"), "MainThread\n")?;
+        std::fs::write(
+            dir.path().join("cmdline"),
+            b"/usr/local/bin/node\0server.ts\0",
+        )?;
+        assert!(is_p2_candidate_process(dir.path()));
+
+        let other = tempfile::tempdir()?;
+        std::fs::write(other.path().join("comm"), "MainThread\n")?;
+        std::fs::write(other.path().join("cmdline"), b"/usr/bin/python3\0app.py\0")?;
+        assert!(!is_p2_candidate_process(other.path()));
+        Ok(())
     }
 }
