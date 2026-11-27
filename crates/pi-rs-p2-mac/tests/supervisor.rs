@@ -17,44 +17,36 @@ use std::{
     time::Duration,
 };
 use tokio::net::UnixListener;
+#[path = "support/fixture.rs"]
+mod fixture;
 mod support;
 use support::{Loopback, Test, sandbox};
 
-// This is the upstream Node entry's observable contract, without its dependencies or providers.
-const CHILD: &str = r#"
-import { createServer } from 'node:http';
-import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-const data = process.env.P2_DATA_DIR;
-writeFileSync(join(data,'started'), JSON.stringify({pid:process.pid,fake:process.env.P2_FAKE,cwd:process.cwd()}));
-const server=createServer((req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({name:'p2'}));});
-server.listen(Number(process.env.PORT),'127.0.0.1');
-process.on('SIGTERM',()=>{
-    writeFileSync(join(data,'term'),'received');
-    if (process.env.FIXTURE_STOP==='graceful') server.close(()=>process.exit(0));
-});
-"#;
-
+// The p2 server's observable contract, without its dependencies or providers: the fixture binary
+// answers `/health`, writes the start and stop files, and stops on SIGTERM.
 fn with_fixture(root: &Path, graceful: bool) -> Test<ServerController> {
-    let checkout = root.join("checkout");
-    fs::create_dir_all(checkout.join("src/hosts"))?;
-    fs::write(checkout.join("src/source.ts"), "")?;
-    fs::write(checkout.join("src/hosts/server.ts"), CHILD)?;
     let mut env = environment();
     env.insert("HOME".into(), root.to_string_lossy().into());
     env.insert(
         "FIXTURE_STOP".into(),
         if graceful { "graceful" } else { "hard" }.into(),
     );
-    let executable = login_environment::which("node", env.get("PATH").map(String::as_str))
-        .ok_or("Node is required for running the p2 child process fixture")?;
     let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
         .local_addr()?
         .port();
+    use std::os::unix::fs::PermissionsExt;
+    let binary = root.join("start-fixture");
+    let child = root.join("p2");
+    fs::copy(std::env::current_exe()?, &child)?;
+    env.insert("FIXTURE_EXE".into(), child.to_string_lossy().into());
+    fs::write(
+        &binary,
+        "#!/bin/sh\nexec \"$FIXTURE_EXE\" --exact fixture::child\n",
+    )?;
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
     let config = ServerConfig {
         source: Source::Own,
-        checkout: Some(checkout),
-        node: Some(executable),
+        binary: Some(binary),
         port,
         data_dir: root.join("private-data"),
         mode: Mode::Start,
@@ -98,16 +90,16 @@ async fn real_child_is_ready_only_after_p2_health_and_stops_with_sigterm() -> Te
     let started: Value =
         serde_json::from_reader(fs::File::open(server.config.data_dir.join("started"))?)?;
     assert_eq!(started["fake"], "1");
-    let Some(checkout) = &server.config.checkout else {
-        return Err("missing checkout".into());
-    };
-    assert_eq!(
-        started["cwd"].as_str().map(Path::new),
-        Some(checkout.as_path())
-    );
     assert!(
-        fs::read_to_string(&server.log_file)?
-            .contains("--import ./src/source.ts src/hosts/server.ts")
+        fs::read_to_string(&server.log_file)?.contains(
+            &server
+                .config
+                .binary
+                .as_ref()
+                .ok_or("missing fixture binary")?
+                .display()
+                .to_string()
+        )
     );
     let pid = u32::try_from(started["pid"].as_u64().ok_or("no child PID")?)?;
     let info = server_scan::scan(&root.path().join("default")).await?;
@@ -122,7 +114,6 @@ async fn real_child_is_ready_only_after_p2_health_and_stops_with_sigterm() -> Te
         })?;
     assert_eq!(scanned.pid, i32::try_from(pid)?);
     assert_eq!(scanned.data_dir, server.config.data_dir);
-    assert_eq!(scanned.checkout.as_ref(), server.config.checkout.as_ref());
     let mut attached = ServerController::new(
         server
             .config
@@ -186,8 +177,7 @@ async fn attached_dev_restart_uses_unix_http_and_leaves_external_process_running
     .await?;
     let config = ServerConfig {
         source: Source::Attached,
-        checkout: None,
-        node: None,
+        binary: None,
         port: upstream.url.port().ok_or("missing port")?,
         data_dir: dir.path().into(),
         mode: Mode::Dev,

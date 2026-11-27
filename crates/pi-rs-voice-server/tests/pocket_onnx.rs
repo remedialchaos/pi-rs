@@ -687,6 +687,7 @@ fn config_load_engines_skips_pocket_when_onnx_missing_and_fails_on_bad_config() 
         default_engine: "pocket".into(),
         default_voice: None,
         tts_threads: 1,
+        pocket_threads: 2,
         tts_steps: 1,
         vad: VadConfig::default(),
         preroll_ms: 0.0,
@@ -867,6 +868,7 @@ async fn pocket_onnx_end_to_end_http_and_websocket_synthesis() -> Test {
         default_engine: "pocket".into(),
         default_voice: None,
         tts_threads: 1,
+        pocket_threads: 2,
         tts_steps: 5,
         vad: VadConfig::default(),
         preroll_ms: 0.0,
@@ -1068,5 +1070,17 @@ fn pocket_onnx_optional_speed_steps_cancellation_caching_and_non_finite_guard() 
         .unwrap_err();
     assert!(matches!(err, Error::Model(_)));
     assert!(nan_chunks.is_empty());
+    Ok(())
+}
+
+#[test]
+fn invalid_pocket_thread_count_reports_the_setting_before_loading_models() -> Test {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pi-voice-server"))
+        .env_clear()
+        .env("VOICE_TOKEN", "test")
+        .env("VOICE_POCKET_THREADS", "two")
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("invalid VOICE_POCKET_THREADS: two"));
     Ok(())
 }

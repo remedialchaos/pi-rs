@@ -167,11 +167,11 @@ async fn server_boot_owner_pairing_invites_ephemeral_and_persistent_restart() {
         server.address,
         "/_chord/login",
         "",
-        json!({"name":" Guest "}),
+        json!({"name":format!("  {}  ", "G".repeat(45))}),
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(user["name"], "Guest");
+    assert_eq!(user["name"], "G".repeat(40));
     assert!(!headers.contains("Max-Age="));
     assert_eq!(
         post(

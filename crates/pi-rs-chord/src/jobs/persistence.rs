@@ -1,5 +1,5 @@
 //! Job storage uses Chord's existing document namespaces and outbox steps.
-use super::StoredRun;
+use super::{FinishStep, StoredRun};
 use crate::{
     Error, Result,
     json::JsonValue,
@@ -41,16 +41,50 @@ impl JobStore {
         })))
     }
     pub async fn load(&self, job: &str) -> Result<Vec<(String, StoredRun, Option<JsonValue>)>> {
+        Ok(self
+            .load_versions(job, |_| true)
+            .await?
+            .into_iter()
+            .map(|(id, run, state)| (id, run, state.map(|(_, _, value)| value)))
+            .collect())
+    }
+    pub(super) async fn load_versions(
+        &self,
+        job: &str,
+        load_state: impl Fn(&StoredRun) -> bool + Send + 'static,
+    ) -> Result<Vec<(String, StoredRun, Option<(u64, String, JsonValue)>)>> {
         let owner = self.0.owner.clone();
         let job = job.to_string();
         self.0.engine.database().call(move |c| {
-            let mut statement=c.prepare_cached("SELECT d.key,r.content FROM chord_documents d JOIN chord_revisions r ON r.document_id=d.id AND r.seq=(SELECT MAX(seq) FROM chord_revisions WHERE document_id=d.id) WHERE d.owner=? AND d.namespace='chord.jobs' AND d.kind=? AND d.retired_at IS NULL ORDER BY d.key")?;
-            let rows=statement.query_map(params![owner,job],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut result=Vec::new();
-            for (id,text) in rows {let record:StoredRun=serde_json::from_str(&text)?;
-                let state:Option<String>=c.query_row("SELECT r.content FROM chord_documents d JOIN chord_revisions r ON r.document_id=d.id AND r.seq=(SELECT MAX(seq) FROM chord_revisions WHERE document_id=d.id) WHERE d.owner=? AND d.namespace='chord.job-states' AND d.kind=? AND d.key=? AND d.retired_at IS NULL",params![owner,job,id],|r|r.get(0)).optional()?;
-                result.push((id,record,state.map(|s|JsonValue::parse(&s)).transpose()?));
-            }Ok(result)
+            let mut statement = c.prepare_cached(
+                "SELECT d.key, r.content FROM chord_documents d JOIN chord_revisions r
+                 ON r.document_id = d.id AND r.seq = (SELECT MAX(seq) FROM chord_revisions WHERE document_id = d.id)
+                 WHERE d.owner = ? AND d.namespace = 'chord.jobs' AND d.kind = ? AND d.retired_at IS NULL ORDER BY d.key"
+            )?;
+            let rows = statement.query_map(params![owner, job], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                let (id, text) = row?;
+                let record: StoredRun = serde_json::from_str(&text)?;
+                let state = if load_state(&record) {
+                    let header: Option<(i64,i64,String)> = c.query_row(
+                        "SELECT id, version, fingerprint FROM chord_documents WHERE owner = ?
+                         AND namespace = 'chord.job-states' AND kind = ? AND key = ? AND retired_at IS NULL",
+                        params![owner,job,id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    ).optional()?;
+                    header.map(|(document, version, fingerprint)| -> Result<_> {
+                        let version = u64::try_from(version).map_err(|_| Error::Invalid("negative stored job state version".into()))?;
+                        let (value, _) = crate::documents::read_document_revision(c, document, version)?;
+                        Ok((version, fingerprint, value))
+                    }).transpose()?
+                } else {
+                    None
+                };
+                result.push((id, record, state));
+            }
+            Ok(result)
         }).await
     }
     pub async fn save(
@@ -93,13 +127,28 @@ impl JobStore {
         Ok(())
     }
     pub async fn remove(&self, job: &str, id: &str) -> Result<()> {
+        self.retire(job, id, None).await
+    }
+    pub(super) async fn retire(
+        &self,
+        job: &str,
+        id: &str,
+        finish: Option<(FinishStep, super::Outcome)>,
+    ) -> Result<()> {
         let owner = self.0.owner.clone();
         let job = job.to_string();
         let id = id.to_string();
         let commit=self.0.engine.database().transaction(move |c| {
             let mut statement=c.prepare_cached("SELECT id,revision FROM chord_documents WHERE owner=? AND namespace IN ('chord.jobs','chord.job-states') AND kind=? AND key=? AND retired_at IS NULL")?;
             let rows=statement.query_map(params![owner,job,id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut step=Step::new(c)?;for (id,revision) in rows {step.apply(StoreWrite::DocumentRetire {id,revision})?;}step.finish()
+            let mut step = Step::new(c)?;
+            if let Some((finish, outcome)) = finish {
+                finish(&outcome, &mut step)?;
+            }
+            for (id, revision) in rows {
+                step.apply(StoreWrite::DocumentRetire { id, revision })?;
+            }
+            step.finish()
         }).await?;
         self.0.engine.publish(commit.seq);
         Ok(())

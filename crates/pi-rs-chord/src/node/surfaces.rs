@@ -1,6 +1,6 @@
 //! Content-addressed native surface artifacts and live script manifests.
 use super::{
-    http::{HttpContribution, HttpError, HttpResponse, RouteOptions, json_response},
+    http::{HttpContribution, HttpError, HttpResponse, RouteOptions, json_response, text_response},
     plugins::digest,
 };
 use crate::{
@@ -63,7 +63,11 @@ impl Surface {
             return Err(Error::Invalid("unknown surface".into()));
         }
         let prefix = format!("/_chord/{name}/");
-        let base = digest(&base_bytes);
+        let base = if base_bytes.is_empty() {
+            String::new()
+        } else {
+            digest(&base_bytes)
+        };
         let base_path = format!("{prefix}base.{base}.wasm");
         let state = Published {
             current: BTreeMap::new(),
@@ -270,10 +274,41 @@ impl Surface {
     }
     pub fn contribution(&self, public: bool) -> std::result::Result<HttpContribution, HttpError> {
         let mut contribution = HttpContribution::new(format!("chord.surface.{}", self.name));
+        if self.name == "web" {
+            contribution.scripts.push(self.prefix.clone());
+            for (directive, sources) in [
+                ("style-src", vec!["'self'".into()]),
+                ("img-src", vec!["'self'".into(), "data:".into()]),
+                ("font-src", vec!["'self'".into()]),
+            ] {
+                contribution.csp.insert(directive.into(), sources);
+            }
+            let base = self.base.clone();
+            let mut base_route = RouteOptions::new(move |_| {
+                let base = base.clone();
+                Box::pin(async move {
+                    let mut response = if base.is_empty() {
+                        text_response(503, "web surface is not built")?
+                    } else {
+                        json_response(&serde_json::json!(base))?
+                    };
+                    response.headers_mut().insert(
+                        ::http::header::CACHE_CONTROL,
+                        ::http::HeaderValue::from_static("no-store"),
+                    );
+                    Ok(response)
+                })
+            });
+            base_route.public = true;
+            contribution.route("GET /_chord/web/base", base_route)?;
+        }
         let surface = self.clone();
         let mut route = RouteOptions::new(move |request| {
             let surface = surface.clone();
             Box::pin(async move {
+                if surface.base.is_empty() {
+                    return Err(HttpError::new(503, "surface is not built"));
+                }
                 if request.path == format!("{}base", surface.prefix) {
                     return json_response(&serde_json::json!(surface.base));
                 }

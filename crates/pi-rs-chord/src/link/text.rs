@@ -254,9 +254,12 @@ fn arity(f: &[Value], allowed: &[usize]) -> Result<()> {
     }
 }
 fn uuid(v: &Value) -> Result<[u8; 16]> {
-    Ok(*uuid::Uuid::parse_str(string(v)?)
-        .map_err(|_| invalid("text: invalid incarnation"))?
-        .as_bytes())
+    let text = string(v)?;
+    let id = uuid::Uuid::parse_str(text).map_err(|_| invalid("text: invalid incarnation"))?;
+    if id.hyphenated().to_string() != text {
+        return Err(invalid("text: invalid incarnation"));
+    }
+    Ok(*id.as_bytes())
 }
 fn error(v: &Value) -> JsonValue {
     JsonValue::from_serde(v.clone())
@@ -364,7 +367,11 @@ pub fn decode_text(bytes: &[u8]) -> Result<Message> {
             let optional = |i: usize| f.get(i).filter(|v| !v.is_null());
             let mut fp = [0; 8];
             let text = string(&f[3])?;
-            if text.len() != 16 || !text.is_ascii() {
+            if text.len() != 16
+                || !text
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
                 return Err(invalid("text: fingerprint"));
             }
             for (i, b) in fp.iter_mut().enumerate() {

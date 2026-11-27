@@ -667,12 +667,14 @@ async fn ask_owner(data_dir: &Path, port: u16, path: &str) -> Result<u16, Failur
 
 /// Sends `name` to `pid`; one that left meanwhile is fine.
 fn signal(pid: u32, name: &str) {
-    let _ = std::process::Command::new("kill")
-        .arg(format!("-{name}"))
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    #[cfg(unix)]
+    crate::unix_signal::signal(pid, name);
+    #[cfg(windows)]
+    if matches!(name, "TERM" | "KILL") {
+        crate::windows_signal::terminate(pid);
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (pid, name);
 }
 
 fn iso_time(ms: u64) -> String {

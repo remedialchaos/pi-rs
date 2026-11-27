@@ -3,12 +3,26 @@ package chord:plugin@0.1.0;
 // No WASI imports. Capabilities are only the explicit host operations below.
 interface host {
     log: func(message: string);
+    // Read a current state or document. A keyed member takes its key as JSON.
+    read: func(object: string, member: string, key-json: option<string>) -> result<string, string>;
+    // Set a state or document, emit an event, or update a keyed entry using {key,value}.
     publish: func(object: string, member: string, value-json: string) -> result<_, string>;
 }
 
 world plugin {
     import host;
-    // JSON array of {name, version, members: {name: {kind, schema, initial?, args?, result?}}}.
+    // A type array, or a facet object with types, routes, registries and contributions.
+    // Types accept name, version, params (field-to-schema), members and optional remote
+    // {hostKind,hostParams,variant}. Host parameters are projected from object params.
+    // Member kinds: state, event, keyed, document, method, job, store. Documents accept persist.
+    // Jobs accept concurrency and an optional persisted resume policy ("rerun" or "abandon").
+    // A store method names a document and invokes the guest inside its transaction,
+    // passing {args,value}. Returning {value,result} commits. Errors roll back.
+    // Object reads and publications require the current object and are unavailable
+    // inside a store callback. Its draft is passed in value.
+    // A route {pattern,handler,public?} invokes its handler on "$http" with method, path,
+    // query, params and JSON body and returns JSON. Registry declarations {name,version}
+    // compose contribution values in order. Contributions also include a value field.
     // Setup records declarations only. The host stages them synchronously before atomic reload.
     export setup: func() -> result<string, string>;
     export invoke: func(object: string, member: string, args-json: string, principal-json: string) -> result<string, string>;

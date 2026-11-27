@@ -2,7 +2,11 @@ use crate::{Error, Result, http};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey};
 use roxmltree::Document;
-use std::{cmp::Ordering, time::Duration};
+use std::{
+    cmp::Ordering,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use url::Url;
 
 const SPARKLE: &str = "http://www.andymatuschak.org/xml-namespaces/sparkle";
@@ -218,4 +222,50 @@ pub async fn download_verified(update: &Update, key: &str) -> Result<Vec<u8>> {
     }
     verify(update, key, &bytes)?;
     Ok(bytes)
+}
+
+/// Unpacks a downloaded update into `staging` and returns the staged app bundle.
+///
+/// The archive holds the new app bundle. The system's `tar` unpacks it, so no archive format is
+/// parsed in Rust and the staged bundle keeps its code signature.
+pub fn stage_bundle(archive: &Path, staging: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(staging)?;
+    let status = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(staging)
+        .status()?;
+    if !status.success() {
+        return Err(Error::Protocol("could not unpack the update".into()));
+    }
+    let bundle = staging.join("Pi.app");
+    if !bundle.is_dir() {
+        return Err(Error::Protocol("the update holds no app bundle".into()));
+    }
+    Ok(bundle)
+}
+
+/// Replaces the running app bundle with a staged one, in place.
+///
+/// The running process keeps the files it has open, so it keeps working; the next launch runs the
+/// new bundle. The old bundle comes back if the swap fails.
+pub fn replace_bundle(current: &Path, staged: &Path) -> Result<()> {
+    let parent = current
+        .parent()
+        .ok_or_else(|| Error::Protocol("the app bundle has no directory".into()))?;
+    let backup_dir = tempfile::tempdir_in(parent)?;
+    let backup = backup_dir.path().join("previous.app");
+    std::fs::rename(current, &backup)?;
+    if let Err(error) = std::fs::rename(staged, current) {
+        if let Err(restore) = std::fs::rename(&backup, current) {
+            let saved = backup_dir.keep();
+            return Err(Error::Protocol(format!(
+                "update failed ({error}) and restoring failed ({restore}). Previous bundle is in {}",
+                saved.display()
+            )));
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }

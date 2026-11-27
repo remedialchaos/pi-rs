@@ -110,6 +110,8 @@ pub struct HttpRequest {
     pub nonce: String,
     pub remote_address: Option<SocketAddr>,
     pub principal: Option<serde_json::Value>,
+    /// Request-local values shared by authenticators and link hooks.
+    pub extensions: Arc<Mutex<http::Extensions>>,
     body: Arc<tokio::sync::Mutex<Option<Body>>>,
 }
 impl HttpRequest {
@@ -294,6 +296,9 @@ impl HttpContribution {
     }
 }
 pub type OpenedLink = Arc<dyn Fn(&HttpRequest) -> Option<Box<dyn FnOnce() + Send>> + Send + Sync>;
+pub type LinkCloser = Arc<dyn Fn() + Send + Sync>;
+pub type OpenedLinkWithClose =
+    Arc<dyn Fn(&HttpRequest, LinkCloser) -> Option<Box<dyn FnOnce() + Send>> + Send + Sync>;
 pub type AdmitLink = Arc<dyn Fn(&HttpRequest) -> LinkAdmission + Send + Sync>;
 struct OpenLease(Option<Box<dyn FnOnce() + Send>>);
 impl Drop for OpenLease {
@@ -318,6 +323,7 @@ pub struct HttpOptions {
     /// Stop at this principal; otherwise keep the first match while checking later authenticators.
     pub prefer_principal: fn(&serde_json::Value) -> bool,
     pub opened: OpenedLink,
+    pub opened_link: OpenedLinkWithClose,
     /// Build Chord link options from the principal admitted by HTTP authentication.
     pub remote: Arc<dyn Fn(serde_json::Value) -> RemoteOptions + Send + Sync>,
     pub max_payload: usize,
@@ -332,6 +338,7 @@ impl Default for HttpOptions {
             admit_link: Arc::new(|_| LinkAdmission::Attach),
             prefer_principal: |_| true,
             opened: Arc::new(|_| None),
+            opened_link: Arc::new(|_, _| None),
             remote: Arc::new(RemoteOptions::new),
             max_payload: 1024 * 1024,
             max_buffered: 8 * 1024 * 1024,
@@ -545,6 +552,7 @@ impl Http {
                 nonce: nonce.clone(),
                 remote_address: Some(remote),
                 principal: None,
+                extensions: Arc::new(Mutex::new(http::Extensions::new())),
                 body: Arc::new(tokio::sync::Mutex::new(Some(body))),
             };
             if !cross_site && (!foreign || navigation && route.as_ref().is_some_and(|r| r.page)) {
@@ -610,6 +618,11 @@ impl Http {
                             {
                                 Ok(peer) => {
                                     let _lease = OpenLease((this.0.options.opened)(&req));
+                                    let opened_link = link.clone();
+                                    let _close_lease = OpenLease((this.0.options.opened_link)(
+                                        &req,
+                                        Arc::new(move || opened_link.close()),
+                                    ));
                                     run.await;
                                     peer.close();
                                 }

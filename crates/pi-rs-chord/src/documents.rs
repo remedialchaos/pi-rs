@@ -5,5 +5,6 @@ mod persistence;
 mod runtime;
 pub use definition::{Definition, KeyedBy};
 pub use line::{Line, LineLease, SealToken};
+pub(crate) use persistence::read_document_revision;
 pub use persistence::{DocumentStore, Stored};
 pub use runtime::{Attempt, DocumentKey, Documents, Draft, Handle, Pin, Staged, Transaction};

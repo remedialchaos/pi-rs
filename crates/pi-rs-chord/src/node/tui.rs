@@ -16,6 +16,12 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
+mod actions;
+pub use actions::TerminalActions;
+mod process;
+#[cfg(windows)]
+mod windows;
+pub use process::LocalActions;
 pub const MAX_PIPE_FRAME: usize = 17 * 1024 * 1024;
 pub const MAX_HEADER: usize = 1024 * 1024;
 pub fn frame(header: &Value, body: &[u8]) -> Result<Vec<u8>> {
@@ -396,6 +402,7 @@ pub struct TerminalSession<G> {
     authorization: http::HeaderValue,
     websocket: String,
     channel: SandboxChannel,
+    replies: Option<mpsc::Sender<LauncherMessage>>,
     requests: mpsc::Receiver<SandboxMessage>,
     overloaded: Arc<AtomicBool>,
 }
@@ -478,6 +485,7 @@ impl<G: SurfaceGet> TerminalSession<G> {
                 authorization,
                 websocket,
                 channel,
+                replies: None,
                 requests,
                 overloaded,
             },
@@ -517,6 +525,12 @@ impl<G: SurfaceGet> TerminalSession<G> {
         if self.launcher.links.contains_key(&socket) {
             return Ok(());
         }
+        let channel = self.channel.clone();
+        let replies = self.replies.clone();
+        let send = move |message| match &replies {
+            Some(tx) => tx.try_send(message).map_err(|_| Error::Closed),
+            None => channel.receive(message),
+        };
         let link = if self.launcher.links.len() < MAX_SOCKETS {
             tokio::time::timeout(
                 NETWORK_TIMEOUT,
@@ -529,22 +543,16 @@ impl<G: SurfaceGet> TerminalSession<G> {
             None
         };
         let Some(link) = link else {
-            return self
-                .channel
-                .receive(LauncherMessage::SocketClosed { socket });
+            return send(LauncherMessage::SocketClosed { socket });
         };
-        let channel = self.channel.clone();
+        let send_close = send.clone();
         link.on_close(Arc::new(move || {
-            let _ = channel.receive(LauncherMessage::SocketClosed { socket });
+            let _ = send_close(LauncherMessage::SocketClosed { socket });
         }));
-        self.channel
-            .receive(LauncherMessage::SocketOpened { socket })?;
-        let channel = self.channel.clone();
+        send(LauncherMessage::SocketOpened { socket })?;
         let weak = Arc::downgrade(&link);
         link.on_message(Arc::new(move |bytes| {
-            if channel
-                .receive(LauncherMessage::SocketMessage { socket, bytes })
-                .is_err()
+            if send(LauncherMessage::SocketMessage { socket, bytes }).is_err()
                 && let Some(link) = weak.upgrade()
             {
                 link.close();
@@ -568,11 +576,22 @@ impl<G: SurfaceGet> TerminalSession<G> {
         if self.overloaded.load(Ordering::Acquire) {
             return Err(Error::Invalid("terminal bridge queue full".into()));
         }
+        self.handle(message, output).await
+    }
+
+    async fn handle(
+        &mut self,
+        message: Option<SandboxMessage>,
+        output: &mut impl std::io::Write,
+    ) -> Result<Option<i32>> {
         match message {
             None => return Ok(Some(0)),
             Some(SandboxMessage::Exit { code }) => return Ok(Some(code)),
             Some(SandboxMessage::SocketOpen { socket }) => self.open(socket).await?,
             Some(SandboxMessage::SocketSend { socket, bytes }) => {
+                if bytes.len() > 1024 * 1024 {
+                    return Err(Error::Invalid("terminal socket frame too large".into()));
+                }
                 if let Some(link) = self.launcher.links.get(&socket)
                     && link.send(bytes).is_err()
                 {
@@ -598,13 +617,18 @@ impl<G: SurfaceGet> TerminalSession<G> {
                 } else {
                     Err(Error::Invalid("terminal action requires trusted UI".into()))
                 };
-                self.channel.receive(match result {
+                let reply = match result {
                     Ok(value) => LauncherMessage::Reply { id, value },
                     Err(_) => LauncherMessage::Refused {
                         id,
                         message: "terminal request refused".into(),
                     },
-                })?;
+                };
+                if let Some(replies) = &self.replies {
+                    replies.try_send(reply).map_err(|_| Error::Closed)?;
+                } else {
+                    self.channel.receive(reply)?;
+                }
             }
             Some(message) => {
                 self.launcher.apply(message, output)?;

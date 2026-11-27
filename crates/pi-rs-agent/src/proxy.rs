@@ -156,18 +156,17 @@ fn wire_options(options: &StreamOptions) -> pi_rs_ai::Result<Value> {
     field!("reasoning", options.reasoning);
     field!("cacheRetention", options.cache_retention);
     field!("sessionId", options.session_id.as_ref());
-    field!(
-        "disableContinuation",
-        options.disable_continuation.then_some(true)
+    // `disableContinuation`, `headers` and `metadata` are always sent, like upstream's
+    // `buildProxyRequestOptions`: the proxy server reads them as present, not as absent.
+    wire.insert(
+        "disableContinuation".into(),
+        Value::Bool(options.disable_continuation),
     );
-    field!(
-        "headers",
-        (!options.request.headers.is_empty()).then_some(&options.request.headers)
+    wire.insert(
+        "headers".into(),
+        serde_json::to_value(&options.request.headers)?,
     );
-    field!(
-        "metadata",
-        (!options.metadata.is_empty()).then_some(&options.metadata)
-    );
+    wire.insert("metadata".into(), serde_json::to_value(&options.metadata)?);
     field!("transport", options.transport);
     field!(
         "thinkingBudgets",

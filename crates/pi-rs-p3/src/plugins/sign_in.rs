@@ -121,7 +121,11 @@ struct Document {
 
 struct Inner {
     document: Document,
+    links: IndexMap<String, Vec<pi_rs_chord::node::http::LinkCloser>>,
 }
+
+#[derive(Clone)]
+struct AuthenticatedSignIn(String);
 
 /// The server's sign-ins: issue, verify, revoke, and the list of them.
 pub struct SignIns {
@@ -147,7 +151,10 @@ impl SignIns {
         };
         let sign_ins = Arc::new(Self {
             path,
-            inner: Mutex::new(Inner { document }),
+            inner: Mutex::new(Inner {
+                document,
+                links: IndexMap::new(),
+            }),
         });
         if sign_ins.persist().is_err() {
             // A store that cannot be written still authenticates within this run; the next start
@@ -248,11 +255,81 @@ impl SignIns {
 
     /// Ends sign-in `id` at once: its token authenticates nothing more.
     pub fn revoke(&self, id: &str) -> bool {
-        let removed = self.lock().document.sign_ins.shift_remove(id).is_some();
-        if removed {
-            let _ = self.persist();
+        let mut inner = self.lock();
+        if inner.document.sign_ins.shift_remove(id).is_none() {
+            return false;
         }
-        removed
+        let links = inner.links.shift_remove(id).unwrap_or_default();
+        drop(inner);
+        let _ = self.persist();
+        for close in links {
+            close();
+        }
+        true
+    }
+
+    fn opened(
+        self: &Arc<Self>,
+        id: String,
+        close: pi_rs_chord::node::http::LinkCloser,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        let mut inner = self.lock();
+        if !inner
+            .document
+            .sign_ins
+            .get(&id)
+            .is_some_and(|entry| now_ms().saturating_sub(entry.last_used) <= SIGN_IN_IDLE_MS)
+        {
+            drop(inner);
+            close();
+            return None;
+        }
+        inner
+            .links
+            .entry(id.clone())
+            .or_default()
+            .push(close.clone());
+        let store = self.clone();
+        Some(Box::new(move || {
+            let mut inner = store.lock();
+            if let Some(links) = inner.links.get_mut(&id) {
+                links.retain(|link| !Arc::ptr_eq(link, &close));
+                if links.is_empty() {
+                    inner.links.shift_remove(&id);
+                }
+            }
+        }))
+    }
+
+    fn renew_cookie(
+        &self,
+        header: &str,
+        name: &str,
+        secret: String,
+        provenance: &Provenance,
+    ) -> HttpResult<Option<String>> {
+        let now = now_seconds();
+        let Some(signed) = read_signed_cookie_at(header, name, &secret, now) else {
+            return Ok(None);
+        };
+        if signed
+            .expires
+            .is_some_and(|expires| expires.saturating_sub(now) > (SIGN_IN_IDLE_MS - ROLL_MS) / 1000)
+            || self.verify(&signed.value).is_none()
+        {
+            return Ok(None);
+        }
+        cookie(
+            name,
+            &signed.value,
+            &pi_rs_chord::node::http::CookieOptions {
+                secret,
+                secure: provenance != &Provenance::Local,
+                max_age: Some((SIGN_IN_IDLE_MS / 1000) as i64),
+                same_site: pi_rs_chord::node::http::SameSite::Strict,
+            },
+        )
+        .map(Some)
     }
 
     /// The sign-ins, never a token or a hash.
@@ -491,7 +568,14 @@ pub fn server_facet(
                         let Some((token, _bearer)) = request_token(&request, &key) else {
                             return Ok(None);
                         };
-                        Ok(sign_ins.verify(&token).map(|principal| principal.value()))
+                        Ok(sign_ins.verify_with_id(&token).map(|(id, principal)| {
+                            request
+                                .extensions
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(AuthenticatedSignIn(id));
+                            principal.value()
+                        }))
                     });
                     future
                 }));
@@ -517,30 +601,11 @@ pub fn server_facet(
                         let Some(header) = request.header("cookie") else {
                             return Ok(answer);
                         };
-                        let Some(signed) =
-                            read_signed_cookie_at(header, &name, &secret, now_seconds())
+                        let Some(renewed) =
+                            sign_ins.renew_cookie(header, &name, secret, &request.provenance)?
                         else {
                             return Ok(answer);
                         };
-                        if signed.expires.is_some_and(|expires| {
-                            expires.saturating_sub(now_seconds())
-                                > SIGN_IN_IDLE_MS / 1000 - ROLL_MS / 1000
-                        }) {
-                            return Ok(answer);
-                        }
-                        if sign_ins.verify(&signed.value).is_none() {
-                            return Ok(answer);
-                        }
-                        let renewed = cookie(
-                            &name,
-                            &signed.value,
-                            &pi_rs_chord::node::http::CookieOptions {
-                                secret,
-                                secure: false,
-                                max_age: Some((SIGN_IN_IDLE_MS / 1000) as i64),
-                                same_site: pi_rs_chord::node::http::SameSite::Strict,
-                            },
-                        )?;
                         let mut answer = answer;
                         answer.headers_mut().insert(
                             "set-cookie",
@@ -557,14 +622,14 @@ pub fn server_facet(
         }
         {
             let sign_ins = sign_ins.clone();
-            let (name, secret) = (cookie_name.clone(), cookie_secret.clone());
-            let hook: LinkOpenedHook = Arc::new(move |request| {
-                let key = (name.clone(), secret.clone());
-                let (token, _) = request_token(request, &key)?;
-                sign_ins.verify(&token)?;
-                // The link closes with the request; the sign-in's revocation cannot reach it from
-                // here (chord hands the hook no close handle): see MILESTONE.md.
-                Some(Box::new(|| {}))
+            let hook: LinkOpenedHook = Arc::new(move |request, close| {
+                let sign_in = request
+                    .extensions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get::<AuthenticatedSignIn>()?
+                    .clone();
+                sign_ins.opened(sign_in.0, close)
             });
             live.contribute(&registries.link_opened, hook);
         }
@@ -638,6 +703,70 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let sign_ins = SignIns::open(root.path()).expect("open");
         (root, sign_ins)
+    }
+
+    #[test]
+    fn rolling_an_aging_remote_cookie_preserves_secure() -> Result<(), Box<dyn std::error::Error>> {
+        use pi_rs_chord::node::http::{CookieOptions, SameSite, cookie_at};
+        let (_root, store) = sign_ins();
+        let issued = store.issue(&Principal::Owner, "browser", SignInKind::Browser, true)?;
+        let (name, secret) = store.cookie_key();
+        let old = cookie_at(
+            &name,
+            &issued.token,
+            &CookieOptions {
+                secret: secret.clone(),
+                secure: true,
+                max_age: Some((SIGN_IN_IDLE_MS / 1000) as i64),
+                same_site: SameSite::Strict,
+            },
+            now_seconds() - ROLL_MS / 1000 - 1,
+        )?;
+        for (provenance, secure) in [
+            (Provenance::Local, false),
+            (
+                Provenance::Remote {
+                    host: "example.org".into(),
+                },
+                true,
+            ),
+            (
+                Provenance::Relayed {
+                    relay: "relay".into(),
+                },
+                true,
+            ),
+        ] {
+            let renewed = store
+                .renew_cookie(&old, &name, secret.clone(), &provenance)?
+                .ok_or("aging cookie was not renewed")?;
+            assert_eq!(renewed.contains("; Secure"), secure);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn revocation_closes_live_and_late_links_but_leaves_finished_links_alone()
+    -> Result<(), SignInError> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_root, store) = sign_ins();
+        let issued = store.issue(&Principal::Owner, "device", SignInKind::Device, false)?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let closer = |weight| -> pi_rs_chord::node::http::LinkCloser {
+            let calls = calls.clone();
+            Arc::new(move || {
+                calls.fetch_add(weight, Ordering::Relaxed);
+            })
+        };
+        let _live = store.opened(issued.id.clone(), closer(1));
+        if let Some(finished) = store.opened(issued.id.clone(), closer(10)) {
+            finished();
+        }
+        assert!(store.revoke(&issued.id));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(store.opened(issued.id, closer(100)).is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 101);
+        Ok(())
     }
 
     #[test]

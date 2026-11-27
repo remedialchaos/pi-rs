@@ -719,3 +719,69 @@ async fn remote_wire_indexes_state_and_methods_in_sorted_utf16_order() -> Result
     host.close(&Context::background()).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn remote_byte_echo_and_event_timestamp_survive_a_link() -> Result<()> {
+    let contract = remote_contract(
+        "binary-echo",
+        IndexMap::from([
+            ("echo".into(), method(Some(bytes()), Some(bytes()))),
+            ("size".into(), event(int())),
+        ]),
+    )?;
+    let host = remote_host()?;
+    let ty = contract.clone();
+    host.load(
+        vec![PluginFacet::new(
+            "echo",
+            define_facet(move |setup| {
+                setup.serve(
+                    ty.clone(),
+                    |_, _, _| {
+                        let mut members = Members::variant("main");
+                        let channel = EventChannel::new();
+                        members.event("size", channel.clone())?;
+                        members.method("echo", move |value, _| {
+                            let channel = channel.clone();
+                            Box::pin(async move {
+                                if let JsonValue::Array(bytes) = &value {
+                                    channel.emit_at(JsonValue::Number(bytes.len() as f64), 101);
+                                }
+                                Ok(value)
+                            })
+                        })?;
+                        Ok(members)
+                    },
+                    ServeOptions::default(),
+                )
+            }),
+        )],
+        &Context::background(),
+    )
+    .await?;
+    let (a, b) = memory_link_pair();
+    let server = host.accept(a, RemoteOptions::new(serde_json::json!("user")))?;
+    let peer = RemotePeer::connect(
+        b,
+        RemoteOptions::new(serde_json::json!("server")),
+        Batch::new(|_| {}),
+    )?;
+    let ctx = Context::background();
+    let held = peer.hold(contract, empty(), &ctx)?;
+    let (send, mut recv) = tokio::sync::mpsc::unbounded_channel();
+    let _subscription = held.subscribe_event_at("size", move |value, at| {
+        let _ = send.send((value, at));
+    })?;
+    let value = JsonValue::parse("[0,128,255]")?;
+    assert_eq!(
+        deadline(held.call("echo", value.clone(), &ctx)).await?,
+        value
+    );
+    assert_eq!(
+        deadline(async { recv.recv().await.ok_or(pi_rs_chord::Error::Closed) }).await?,
+        (JsonValue::Number(3.0), 101)
+    );
+    peer.close();
+    server.close();
+    host.close(&ctx).await
+}

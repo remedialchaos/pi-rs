@@ -524,3 +524,36 @@ async fn openrouter_personalization_limits_only_chat_and_uses_prompt_tiers() -> 
     assert_eq!(server.drain()?[0].path, "/models/user");
     Ok(())
 }
+
+#[tokio::test]
+async fn compat_dispatches_built_in_providers_through_the_model_registry() -> TestResult {
+    // A built-in provider resolves its session header through `Models`, like upstream's
+    // `createModels()` path: the direct API path never sent it.
+    let server = Server::start(vec![sse(
+        &[
+            json!({"type":"message_start","message":{"id":"a1","model":"claude-fable-5","usage":{"input_tokens":1,"output_tokens":1}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+            json!({"type":"message_stop"}),
+        ],
+        "\r\n",
+    )])
+    .await?;
+    let mut options = stream_options()?;
+    options.request.api_key = Some("fixture-key".into());
+    options.request.client = Some(reqwest::Client::builder().no_proxy().build()?);
+    options.session_id = Some("session-1".into());
+    let model = model(
+        Api::AnthropicMessages,
+        "opencode",
+        "claude-fable-5",
+        &server.url,
+    )?;
+    let stream = compat::stream(model, context()?, options)?;
+    let result = stream.result().await?;
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    let request = &server.drain()?[0];
+    assert_eq!(request.headers["x-opencode-session"], "session-1");
+    assert_eq!(request.headers["x-api-key"], "fixture-key");
+    Ok(())
+}

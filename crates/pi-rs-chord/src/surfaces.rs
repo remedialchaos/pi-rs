@@ -14,7 +14,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 pub mod connection;
+pub mod format;
 pub mod language;
+pub use format::{NumberFormatOptions, TimeFormatOptions, TimeValue, format_number, format_time};
 mod preference;
 pub use preference::*;
 pub mod themes;

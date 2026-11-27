@@ -30,3 +30,19 @@ done
 ```
 
 Copy the three generated components to this directory and run `--test b3_guest`.
+
+`facet.wasm` exercises the extended manifest in `facet.json`. Its Rust source
+is `facet.rs`. The component declares a parameterized object with a document,
+job, store callback, event and keyed member, a remote type, an HTTP route and a
+registry contribution.
+
+To regenerate, create a scratch Rust binary package named `chord-facet-fixture`
+(edition 2024) with dependencies `wit-bindgen = "=0.57.1"` and `serde_json = "1"`.
+Copy `facet.rs` to `src/main.rs`, `facet.json` to `src/facet.json`, and the
+crate's `wit/plugin.wit` to `wit/plugin.wit`. Then run:
+
+```sh
+RUSTFLAGS="--remap-path-prefix=$HOME=/home/user" CARGO_PROFILE_RELEASE_STRIP=symbols \
+    cargo build --offline --release --target wasm32-unknown-unknown
+wasm-tools component new target/wasm32-unknown-unknown/release/chord-facet-fixture.wasm -o facet.wasm
+```

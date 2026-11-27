@@ -169,7 +169,8 @@ async fn host_reload_replaces_routes_wraps_and_socket_owners_on_the_same_listene
 }
 
 #[tokio::test]
-async fn surface_registry_serves_bootstrap_artifacts_and_live_publications() {
+async fn surface_registry_serves_bootstrap_artifacts_and_live_publications()
+-> Result<(), Box<dyn std::error::Error>> {
     let ctx = Context::background();
     let host = create_host(HostOptions {
         principal: Some(serde_json::json!({"kind":"server"})),
@@ -248,6 +249,37 @@ async fn surface_registry_serves_bootstrap_artifacts_and_live_publications() {
             .0
             .starts_with("HTTP/1.1 401")
     );
+    let (headers, body) = request(addr, "GET", "/_chord/web/base").await;
+    assert!(
+        headers.starts_with("HTTP/1.1 200") && headers.contains("cache-control: no-store"),
+        "{headers}"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).ok(),
+        Some(initial["base"].clone())
+    );
+    assert!(
+        headers.contains("style-src 'self'")
+            && headers.contains("img-src 'self' data:")
+            && headers.contains("font-src 'self'")
+            && headers.contains("/_chord/web/"),
+        "{headers}"
+    );
+    let unbuilt = Surface::new("web", Vec::new())?;
+    host.reload(
+        vec![PluginFacet::new(
+            "example.surface",
+            unbuilt.http_facet(false)?,
+        )],
+        &ctx,
+    )
+    .await?;
+    assert!(
+        request(addr, "GET", "/_chord/web/base")
+            .await
+            .0
+            .starts_with("HTTP/1.1 503")
+    );
     host.reload(vec![], &ctx).await.unwrap();
     assert!(
         request(addr, "GET", base)
@@ -257,4 +289,5 @@ async fn surface_registry_serves_bootstrap_artifacts_and_live_publications() {
     );
     server.close().await.unwrap();
     host.close(&ctx).await.unwrap();
+    Ok(())
 }

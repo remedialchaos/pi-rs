@@ -825,3 +825,117 @@ async fn registry_contributions_swap_without_a_gap_unless_the_old_object_opens_n
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn named_query_checks_its_argument_before_building_the_store_query() -> Result<()> {
+    use pi_rs_chord::store::{ColumnRecord, ColumnType, Query, TableDefinition};
+    let contract = Arc::new(Contract::local(
+        "lookup",
+        1,
+        vec![],
+        IndexMap::from([(
+            "rows".into(),
+            queries(int(), IndexMap::from([("recent".into(), int())])),
+        )]),
+    )?);
+    let table = TableDefinition::new(
+        "rows",
+        1,
+        IndexMap::from([("id".into(), ColumnRecord::new(ColumnType::Int))]),
+        vec!["id".into()],
+        IndexMap::new(),
+    )?;
+    let provided = contract.clone();
+    let host = create_host(HostOptions::default())?;
+    let ctx = Context::background();
+    host.load(
+        vec![PluginFacet::new(
+            "lookup",
+            define_facet(move |setup| {
+                let table = table.clone();
+                setup.serve(
+                    provided.clone(),
+                    move |_, _, _| {
+                        let table = table.clone();
+                        let mut members = Members::new();
+                        let recent: QueryBuilder =
+                            Arc::new(move |_| Query::new("lookup", table.clone())?.with_limit(7));
+                        members.queries("rows", IndexMap::from([("recent".into(), recent)]))?;
+                        Ok(members)
+                    },
+                    ServeOptions::default(),
+                )
+            }),
+        )],
+        &ctx,
+    )
+    .await?;
+    let held = host.hold(contract, JsonValue::Object(Default::default()), &ctx)?;
+    held.wait(&ctx).await?;
+    assert_eq!(
+        held.query("rows", "recent", JsonValue::Number(1.0))?.limit,
+        7
+    );
+    assert!(held.query("rows", "recent", JsonValue::Null).is_err());
+    host.close(&ctx).await
+}
+
+#[tokio::test]
+async fn held_key_tracks_the_same_key_after_provider_reload() -> Result<()> {
+    let contract = Arc::new(Contract::local(
+        "keyed-values",
+        1,
+        vec![],
+        IndexMap::from([("label".into(), keyed(str(), None))]),
+    )?);
+    let host = create_host(HostOptions::default())?;
+    let ctx = Context::background();
+    let facet = |generation: &'static str| {
+        let contract = contract.clone();
+        let batch = host.batch();
+        define_facet(move |setup| {
+            let batch = batch.clone();
+            setup.serve(
+                contract.clone(),
+                move |_, _, _| {
+                    let mut members = Members::new();
+                    let batch = batch.clone();
+                    members.keyed("label", move |key| {
+                        let JsonValue::String(key) = key else {
+                            return Err(pi_rs_chord::Error::Invalid("string key".into()));
+                        };
+                        pi_rs_chord::state::Source::new(
+                            batch.clone(),
+                            JsonValue::String(format!("{}-{generation}", key.to_utf8()?).into()),
+                        )
+                    })?;
+                    Ok(members)
+                },
+                ServeOptions::default(),
+            )
+        })
+    };
+    host.load(vec![PluginFacet::new("keys", facet("first"))], &ctx)
+        .await?;
+    let held = host.hold(
+        contract.clone(),
+        JsonValue::Object(Default::default()),
+        &ctx,
+    )?;
+    held.wait(&ctx).await?;
+    let source = held.keyed("label", &JsonValue::String("leaf".into()))?;
+    assert_eq!(
+        source.value()?.to_json(),
+        JsonValue::String("leaf-first".into())
+    );
+    host.reload(vec![PluginFacet::new("keys", facet("second"))], &ctx)
+        .await?;
+    held.wait(&ctx).await?;
+    assert_eq!(
+        source.value()?.to_json(),
+        JsonValue::String("leaf-second".into())
+    );
+    held.release();
+    assert!(source.value().is_err());
+    host.close(&ctx).await
+}

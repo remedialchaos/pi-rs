@@ -11,7 +11,7 @@ use pi_rs_p2_mac::{
     updater,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use url::Url;
 mod support;
 use support::{Loopback, Test, sandbox};
@@ -51,9 +51,14 @@ async fn updater_downloads_and_verifies_the_actual_enclosure_from_loopback() -> 
 #[test]
 fn attach_uses_its_own_directory_but_never_changes_own_server_precedence() -> Test {
     let tmp = sandbox()?;
-    let checkout = tmp.path().join("repo/apps/p2");
-    fs::create_dir_all(checkout.join("src/hosts"))?;
-    fs::write(checkout.join("src/hosts/server.ts"), "")?;
+    let binary = tmp.path().join("bin/p2");
+    fs::create_dir_all(tmp.path().join("bin"))?;
+    fs::write(&binary, "")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
+    }
     let mut preferences = JsonPreferences::open(tmp.path().join("preferences.json"))?;
     preferences.set("source", Some("attached"))?;
     preferences.set("attachedPort", Some("8765"))?;
@@ -65,7 +70,7 @@ fn attach_uses_its_own_directory_but_never_changes_own_server_precedence() -> Te
         ("P2MAC_ATTACH".into(), "9876".into()),
         ("P2MAC_PORT".into(), "5678".into()),
         ("P2MAC_DATA_DIR".into(), "~/env-data".into()),
-        ("P2MAC_CHECKOUT".into(), "~/repo".into()),
+        ("P2MAC_BINARY".into(), "~/bin/p2".into()),
         ("P2MAC_FAKE".into(), "1".into()),
     ]);
     let loaded = Launch::load(&env, &preferences, None)?;
@@ -75,7 +80,7 @@ fn attach_uses_its_own_directory_but_never_changes_own_server_precedence() -> Te
     assert_eq!(loaded.own.port, 5678);
     assert_eq!(loaded.own.data_dir, tmp.path().join("saved-own"));
     assert_eq!(loaded.own.mode, Mode::Dev);
-    assert_eq!(loaded.own.checkout, Some(checkout));
+    assert_eq!(loaded.own.binary, Some(binary));
     assert!(loaded.own.fake);
     env.remove("P2MAC_ATTACH");
     let loaded = Launch::load(&env, &preferences, None)?;
@@ -92,21 +97,20 @@ fn attach_uses_its_own_directory_but_never_changes_own_server_precedence() -> Te
 }
 
 #[test]
-fn bundled_fallback_uses_its_node_and_preserves_default_port_mode_and_path() -> Test {
+fn bundled_fallback_uses_its_binary_and_preserves_default_port_mode_and_path() -> Test {
     let home = sandbox()?;
     let env = Environment::from([
         ("HOME".into(), home.path().to_string_lossy().into()),
-        ("P2MAC_CHECKOUT".into(), "~/does-not-exist".into()),
+        ("P2MAC_BINARY".into(), "~/does-not-exist".into()),
     ]);
     let bundled = Bundled {
-        checkout: home.path().join("bundled"),
-        node: home.path().join("bundled-node"),
+        binary: home.path().join("bundled"),
     };
     let launch = Launch::load(&env, &BTreeMap::new(), Some(&bundled))?;
     assert_eq!(launch.selected.port, 8788);
     assert_eq!(launch.selected.mode, Mode::Start);
     assert_eq!(launch.selected.data_dir, home.path().join(".pi/p2"));
-    assert_eq!(launch.selected.node, Some(bundled.node));
+    assert_eq!(launch.selected.binary, Some(bundled.binary));
     assert!(launch.selected.runs_bundled);
     Ok(())
 }
@@ -335,5 +339,43 @@ fn sparkle_feed_selects_newer_compatible_minute_and_verifies_signed_archive() ->
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn paths_are_abbreviated_with_the_home_directory() -> Test {
+    let home = sandbox()?;
+    assert_eq!(
+        pi_rs_p2_mac::server_config::abbreviate(home.path(), &home.path().join("Library/Logs")),
+        "~/Library/Logs"
+    );
+    assert_eq!(
+        pi_rs_p2_mac::server_config::abbreviate(home.path(), home.path()),
+        "~"
+    );
+    assert_eq!(
+        pi_rs_p2_mac::server_config::abbreviate(home.path(), Path::new("/opt/p2")),
+        "/opt/p2"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_update_replaces_the_app_bundle_in_place() -> Test {
+    let root = sandbox()?;
+    let current = root.path().join("Pi.app");
+    let staged = root.path().join("staged/Pi.app");
+    fs::create_dir_all(current.join("Contents/MacOS"))?;
+    fs::write(current.join("Contents/MacOS/pi-mac"), "old")?;
+    fs::create_dir_all(staged.join("Contents/MacOS"))?;
+    fs::write(staged.join("Contents/MacOS/pi-mac"), "new")?;
+    pi_rs_p2_mac::updater::replace_bundle(&current, &staged)?;
+    assert_eq!(
+        fs::read_to_string(current.join("Contents/MacOS/pi-mac"))?,
+        "new"
+    );
+    // The old bundle is gone, and the staged one was moved into place.
+    assert!(!root.path().join("Pi.app.old").exists());
+    assert!(!staged.exists());
     Ok(())
 }

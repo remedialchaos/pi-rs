@@ -42,11 +42,24 @@ pub type RemoteExecutor = Arc<
         + Sync,
 >;
 pub type RemoteFactory = Arc<dyn Fn() -> Result<RemoteExecutor, HostError> + Send + Sync>;
+/// Default VM memory limit of a remote sandbox. Isolates have 128 MB in total.
+pub const DEFAULT_REMOTE_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Clone)]
 pub struct ServeOptions {
     pub wasm: WasmModule,
     pub max_interrupt_budget: Option<u64>,
+    /// VM memory per execution; the client may only ask for less. `None` leaves the VM unbounded.
     pub max_memory_limit_bytes: Option<usize>,
+}
+impl ServeOptions {
+    /// Serve options with the default remote memory limit of 32 MiB.
+    pub fn new(wasm: WasmModule) -> Self {
+        Self {
+            wasm,
+            max_interrupt_budget: None,
+            max_memory_limit_bytes: Some(DEFAULT_REMOTE_MEMORY_LIMIT_BYTES),
+        }
+    }
 }
 /// Runs the VM on this thread. Exchange failures stop the session and never escape.
 pub async fn serve_codemode_remote(

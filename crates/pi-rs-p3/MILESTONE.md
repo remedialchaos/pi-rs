@@ -72,18 +72,13 @@ native Rust facets (ADR-002), so there are no per-process module tables.
    identities, so no plugin is rebuilt; the workers' script set is empty and their rollout reaches
    nobody. The route and its answer shape (`steps`, `stopped`) are exact. A reload on a worker re-runs
    its facets and reports no failures.
-5. **Revocation cannot close open links.** Chord's `HttpOptions::opened` hook gets the request and
-   returns an end callback, but no link-close handle, so revoking a sign-in ends its token and its
-   browser's next request, not its open `/chord` link. `SignIns::revoke` and the store are exact.
-6. **Signals without `unsafe`.** `#![forbid(unsafe_code)]` rules out `libc::kill`, so `p3 stop` and the
-   supervisor send `TERM`/`KILL` through the system `kill` utility. A killed worker's own child
-   processes are not signalled as a group; workers are asked to shut down first and killed only after
-   the grace.
+5. Revoking a sign-in closes all of its open Chord links.
+6. Unix workers start in separate process groups. Forced shutdown signals the group and falls back to the worker if the group has gone.
 7. **Data-directory ownership** is checked by writability (and refusal of `~` and `/`), not by
    `getuid`: no safe standard API exposes it.
 8. **Worker process exit.** After its host closes, a worker exits with `process::exit`, as upstream's
    forced-exit path does; a runtime with leftover tasks must not keep it alive.
-9. **Version** is the crate version (`0.1.0`), where upstream reads `package.json`.
+9. **Version** reports the pinned upstream p3 package version (`0.0.1`).
 10. **Supervised detection** is `P3_SUPERVISED=1` in the environment, where upstream uses
     `process.send` being defined.
 11. **Hidden modes.** `p3 __worker` and `p3 __supervisor <data dir> <argv...>` are internal modes of

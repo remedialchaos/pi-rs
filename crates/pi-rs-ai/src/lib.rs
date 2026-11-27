@@ -5,6 +5,7 @@ pub mod auth;
 pub mod bedrock;
 pub mod cache_warming;
 pub mod catalog;
+pub mod catalog_generate;
 mod chat_state;
 pub mod classifier;
 pub mod codex;
@@ -40,6 +41,9 @@ pub mod types;
 pub mod utils;
 
 pub use cache_warming::*;
+pub use codex::{
+    OpenAICodexWebSocketDebugStats, codex_websocket_debug_stats, reset_codex_websocket_debug_stats,
+};
 pub use error::{Error, Result};
 pub use event_stream::{AssistantMessageEventSender, AssistantMessageEventStream};
 pub use model::*;

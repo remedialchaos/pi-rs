@@ -2,9 +2,9 @@ use crate::{
     Error, Result,
     context::Context,
     contracts::{Contract, Member},
-    host::{Facet, Members, ServeOptions, define_facet},
+    host::{EventChannel, Facet, Members, ServeOptions, define_facet},
     json::JsonValue,
-    state::Source,
+    state::{Batch, Source},
 };
 use indexmap::IndexMap;
 use std::{
@@ -19,24 +19,89 @@ use wasmtime::{
 pub mod bindings {
     wasmtime::component::bindgen!({path:"wit/plugin.wit",world:"plugin",imports:{default:async},exports:{default:async}});
 }
-type Sources = Arc<Mutex<BTreeMap<(String, String), Source>>>;
+#[derive(Clone)]
+enum Publisher {
+    State(Source),
+    Document(crate::host::ObjectDocument),
+    Event(EventChannel),
+    Keyed(Keyed),
+}
+#[derive(Clone)]
+struct Keyed {
+    batch: Batch,
+    initial: JsonValue,
+    entries: Arc<Mutex<BTreeMap<String, Source>>>,
+}
+impl Keyed {
+    fn source(&self, key: &JsonValue) -> Result<Source> {
+        let JsonValue::String(key) = key else {
+            return Err(failure("keyed member requires a string key"));
+        };
+        let key = key.to_json();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(source) = entries.get(&key) {
+            return Ok(source.clone());
+        }
+        let source = Source::new(self.batch.clone(), self.initial.clone())?;
+        entries.insert(key, source.clone());
+        Ok(source)
+    }
+}
+type Sources = Arc<Mutex<BTreeMap<(String, String), Publisher>>>;
+type Logger = Arc<dyn Fn(&str) + Send + Sync>;
 struct GuestState {
     limits: StoreLimits,
     sources: Sources,
-    staged: bool,
+    active_object: Option<String>,
+    logger: Logger,
 }
 impl bindings::chord::plugin::host::Host for GuestState {
-    async fn log(&mut self, _message: String) {}
+    async fn log(&mut self, message: String) {
+        (self.logger)(&message);
+    }
+    async fn read(
+        &mut self,
+        object: String,
+        member: String,
+        key_json: Option<String>,
+    ) -> std::result::Result<String, String> {
+        if self.active_object.as_deref() != Some(&object) {
+            return Err("read requires the current object".into());
+        }
+        let publisher = self
+            .sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(object, member))
+            .cloned()
+            .ok_or("unknown readable")?;
+        let value = match publisher {
+            Publisher::Document(doc) => doc.value(),
+            Publisher::State(source) => source.value().map(|revision| revision.to_json()),
+            Publisher::Keyed(keyed) => {
+                let key = JsonValue::parse(key_json.as_deref().ok_or("missing key")?)
+                    .map_err(|e| e.to_string())?;
+                keyed
+                    .source(&key)
+                    .and_then(|source| source.value())
+                    .map(|revision| revision.to_json())
+            }
+            Publisher::Event(_) => return Err("events have no current value".into()),
+        };
+        value
+            .and_then(|value| value.to_json())
+            .map_err(|e| e.to_string())
+    }
     async fn publish(
         &mut self,
         object: String,
         member: String,
         value_json: String,
     ) -> std::result::Result<(), String> {
-        if self.staged {
-            return Err("publish is forbidden during setup".into());
+        if self.active_object.as_deref() != Some(&object) {
+            return Err("publish requires the current object".into());
         }
-        let value = serde_json::from_str(&value_json).map_err(|e| e.to_string())?;
+        let value = JsonValue::parse(&value_json).map_err(|e| e.to_string())?;
         let source = self
             .sources
             .lock()
@@ -44,27 +109,85 @@ impl bindings::chord::plugin::host::Host for GuestState {
             .get(&(object, member))
             .cloned()
             .ok_or_else(|| "unknown readable".to_string())?;
-        source
-            .set(JsonValue::from_serde(value), &Context::background())
-            .map_err(|e| e.to_string())
+        match source {
+            Publisher::Document(document) => {
+                document
+                    .change(&Context::background(), move |draft| {
+                        Box::pin(async move { draft.apply(crate::delta::Op::Replace(value)) })
+                    })
+                    .await
+            }
+            Publisher::State(source) => source.set(value, &Context::background()),
+            Publisher::Event(event) => {
+                event.emit(value);
+                Ok(())
+            }
+            Publisher::Keyed(keyed) => {
+                let key = value.get("key").ok_or("missing key")?;
+                let value = value.get("value").ok_or("missing value")?;
+                keyed
+                    .source(key)
+                    .and_then(|source| source.set(value.clone(), &Context::background()))
+            }
+        }
+        .map_err(|e| e.to_string())
     }
 }
 struct Guest {
     store: Store<GuestState>,
     instance: bindings::Plugin,
 }
+async fn invoke(
+    guest: &Arc<tokio::sync::Mutex<Guest>>,
+    object: &str,
+    name: &str,
+    args: JsonValue,
+    principal: &(impl serde::Serialize + Sync),
+) -> Result<JsonValue> {
+    let mut guest = guest.lock().await;
+    guest.call(object, name, args, principal, true).await
+}
+impl Guest {
+    async fn call(
+        &mut self,
+        object: &str,
+        name: &str,
+        args: JsonValue,
+        principal: &(impl serde::Serialize + Sync),
+        access_object: bool,
+    ) -> Result<JsonValue> {
+        let args = args.to_json()?;
+        let principal = serde_json::to_string(principal)?;
+        self.store.set_fuel(10_000_000).map_err(failure)?;
+        self.store.data_mut().active_object = access_object.then(|| object.to_owned());
+        let result = self
+            .instance
+            .call_invoke(&mut self.store, object, name, &args, &principal)
+            .await;
+        self.store.data_mut().active_object = None;
+        JsonValue::parse(&result.map_err(failure)?.map_err(failure)?)
+    }
+}
 #[derive(Clone)]
 pub struct WasmPluginHost {
     engine: Engine,
+    logger: Logger,
 }
 fn failure(error: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("WASM plugin: {error}"))
 }
 impl WasmPluginHost {
     pub fn new() -> Result<Self> {
+        Self::with_logger(|message| {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr().lock(), "{message}");
+        })
+    }
+    pub fn with_logger(logger: impl Fn(&str) + Send + Sync + 'static) -> Result<Self> {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true).consume_fuel(true);
         Ok(Self {
+            logger: Arc::new(logger),
             engine: Engine::new(&config).map_err(failure)?,
         })
     }
@@ -79,7 +202,8 @@ impl WasmPluginHost {
                     .memories(10)
                     .build(),
                 sources,
-                staged: true,
+                active_object: None,
+                logger: self.logger.clone(),
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -101,106 +225,24 @@ impl WasmPluginHost {
         Ok(())
     }
     pub async fn prepare(&self, bytes: &[u8]) -> Result<Facet> {
-        let component = Component::new(&self.engine, bytes).map_err(failure)?;
         let sources = Sources::default();
+        let component = Component::new(&self.engine, bytes).map_err(failure)?;
         let mut linker = Linker::new(&self.engine);
         bindings::Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |s| s).map_err(failure)?;
         let mut store = self.store(sources.clone())?;
         let instance = bindings::Plugin::instantiate_async(&mut store, &component, &linker)
             .await
             .map_err(failure)?;
-        let declarations = instance
-            .call_setup(&mut store)
+        let mut guest = Guest { store, instance };
+        let declarations = guest
+            .instance
+            .call_setup(&mut guest.store)
             .await
             .map_err(failure)?
             .map_err(failure)?;
-        let declarations: Vec<TypeDeclaration> = serde_json::from_str(&declarations)?;
-        // Validate the complete declaration set before any facet can be staged.
-        let mut types = Vec::new();
-        for declaration in declarations {
-            let mut members = IndexMap::new();
-            for (name, member) in &declaration.members {
-                let schema = JsonValue::from_serde(member.schema.clone());
-                let kind = match member.kind.as_str() {
-                    "state" => Member::State(schema),
-                    "method" => crate::contracts::schema::method(
-                        member.args.clone().map(JsonValue::from_serde),
-                        member.result.clone().map(JsonValue::from_serde),
-                    ),
-                    _ => return Err(failure("unknown member kind")),
-                };
-                members.insert(name.clone(), kind);
-            }
-            let contract = Arc::new(Contract::local(
-                &declaration.name,
-                u64::from(declaration.version),
-                vec![],
-                members,
-            )?);
-            types.push((contract, declaration));
-        }
-        store.data_mut().staged = false;
-        let guest = Arc::new(tokio::sync::Mutex::new(Guest { store, instance }));
-        Ok(define_facet(move |setup| {
-            for (contract, declaration) in &types {
-                let sources = sources.clone();
-                let guest = guest.clone();
-                let declaration = declaration.clone();
-                setup.serve(contract.clone(),move |params,principal,self_| {
-                    let object=serde_json::to_string(&serde_json::json!({"type":declaration.name,"params":params.to_serde()?,"principal":principal}))?;
-                    let mut members=Members::new();
-                    for (name,member) in &declaration.members {
-                        if member.kind=="state" {
-                            let source=self_.writable(JsonValue::from_serde(member.initial.clone().unwrap_or(serde_json::Value::Null)))?;
-                            let key=(object.clone(),name.clone());
-                            let opened=sources.clone();
-                            let closed=sources.clone();
-                            let readable=source.clone();
-                            self_.open(move |_| Box::pin(async move {
-                                opened.lock().unwrap_or_else(|e|e.into_inner()).insert(key.clone(),readable);
-                                Ok(key)
-                            }),move |key,_| Box::pin(async move {
-                                closed.lock().unwrap_or_else(|e|e.into_inner()).remove(key.as_ref());
-                                Ok(())
-                            }));
-                            members.state(name,source)?;
-                        } else {
-                            let (guest,object,name)=(guest.clone(),object.clone(),name.clone());
-                            members.method(name.clone(),move |args,ctx| {
-                                let (guest,object,name)=(guest.clone(),object.clone(),name.clone());
-                                Box::pin(async move {
-                                    let args=args.to_json()?;
-                                    let principal=serde_json::to_string(&ctx.principal)?;
-                                    let mut guest=guest.lock().await;
-                                    let Guest {store,instance}=&mut *guest;
-                                    store.set_fuel(10_000_000).map_err(failure)?;
-                                    let value=instance.call_invoke(&mut *store,&object,&name,&args,&principal).await.map_err(failure)?.map_err(failure)?;
-                                    Ok(JsonValue::from_serde(serde_json::from_str(&value)?))
-                                })
-                            })?;
-                        }
-                    }
-                    Ok(members)
-                },ServeOptions::default())?;
-            }
-            Ok(())
-        }))
+        guest.facet(&declarations, sources)
     }
 }
-#[derive(Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TypeDeclaration {
-    name: String,
-    version: u32,
-    members: IndexMap<String, MemberDeclaration>,
-}
-#[derive(Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MemberDeclaration {
-    kind: String,
-    #[serde(default)]
-    schema: serde_json::Value,
-    initial: Option<serde_json::Value>,
-    args: Option<serde_json::Value>,
-    result: Option<serde_json::Value>,
-}
+mod manifest;
+#[cfg(test)]
+mod tests;

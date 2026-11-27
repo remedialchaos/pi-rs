@@ -86,8 +86,8 @@ pub enum Mode {
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     pub source: Source,
-    pub checkout: Option<PathBuf>,
-    pub node: Option<PathBuf>,
+    /// The native `p2` binary the app runs; `None`: `p2` on the login shell's PATH.
+    pub binary: Option<PathBuf>,
     pub port: u16,
     pub data_dir: PathBuf,
     pub mode: Mode,
@@ -97,26 +97,14 @@ pub struct ServerConfig {
 
 #[derive(Clone, Debug)]
 pub struct Bundled {
-    pub checkout: PathBuf,
-    pub node: PathBuf,
+    /// The native `p2` binary the app carries in its resources.
+    pub binary: PathBuf,
 }
 impl Bundled {
     pub fn find(resources: &Path) -> Option<Self> {
-        let checkout = p2_directory(&resources.join("p2/apps/p2"))?;
-        let node = resources.join("node/bin/node");
-        crate::login_environment::executable(&node).then_some(Self { checkout, node })
+        let binary = resources.join("bin/p2");
+        crate::login_environment::executable(&binary).then_some(Self { binary })
     }
-}
-
-pub fn p2_directory(folder: &Path) -> Option<PathBuf> {
-    if folder.join("src/hosts/server.ts").is_file() {
-        return Some(folder.to_owned());
-    }
-    let nested = folder.join("apps/p2");
-    nested
-        .join("src/hosts/server.ts")
-        .is_file()
-        .then_some(nested)
 }
 
 pub fn expand(home: &Path, value: &str) -> PathBuf {
@@ -127,6 +115,18 @@ pub fn expand(home: &Path, value: &str) -> PathBuf {
         return home.join(rest);
     }
     PathBuf::from(value)
+}
+
+/// The path with the home directory written as `~`, like macOS's `abbreviatingWithTildeInPath`.
+pub fn abbreviate(home: &Path, path: &Path) -> String {
+    let Ok(rest) = path.strip_prefix(home) else {
+        return path.to_string_lossy().into_owned();
+    };
+    let rest = rest.to_string_lossy();
+    if rest.is_empty() {
+        return "~".to_owned();
+    }
+    format!("~/{rest}")
 }
 
 pub fn home(env: &Environment) -> PathBuf {
@@ -164,22 +164,14 @@ impl Launch {
         } else {
             value("dataDir", "P2MAC_DATA_DIR")
         };
-        let picked = value("checkout", "P2MAC_CHECKOUT")
+        let binary = value("binary", "P2MAC_BINARY")
             .map(path)
-            .and_then(|p| p2_directory(&p));
-        let checkout = picked
-            .clone()
-            .or_else(|| bundled.map(|b| b.checkout.clone()));
-        let node = value("node", "P2MAC_NODE").map(path).or_else(|| {
-            (picked.is_none())
-                .then(|| bundled.map(|b| b.node.clone()))
-                .flatten()
-        });
+            .filter(|binary| crate::login_environment::executable(binary))
+            .or_else(|| bundled.map(|b| b.binary.clone()));
         let own = ServerConfig {
             source: Source::Own,
-            runs_bundled: bundled.is_some_and(|b| checkout.as_ref() == Some(&b.checkout)),
-            checkout,
-            node,
+            runs_bundled: bundled.is_some_and(|b| binary.as_ref() == Some(&b.binary)),
+            binary,
             port: value("port", "P2MAC_PORT")
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8788),

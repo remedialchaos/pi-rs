@@ -47,7 +47,7 @@ fn help_and_version_answer_without_a_pi() {
     assert!(text.contains("server     Run the Pi's server"), "{text}");
     let (code, text) = run(home.path(), &["--version"]);
     assert_eq!(code, 0);
-    assert_eq!(text.trim(), env!("CARGO_PKG_VERSION"));
+    assert_eq!(text.trim(), "0.0.1");
 }
 
 #[test]

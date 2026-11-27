@@ -14,7 +14,8 @@ use super::{model, session, tensor};
 use crate::{Engine, EngineInfo, Error, Result, TtsEngine, Voice};
 
 pub const DEFAULT_POCKET_SAMPLE_RATE: u32 = 24_000;
-pub const DEFAULT_POCKET_CHUNK_SAMPLES: usize = 4_800;
+/// 80 ms of audio at the default sample rate, like upstream's Pocket TTS chunks.
+pub const DEFAULT_POCKET_CHUNK_SAMPLES: usize = 1_920;
 pub const DEFAULT_POCKET_ONNX_MODEL: &str = "pocket_tts.onnx";
 const MAX_SAFETENSORS_HEADER_BYTES: usize = 100 * 1024 * 1024;
 const CANONICAL_STATE_TENSORS: &[&str] = &[
@@ -424,6 +425,11 @@ pub struct PocketConfig {
     pub steps_input: Option<String>,
     pub default_speed: f32,
     pub audio_output: Option<String>,
+    /// Tokens per streaming step. `None` renders the whole utterance in one pass; a value makes
+    /// the model run step by step, carrying its state forward, like upstream's Pocket TTS.
+    pub stream_tokens: Option<usize>,
+    /// The output that carries the state to the next step. Defaults to the state input's name.
+    pub state_output: Option<String>,
 }
 
 impl Default for PocketConfig {
@@ -444,6 +450,8 @@ impl Default for PocketConfig {
             steps_input: None,
             default_speed: 1.0,
             audio_output: None,
+            stream_tokens: None,
+            state_output: None,
         }
     }
 }
@@ -481,11 +489,40 @@ impl PocketConfig {
                 "pocket token_encoding=vocab requires a vocab path".into(),
             ));
         }
+        if self.stream_tokens == Some(0) {
+            return Err(Error::Config(
+                "pocket stream_tokens must be greater than 0".into(),
+            ));
+        }
         Ok(())
     }
 
     pub fn model_path(&self, base: &Path) -> PathBuf {
         base.join(&self.onnx_model)
+    }
+
+    /// The ONNX weights of the Pocket directory. `VOICE_POCKET_MODEL` wins, then the configured
+    /// name, then the usual export names, so an upstream-style directory works.
+    pub fn resolve_model_path(&self, base: &Path) -> Option<PathBuf> {
+        if let Some(model) = std::env::var_os("VOICE_POCKET_MODEL") {
+            let model = PathBuf::from(model);
+            let candidate = if model.is_absolute() {
+                model
+            } else {
+                base.join(model)
+            };
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let configured = base.join(&self.onnx_model);
+        if configured.is_file() {
+            return Some(configured);
+        }
+        ["pocket_tts.onnx", "model.onnx", "pocket.onnx"]
+            .iter()
+            .map(|name| base.join(name))
+            .find(|path| path.is_file())
     }
 }
 
@@ -725,7 +762,9 @@ impl PocketOnnx {
         steps: usize,
     ) -> Result<Self> {
         config.validate()?;
-        let model_path = config.model_path(base);
+        let model_path = config.resolve_model_path(base).ok_or_else(|| {
+            Error::Model(format!("Pocket ONNX model not found in {}", base.display()))
+        })?;
         let session = session(&model_path, threads)?;
         let tokenizer = PocketTokenizer::from_config(base, &config)?;
         let bindings = classify_inputs(&session, &config)?;
@@ -925,26 +964,63 @@ fn select_audio_output(session: &Session, preferred: Option<&str>) -> Result<Str
     Ok(outlet.name().to_owned())
 }
 
-fn state_input_value<'a>(
-    tensor_data: &'a PocketTensor,
+/// The token windows of one utterance: one per streaming step, or the whole utterance.
+fn stream_windows(tokens: &[i64], stream_tokens: Option<usize>) -> Vec<&[i64]> {
+    match stream_tokens.filter(|size| *size > 0) {
+        Some(size) => tokens.chunks(size).collect(),
+        None => vec![tokens],
+    }
+}
+
+/// The state a step carries forward for one state input.
+fn carried_state<'a>(
+    carried: &'a HashMap<String, CarriedState>,
+    config: &PocketConfig,
+    input_name: &str,
+) -> Option<&'a CarriedState> {
+    if let Some(state) = carried.get(input_name) {
+        return Some(state);
+    }
+    if let Some(name) = config.state_output.as_deref()
+        && let Some(state) = carried.get(name)
+    {
+        return Some(state);
+    }
+    // A model with one state output names it after its input; a model that names it otherwise
+    // still has exactly one state to carry.
+    (carried.len() == 1)
+        .then(|| carried.values().next())
+        .flatten()
+}
+
+/// A state the previous streaming step produced.
+#[derive(Clone, Debug, PartialEq)]
+struct CarriedState {
+    shape: Vec<usize>,
+    data: Vec<f32>,
+}
+
+/// Builds the session input for a state tensor, checking it against the model's shape.
+fn state_value<'a>(
+    shape: &[usize],
+    data: &'a [f32],
     expected_shape: &[i64],
     input_name: &str,
 ) -> Result<SessionInputValue<'a>> {
-    let actual = &tensor_data.shape;
-    let effective_shape: Vec<usize> = if actual.len() == expected_shape.len() {
-        actual.clone()
-    } else if actual.len() + 1 == expected_shape.len()
+    let effective_shape: Vec<usize> = if shape.len() == expected_shape.len() {
+        shape.to_vec()
+    } else if shape.len() + 1 == expected_shape.len()
         && matches!(expected_shape.first(), Some(1 | -1))
     {
         let mut expanded = Vec::with_capacity(expected_shape.len());
         expanded.push(1);
-        expanded.extend_from_slice(actual);
+        expanded.extend_from_slice(shape);
         expanded
     } else {
         return Err(Error::Model(format!(
             "Pocket prompt-state rank mismatch for {input_name}: expected {}, got {}",
             expected_shape.len(),
-            actual.len()
+            shape.len()
         )));
     };
     for (&got, &want) in effective_shape.iter().zip(expected_shape.iter()) {
@@ -955,8 +1031,21 @@ fn state_input_value<'a>(
         }
     }
     Ok(SessionInputValue::from(model(TensorRef::from_array_view(
-        (effective_shape, tensor_data.data.as_slice()),
+        (effective_shape, data),
     ))?))
+}
+
+fn state_input_value<'a>(
+    tensor_data: &'a PocketTensor,
+    expected_shape: &[i64],
+    input_name: &str,
+) -> Result<SessionInputValue<'a>> {
+    state_value(
+        &tensor_data.shape,
+        &tensor_data.data,
+        expected_shape,
+        input_name,
+    )
 }
 
 fn scalar_or_vec1_shape(rank: usize) -> Vec<usize> {
@@ -986,145 +1075,201 @@ impl PocketSynthesis for PocketOnnx {
             })?;
         let voice_state = self.states.load(voice_id, state)?;
         let token_ids = self.tokenizer.encode(text)?;
-        let token_len = token_ids.len();
+        // One pass renders the whole utterance. A streaming model runs step by step and carries
+        // its state forward, so the first audio arrives before the utterance is done.
+        let windows = stream_windows(&token_ids, self.config.stream_tokens);
+        let mut carried: HashMap<String, CarriedState> = HashMap::new();
+        for window in windows {
+            if stop.is_cancelled() {
+                return Ok(());
+            }
+            let token_len = window.len();
 
-        let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
-            Vec::with_capacity(self.bindings.len());
-        for binding in &self.bindings {
-            let value = match &binding.role {
-                InputRole::Tokens { dtype, rank } => {
-                    let shape: Vec<usize> = if *rank == 2 {
-                        vec![1, token_len]
-                    } else {
-                        vec![token_len]
-                    };
-                    match dtype {
-                        TensorElementType::Int64 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, token_ids.clone())),
-                        )?),
-                        TensorElementType::Int32 => {
-                            let cast = token_ids
-                                .iter()
-                                .map(|&id| {
-                                    i32::try_from(id).map_err(|_| {
-                                        Error::Model(format!(
-                                            "Pocket token ID {id} overflows int32"
-                                        ))
+            let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
+                Vec::with_capacity(self.bindings.len());
+            for binding in &self.bindings {
+                let value = match &binding.role {
+                    InputRole::Tokens { dtype, rank } => {
+                        let shape: Vec<usize> = if *rank == 2 {
+                            vec![1, token_len]
+                        } else {
+                            vec![token_len]
+                        };
+                        match dtype {
+                            TensorElementType::Int64 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, window.to_vec())),
+                            )?),
+                            TensorElementType::Int32 => {
+                                let cast = window
+                                    .iter()
+                                    .map(|&id| {
+                                        i32::try_from(id).map_err(|_| {
+                                            Error::Model(format!(
+                                                "Pocket token ID {id} overflows int32"
+                                            ))
+                                        })
                                     })
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-                            SessionInputValue::from(model(ort::value::Tensor::from_array((
-                                shape, cast,
-                            )))?)
+                                    .collect::<Result<Vec<_>>>()?;
+                                SessionInputValue::from(model(ort::value::Tensor::from_array((
+                                    shape, cast,
+                                )))?)
+                            }
+                            // INFALLIBLE: `classify_inputs` validates token dtype.
+                            _ => unreachable!("validated token dtype"),
                         }
-                        // INFALLIBLE: `classify_inputs` validates token dtype.
-                        _ => unreachable!("validated token dtype"),
                     }
-                }
-                InputRole::PrimaryState { expected_shape } => {
-                    let (_, st) =
-                        voice_state.primary_tensor(self.config.state_tensor.as_deref())?;
-                    state_input_value(st, expected_shape, &binding.name)?
-                }
-                InputRole::NamedState { expected_shape } => {
-                    let st = voice_state.tensor(&binding.name).ok_or_else(|| {
-                        Error::Model(format!(
-                            "Pocket voice {voice_id} is missing prompt-state tensor {:?}",
-                            binding.name
-                        ))
-                    })?;
-                    state_input_value(st, expected_shape, &binding.name)?
-                }
-                InputRole::Speed { dtype, rank } => {
-                    let shape = scalar_or_vec1_shape(*rank);
-                    let speed = self.config.default_speed;
-                    match dtype {
-                        TensorElementType::Float32 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, vec![speed])),
-                        )?),
-                        TensorElementType::Float64 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, vec![f64::from(speed)])),
-                        )?),
-                        TensorElementType::Int32 => {
-                            SessionInputValue::from(model(ort::value::Tensor::from_array((
-                                shape,
-                                vec![speed.round_ties_even().max(1.0) as i32],
-                            )))?)
+                    InputRole::PrimaryState { expected_shape } => {
+                        match carried_state(&carried, &self.config, &binding.name) {
+                            Some(carried) => state_value(
+                                &carried.shape,
+                                &carried.data,
+                                expected_shape,
+                                &binding.name,
+                            )?,
+                            None => {
+                                let (_, st) = voice_state
+                                    .primary_tensor(self.config.state_tensor.as_deref())?;
+                                state_input_value(st, expected_shape, &binding.name)?
+                            }
                         }
-                        TensorElementType::Int64 => {
-                            SessionInputValue::from(model(ort::value::Tensor::from_array((
-                                shape,
-                                vec![speed.round_ties_even().max(1.0) as i64],
-                            )))?)
+                    }
+                    InputRole::NamedState { expected_shape } => {
+                        match carried_state(&carried, &self.config, &binding.name) {
+                            Some(carried) => state_value(
+                                &carried.shape,
+                                &carried.data,
+                                expected_shape,
+                                &binding.name,
+                            )?,
+                            None => {
+                                let st = voice_state.tensor(&binding.name).ok_or_else(|| {
+                                    Error::Model(format!(
+                                        "Pocket voice {voice_id} is missing prompt-state tensor {:?}",
+                                        binding.name
+                                    ))
+                                })?;
+                                state_input_value(st, expected_shape, &binding.name)?
+                            }
                         }
-                        // INFALLIBLE: `classify_inputs` validates speed dtype.
-                        _ => unreachable!("validated speed dtype"),
                     }
-                }
-                InputRole::Steps { dtype, rank } => {
-                    let shape = scalar_or_vec1_shape(*rank);
-                    match dtype {
-                        TensorElementType::Int64 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, vec![self.steps as i64])),
-                        )?),
-                        TensorElementType::Int32 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, vec![self.steps as i32])),
-                        )?),
-                        TensorElementType::Float32 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, vec![self.steps as f32])),
-                        )?),
-                        // INFALLIBLE: `classify_inputs` validates steps dtype.
-                        _ => unreachable!("validated steps dtype"),
+                    InputRole::Speed { dtype, rank } => {
+                        let shape = scalar_or_vec1_shape(*rank);
+                        let speed = self.config.default_speed;
+                        match dtype {
+                            TensorElementType::Float32 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, vec![speed])),
+                            )?),
+                            TensorElementType::Float64 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, vec![f64::from(speed)])),
+                            )?),
+                            TensorElementType::Int32 => {
+                                SessionInputValue::from(model(ort::value::Tensor::from_array((
+                                    shape,
+                                    vec![speed.round_ties_even().max(1.0) as i32],
+                                )))?)
+                            }
+                            TensorElementType::Int64 => {
+                                SessionInputValue::from(model(ort::value::Tensor::from_array((
+                                    shape,
+                                    vec![speed.round_ties_even().max(1.0) as i64],
+                                )))?)
+                            }
+                            // INFALLIBLE: `classify_inputs` validates speed dtype.
+                            _ => unreachable!("validated speed dtype"),
+                        }
                     }
-                }
-                InputRole::TokensLength { dtype, rank } => {
-                    let shape = scalar_or_vec1_shape(*rank);
-                    match dtype {
-                        TensorElementType::Int64 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, vec![token_len as i64])),
-                        )?),
-                        TensorElementType::Int32 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, vec![token_len as i32])),
-                        )?),
-                        // INFALLIBLE: `classify_inputs` validates length dtype.
-                        _ => unreachable!("validated length dtype"),
+                    InputRole::Steps { dtype, rank } => {
+                        let shape = scalar_or_vec1_shape(*rank);
+                        match dtype {
+                            TensorElementType::Int64 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, vec![self.steps as i64])),
+                            )?),
+                            TensorElementType::Int32 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, vec![self.steps as i32])),
+                            )?),
+                            TensorElementType::Float32 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, vec![self.steps as f32])),
+                            )?),
+                            // INFALLIBLE: `classify_inputs` validates steps dtype.
+                            _ => unreachable!("validated steps dtype"),
+                        }
                     }
-                }
-                InputRole::AttentionMask { dtype, rank } => {
-                    let shape = if *rank == 2 {
-                        vec![1, token_len]
-                    } else {
-                        vec![token_len]
-                    };
-                    match dtype {
-                        TensorElementType::Int64 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, vec![1i64; token_len])),
-                        )?),
-                        TensorElementType::Int32 => SessionInputValue::from(model(
-                            ort::value::Tensor::from_array((shape, vec![1i32; token_len])),
-                        )?),
-                        TensorElementType::Float32 => SessionInputValue::from(tensor(
-                            [1, token_len],
-                            vec![1.0f32; token_len],
-                        )?),
-                        // INFALLIBLE: `classify_inputs` validates mask dtype.
-                        _ => unreachable!("validated mask dtype"),
+                    InputRole::TokensLength { dtype, rank } => {
+                        let shape = scalar_or_vec1_shape(*rank);
+                        match dtype {
+                            TensorElementType::Int64 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, vec![token_len as i64])),
+                            )?),
+                            TensorElementType::Int32 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, vec![token_len as i32])),
+                            )?),
+                            // INFALLIBLE: `classify_inputs` validates length dtype.
+                            _ => unreachable!("validated length dtype"),
+                        }
                     }
-                }
-            };
-            inputs.push((Cow::Borrowed(binding.name.as_str()), value));
-        }
+                    InputRole::AttentionMask { dtype, rank } => {
+                        let shape = if *rank == 2 {
+                            vec![1, token_len]
+                        } else {
+                            vec![token_len]
+                        };
+                        match dtype {
+                            TensorElementType::Int64 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, vec![1i64; token_len])),
+                            )?),
+                            TensorElementType::Int32 => SessionInputValue::from(model(
+                                ort::value::Tensor::from_array((shape, vec![1i32; token_len])),
+                            )?),
+                            TensorElementType::Float32 => SessionInputValue::from(tensor(
+                                [1, token_len],
+                                vec![1.0f32; token_len],
+                            )?),
+                            // INFALLIBLE: `classify_inputs` validates mask dtype.
+                            _ => unreachable!("validated mask dtype"),
+                        }
+                    }
+                };
+                inputs.push((Cow::Borrowed(binding.name.as_str()), value));
+            }
 
-        if stop.is_cancelled() {
-            return Ok(());
+            if stop.is_cancelled() {
+                return Ok(());
+            }
+            let outputs = model(self.session.run(inputs))?;
+            let audio_val = outputs.get(&self.output_name).ok_or_else(|| {
+                Error::Model(format!("missing Pocket ONNX output {:?}", self.output_name))
+            })?;
+            let (_, samples) = model(audio_val.try_extract_tensor::<f32>())?;
+            emit_pcm_chunks(samples, self.config.chunk_samples, stop, emit)?;
+            carried = carry_state(&outputs, &self.output_name)?;
         }
-        let outputs = model(self.session.run(inputs))?;
-        let audio_val = outputs.get(&self.output_name).ok_or_else(|| {
-            Error::Model(format!("missing Pocket ONNX output {:?}", self.output_name))
-        })?;
-        let (_, samples) = model(audio_val.try_extract_tensor::<f32>())?;
-        emit_pcm_chunks(samples, self.config.chunk_samples, stop, emit)
+        Ok(())
     }
+}
+
+/// Collects the state the model produced, keyed by output name, so the next step can use it.
+/// The state outputs are named like the state inputs they replace.
+fn carry_state(
+    outputs: &ort::session::SessionOutputs<'_>,
+    audio_output: &str,
+) -> Result<HashMap<String, CarriedState>> {
+    let mut carried = HashMap::new();
+    for (name, value) in outputs.iter() {
+        if name == audio_output {
+            continue;
+        }
+        let Ok((shape, data)) = value.try_extract_tensor::<f32>() else {
+            continue;
+        };
+        carried.insert(
+            name.to_owned(),
+            CarriedState {
+                shape: shape.iter().map(|&dim| dim.max(0) as usize).collect(),
+                data: data.to_vec(),
+            },
+        );
+    }
+    Ok(carried)
 }
 
 fn emit_pcm_chunks(
@@ -1160,11 +1305,10 @@ fn emit_pcm_chunks(
 
 pub(crate) fn load_if_present(base: &Path, threads: usize, steps: usize) -> Result<Option<Engine>> {
     let config = PocketConfig::load(base)?;
-    let model_path = config.model_path(base);
-    if !fs::exists(&model_path)? {
+    if config.resolve_model_path(base).is_none() {
         eprintln!(
-            "Pocket TTS not loaded: ONNX model not found at {}",
-            model_path.display()
+            "Pocket TTS not loaded: install a compatible exported pocket_tts.onnx alongside the voice .safetensors in {}, or set VOICE_POCKET_MODEL to the graph path. Raw Hugging Face weights require conversion. See the Pocket export section in crates/pi-rs-voice-server/README.md.",
+            base.display()
         );
         return Ok(None);
     }
@@ -1180,6 +1324,64 @@ pub(crate) fn load_if_present(base: &Path, threads: usize, steps: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_streaming_run_splits_the_utterance_into_token_windows() {
+        let tokens = [1i64, 2, 3, 4, 5];
+        assert_eq!(stream_windows(&tokens, None), vec![tokens.as_slice()]);
+        assert_eq!(
+            stream_windows(&tokens, Some(2)),
+            vec![
+                tokens[..2].as_ref(),
+                tokens[2..4].as_ref(),
+                tokens[4..].as_ref()
+            ]
+        );
+        // A zero or missing size renders the whole utterance in one pass.
+        assert_eq!(stream_windows(&tokens, Some(0)), vec![tokens.as_slice()]);
+    }
+
+    #[test]
+    fn a_carried_state_is_found_by_its_input_or_output_name() {
+        let mut carried = HashMap::new();
+        carried.insert(
+            "next_state".to_owned(),
+            CarriedState {
+                shape: vec![1, 2],
+                data: vec![0.5, 0.25],
+            },
+        );
+        let config = PocketConfig::default();
+        // The state's own name, then the configured output name, then the only state there is.
+        assert!(carried_state(&carried, &config, "next_state").is_some());
+        assert!(carried_state(&carried, &config, "prompt_state").is_some());
+        let named = PocketConfig {
+            state_output: Some("next_state".into()),
+            ..PocketConfig::default()
+        };
+        assert!(carried_state(&carried, &named, "prompt_state").is_some());
+        let mut two = carried.clone();
+        two.insert(
+            "other".to_owned(),
+            CarriedState {
+                shape: vec![1, 2],
+                data: vec![0.1, 0.2],
+            },
+        );
+        // With more than one state, only a matching name counts.
+        assert!(carried_state(&two, &config, "prompt_state").is_none());
+    }
+
+    #[test]
+    fn a_state_tensor_must_match_the_shape_the_model_expects() -> Result<()> {
+        let state = CarriedState {
+            shape: vec![1, 4],
+            data: vec![0.0; 4],
+        };
+        assert!(state_value(&state.shape, &state.data, &[1, 3], "prompt_state").is_err());
+        assert!(state_value(&state.shape, &state.data, &[4], "prompt_state").is_err());
+        Ok(())
+    }
 
     #[test]
     fn f16_and_bf16_bit_conversions_cover_normals_subnormals_zeros_and_specials() {

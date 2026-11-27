@@ -276,6 +276,8 @@ async fn neighbors() -> Vec<(i32, u16)> {
         &uid,
         "-c",
         "node",
+        "-c",
+        "p2",
         "-F",
         "pn",
     ])

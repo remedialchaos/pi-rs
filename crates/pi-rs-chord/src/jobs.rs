@@ -202,11 +202,13 @@ pub enum AbortStatus {
     Terminal,
 }
 type RunFn = Arc<dyn Fn(JsonValue, JobContext) -> SyncFuture<JsonValue> + Send + Sync>;
+type FinishStep = Arc<dyn Fn(&Outcome, &mut crate::store::Step) -> Result<()> + Send + Sync>;
 type FinishFn = Arc<dyn Fn(Outcome) -> SyncFuture<()> + Send + Sync>;
 #[derive(Clone)]
 pub struct JobImplementation {
     run: RunFn,
     finish: Option<FinishFn>,
+    finish_step: Option<FinishStep>,
 }
 impl JobImplementation {
     pub fn new(
@@ -215,12 +217,23 @@ impl JobImplementation {
         Self {
             run: Arc::new(run),
             finish: None,
+            finish_step: None,
         }
+    }
+    /// Stage document or table writes in the same SQLite transaction as retiring the run.
+    pub fn with_transactional_finish(
+        mut self,
+        finish: impl Fn(&Outcome, &mut crate::store::Step) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.finish_step = Some(Arc::new(finish));
+        self.finish = None;
+        self
     }
     pub fn with_finish(
         mut self,
         finish: impl Fn(Outcome) -> SyncFuture<()> + Send + Sync + 'static,
     ) -> Self {
+        self.finish_step = None;
         self.finish = Some(Arc::new(finish));
         self
     }
@@ -337,6 +350,11 @@ impl Job {
                 "persisted job requires an owner store".into(),
             ));
         }
+        if implementation.finish_step.is_some() && definition.persist.is_none() {
+            return Err(Error::Invalid(
+                "transactional finish requires a persisted job".into(),
+            ));
+        }
         if adapters.keys().any(|v| *v == 0 || *v >= definition.version) {
             return Err(Error::Invalid("job accepts only older versions".into()));
         }
@@ -344,7 +362,16 @@ impl Job {
         let (stop, cancel) = Context::background().with_cancel();
         let loaded = if definition.persist.is_some() {
             match &store {
-                Some(s) => s.load(&definition.name).await?,
+                Some(s) => {
+                    let version = definition.version;
+                    let fingerprint = definition.fingerprint.clone();
+                    let accepted = adapters.keys().copied().collect::<Vec<_>>();
+                    s.load_versions(&definition.name, move |record| {
+                        (record.version == version && record.fingerprint == fingerprint)
+                            || accepted.contains(&record.version)
+                    })
+                    .await?
+                }
                 None => Vec::new(),
             }
         } else {
@@ -384,6 +411,40 @@ impl Job {
                     stored.blocked = Some("version".into());
                 }
             }
+            if stored.blocked.as_deref() == Some("version")
+                && stored.version == job.0.definition.version
+                && stored.fingerprint == job.0.definition.fingerprint
+            {
+                stored.blocked = None;
+                stored.phase = if stored.outcome.is_some() {
+                    Phase::Finishing
+                } else {
+                    Phase::Pending
+                };
+            }
+            let state = match (state, job.0.definition.state.as_ref()) {
+                (Some((version, fingerprint, value)), Some(definition))
+                    if stored.blocked.as_deref() != Some("version") =>
+                {
+                    if version > definition.version()
+                        || (version == definition.version()
+                            && fingerprint != definition.fingerprint())
+                    {
+                        return Err(Error::Invalid(format!(
+                            "{}: incompatible stored state version {version}",
+                            definition.name()
+                        )));
+                    }
+                    let value = if version < definition.version() {
+                        definition.migrate(value, version)?
+                    } else {
+                        definition.validate(&value)?;
+                        value
+                    };
+                    Some(value)
+                }
+                (other, _) => other.map(|(_, _, value)| value),
+            };
             if stored.phase == Phase::Running {
                 stored.restarts += 1;
             }
@@ -467,6 +528,46 @@ impl Job {
         }
         Ok(())
     }
+    /// Retry settled work whose finish callback failed, without rerunning the job body.
+    pub async fn retry_blocked(&self, context: &Context) -> Result<()> {
+        let _line = self.0.line.lock().await;
+        let retry = {
+            let state = lock(&self.0.state);
+            if state.closed {
+                return Err(Error::Closed);
+            }
+            state
+                .runs
+                .iter()
+                .filter(|(_, r)| {
+                    r.stored.phase == Phase::Blocked
+                        && r.stored.blocked.as_deref() == Some("finish_failed")
+                })
+                .map(|(id, r)| (id.clone(), r.stored.clone(), r.state.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (id, mut stored, value) in retry {
+            context
+                .check()
+                .map_err(|e| ChordError::new("aborted", e.to_string()))?;
+            stored.phase = Phase::Finishing;
+            stored.finish_failures = 0;
+            stored.blocked = None;
+            self.persist(&id, &stored, value.as_ref()).await?;
+            let live = {
+                let mut state = lock(&self.0.state);
+                if let Some(run) = state.runs.get_mut(&id) {
+                    run.stored = stored;
+                }
+                state.live
+            };
+            if live {
+                self.spawn(id)?;
+            }
+        }
+        self.publish()
+    }
+
     pub async fn start(
         &self,
         args: JsonValue,
@@ -748,13 +849,24 @@ impl Job {
             if lock(&self.0.state).closed {
                 return Ok(());
             }
+            let finished = match (finished, &self.0.store) {
+                (Ok(()), Some(store)) if self.0.definition.persist.is_some() => {
+                    store
+                        .retire(
+                            &self.0.definition.name,
+                            id,
+                            self.0
+                                .implementation
+                                .finish_step
+                                .clone()
+                                .map(|finish| (finish, answer.clone())),
+                        )
+                        .await
+                }
+                (other, _) => other,
+            };
             match finished {
                 Ok(()) => {
-                    if let Some(store) = &self.0.store
-                        && self.0.definition.persist.is_some()
-                    {
-                        store.remove(&self.0.definition.name, id).await?;
-                    }
                     if let Some(record) = lock(&self.0.state).runs.shift_remove(id) {
                         record.answer.send_replace(Some(Ok(answer)));
                     }
@@ -802,7 +914,7 @@ impl Job {
             .map(|(id, r)| (id.clone(), r.stored.clone(), r.state.clone()))
             .collect::<Vec<_>>();
         for (id, mut run, state) in records {
-            if self.0.definition.persist.is_some() {
+            if self.0.definition.persist.is_some() && run.blocked.as_deref() != Some("version") {
                 if run.phase == Phase::Running || run.phase == Phase::Pending {
                     run.phase = Phase::Stopped;
                 }

@@ -10,6 +10,10 @@ description = "Model registry and direct AI provider protocols for pi-rs"
 name = "pi-ai"
 path = "src/bin/pi-ai.rs"
 
+[[bin]]
+name = "pi-ai-catalog"
+path = "src/bin/pi-ai-catalog.rs"
+
 [dependencies]
 pi-rs-schema = { path = "../pi-rs-schema" }
 pi-rs-telemetry = { path = "../pi-rs-telemetry" }
@@ -35,6 +39,10 @@ aws-credential-types = "1"
 aws-sigv4 = "1"
 aws-smithy-eventstream = "0.61"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1"
 zstd = "0.13"
 uuid = { version = "1", features = ["v4", "v7"] }
 

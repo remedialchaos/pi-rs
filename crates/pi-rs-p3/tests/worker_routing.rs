@@ -251,6 +251,18 @@ async fn chord_routes_session_holds_to_child_workers_and_enforces_principal_and_
         "non-owner principal must be denied access to session worker"
     );
     denied.release();
+    assert!(server.runtime.sign_ins().revoke(&person_issued.id));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !person_link.closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok(),
+        "revoking the person sign-in closes its WebSocket"
+    );
+    assert!(!owner_link.closed());
     person_peer.close();
 
     // 7. Worker-to-worker admission must also be denied.

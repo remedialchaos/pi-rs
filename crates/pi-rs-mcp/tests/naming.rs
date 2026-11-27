@@ -15,6 +15,25 @@ fn joins_server_and_tool_and_replaces_characters_outside_the_alphabet() {
 }
 
 #[test]
+fn sanitizes_per_utf16_code_unit_like_javascript() {
+    // JavaScript's `.replace(/[^A-Za-z0-9_]/g, "_")` replaces each UTF-16 code unit, so a
+    // surrogate pair contributes two underscores.
+    assert_eq!(
+        create_mcp_tool_name("docs", "lookup\u{10400}x", |_| false),
+        "mcp__docs__lookup__x"
+    );
+    assert_eq!(
+        create_mcp_tool_name("docs", "lookup\u{10400}x", |_| false).len(),
+        "mcp__docs__lookup__x".len()
+    );
+    // A BMP character is one code unit and contributes one underscore.
+    assert_eq!(
+        create_mcp_tool_name("docs", "lookup\u{00e9}x", |_| false),
+        "mcp__docs__lookup_x"
+    );
+}
+
+#[test]
 fn shortens_names_over_64_characters_with_a_hash_of_server_and_tool() {
     let long = create_mcp_tool_name("server", &"x".repeat(100), |_| false);
     assert_eq!(long.chars().count(), 64);

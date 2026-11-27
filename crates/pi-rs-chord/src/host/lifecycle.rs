@@ -761,6 +761,18 @@ fn validate_members(contract: &Contract, members: &Members) -> Result<()> {
             ))
         })?;
     if variant.state.len() != members.state.len()
+        || variant.keyed.len() != members.keyed.len()
+        || variant
+            .keyed
+            .keys()
+            .any(|name| !members.keyed.contains_key(name))
+        || variant.queries.len() != members.queries.len()
+        || variant.queries.iter().any(|(name, queries)| {
+            members.queries.get(name).is_none_or(|builders| {
+                builders.len() != queries.args.len()
+                    || queries.args.keys().any(|k| !builders.contains_key(k))
+            })
+        })
         || variant.methods.len() != members.methods.len()
         || variant.events.len() != members.events.len()
         || variant.state.keys().any(|n| !members.state.contains_key(n))

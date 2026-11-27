@@ -306,3 +306,94 @@ fn image_accepts_large_wrapped_base64_without_mime_trust() -> Result<(), HostErr
     );
     Ok(())
 }
+#[test]
+fn start_fails_synchronously_when_the_sandbox_is_closed() -> Result<(), &'static str> {
+    let sandbox = CodemodeSandbox::default();
+    sandbox.close();
+    let error = sandbox
+        .start("return 1", RunOptions::default())
+        .err()
+        .ok_or("a closed sandbox cannot start a run")?;
+    assert_eq!(error.to_string(), "Sandbox is closed");
+    Ok(())
+}
+#[test]
+fn start_reports_the_upstream_error_messages() -> Result<(), &'static str> {
+    let sandbox = CodemodeSandbox::default();
+    let started_at = RunOptions {
+        started_at: -1.0,
+        ..RunOptions::default()
+    };
+    assert_eq!(
+        sandbox
+            .start("return 1", started_at)
+            .err()
+            .ok_or("a negative start time is rejected")?
+            .to_string(),
+        "startedAt must be a non-negative number of milliseconds since the epoch"
+    );
+    let duplicate = RunOptions {
+        tools: vec![
+            DeclaredTool {
+                name: "host".into(),
+                js_name: None,
+                description: String::new(),
+            },
+            DeclaredTool {
+                name: "host".into(),
+                js_name: None,
+                description: String::new(),
+            },
+        ],
+        ..RunOptions::default()
+    };
+    assert_eq!(
+        sandbox
+            .start("return 1", duplicate)
+            .err()
+            .ok_or("duplicate tool names are rejected")?
+            .to_string(),
+        "Tool names must be unique"
+    );
+    let aliases = RunOptions {
+        tools: vec![
+            DeclaredTool {
+                name: "host".into(),
+                js_name: Some("same".into()),
+                description: String::new(),
+            },
+            DeclaredTool {
+                name: "other".into(),
+                js_name: Some("same".into()),
+                description: String::new(),
+            },
+        ],
+        ..RunOptions::default()
+    };
+    assert_eq!(
+        sandbox
+            .start("return 1", aliases)
+            .err()
+            .ok_or("duplicate script names are rejected")?
+            .to_string(),
+        "Tool script names must be unique"
+    );
+    Ok(())
+}
+#[test]
+fn the_sandbox_lists_its_globals() -> Result<(), HostError> {
+    let global = CodemodeTool::new("host", |_, _| async { Ok(None) });
+    let sandbox = CodemodeSandbox::new(SandboxOptions {
+        globals: vec![global],
+        ..SandboxOptions::default()
+    })?;
+    assert_eq!(
+        sandbox
+            .globals()?
+            .iter()
+            .map(|g| g.name())
+            .collect::<Vec<_>>(),
+        vec!["host"]
+    );
+    Ok(())
+}

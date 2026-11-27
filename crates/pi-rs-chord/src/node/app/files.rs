@@ -129,7 +129,7 @@ struct Inner {
     line: tokio::sync::Mutex<()>,
     uploads: Mutex<BTreeMap<String, Upload>>,
     views: Mutex<BTreeMap<String, (String, String, Source)>>,
-    summary: Source,
+    summaries: Mutex<BTreeMap<String, crate::state::WeakSource>>,
     sweep: Mutex<Option<tokio::task::AbortHandle>>,
 }
 impl Drop for Inner {
@@ -407,7 +407,6 @@ impl Files {
                 std::fs::remove_file(entry.path())?;
             }
         }
-        let summary = Source::new(store.batch(), Self::summaries(&index)?)?;
         let files = Self(Arc::new(Inner {
             store,
             dir,
@@ -417,7 +416,7 @@ impl Files {
             line: tokio::sync::Mutex::new(()),
             uploads: Mutex::new(BTreeMap::new()),
             views: Mutex::new(BTreeMap::new()),
-            summary,
+            summaries: Mutex::new(BTreeMap::new()),
             sweep: Mutex::new(None),
         }));
         let weak = Arc::downgrade(&files.0);
@@ -591,10 +590,27 @@ impl Files {
             });
         }
         self.0.store.commit(writes).await?;
-        let summary = Self::summaries(&next)?;
         *self.0.index.lock().unwrap_or_else(|e| e.into_inner()) = next;
         let context = Context::background();
-        self.0.summary.set(summary, &context)?;
+        let observed = {
+            let mut summaries = self.0.summaries.lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = Vec::new();
+            summaries.retain(|space, source| {
+                if let Some(source) = source.upgrade() {
+                    active.push((space.clone(), source));
+                    true
+                } else {
+                    false
+                }
+            });
+            active
+        };
+        for (space, source) in observed {
+            source.set(
+                JsonValue::from_serde(serde_json::to_value(self.summary(&space)?)?),
+                &context,
+            )?;
+        }
         for id in old_blobs.keys().filter(|id| !blobs.contains_key(*id)) {
             match std::fs::remove_file(self.0.dir.join("blobs").join(id)) {
                 Ok(()) => {}
@@ -769,19 +785,21 @@ impl Files {
                 .collect(),
         ))
     }
-    fn summaries(index: &Index) -> Result<JsonValue> {
-        let mut spaces = BTreeMap::<&str, Vec<&FileInfo>>::new();
-        for record in index.files.values() {
-            spaces
-                .entry(&record.info.space)
-                .or_default()
-                .push(&record.info);
+    fn summary_source(&self, space: String) -> Result<Source> {
+        let mut observed = self.0.summaries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(source) = observed
+            .get(&space)
+            .and_then(crate::state::WeakSource::upgrade)
+        {
+            return Ok(source);
         }
-        let summaries = spaces
-            .into_iter()
-            .map(|(space, files)| (space, Self::summarize(files)))
-            .collect::<BTreeMap<_, _>>();
-        Ok(JsonValue::from_serde(serde_json::to_value(summaries)?))
+        let source = Source::new(
+            self.0.store.batch(),
+            JsonValue::from_serde(serde_json::to_value(self.summary(&space)?)?),
+        )?;
+        observed.retain(|_, source| source.upgrade().is_some());
+        observed.insert(space, source.downgrade());
+        Ok(source)
     }
     fn summarize(mut newest: Vec<&FileInfo>) -> SpaceSummary {
         let versions = newest.len();

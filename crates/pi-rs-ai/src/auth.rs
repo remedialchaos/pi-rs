@@ -102,6 +102,18 @@ pub fn home_path(path: &str) -> PathBuf {
         .and_then(|inner| home().map(|home| home.join(inner)))
         .unwrap_or_else(|| PathBuf::from(path))
 }
+/// Directory holding pi's agent files: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+pub fn agent_dir() -> PathBuf {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| home_path("~/.pi/agent"))
+}
+/// Credential store at the standard `auth.json` path, so stored credentials apply to
+/// requests that resolve their provider through `Models`.
+pub fn default_credential_store() -> FileCredentialStore {
+    FileCredentialStore::new(agent_dir().join("auth.json"))
+}
 #[async_trait]
 impl AuthContext for SystemAuthContext {
     async fn env(&self, name: &str) -> Option<String> {

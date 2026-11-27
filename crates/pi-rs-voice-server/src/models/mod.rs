@@ -34,6 +34,9 @@ pub struct Config {
     pub default_voice: Option<String>,
     pub tts_threads: usize,
     pub tts_steps: usize,
+    /// Threads the Pocket TTS session uses. Pocket sets its own thread count, so it has its own
+    /// setting, like upstream's `VOICE_POCKET_THREADS`.
+    pub pocket_threads: usize,
     pub vad: VadConfig,
     pub preroll_ms: f64,
     pub port: u16,
@@ -47,12 +50,14 @@ impl Config {
         let silence = number::<f32>("VOICE_VAD_SILENCE", 1.2)?;
         let preroll_ms = number::<f64>("VOICE_VAD_PREROLL_MS", 750.)?;
         let tts_threads = number("VOICE_TTS_THREADS", 8)?;
+        let pocket_threads = number("VOICE_POCKET_THREADS", 2)?;
         let tts_steps = number("VOICE_TTS_STEPS", 5)?;
         if !(0. ..=1.).contains(&threshold)
             || !silence.is_finite()
             || !(0. ..60.).contains(&silence)
             || !preroll_ms.is_finite()
             || tts_threads == 0
+            || pocket_threads == 0
             || tts_steps == 0
         {
             return Err(Error::Config("invalid voice model configuration".into()));
@@ -69,6 +74,7 @@ impl Config {
             default_voice: env::var("VOICE_DEFAULT").ok(),
             tts_threads,
             tts_steps,
+            pocket_threads,
             vad: VadConfig {
                 threshold,
                 silence_seconds: silence,
@@ -99,7 +105,7 @@ impl Config {
                 "pocket" => {
                     if let Some(engine) = pocket::load_if_present(
                         &self.models.join("pocket"),
-                        self.tts_threads,
+                        self.pocket_threads,
                         self.tts_steps,
                     )? {
                         engines.push(engine);

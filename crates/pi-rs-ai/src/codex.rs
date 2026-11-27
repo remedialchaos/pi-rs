@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::{
@@ -9,11 +11,11 @@ use base64::{
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Response, StatusCode, header::HeaderMap};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, client_async_tls, connect_async,
+    MaybeTlsStream, WebSocketStream, client_async_tls,
     tungstenite::{Message, client::IntoClientRequest},
 };
 use url::Url;
@@ -34,7 +36,48 @@ use crate::types::{StopReason, TranscriptContext};
 const MAX_AGE: Duration = Duration::from_secs(45 * 60);
 const IDLE: Duration = Duration::from_secs(5 * 60);
 const BETA: &str = "responses_websockets=2026-02-06";
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Socket = WebSocketStream<MaybeTlsStream<ProxyStream>>;
+/// The stream to the provider: plain, or TLS to an HTTPS proxy.
+enum ProxyStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+impl AsyncRead for ProxyStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+impl AsyncWrite for ProxyStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
 struct Continuation {
     request: Value,
     response_id: String,
@@ -61,6 +104,94 @@ pub fn close_sessions(session: Option<&str>) {
         pool.clear();
         fallback.clear();
     }
+}
+
+/// Debug counters of the Codex WebSocket transport for one session, like upstream's
+/// `OpenAICodexWebSocketDebugStats`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpenAICodexWebSocketDebugStats {
+    /// WebSocket requests the session started.
+    pub requests: u64,
+    /// WebSocket connections the session opened.
+    pub connections_created: u64,
+    /// Pooled WebSocket connections the session reused.
+    pub connections_reused: u64,
+    /// Requests that could use the cached continuation context.
+    pub cached_context_requests: u64,
+    /// Requests sent with `store: true`.
+    pub store_true_requests: u64,
+    /// Requests sent with the whole conversation.
+    pub full_context_requests: u64,
+    /// Requests sent as a delta of the previous response.
+    pub delta_requests: u64,
+    /// Number of input items of the last request.
+    pub last_input_items: usize,
+    /// Number of input items of the last delta request.
+    pub last_delta_input_items: Option<usize>,
+    /// `previous_response_id` of the last delta request.
+    pub last_previous_response_id: Option<String>,
+    /// WebSocket failures the session hit.
+    pub websocket_failures: u64,
+    /// Times the session fell back to SSE.
+    pub sse_fallbacks: u64,
+    /// Whether the session currently uses the SSE fallback.
+    pub websocket_fallback_active: Option<bool>,
+    /// The last WebSocket error of the session.
+    pub last_websocket_error: Option<String>,
+}
+static STATS: LazyLock<Mutex<HashMap<String, OpenAICodexWebSocketDebugStats>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The debug counters of a Codex WebSocket session, if the session has any.
+pub fn codex_websocket_debug_stats(session_id: &str) -> Option<OpenAICodexWebSocketDebugStats> {
+    STATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .cloned()
+}
+
+/// Forgets the debug counters of one session, or of every session.
+pub fn reset_codex_websocket_debug_stats(session_id: Option<&str>) {
+    let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+    match session_id {
+        Some(session) => {
+            stats.remove(session);
+        }
+        None => stats.clear(),
+    }
+}
+fn record_stats(session: Option<&str>, update: impl FnOnce(&mut OpenAICodexWebSocketDebugStats)) {
+    let Some(session) = session else {
+        return;
+    };
+    let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+    update(stats.entry(session.to_owned()).or_default());
+}
+fn record_websocket_failure(session: Option<&str>, error: &Error) {
+    if let Some(session) = session {
+        FALLBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.to_owned());
+    }
+    record_stats(session, |stats| {
+        stats.websocket_failures += 1;
+        stats.last_websocket_error = Some(error.to_string());
+        stats.websocket_fallback_active = Some(true);
+    });
+}
+fn record_sse_fallback(session: Option<&str>) {
+    let active = session.is_some_and(|session| {
+        FALLBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(session)
+    });
+    record_stats(session, |stats| {
+        stats.sse_fallbacks += 1;
+        stats.websocket_fallback_active = Some(active);
+    });
 }
 
 pub fn extract_account_id(token: &str) -> Result<String> {
@@ -179,25 +310,23 @@ async fn connect(url: &Url, headers: HeaderMap, opts: &StreamOptions) -> Result<
     req.headers_mut().extend(headers);
     let proxy = resolve_http_proxy_url_for_target(url.as_str(), &opts.request.env)?;
     let connection = async {
-        if let Some(proxy) = proxy {
-            // Use CONNECT to keep TLS and the WebSocket handshake end-to-end with the provider.
-            // An HTTPS proxy cannot be safely treated as a cleartext proxy.
-            if proxy.scheme() != "http" {
-                return Err(Error::Protocol(
-                    "Codex WebSocket HTTPS proxy requires TLS tunneling; retry over HTTP SSE"
-                        .into(),
-                ));
+        match proxy {
+            // Use CONNECT to keep TLS and the WebSocket handshake end-to-end with the
+            // provider. An HTTPS proxy is reached over TLS itself.
+            Some(proxy) => {
+                let stream = proxy_tunnel(&proxy, url).await?;
+                client_async_tls(req, stream)
+                    .await
+                    .map(|(socket, _)| socket)
+                    .map_err(|e| Error::Protocol(format!("Codex WebSocket connect failed: {e}")))
             }
-            let stream = proxy_tunnel(&proxy, url).await?;
-            client_async_tls(req, stream)
-                .await
-                .map(|(socket, _)| socket)
-                .map_err(|e| Error::Protocol(format!("Codex WebSocket connect failed: {e}")))
-        } else {
-            connect_async(req)
-                .await
-                .map(|(socket, _)| socket)
-                .map_err(|e| Error::Protocol(format!("Codex WebSocket connect failed: {e}")))
+            None => {
+                let stream = TcpStream::connect(host_port(url)?).await?;
+                client_async_tls(req, ProxyStream::Plain(stream))
+                    .await
+                    .map(|(socket, _)| socket)
+                    .map_err(|e| Error::Protocol(format!("Codex WebSocket connect failed: {e}")))
+            }
         }
     };
     let timeout = opts.websocket_connect_timeout_ms.unwrap_or(15_000);
@@ -213,21 +342,68 @@ async fn connect(url: &Url, headers: HeaderMap, opts: &StreamOptions) -> Result<
     })
     .await
 }
-async fn proxy_tunnel(proxy: &Url, target: &Url) -> Result<TcpStream> {
+/// The address of a URL, as `(host, port)`.
+fn host_port(url: &Url) -> Result<(String, u16)> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| Error::Protocol("WebSocket target host missing".into()))?
+        .trim_matches(['[', ']'])
+        .to_owned();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| Error::Protocol("WebSocket target port missing".into()))?;
+    Ok((host, port))
+}
+/// TLS to an HTTPS proxy, trusting the operating system's root CAs.
+async fn tls_to_proxy(host: &str, stream: TcpStream) -> Result<ProxyStream> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    let (added, _ignored) = roots.add_parsable_certificates(native.certs);
+    if added == 0 {
+        return Err(Error::Protocol(format!(
+            "no native root CA certificates found for the HTTPS proxy (errors: {:?})",
+            native.errors
+        )));
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| Error::Protocol(format!("TLS protocol configuration failed: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let name = rustls_pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|e| Error::Protocol(format!("invalid proxy host name: {e}")))?;
+    let tls = connector
+        .connect(name, stream)
+        .await
+        .map_err(|e| Error::Protocol(format!("HTTPS proxy TLS handshake failed: {e}")))?;
+    Ok(ProxyStream::Tls(Box::new(tls)))
+}
+async fn proxy_tunnel(proxy: &Url, target: &Url) -> Result<ProxyStream> {
     let host = proxy
         .host_str()
         .ok_or_else(|| Error::Protocol("proxy host missing".into()))?;
     let port = proxy
         .port_or_known_default()
         .ok_or_else(|| Error::Protocol("proxy port missing".into()))?;
-    let mut stream = TcpStream::connect((host.trim_matches(['[', ']']), port)).await?;
-    let target_host = target
-        .host_str()
-        .ok_or_else(|| Error::Protocol("WebSocket target host missing".into()))?;
-    let target_port = target
-        .port_or_known_default()
-        .ok_or_else(|| Error::Protocol("WebSocket target port missing".into()))?;
-    let authority = format!("{target_host}:{target_port}");
+    let tcp = TcpStream::connect((host.trim_matches(['[', ']']), port)).await?;
+    let mut stream = match proxy.scheme() {
+        "http" => ProxyStream::Plain(tcp),
+        "https" => tls_to_proxy(host.trim_matches(['[', ']']), tcp).await?,
+        other => {
+            return Err(Error::Protocol(format!(
+                "unsupported proxy scheme for the Codex WebSocket: {other}"
+            )));
+        }
+    };
+    let (target_host, target_port) = host_port(target)?;
+    let authority = if target_host.contains(':') {
+        format!("[{target_host}]:{target_port}")
+    } else {
+        format!("{target_host}:{target_port}")
+    };
     let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if !proxy.username().is_empty() || proxy.password().is_some() {
         let credentials = format!(
@@ -312,6 +488,14 @@ impl Fault {
         }
     }
 }
+fn cache_session(opts: &StreamOptions) -> Option<&str> {
+    if opts.cache_retention == Some(CacheRetention::None) {
+        None
+    } else {
+        opts.session_id.as_deref().filter(|s| !s.is_empty())
+    }
+}
+
 async fn websocket(
     url: &Url,
     headers: HeaderMap,
@@ -321,11 +505,13 @@ async fn websocket(
     req: &ResponsesRequest,
     entry: Option<&Entry>,
 ) -> Result<StopReason, Fault> {
+    let session = cache_session(opts);
     let mut guard = entry.and_then(|map| map.try_lock().ok());
     let mut conn = guard
         .as_deref_mut()
         .and_then(Option::take)
         .filter(|conn| conn.created.elapsed() < MAX_AGE && conn.last_used.elapsed() < IDLE);
+    let reused = conn.is_some();
     if conn.is_none() {
         let socket = connect(url, headers, opts)
             .await
@@ -355,6 +541,45 @@ async fn websocket(
         None
     };
     let chosen = maybe_delta.as_ref().unwrap_or(&req.body);
+    let input_items = chosen
+        .get("input")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let previous_response_id = chosen
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let store = chosen
+        .get("store")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    record_stats(session, |stats| {
+        stats.requests += 1;
+        if reused {
+            stats.connections_reused += 1;
+        } else {
+            stats.connections_created += 1;
+        }
+        if allow_delta {
+            stats.cached_context_requests += 1;
+        }
+        if store {
+            stats.store_true_requests += 1;
+        }
+        stats.last_input_items = input_items;
+        match previous_response_id {
+            Some(previous) => {
+                stats.delta_requests += 1;
+                stats.last_delta_input_items = Some(input_items);
+                stats.last_previous_response_id = Some(previous);
+            }
+            None => {
+                stats.full_context_requests += 1;
+                stats.last_delta_input_items = None;
+                stats.last_previous_response_id = None;
+            }
+        }
+    });
     let mut wire = json!({"type":"response.create"});
     if let Some(w) = wire.as_object_mut()
         && let Some(body) = chosen.as_object()
@@ -493,11 +718,7 @@ async fn run(
         .provider_thinking_level
         .clone_from(&request.provider_effort);
     request.body = payload(request.body, model, &opts.request).await?;
-    let session = if opts.cache_retention == Some(CacheRetention::None) {
-        None
-    } else {
-        opts.session_id.as_deref().filter(|s| !s.is_empty())
-    };
+    let session = cache_session(opts);
     let id = session.map(|s| s.chars().take(64).collect::<String>());
     let url = codex_url(&model.base_url)?;
     let transport = opts.transport.unwrap_or(Transport::Auto);
@@ -559,9 +780,14 @@ async fn run(
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(session.into());
                     }
+                    record_websocket_failure(session, &fault.error);
+                    record_sse_fallback(session);
                     break;
                 }
-                Err(fault) => return Err(fault.error),
+                Err(fault) => {
+                    record_websocket_failure(session, &fault.error);
+                    return Err(fault.error);
+                }
             }
         }
     }
@@ -776,4 +1002,29 @@ async fn send_sse(
         .await?;
     }
     Err(Error::Protocol("Failed after retries".into()))
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn https_proxy_requires_tls_before_sending_connect() -> Result<()> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let proxy = Url::parse(&format!("https://{}", listener.local_addr()?))?;
+        let target = Url::parse("wss://service.example/socket")?;
+        let observe = async {
+            let (mut stream, _) = listener.accept().await?;
+            let mut header = [0u8; 3];
+            stream.read_exact(&mut header).await?;
+            Ok::<_, std::io::Error>(header)
+        };
+        let (received, tunnel) = tokio::join!(observe, proxy_tunnel(&proxy, &target));
+        // TLS handshake record. The listener closes before presenting a certificate.
+        let header = received?;
+        assert_eq!(header[..2], [0x16, 0x03]);
+        assert!(tunnel.is_err());
+        Ok(())
+    }
 }

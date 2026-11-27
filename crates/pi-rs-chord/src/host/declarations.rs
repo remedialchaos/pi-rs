@@ -7,7 +7,9 @@ use crate::{
 };
 use std::sync::atomic::AtomicU64;
 type Method = Arc<dyn Fn(JsonValue, Ctx) -> SyncFuture<JsonValue> + Send + Sync>;
-type EventListener = Arc<dyn Fn(JsonValue) + Send + Sync>;
+type Keyed = Arc<dyn Fn(JsonValue) -> Result<Source> + Send + Sync>;
+pub type QueryBuilder = Arc<dyn Fn(JsonValue) -> Result<crate::store::Query> + Send + Sync>;
+type EventListener = Arc<dyn Fn(JsonValue, u64) + Send + Sync>;
 
 /// Native event broadcaster for contract `event` members.
 #[derive(Clone, Default)]
@@ -19,15 +21,31 @@ impl EventChannel {
     pub fn new() -> Self {
         Self::default()
     }
+    pub(crate) fn tapped(&self) -> bool {
+        !lock(&self.listeners).is_empty()
+    }
     pub fn emit(&self, payload: JsonValue) {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.emit_at(payload, at);
+    }
+    pub fn emit_at(&self, payload: JsonValue, at: u64) {
         let listeners: Vec<_> = lock(&self.listeners).values().cloned().collect();
         for listener in listeners {
-            listener(payload.clone());
+            listener(payload.clone(), at);
         }
     }
     pub fn subscribe(
         &self,
         listener: impl Fn(JsonValue) + Send + Sync + 'static,
+    ) -> EventSubscription {
+        self.subscribe_at(move |value, _| listener(value))
+    }
+    pub fn subscribe_at(
+        &self,
+        listener: impl Fn(JsonValue, u64) + Send + Sync + 'static,
     ) -> EventSubscription {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         lock(&self.listeners).insert(id, Arc::new(listener));
@@ -55,6 +73,8 @@ impl Drop for EventSubscription {
 pub struct Members {
     pub variant: String,
     pub state: IndexMap<String, Source>,
+    pub keyed: IndexMap<String, Keyed>,
+    pub queries: IndexMap<String, IndexMap<String, QueryBuilder>>,
     pub methods: IndexMap<String, Method>,
     pub events: IndexMap<String, EventChannel>,
 }
@@ -68,6 +88,8 @@ impl Members {
         Self {
             variant: crate::contracts::LOCAL.into(),
             state: IndexMap::new(),
+            keyed: IndexMap::new(),
+            queries: IndexMap::new(),
             methods: IndexMap::new(),
             events: IndexMap::new(),
         }
@@ -80,6 +102,8 @@ impl Members {
     }
     fn has_member(&self, name: &str) -> bool {
         self.state.contains_key(name)
+            || self.keyed.contains_key(name)
+            || self.queries.contains_key(name)
             || self.methods.contains_key(name)
             || self.events.contains_key(name)
     }
@@ -89,6 +113,30 @@ impl Members {
             return Err(Error::Invalid(format!("duplicate member {name}")));
         }
         self.state.insert(name, source);
+        Ok(())
+    }
+    pub fn keyed(
+        &mut self,
+        name: impl Into<String>,
+        resolve: impl Fn(JsonValue) -> Result<Source> + Send + Sync + 'static,
+    ) -> Result<()> {
+        let name = name.into();
+        if self.has_member(&name) {
+            return Err(Error::Invalid(format!("duplicate member {name}")));
+        }
+        self.keyed.insert(name, Arc::new(resolve));
+        Ok(())
+    }
+    pub fn queries(
+        &mut self,
+        name: impl Into<String>,
+        builders: IndexMap<String, QueryBuilder>,
+    ) -> Result<()> {
+        let name = name.into();
+        if self.has_member(&name) {
+            return Err(Error::Invalid(format!("duplicate member {name}")));
+        }
+        self.queries.insert(name, builders);
         Ok(())
     }
     pub fn method(

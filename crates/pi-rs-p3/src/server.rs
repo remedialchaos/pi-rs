@@ -629,11 +629,11 @@ async fn start_with(
         HttpOptions {
             links_path: Some("/chord".into()),
             remote: Arc::new(move |principal| route_sessions.remote_options(principal)),
-            opened: Arc::new(move |request: &pi_rs_chord::node::http::HttpRequest| {
+            opened_link: Arc::new(move |request, close| {
                 let hook = links.link_hooks().into_iter();
                 let mut ends = Vec::new();
                 for plugin in hook {
-                    if let Some(end) = plugin(request) {
+                    if let Some(end) = plugin(request, close.clone()) {
                         ends.push(end);
                     }
                 }

@@ -110,46 +110,11 @@ impl DocumentStore {
         };
         let version = u64::try_from(version)
             .map_err(|_| Error::Invalid("negative document version".into()))?;
-        let (mut value, mut deltas) = (JsonValue::Null, 0);
-        if load {
-            let mut statement=c.prepare_cached("SELECT kind,version,content FROM chord_revisions WHERE document_id=? AND seq >= (SELECT MAX(seq) FROM chord_revisions WHERE document_id=? AND kind='base') ORDER BY seq")?;
-            let rows = statement.query_map([id, id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?;
-            let mut found_base = false;
-            for row in rows {
-                let (kind, v, text) = row?;
-                if u64::try_from(v).ok() != Some(version) {
-                    return Err(Error::Invalid("document revision version mismatch".into()));
-                }
-                let data: JsonValue = serde_json::from_str(&text)?;
-                if kind == "base" {
-                    value = data;
-                    found_base = true;
-                    deltas = 0;
-                } else {
-                    if !found_base {
-                        return Err(Error::Invalid("document has no base".into()));
-                    }
-                    let JsonValue::Array(wire) = data else {
-                        return Err(Error::Invalid("invalid stored delta".into()));
-                    };
-                    let ops = wire
-                        .iter()
-                        .map(Op::from_json)
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    value = apply(value, &ops)?;
-                    deltas += 1;
-                }
-            }
-            if !found_base {
-                return Err(Error::Invalid("document has no base".into()));
-            }
-        }
+        let (value, deltas) = if load {
+            read_document_revision(c, id, version)?
+        } else {
+            (JsonValue::Null, 0)
+        };
         Ok(Some(Loaded {
             stored: Stored {
                 id,
@@ -279,4 +244,51 @@ impl DocumentStore {
             .map_or_else(Vec::new, |engine| engine.prepare_live(c));
         Ok((results, seq, runs))
     }
+}
+
+/// Replay the most recent base and its subsequent deltas in the active read transaction.
+pub(crate) fn read_document_revision(
+    c: &Connection,
+    id: i64,
+    version: u64,
+) -> Result<(JsonValue, usize)> {
+    let (mut value, mut deltas) = (JsonValue::Null, 0);
+    let mut statement=c.prepare_cached("SELECT kind,version,content FROM chord_revisions WHERE document_id=? AND seq >= (SELECT MAX(seq) FROM chord_revisions WHERE document_id=? AND kind='base') ORDER BY seq")?;
+    let rows = statement.query_map([id, id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut found_base = false;
+    for row in rows {
+        let (kind, v, text) = row?;
+        if u64::try_from(v).ok() != Some(version) {
+            return Err(Error::Invalid("document revision version mismatch".into()));
+        }
+        let data: JsonValue = serde_json::from_str(&text)?;
+        if kind == "base" {
+            value = data;
+            found_base = true;
+            deltas = 0;
+        } else {
+            if !found_base {
+                return Err(Error::Invalid("document has no base".into()));
+            }
+            let JsonValue::Array(wire) = data else {
+                return Err(Error::Invalid("invalid stored delta".into()));
+            };
+            let ops = wire
+                .iter()
+                .map(Op::from_json)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            value = apply(value, &ops)?;
+            deltas += 1;
+        }
+    }
+    if !found_base {
+        return Err(Error::Invalid("document has no base".into()));
+    }
+    Ok((value, deltas))
 }

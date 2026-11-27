@@ -306,7 +306,11 @@ impl SpeakRequest {
 
 async fn speak(State(server): State<VoiceServer>, body: Body) -> Response {
     let Ok(body) = to_bytes(body, BODY_LIMIT).await else {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error":"request body too large"})),
+        )
+            .into_response();
     };
     let request = serde_json::from_slice(&body)
         .map_err(Error::from)
@@ -338,9 +342,19 @@ async fn speak(State(server): State<VoiceServer>, body: Body) -> Response {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(error)) => {
             eprintln!("voice synthesis failed ({voice}): {error}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":error.to_string()})),
+            )
+                .into_response();
         }
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"synthesis task failed"})),
+            )
+                .into_response();
+        }
     };
     (
         [

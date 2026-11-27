@@ -15,9 +15,7 @@ use crate::{
     local_sign_in::{self, WebCookie},
     pi_glyph,
     radius_account::RadiusAccount,
-    server_config::{
-        Bundled, Environment, Launch, Preferences, ServerConfig, Source, environment, p2_directory,
-    },
+    server_config::{Bundled, Environment, Launch, Preferences, ServerConfig, Source, environment},
     server_controller::{Ownership, PROBE_INTERVAL, Phase, ServerController, State},
     server_scan::{self, FoundServer},
     updater, view_cookie,
@@ -104,7 +102,7 @@ enum Event {
     Renewed(u64, WebCookie),
     Prompt(String),
     OpenUrl(Url),
-    Install(PathBuf),
+    Install(tempfile::TempPath),
     Switch(ServerConfig),
     Quit,
     QuitReady,
@@ -165,23 +163,24 @@ define_class!(
         }
         #[unsafe(method(useOwn:))]
         fn use_own(&self,_:&AnyObject){let own=self.ivars().borrow().launch.own.clone();self.switch(own);}
-        #[unsafe(method(chooseCheckout:))]
-        fn checkout(&self,_:&AnyObject){
+        #[unsafe(method(chooseBinary:))]
+        fn choose_binary(&self,_:&AnyObject){
             let panel=NSOpenPanel::openPanel(self.mtm());
-            panel.setCanChooseDirectories(true);panel.setCanChooseFiles(false);panel.setMessage(Some(&NSString::from_str("Choose a pi-mono checkout or its apps/p2 directory")));
+            panel.setCanChooseDirectories(false);panel.setCanChooseFiles(true);panel.setMessage(Some(&NSString::from_str("Choose the p2 binary")));
             if panel.runModal()!=NSModalResponseOK{return;}
-            let selected=panel.URL().and_then(|u|u.path()).map(|s|PathBuf::from(s.to_string())).and_then(|p|p2_directory(&p));
+            let selected=panel.URL().and_then(|u|u.path()).map(|s|PathBuf::from(s.to_string()));
             if let Some(selected)=selected {
-                if let Err(error)=MacPreferences.set("checkout",selected.to_str()){self.alert("Could not save checkout",&error.to_string());return;}
+                if let Err(error)=MacPreferences.set("binary",selected.to_str()){self.alert("Could not save the p2 binary",&error.to_string());return;}
                 self.refresh_own();
-            } else {self.alert("No p2 in that directory","Choose a folder containing apps/p2/src/hosts/server.ts.");}
+            } else {self.alert("No p2 binary selected","Choose the native p2 binary this app runs.");}
         }
-        #[unsafe(method(forgetCheckout:))]
-        fn forget_checkout(&self,_:&AnyObject){let _=MacPreferences.set("checkout",None);self.refresh_own();}
+        #[unsafe(method(forgetBinary:))]
+        fn forget_binary(&self,_:&AnyObject){let _=MacPreferences.set("binary",None);self.refresh_own();}
         #[unsafe(method(showLog:))]
         fn show_log(&self,_:&AnyObject){
-            let ui=self.ivars().borrow();let path=ui.launch.home.join(format!("Library/Logs/Pi/server-{}.log",ui.model.config.port));
-            let _=NSWorkspace::sharedWorkspace().openURL(&NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())));
+            let path={let ui=self.ivars().borrow();ui.launch.home.join(format!("Library/Logs/Pi/server-{}.log",ui.model.config.port))};
+            // Console reads the log file itself, like the menu says.
+            let _=std::process::Command::new("/usr/bin/open").args(["-a","Console",&path.to_string_lossy()]).spawn();
         }
         #[unsafe(method(signInRadius:))]
         fn signin(&self,_:&AnyObject){ self.sign_in(); }
@@ -345,9 +344,28 @@ impl AppDelegate {
                     }
                 }
                 Event::Install(path) => {
-                    let _ = NSWorkspace::sharedWorkspace().openURL(&NSURL::fileURLWithPath(
-                        &NSString::from_str(&path.to_string_lossy()),
-                    ));
+                    // The update replaces the app bundle in place; the running app keeps working
+                    // and the next launch runs the new bundle.
+                    let current = PathBuf::from(NSBundle::mainBundle().bundlePath().to_string());
+                    let outcome = (|| -> crate::Result<()> {
+                        if current.extension().and_then(|s| s.to_str()) != Some("app") {
+                            return Err(crate::Error::Protocol(
+                                "the running executable is outside an app bundle".into(),
+                            ));
+                        }
+                        let parent = current.parent().ok_or_else(|| {
+                            crate::Error::Protocol("the app bundle has no parent".into())
+                        })?;
+                        let staging = tempfile::tempdir_in(parent)?;
+                        let staged = updater::stage_bundle(&path, staging.path())?;
+                        updater::replace_bundle(&current, &staged)
+                    })();
+                    match outcome {
+                        Ok(()) => self.alert("Pi", "Pi was updated. Restart Pi to use it."),
+                        Err(error) => {
+                            self.alert("Could not install the update", &error.to_string())
+                        }
+                    }
                 }
                 Event::Switch(config) => self.apply_switch(config),
                 Event::Quit => NSApplication::sharedApplication(self.mtm()).terminate(None),
@@ -502,18 +520,30 @@ impl AppDelegate {
         };
         let label = status_text(&ui.phase.phase);
         menu.addItem(&entry(&label, None));
-        menu.addItem(&entry(
-            &format!(
-                "127.0.0.1:{} · {}",
-                ui.model.config.port,
-                ui.model.config.data_dir.display()
-            ),
-            None,
+        let mut detail = format!(
+            "127.0.0.1:{} · {}",
+            ui.model.config.port,
+            crate::server_config::abbreviate(&ui.launch.home, &ui.model.config.data_dir)
+        );
+        if ui.phase.ownership == Ownership::External || ui.model.config.source == Source::Attached {
+            detail.push_str(if dev_control::available(&ui.model.config.data_dir) {
+                " · run elsewhere (dev)"
+            } else {
+                " · run elsewhere"
+            });
+        }
+        menu.addItem(&entry(&detail, None));
+        menu.addItem(&NSMenuItem::separatorItem(m));
+        menu.addItem(&main_menu::item(
+            "Open Pi",
+            Some(sel!(openPi:)),
+            "o",
+            Some(self as &AnyObject),
+            m,
         ));
         menu.addItem(&NSMenuItem::separatorItem(m));
-        menu.addItem(&entry("Open Pi", Some(sel!(openPi:))));
-        if ui.phase.ownership == Ownership::Managed && ui.phase.phase != Phase::Stopping {
-            menu.addItem(&entry("Stop Pi", Some(sel!(stopServer:))));
+        if can_start(&ui.model.config, &ui.phase) {
+            menu.addItem(&entry("Start Pi", Some(sel!(startServer:))));
         }
         if ui.phase.phase == Phase::Running
             && (ui.phase.ownership == Ownership::Managed
@@ -521,8 +551,8 @@ impl AppDelegate {
         {
             menu.addItem(&entry("Restart Pi", Some(sel!(restartServer:))));
         }
-        if can_start(&ui.model.config, &ui.phase) {
-            menu.addItem(&entry("Start Pi", Some(sel!(startServer:))));
+        if ui.phase.ownership == Ownership::Managed && ui.phase.phase != Phase::Stopping {
+            menu.addItem(&entry("Stop Pi", Some(sel!(stopServer:))));
         }
         if ui.model.config.source == Source::Own
             && ui
@@ -542,6 +572,7 @@ impl AppDelegate {
         if ui.launch.brains.is_some() {
             menu.addItem(&entry("Radius: brains from P2MAC_BRAINS", None));
         } else if ui.model.radius.signed_in() {
+            menu.addItem(&entry("Signed in to Radius · with this Mac's Pi", None));
             menu.addItem(&entry("Sign Out of Radius", Some(sel!(signOutRadius:))));
         } else {
             menu.addItem(&entry("Sign In to Radius…", Some(sel!(signInRadius:))));
@@ -556,9 +587,16 @@ impl AppDelegate {
             None,
         ));
         for (i, server) in ui.found.iter().enumerate() {
-            let mut title = format!("127.0.0.1:{} · {}", server.port, server.data_dir.display());
+            let mut title = format!(
+                "127.0.0.1:{} · {}",
+                server.port,
+                crate::server_config::abbreviate(&ui.launch.home, &server.data_dir)
+            );
             if let Some(checkout) = &server.checkout {
-                title.push_str(&format!(" · {}", checkout.display()));
+                title.push_str(&format!(
+                    " · {}",
+                    crate::server_config::abbreviate(&ui.launch.home, checkout)
+                ));
             }
             if server.dev {
                 title.push_str(" · dev");
@@ -579,20 +617,25 @@ impl AppDelegate {
         let label = if ui.launch.own.runs_bundled {
             "Run Pi from This App".into()
         } else {
-            ui.launch.own.checkout.as_ref().map_or_else(
+            ui.launch.own.binary.as_ref().map_or_else(
                 || "Run Pi from a Checkout".into(),
-                |p| format!("Run Pi from {}", p.display()),
+                |p| {
+                    format!(
+                        "Run Pi from {}",
+                        crate::server_config::abbreviate(&ui.launch.home, p)
+                    )
+                },
             )
         };
         servers.addItem(&entry(
             &label,
-            ui.launch.own.checkout.as_ref().map(|_| sel!(useOwn:)),
+            ui.launch.own.binary.as_ref().map(|_| sel!(useOwn:)),
         ));
-        servers.addItem(&entry("Choose p2 Checkout…", Some(sel!(chooseCheckout:))));
+        servers.addItem(&entry("Choose p2 Binary…", Some(sel!(chooseBinary:))));
         if ui.bundled.is_some() && !ui.launch.own.runs_bundled {
             servers.addItem(&entry(
                 "Use This App's Pi Instead of the Checkout",
-                Some(sel!(forgetCheckout:)),
+                Some(sel!(forgetBinary:)),
             ));
         }
         menu.addItem(&NSMenuItem::separatorItem(m));
@@ -997,13 +1040,11 @@ impl AppDelegate {
                             let bytes = updater::download_verified(&update, &key).await?;
                             let mut file = tempfile::Builder::new()
                                 .prefix("pi-update-")
-                                .suffix(".dmg")
+                                .suffix(".tar")
                                 .tempfile()?;
                             file.write_all(&bytes)?;
                             file.as_file().sync_all()?;
-                            file.keep()
-                                .map(|(_, path)| path)
-                                .map_err(|e| Error::Io(e.error))
+                            Ok::<_, Error>(file.into_temp_path())
                         }
                         .await;
                         let _ = out.send(match result {
@@ -1212,7 +1253,6 @@ fn bundle_string(key: &str) -> Option<String> {
 }
 fn can_start(config: &ServerConfig, state: &State) -> bool {
     config.source == Source::Own
-        && config.checkout.is_some()
         && state.ownership == Ownership::None
         && matches!(
             state.phase,

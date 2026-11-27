@@ -6,4 +6,5 @@ mod source;
 pub use batch::{Batch, BatchError};
 pub use native::{NativeObservation, NativeSource};
 pub use shared::{MapShared, map_shared};
+pub(crate) use source::WeakSource;
 pub use source::{Constant, Source, Subscription, constant};

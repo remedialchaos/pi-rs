@@ -10,7 +10,7 @@ use std::{
 
 /// p3's version.
 pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    "0.0.1"
 }
 
 /// The hidden first argument of a session worker process.

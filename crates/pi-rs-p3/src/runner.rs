@@ -176,6 +176,8 @@ pub struct ProcessLauncher;
 impl WorkerLauncher for ProcessLauncher {
     fn launch(&self, launch: WorkerLaunch) -> Result<Arc<dyn WorkerTransport>, RunnerError> {
         let mut command = Command::new(&launch.spec.executable);
+        #[cfg(unix)]
+        command.process_group(0);
         command
             .args(&launch.spec.args)
             .envs(launch.env.iter().map(|(key, value)| (key, value)))
@@ -193,10 +195,23 @@ impl WorkerLauncher for ProcessLauncher {
         match (stdin, stdout) {
             (Some(mut stdin), Some(mut stdout)) => {
                 let (exit_code, exit) = watch::channel(None);
+                let kill = Arc::new(tokio::sync::Notify::new());
+                let kill_request = kill.clone();
                 tokio::spawn(async move {
-                    let code = child
-                        .wait()
-                        .await
+                    let status = tokio::select! {
+                        status = child.wait() => status,
+                        _ = kill_request.notified() => {
+                            #[cfg(unix)]
+                            let group_killed = pid.is_some_and(crate::unix_signal::kill_group);
+                            #[cfg(not(unix))]
+                            let group_killed = false;
+                            if !group_killed {
+                                let _ = child.start_kill();
+                            }
+                            child.wait().await
+                        }
+                    };
+                    let code = status
                         .ok()
                         .and_then(|status| status.code())
                         .map(|code| code.max(0) as u32)
@@ -232,6 +247,7 @@ impl WorkerLauncher for ProcessLauncher {
                     reader_link.ended();
                 });
                 Ok(Arc::new(ProcessTransport {
+                    kill,
                     pid,
                     outgoing: out_tx,
                     controls: Arc::new(AsyncMutex::new(ctrl_rx)),
@@ -251,6 +267,7 @@ impl WorkerLauncher for ProcessLauncher {
 }
 
 struct ProcessTransport {
+    kill: Arc<tokio::sync::Notify>,
     pid: Option<u32>,
     outgoing: mpsc::Sender<IpcFrame>,
     controls: Arc<AsyncMutex<mpsc::Receiver<FromWorker>>>,
@@ -299,18 +316,9 @@ impl WorkerTransport for ProcessTransport {
     }
 
     fn kill(&self) -> RunnerFuture<()> {
-        let pid = self.pid;
+        let kill = self.kill.clone();
         Box::pin(async move {
-            // The child waits in a task of its own (a `wait` under a shared lock would deadlock a
-            // kill). Without `libc::kill` (unsafe, forbidden here) the system utility signals it.
-            if let Some(pid) = pid {
-                let _ = std::process::Command::new("kill")
-                    .arg("-KILL")
-                    .arg(pid.to_string())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
+            kill.notify_one();
             Ok(())
         })
     }

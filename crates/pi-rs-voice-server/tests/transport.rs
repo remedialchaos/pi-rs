@@ -396,6 +396,30 @@ async fn invalid_http_inputs_use_exact_validation_messages_and_body_limit() -> T
         .send()
         .await?;
     assert_eq!(response.status(), 413);
+    // The body says what went wrong, so a client does not have to guess from the status.
+    assert_eq!(
+        response.json::<Value>().await?,
+        json!({"error":"request body too large"})
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_synthesis_returns_an_error_body() -> Test {
+    let server = Server::start("supertonic", None, None, None).await?;
+    let client = client()?;
+    let response = client
+        .post(format!("{}/speak", server.http))
+        .bearer_auth(TOKEN)
+        .json(&json!({"text":"fail"}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 500);
+    // The body says what went wrong, so a client does not have to guess from the status.
+    assert_eq!(
+        response.json::<Value>().await?,
+        json!({"error":"synthesis exploded"})
+    );
     Ok(())
 }
 

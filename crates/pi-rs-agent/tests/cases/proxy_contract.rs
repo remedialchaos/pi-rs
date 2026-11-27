@@ -146,6 +146,42 @@ async fn posts_normalized_transcript_and_allowlisted_options_only() -> TestResul
 }
 
 #[tokio::test]
+async fn always_sends_continuation_headers_and_metadata_fields() -> TestResult {
+    let (requests, captured) = oneshot::channel();
+    let requests = Arc::new(Mutex::new(Some(requests)));
+    let server = serve(Router::new().route(
+        "/api/stream",
+        post(move |Json(body): Json<Value>| {
+            let requests = requests.clone();
+            async move {
+                if let Some(send) = locked(&requests).take() {
+                    let _ = send.send(body);
+                }
+                sse(Body::from(frame(
+                    json!({"type":"done","reason":"stop","usage":usage()}),
+                )))
+            }
+        }),
+    ))
+    .await?;
+    let options = options(&server)?;
+    let agent = Agent::new(AgentOptions {
+        stream_options: options.stream,
+        proxy: Some(options.proxy),
+        ..AgentOptions::default()
+    })?;
+    agent.set_model(model());
+    agent.prompt("hello").await?;
+    let body = timeout(Duration::from_secs(2), captured).await??;
+    // The proxy server reads these as present, so they are always on the wire, even when
+    // they carry no value.
+    assert_eq!(body["options"]["disableContinuation"], json!(false));
+    assert_eq!(body["options"]["headers"], json!({}));
+    assert_eq!(body["options"]["metadata"], json!({}));
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconstructs_interleaved_content_signatures_and_tool_metadata() -> TestResult {
     let release = Arc::new(Notify::new());
     let release_handler = release.clone();

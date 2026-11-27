@@ -234,30 +234,26 @@ impl RemotePeer {
                         })?;
                     (entry.held.clone(), name)
                 };
-                let args = if let Some(args) = args {
-                    if self.0.options.role == LinkRole::Child
-                        && matches!(args.part, Part::Deflated(_))
-                    {
-                        return Err(Error::Invalid(
-                            "child arguments must not be compressed".into(),
-                        ));
-                    }
-                    if args.segments.is_some() {
+                let contract = held.0.contract();
+                let declaration =
+                    contract.current().variants[&held.0.variant()?].methods[&held.1].clone();
+                if self.0.options.role == LinkRole::Child
+                    && args
+                        .as_ref()
+                        .is_some_and(|v| matches!(v.part, Part::Deflated(_)))
+                {
+                    return Err(Error::Invalid(
+                        "child arguments must not be compressed".into(),
+                    ));
+                }
+                let args = match payload::decode(args, &declaration.args, self.0.options.trusted) {
+                    Ok(value) => value,
+                    Err(error) => {
                         return self.send(Body::Error {
                             call,
-                            error: wire_error(
-                                &ChordError::invalid(
-                                    "args",
-                                    "JSON methods do not accept byte segments",
-                                    None,
-                                )
-                                .into(),
-                            )?,
+                            error: wire_error(&error)?,
                         });
                     }
-                    args.part.parse(Limits::for_link(self.0.options.trusted))?
-                } else {
-                    JsonValue::Null
                 };
                 let (context, cancel) = Context::background().with_cancel();
                 let key = Arc::new(());
@@ -274,17 +270,10 @@ impl RemotePeer {
                     let result = held.0.call(&held.1, args, &context).await;
                     let reply = result
                         .and_then(|value| {
-                            if value == JsonValue::Null {
-                                Ok(Body::Result { call, value: None })
-                            } else {
-                                Ok(Body::Result {
-                                    call,
-                                    value: Some(Payload {
-                                        part: Part::origin(value.to_json()?, true)?,
-                                        segments: None,
-                                    }),
-                                })
-                            }
+                            Ok(Body::Result {
+                                call,
+                                value: payload::encode(value, &declaration.result, true)?,
+                            })
                         })
                         .or_else(|error| {
                             Ok::<Body, Error>(Body::Error {
@@ -375,6 +364,7 @@ impl RemotePeer {
                 cancel,
                 _observation: Some(observation),
                 subscriptions: Vec::new(),
+                events: Vec::new(),
                 methods: Vec::new(),
             },
         );
@@ -389,6 +379,7 @@ impl RemotePeer {
             return Ok(());
         };
         entry.subscriptions.clear();
+        entry.events.clear();
         entry.methods.clear();
         let held = &entry.held;
         match state {
@@ -463,6 +454,36 @@ impl RemotePeer {
                         |_| {},
                     );
                     subscriptions.push(subscription);
+                }
+                for (member, name) in names.events.iter().enumerate() {
+                    let weak = Arc::downgrade(&self.0);
+                    let listener = move |payload: JsonValue, at: u64| {
+                        let Some(inner) = weak.upgrade() else { return };
+                        let peer = RemotePeer(inner);
+                        let result = (|| {
+                            let value = Part::origin(payload.to_json()?, true)?;
+                            {
+                                let mut flow = lock(&peer.0.replica);
+                                if flow.events_in_flight >= peer.0.options.event_window {
+                                    return Ok(());
+                                }
+                                flow.events_in_flight += 1;
+                            }
+                            peer.send(Body::Event(vec![crate::link::WireEvent {
+                                hold: id,
+                                member: member as u64,
+                                at,
+                                value,
+                            }]))
+                        })();
+                        if let Err(error) = result {
+                            (peer.0.options.report)(error.to_string());
+                        }
+                    };
+                    entry.events.push(match held {
+                        Provided::Local(held) => held.subscribe_event_at(name, listener)?,
+                        Provided::Routed(held) => held.subscribe_event_at(name, listener)?,
+                    });
                 }
                 entry.methods = names.methods;
                 entry.subscriptions = subscriptions;

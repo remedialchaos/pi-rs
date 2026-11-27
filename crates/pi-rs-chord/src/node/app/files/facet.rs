@@ -61,8 +61,7 @@ fn file_schema() -> JsonValue {
     ])
 }
 
-/// The host-wide Files contract. Native methods carry bytes as arrays of octets;
-/// `summary` is an observable map indexed by space.
+/// The host-wide Files contract with binary chunks and a live summary per space.
 pub fn files_contract() -> Result<Contract> {
     let obj = |keys: &[&'static str]| s::obj(keys.iter().map(|&key| (key, s::required(s::str()))));
     let int = |min: f64, max| {
@@ -74,9 +73,8 @@ pub fn files_contract() -> Result<Contract> {
             },
         )
     };
-    let octets = s::arr(int(0., Some(255.))?);
     let piece = s::bounded(
-        octets,
+        s::bytes(),
         s::Bounds {
             min: None,
             max: Some(CHUNK as f64),
@@ -149,7 +147,7 @@ pub fn files_contract() -> Result<Contract> {
         2,
         vec![],
         IndexMap::from([
-            ("summary".into(), Member::State(s::map(summary))),
+            ("summary".into(), s::keyed(summary, None)),
             (
                 "put".into(),
                 s::method(Some(s::obj(put)), Some(file.clone())),
@@ -256,9 +254,19 @@ impl Files {
             let storage = files.clone();
             host.serve(
                 contract.clone(),
-                move |_, _, this| {
+                move |_, _, _| {
                     let mut members = Members::new();
-                    members.state("summary", this.follow_source(storage.0.summary.clone())?)?;
+                    let summaries = storage.clone();
+                    members.keyed("summary", move |key| {
+                        let space = key
+                            .to_serde()?
+                            .as_str()
+                            .ok_or_else(|| {
+                                ChordError::invalid("space", "expected a space name", None)
+                            })?
+                            .to_owned();
+                        summaries.summary_source(space)
+                    })?;
                     for method in METHODS.into_iter().chain(["removeSpace"]) {
                         let storage = storage.clone();
                         members.method(method, move |args, _| {

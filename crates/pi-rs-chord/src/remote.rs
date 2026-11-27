@@ -24,6 +24,7 @@ use std::{
     },
 };
 use tokio::sync::{Semaphore, oneshot, watch};
+mod payload;
 mod provider;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkRole {
@@ -50,6 +51,7 @@ pub struct RemoteOptions {
     pub trusted: bool,
     pub codec: Codec,
     pub call_window: usize,
+    pub event_window: usize,
     pub report: Arc<dyn Fn(String) + Send + Sync>,
     /// Resolve a forward destination. `Ok(None)` dispatches locally.
     pub route: Option<HoldRouter>,
@@ -64,6 +66,7 @@ impl RemoteOptions {
             trusted: false,
             codec: Codec::Binary,
             call_window: 64,
+            event_window: 32,
             report: Arc::new(|_| {}),
             route: None,
             route_contracts: BTreeMap::new(),
@@ -73,6 +76,7 @@ impl RemoteOptions {
 struct Outgoing {
     hold: u64,
     reply: oneshot::Sender<Result<JsonValue>>,
+    result: crate::contracts::Snapshot,
 }
 struct Serving {
     key: Arc<()>,
@@ -80,6 +84,7 @@ struct Serving {
     cancel: Cancel,
     _observation: Option<crate::state::NativeObservation<RefState>>,
     subscriptions: Vec<Subscription>,
+    events: Vec<crate::host::EventSubscription>,
     methods: Vec<String>,
 }
 #[derive(Clone)]
@@ -102,6 +107,7 @@ struct ReplicaFlow {
     pending: Vec<StateEntry>,
     scheduled: bool,
     in_flight: usize,
+    events_in_flight: usize,
     queued: std::collections::VecDeque<Body>,
 }
 #[derive(Default)]
@@ -192,6 +198,7 @@ struct Reference {
     changed: watch::Sender<u64>,
     variant: Mutex<Option<String>>,
     members: Mutex<IndexMap<String, Source>>,
+    events: Mutex<IndexMap<String, crate::host::EventChannel>>,
     decoders: Mutex<Vec<Decoder>>,
     released: AtomicBool,
     sent_epoch: AtomicU64,
@@ -631,6 +638,7 @@ impl RemotePeer {
             changed,
             variant: Mutex::new(None),
             members: Mutex::new(IndexMap::new()),
+            events: Mutex::new(IndexMap::new()),
             decoders: Mutex::new(Vec::new()),
             released: AtomicBool::new(false),
             sent_epoch: AtomicU64::new(0),
@@ -764,18 +772,8 @@ impl RemotePeer {
             }
             Body::Result { call, value } => {
                 if let Some(call) = lock(&self.0.outgoing).remove(&call) {
-                    let value = match value {
-                        Some(value) => {
-                            if value.segments.is_some() {
-                                return Err(Error::Invalid(
-                                    "JSON reference received byte segments".into(),
-                                ));
-                            }
-                            value.part.parse(Limits::for_link(self.0.options.trusted))?
-                        }
-                        None => JsonValue::Null,
-                    };
-                    let _ = call.reply.send(Ok(value));
+                    let value = payload::decode(value, &call.result, self.0.options.trusted);
+                    let _ = call.reply.send(value);
                 }
             }
             Body::Error { call, error } => {
@@ -826,14 +824,43 @@ impl RemotePeer {
                 }
             }
             Body::Ack { events: None } => self.acknowledge_replica()?,
-            Body::Ack { events: Some(_) } | Body::Revoke(_) => {}
+            Body::Ack {
+                events: Some(count),
+            } => {
+                let mut flow = lock(&self.0.replica);
+                flow.events_in_flight = flow
+                    .events_in_flight
+                    .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
+            }
+            Body::Revoke(_) => {}
             Body::Event(events) => {
-                self.send(Body::Ack { events: Some(1) })?;
-                if !events.is_empty() {
-                    return Err(Error::Invalid(
-                        "event members are not subscribed by this reference".into(),
-                    ));
+                for event in events {
+                    let Some(reference) = self.reference(event.hold) else {
+                        continue;
+                    };
+                    if !matches!(reference.state.value(), RefState::Live) {
+                        continue;
+                    }
+                    let Some(variant) = lock(&reference.variant).clone() else {
+                        continue;
+                    };
+                    let names = reference.contract.variant_member_names(Some(&variant))?;
+                    let name = names
+                        .events
+                        .get(event.member as usize)
+                        .ok_or_else(|| Error::Invalid("unknown event index".into()))?;
+                    let channel = lock(&reference.events).get(name).cloned();
+                    if let Some(channel) = channel.filter(crate::host::EventChannel::tapped) {
+                        let value =
+                            match event.value.parse(Limits::for_link(self.0.options.trusted)) {
+                                Ok(value) => value,
+                                Err(Error::Chord(error)) if error.code == "too_large" => continue,
+                                Err(error) => return Err(error),
+                            };
+                        channel.emit_at(value, event.at);
+                    }
                 }
+                self.send(Body::Ack { events: Some(1) })?;
             }
             _ => {}
         }
@@ -978,6 +1005,35 @@ impl Reference {
     }
 }
 impl RemoteReference {
+    pub fn subscribe_event(
+        &self,
+        name: &str,
+        listener: impl Fn(JsonValue) + Send + Sync + 'static,
+    ) -> Result<crate::host::EventSubscription> {
+        self.subscribe_event_at(name, move |value, _| listener(value))
+    }
+    pub fn subscribe_event_at(
+        &self,
+        name: &str,
+        listener: impl Fn(JsonValue, u64) + Send + Sync + 'static,
+    ) -> Result<crate::host::EventSubscription> {
+        if !self
+            .0
+            .contract
+            .current()
+            .variants
+            .values()
+            .any(|variant| variant.events.contains_key(name))
+        {
+            return Err(
+                ChordError::invalid("event", format!("unknown event member {name}"), None).into(),
+            );
+        }
+        Ok(lock(&self.0.events)
+            .entry(name.into())
+            .or_default()
+            .subscribe_at(listener))
+    }
     pub fn state(&self) -> NativeSource<RefState> {
         self.0.state.clone()
     }
@@ -1029,6 +1085,12 @@ impl RemoteReference {
             .variant()
             .ok_or_else(|| ChordError::new("not_ready", "reference is not bound"))?;
         let names = self.0.contract.variant_member_names(Some(&variant))?;
+        let declaration = self.0.contract.current().variants[&variant]
+            .methods
+            .get(method)
+            .cloned()
+            .ok_or_else(|| ChordError::invalid("member", "unknown method", None))?;
+        let payload = payload::encode(args, &declaration.args, false)?;
         let method = names
             .methods
             .iter()
@@ -1046,6 +1108,7 @@ impl RemoteReference {
             call,
             Outgoing {
                 hold: self.0.id,
+                result: declaration.result,
                 reply,
             },
         );
@@ -1058,14 +1121,7 @@ impl RemoteReference {
             call,
             hold: self.0.id,
             method: method as u64,
-            args: if args == JsonValue::Null {
-                None
-            } else {
-                Some(Payload {
-                    part: Part::Text(args.to_json()?),
-                    segments: None,
-                })
-            },
+            args: payload,
         })?;
         let result = context
             .await_with(receive)

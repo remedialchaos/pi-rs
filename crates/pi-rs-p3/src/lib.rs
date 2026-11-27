@@ -13,7 +13,12 @@
 //! `pi-rs-chord` does not yet route objects by host address (the `2.1b-3` orchestration gap), so
 //! `p3` keeps one local seam for it: [`server::SessionRouter`] decides whether a session exists,
 //! admits a principal, and asks a [`runner::WorkerRunner`] to start its worker. See `MILESTONE.md`.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+#[cfg(unix)]
+mod unix_signal;
+#[cfg(windows)]
+mod windows_signal;
 
 pub mod api;
 pub mod app;

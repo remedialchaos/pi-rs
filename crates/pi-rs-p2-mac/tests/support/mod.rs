@@ -6,8 +6,8 @@ use url::Url;
 pub type Test<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub fn sandbox() -> Test<tempfile::TempDir> {
-    let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-    std::fs::create_dir_all(&target)?;
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(target)?;
     Ok(tempfile::tempdir_in(target)?)
 }
 

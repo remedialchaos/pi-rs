@@ -104,6 +104,15 @@ impl CodemodeSandbox {
             .tools
             .clone())
     }
+    /// The sandbox's globals, like upstream's `globals` getter.
+    pub fn globals(&self) -> Result<Vec<CodemodeTool>, HostError> {
+        Ok(self
+            .options
+            .lock()
+            .map_err(|e| HostError(e.to_string()))?
+            .globals
+            .clone())
+    }
     pub async fn execute(
         &self,
         code: &str,
@@ -112,28 +121,26 @@ impl CodemodeSandbox {
         self.drive(code, options, None).await
     }
     pub fn start(&self, code: &str, options: RunOptions) -> Result<CodemodeRun, HostError> {
+        if self.closed.is_cancelled() {
+            return Err(HostError("Sandbox is closed".into()));
+        }
         if !options.started_at.is_finite() || options.started_at < 0.0 {
             return Err(HostError(
-                "startedAt must be a finite non-negative number".into(),
+                "startedAt must be a non-negative number of milliseconds since the epoch".into(),
             ));
         }
         let mut names = HashSet::new();
         let mut aliases = HashSet::new();
         for tool in &options.tools {
             if !names.insert(&tool.name) {
-                return Err(HostError(format!(
-                    "Tool {:?} is already declared",
-                    tool.name
-                )));
+                return Err(HostError("Tool names must be unique".into()));
             }
             let alias = match &tool.js_name {
                 Some(alias) => alias.clone(),
                 None => to_codemode_identifier(tool.name.clone()).map_err(HostError)?,
             };
-            if !aliases.insert(alias.clone()) {
-                return Err(HostError(format!(
-                    "Tool script names must be unique: {alias:?} is already declared"
-                )));
+            if !aliases.insert(alias) {
+                return Err(HostError("Tool script names must be unique".into()));
             }
         }
         validate_globals(&options.globals)?;

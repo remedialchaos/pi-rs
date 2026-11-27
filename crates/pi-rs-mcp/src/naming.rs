@@ -12,11 +12,13 @@ const MAX_TOOL_NAME_LENGTH: usize = 64;
 /// call it by. `is_taken` reports names used by a different MCP tool: sanitizing can map two tools
 /// to one name (`a-b` and `a_b`), which then get the hash suffix.
 pub fn create_mcp_tool_name(server: &str, tool: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    // JavaScript's `.replace(/[^A-Za-z0-9_]/g, "_")` works per UTF-16 code unit, so a
+    // character outside the Basic Multilingual Plane contributes two underscores, not one.
     let name: String = format!("mcp__{server}__{tool}")
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
+        .encode_utf16()
+        .map(|unit| {
+            if unit < 128 && (unit as u8).is_ascii_alphanumeric() || unit == u16::from(b'_') {
+                char::from(unit as u8)
             } else {
                 '_'
             }

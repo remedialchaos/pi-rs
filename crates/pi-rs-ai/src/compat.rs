@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use indexmap::IndexMap;
 
@@ -8,7 +8,7 @@ use crate::event_stream::AssistantMessageEventStream;
 use crate::model::{Api, ImageApi, ImageModel, Model};
 use crate::openrouter_images::ImagesOptions;
 use crate::providers::{builtin_provider_specs, materialize};
-use crate::registry::{ImageGenerator, Models};
+use crate::registry::{ImageGenerator, Models, ModelsOptions};
 use crate::request::{ProviderEnv, StreamOptions, provider_env_value};
 use crate::transcript::normalize_context;
 use crate::types::{AssistantImages, Context, FinalMessage, ImagesContext, TranscriptContext};
@@ -193,6 +193,30 @@ pub fn get_env_api_key(provider: &str, env: &ProviderEnv) -> Result<Option<Strin
     }
     Ok(None)
 }
+/// The built-in providers, resolved through `Models` so stored `auth.json` credentials,
+/// OAuth refresh, Bedrock/Vertex ambient auth and the `x-opencode-session` header apply.
+static BUILTIN_MODELS: LazyLock<std::result::Result<Models, String>> = LazyLock::new(|| {
+    Models::builtin(ModelsOptions {
+        credentials: Arc::new(crate::auth::default_credential_store()),
+        ..ModelsOptions::default()
+    })
+    .map_err(|e| e.to_string())
+});
+fn builtin_models() -> Result<&'static Models> {
+    BUILTIN_MODELS
+        .as_ref()
+        .map_err(|e| Error::ModelSource(e.clone()))
+}
+
+/// True when the model belongs to a built-in catalog provider and that provider serves the
+/// model's API, like upstream's `getBuiltinProviderForModel`.
+fn is_builtin_provider_model(model: &Model) -> bool {
+    Catalog::embedded().is_ok_and(|catalog| {
+        catalog
+            .chat_models(&model.provider)
+            .is_some_and(|models| models.values().any(|entry| entry.api == model.api))
+    })
+}
 fn dispatch(
     mut model: Model,
     context: Context,
@@ -211,20 +235,20 @@ fn dispatch(
         .api_key
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
+    // Cloudflare keeps its direct path when the caller already resolved its binding
+    // authorization, like upstream's `hasResolvedCloudflareAuth`.
+    let cloudflare_resolved = explicit
+        || opts.request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cf-aig-authorization") && value.is_some()
+        });
     if builtin
-        && model.provider.starts_with("cloudflare-")
-        && !explicit
-        && !opts
-            .request
-            .headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("cf-aig-authorization") && v.is_some())
+        && !(model.provider.starts_with("cloudflare-") && cloudflare_resolved)
+        && is_builtin_provider_model(&model)
     {
-        static MODELS: OnceLock<std::result::Result<Models, String>> = OnceLock::new();
-        let models = MODELS
-            .get_or_init(|| Models::builtin(Default::default()).map_err(|e| e.to_string()))
-            .as_ref()
-            .map_err(|e| Error::ModelSource(e.clone()))?;
+        // Built-in providers resolve their provider through `Models`, so stored
+        // `auth.json` credentials, OAuth refresh, Bedrock/Vertex ambient auth and the
+        // `x-opencode-session` header apply to every one of them.
+        let models = builtin_models()?;
         return Ok(if simple {
             models.stream_simple(model, context, opts)
         } else {

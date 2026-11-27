@@ -601,3 +601,27 @@ async fn pi_messages_preserves_server_rewrites_and_rejects_sparse_indices() -> T
     assert_eq!(captures[0].json()?["options"]["maxTokens"], 1024);
     Ok(())
 }
+
+#[tokio::test]
+async fn mistral_times_out_after_sixty_seconds_waiting_for_response_headers() -> TestResult {
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{Duration, advance, pause, timeout};
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let m = model(Api::MistralConversations, "mistral", "mistral-test", &base)?;
+    let mut options = stream_options()?;
+    options.request.timeout_ms = None;
+    let stream = mistral::stream_simple(m, normalize_context(context()?), options)?;
+    let (mut peer, _) = listener.accept().await?;
+    peer.read_u8().await?;
+    pause();
+    advance(Duration::from_secs(60)).await;
+    let end = timeout(Duration::from_secs(1), stream.result()).await??;
+    assert_eq!(end.stop_reason, StopReason::Error);
+    assert_eq!(
+        end.error_message.as_deref(),
+        Some("Mistral response headers timed out after 60000ms")
+    );
+    Ok(())
+}

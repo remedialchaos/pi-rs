@@ -14,52 +14,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
-/// Canonicalizes well-formed BCP 47 tags. CLDR alias/likely-subtag data belongs to the platform adapter.
+/// Return the canonical BCP 47 spelling, including CLDR aliases.
 pub fn canonical_locale(locale: &str) -> Option<String> {
-    let parts = locale.split('-').collect::<Vec<_>>();
-    let first = *parts.first()?;
-    if !(2..=8).contains(&first.len()) || !first.bytes().all(|b| b.is_ascii_alphabetic()) {
+    if locale.contains('_') {
         return None;
     }
-    let language = match first.to_ascii_lowercase().as_str() {
-        "iw" => "he".into(),
-        "in" => "id".into(),
-        "ji" => "yi".into(),
-        other => other.into(),
-    };
-    let mut out = vec![language];
-    let mut seen = BTreeSet::new();
-    let mut extension = false;
-    for (index, part) in parts.iter().enumerate().skip(1) {
-        if part.is_empty() || part.len() > 8 || !part.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return None;
-        }
-        let lower = part.to_ascii_lowercase();
-        if part.len() == 1 {
-            if index + 1 == parts.len() || !seen.insert(lower.clone()) {
-                return None;
-            }
-            extension = true;
-            out.push(lower);
-        } else if !extension && part.len() == 4 && part.bytes().all(|b| b.is_ascii_alphabetic()) {
-            let mut value = lower;
-            value[..1].make_ascii_uppercase();
-            out.push(value);
-        } else if !extension
-            && ((part.len() == 2 && part.bytes().all(|b| b.is_ascii_alphabetic()))
-                || (part.len() == 3 && part.bytes().all(|b| b.is_ascii_digit())))
-        {
-            out.push(part.to_ascii_uppercase());
-        } else {
-            if !extension
-                && !(part.len() >= 5 || (part.len() == 4 && part.as_bytes()[0].is_ascii_digit()))
-            {
-                return None;
-            }
-            out.push(lower);
-        }
-    }
-    Some(out.join("-"))
+    let mut locale: icu_locale::Locale = locale.parse().ok()?;
+    icu_locale::LocaleCanonicalizer::new_extended().canonicalize(&mut locale);
+    Some(locale.to_string())
 }
 pub fn locale_chain(locale: &str) -> Vec<String> {
     let mut parts = locale.split('-').collect::<Vec<_>>();
@@ -98,18 +60,16 @@ pub fn resolve_locale(pick: Option<&str>, preferred: &[String], offered: &[Strin
     .unwrap_or_else(|| "en".into())
 }
 pub fn direction_of(locale: &str) -> &'static str {
-    let script = locale.split('-').find(|part| part.len() == 4);
-    let rtl = match script {
-        Some(script) => [
-            "Adlm", "Arab", "Hebr", "Mand", "Nkoo", "Rohg", "Samr", "Syrc", "Thaa", "Yezi",
-        ]
-        .contains(&script),
-        None => [
-            "ar", "ur", "fa", "he", "yi", "ps", "sd", "ug", "dv", "syr", "nqo",
-        ]
-        .contains(&locale.split('-').next().unwrap_or("")),
+    let Some(mut id) = locale.parse::<icu_locale::Locale>().ok().map(|l| l.id) else {
+        return "ltr";
     };
-    if rtl { "rtl" } else { "ltr" }
+    icu_locale::LocaleExpander::new_extended().maximize(&mut id);
+    match id.script.as_ref().map(|s| s.as_str()) {
+        Some(
+            "Adlm" | "Arab" | "Hebr" | "Mand" | "Nkoo" | "Rohg" | "Samr" | "Syrc" | "Thaa" | "Yezi",
+        ) => "rtl",
+        _ => "ltr",
+    }
 }
 type MessageFunction = Arc<dyn Fn(&[JsonValue]) -> Result<String> + Send + Sync>;
 #[derive(Clone)]
@@ -190,6 +150,7 @@ pub struct MessagesReport {
 }
 #[derive(Clone)]
 pub struct Language {
+    pub(super) format: &'static super::format::Profile,
     pub locale: String,
     pub dir: String,
     pub chain: Vec<String>,
@@ -204,6 +165,7 @@ pub fn create_language(
     let locale =
         canonical_locale(locale).ok_or_else(|| Error::Invalid("invalid language tag".into()))?;
     Ok(Language {
+        format: super::format::profile(&locale)?,
         dir: direction_of(&locale).into(),
         chain: locale_chain(&locale),
         locale,

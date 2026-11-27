@@ -330,6 +330,11 @@ struct Instance {
     opens_natives: bool,
 }
 type Cleanup = Box<dyn FnOnce(String) -> SyncFuture<()> + Send>;
+struct HeldKey {
+    proxy: Source,
+    // Keep the provider source and subscription alive until the reference moves.
+    pin: Option<(String, Source, Subscription)>,
+}
 struct Binding {
     batch: Batch,
     object: Mutex<Option<Arc<Object>>>,
@@ -341,6 +346,7 @@ struct Binding {
     members: Mutex<IndexMap<String, Source>>,
     subscriptions: Mutex<Vec<Subscription>>,
     bound_instance: Mutex<Option<String>>,
+    keys: Mutex<IndexMap<(String, String), HeldKey>>,
 }
 #[derive(Clone)]
 pub struct Held(Arc<Binding>);
@@ -598,6 +604,7 @@ impl Host {
             members: Mutex::new(IndexMap::new()),
             subscriptions: Mutex::new(Vec::new()),
             bound_instance: Mutex::new(None),
+            keys: Mutex::new(IndexMap::new()),
         }));
         lock(&object.holders).push(Arc::downgrade(&held.0));
         if let Some(signal) = context.abort_signal() {
@@ -761,6 +768,7 @@ impl Held {
             members: Mutex::new(IndexMap::new()),
             subscriptions: Mutex::new(Vec::new()),
             bound_instance: Mutex::new(None),
+            keys: Mutex::new(IndexMap::new()),
         }))
     }
     pub fn state(&self) -> NativeSource<RefState> {
@@ -774,6 +782,10 @@ impl Held {
             return;
         }
         lock(&self.0.abort).take();
+        let keys = std::mem::take(&mut *lock(&self.0.keys));
+        for (_, key) in keys {
+            key.proxy.detach("released");
+        }
         lock(&self.0.subscriptions).clear();
         let members = lock(&self.0.members).values().cloned().collect::<Vec<_>>();
         for member in members {
@@ -892,10 +904,59 @@ impl Held {
             .variant
             .clone())
     }
+    pub fn keyed(&self, name: &str, key: &JsonValue) -> Result<Source> {
+        let object = self.object()?;
+        let instance = lock(&object.state)
+            .attempt
+            .clone()
+            .ok_or_else(|| ChordError::new("not_ready", "object is not live"))?;
+        let declaration = self.0.contract.current().variants[&instance.members.variant]
+            .keyed
+            .get(name)
+            .ok_or_else(|| {
+                ChordError::invalid("keyed", format!("unknown keyed member {name}"), None)
+            })?;
+        let key = match (&declaration.key, key) {
+            (Some(kind), key) => kind
+                .key_of_address(key)?
+                .ok_or_else(|| ChordError::invalid("key", "invalid keyed member address", None))?,
+            (None, JsonValue::String(key)) => key.to_utf8()?,
+            _ => return Err(ChordError::invalid("key", "expected a string key", None).into()),
+        };
+        self.0.pin_key(&instance, name, &key)
+    }
+
+    pub fn query(&self, member: &str, name: &str, args: JsonValue) -> Result<crate::store::Query> {
+        let object = self.object()?;
+        let instance = lock(&object.state)
+            .attempt
+            .clone()
+            .ok_or_else(|| ChordError::new("not_ready", "object is not live"))?;
+        let build = instance
+            .members
+            .queries
+            .get(member)
+            .and_then(|queries| queries.get(name))
+            .ok_or_else(|| {
+                ChordError::invalid("query", format!("unknown query {member}.{name}"), None)
+            })?;
+        let schema = &self.0.contract.current().variants[&instance.members.variant].queries[member]
+            .args[name];
+        crate::data::Validator::compile(&schema.schema.to_serde()?)?
+            .check(&args.to_serde()?, name)?;
+        build(args)
+    }
     pub fn subscribe_event(
         &self,
         name: &str,
         listener: impl Fn(JsonValue) + Send + Sync + 'static,
+    ) -> Result<EventSubscription> {
+        self.subscribe_event_at(name, move |value, _| listener(value))
+    }
+    pub fn subscribe_event_at(
+        &self,
+        name: &str,
+        listener: impl Fn(JsonValue, u64) + Send + Sync + 'static,
     ) -> Result<EventSubscription> {
         let object = self.object()?;
         let state = lock(&object.state);
@@ -906,7 +967,7 @@ impl Held {
         let channel = instance.members.events.get(name).ok_or_else(|| {
             ChordError::invalid("event", format!("unknown event member {name}"), None)
         })?;
-        Ok(channel.subscribe(listener))
+        Ok(channel.subscribe_at(listener))
     }
     pub fn retry(&self) -> Result<()> {
         let object = self.object()?;
@@ -915,6 +976,48 @@ impl Held {
     }
 }
 impl Binding {
+    fn pin_key(&self, instance: &Instance, name: &str, key: &str) -> Result<Source> {
+        let slot = (name.to_owned(), key.to_owned());
+        let proxy = {
+            let mut keys = lock(&self.keys);
+            let entry = keys.entry(slot.clone()).or_insert_with(|| HeldKey {
+                proxy: Source::framed(self.batch.clone(), format!("held:{name}:{key}"), |_| {}),
+                pin: None,
+            });
+            if entry
+                .pin
+                .as_ref()
+                .is_some_and(|(bound, _, _)| bound == &instance.id)
+            {
+                return Ok(entry.proxy.clone());
+            }
+            entry.pin.take();
+            entry.proxy.clone()
+        };
+        let resolve = instance.members.keyed.get(name).ok_or_else(|| {
+            ChordError::invalid("keyed", format!("unknown keyed member {name}"), None)
+        })?;
+        let source = resolve(JsonValue::String(key.into()))?;
+        let schema = &self.contract.current().variants[&instance.members.variant].keyed[name]
+            .snapshot
+            .schema;
+        let validator = crate::data::Validator::compile(&schema.to_serde()?)?;
+        let value = source.value()?;
+        validator.check(&value.to_json().to_serde()?, name)?;
+        proxy.set_revision(value, &Context::background())?;
+        let target = proxy.clone();
+        let subscription = source.subscribe(
+            move |call, context| match call {
+                crate::watch::WatchCall::Value { value, .. } => target.set(value, context),
+                crate::watch::WatchCall::Failed { error } => target.fail(error, context),
+            },
+            |_| {},
+        );
+        if let Some(entry) = lock(&self.keys).get_mut(&slot) {
+            entry.pin = Some((instance.id.clone(), source, subscription));
+        }
+        Ok(proxy)
+    }
     fn forward(&self, instance: &Instance) -> Result<()> {
         {
             let mut bound = lock(&self.bound_instance);
@@ -948,6 +1051,15 @@ impl Binding {
             ));
         }
         *lock(&self.subscriptions) = subscriptions;
+        let keys = lock(&self.keys)
+            .iter()
+            .map(|((member, key), entry)| (member.clone(), key.clone(), entry.proxy.clone()))
+            .collect::<Vec<_>>();
+        for (member, key, proxy) in keys {
+            if let Err(error) = self.pin_key(instance, &member, &key) {
+                proxy.fail(error.to_string(), &Context::background())?;
+            }
+        }
         Ok(())
     }
 }

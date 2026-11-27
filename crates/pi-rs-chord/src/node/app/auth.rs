@@ -533,17 +533,34 @@ impl SignIns {
         if request.method == ::http::Method::GET {
             if request.path.starts_with("/_chord/pair/") {
                 self.owner(&request)?;
-                return super::super::http::html_response(
-                    "<form method=post><button>Approve device</button></form>",
-                );
+                let code = request.params.get("code").map(String::as_str).unwrap_or("");
+                let memory = self.0.memory.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(pair) = memory
+                    .pairs
+                    .get(code)
+                    .filter(|p| p.expires > now_seconds() && p.token.is_none() && !p.approving)
+                else {
+                    return pairing_ended();
+                };
+                return super::super::http::html_response(format!(
+                    "<!doctype html><title>Pair a device</title>\n<p>Sign in <b>{}</b> as the owner? Its code: <b>{}</b> (compare it with the device).</p>\n<form method=\"post\"><button>Approve</button></form>",
+                    escape_html(&pair.label),
+                    escape_html(code)
+                ));
             }
-            let script = "const token=location.hash.slice(1);history.replaceState(null,'',location.pathname);fetch(location.pathname,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})}).then(r=>r.ok?location.replace('/'):document.body.textContent='Sign-in refused');";
+            let script = "const token=location.hash.slice(1);history.replaceState(null,'',location.pathname);fetch(location.pathname,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})}).then(r=>{if(r.ok)location.replace('/');else document.getElementById('status').textContent='This link is used up or expired.';});";
             return super::super::http::html_response(format!(
-                "<!doctype html><body>Signing in<script nonce=\"{}\">{script}</script>",
+                "<!doctype html><title>Sign in</title><p id=status>Signing in…</p>\n<script nonce=\"{}\">{script}</script>",
                 request.nonce
             ));
         }
-        let bytes = request.body(16 * 1024).await?;
+        let bytes = request
+            .body(if request.path == "/_chord/pair" {
+                4096
+            } else {
+                16 * 1024
+            })
+            .await?;
         let body: Value = if bytes.is_empty() {
             json!({})
         } else {
@@ -614,13 +631,12 @@ impl SignIns {
                     code.clone(),
                     Pair {
                         poll: hash(&poll),
-                        label: body
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Device")
-                            .chars()
-                            .take(120)
-                            .collect(),
+                        label: bounded_name(
+                            body.get("label").and_then(Value::as_str).unwrap_or(""),
+                            100,
+                            "device",
+                        )
+                        .into(),
                         address,
                         expires: now + 600,
                         token: None,
@@ -687,8 +703,8 @@ impl SignIns {
                 )
             }
             "/_chord/login" => {
-                let name = required("name")?.trim();
-                if name.is_empty() || name.encode_utf16().count() > 40 {
+                let name = bounded_name(required("name")?, 40, "");
+                if name.is_empty() {
                     return Err(HttpError::new(400, "invalid login name"));
                 }
                 let principal = json!({"kind":"user","id":new_token(12),"name":name});
@@ -704,16 +720,17 @@ impl SignIns {
                     .params
                     .get("code")
                     .ok_or_else(|| HttpError::new(404, "pairing ended"))?;
-                let label = {
-                    let mut memory = self.0.memory.lock().unwrap_or_else(|e| e.into_inner());
-                    let pair = memory
-                        .pairs
-                        .get_mut(code)
-                        .filter(|p| p.expires > now_seconds() && p.token.is_none() && !p.approving)
-                        .ok_or_else(|| HttpError::new(404, "pairing ended"))?;
-                    pair.approving = true;
-                    pair.label.clone()
-                };
+                let label =
+                    {
+                        let mut memory = self.0.memory.lock().unwrap_or_else(|e| e.into_inner());
+                        let Some(pair) = memory.pairs.get_mut(code).filter(|p| {
+                            p.expires > now_seconds() && p.token.is_none() && !p.approving
+                        }) else {
+                            return pairing_ended();
+                        };
+                        pair.approving = true;
+                        pair.label.clone()
+                    };
                 let issued = self
                     .issue(self.0.owner.clone(), &label, "device", secure)
                     .await;
@@ -731,7 +748,10 @@ impl SignIns {
                     }
                 }
                 issued?;
-                json_response(&json!("approved"))
+                super::super::http::html_response(format!(
+                    "<p>Approved: {} is signed in as the owner.</p>",
+                    escape_html(&label)
+                ))
             }
             _ => Err(HttpError::new(404, "not found")),
         }
@@ -746,6 +766,37 @@ impl SignIns {
         self.0.docs.end();
     }
 }
+fn pairing_ended() -> std::result::Result<HttpResponse, HttpError> {
+    let mut response =
+        super::super::http::html_response("<p>No such pairing (or it expired).</p>")?;
+    *response.status_mut() = ::http::StatusCode::NOT_FOUND;
+    Ok(response)
+}
+
+fn bounded_name<'a>(value: &'a str, limit: usize, fallback: &'a str) -> &'a str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return fallback;
+    }
+    let mut units = 0;
+    for (offset, c) in trimmed.char_indices() {
+        units += c.len_utf16();
+        if units > limit {
+            return &trimmed[..offset];
+        }
+    }
+    trimmed
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&#38;")
+        .replace('<', "&#60;")
+        .replace('>', "&#62;")
+        .replace('"', "&#34;")
+        .replace('\'', "&#39;")
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct IssuedSignIn {
     pub id: String,

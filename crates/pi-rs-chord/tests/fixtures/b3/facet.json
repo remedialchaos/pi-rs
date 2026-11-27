@@ -1,0 +1,23 @@
+{
+  "types": [
+    {
+      "name": "guest-counter", "version": 1, "params": {"room": {"type":"string"}},
+      "members": {
+        "total": {"kind":"document","schema":{"type":"object","properties":{"total":{"type":"integer"}},"required":["total"],"additionalProperties":false},"initial":{"total":0}},
+        "add": {"kind":"job","args":{"type":"integer"},"result":{"type":"integer"}},
+        "update": {"kind":"store","document":"total","args":{"type":"integer"},"result":{"type":"integer"}},
+        "tick": {"kind":"event","schema":{"type":"integer"}},
+        "rows": {"kind":"keyed","schema":{"type":"integer"},"initial":0},
+        "foreign": {"kind":"method","result":{"type":"integer"}}
+      }
+    },
+    {
+      "name": "guest-remote", "version": 1, "params": {"region":{"type":"string"},"room":{"type":"string"}},
+      "remote":{"hostKind":"stage","hostParams":["region"],"variant":"main"},
+      "members":{"who":{"kind":"method","result":{}}}
+    }
+  ],
+  "routes": [{"pattern":"POST /guest/:id","public":true,"handler":"echo"}],
+  "registries": [{"name":"guest-registry","version":1}],
+  "contributions": [{"name":"guest-registry","version":1,"value":42}]
+}

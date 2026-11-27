@@ -12,14 +12,13 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use pi_rs_chord::node::http::HttpRequest;
+use pi_rs_chord::node::http::OpenedLinkWithClose;
 
 use crate::{runner::WorkerRunner, server::ServerRuntime, worker::WorkerRuntime};
 
 /// A hook on each `/chord` link the HTTP component accepts: the hook returns what to call once the
 /// link closed.
-pub type LinkOpenedHook =
-    Arc<dyn Fn(&HttpRequest) -> Option<Box<dyn FnOnce() + Send>> + Send + Sync>;
+pub type LinkOpenedHook = OpenedLinkWithClose;
 
 /// One plugin's contribution to a table.
 #[derive(Clone)]

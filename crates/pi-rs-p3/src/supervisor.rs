@@ -268,7 +268,7 @@ async fn ask_stop(data_dir: &Path, child: &mut Child) {
     let _ = child.wait().await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -295,12 +295,7 @@ mod tests {
         false
     }
 
-    fn signal(pid: u32, name: &str) {
-        let _ = std::process::Command::new("kill")
-            .arg(format!("-{name}"))
-            .arg(pid.to_string())
-            .status();
-    }
+    use crate::unix_signal::signal;
 
     #[tokio::test]
     async fn a_crashed_server_starts_again() {

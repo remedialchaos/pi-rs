@@ -278,7 +278,7 @@ impl Validator {
     }
 }
 
-fn schema_value_with_bytes(value: &Value, schema: &Value) -> pi_rs_schema::Value {
+pub(crate) fn schema_value_with_bytes(value: &Value, schema: &Value) -> pi_rs_schema::Value {
     let Some(obj) = schema.as_object() else {
         return pi_rs_schema::Value::from(value);
     };
@@ -303,7 +303,7 @@ fn schema_value_with_bytes(value: &Value, schema: &Value) -> pi_rs_schema::Value
     if let Some(branches) = obj.get("anyOf").and_then(Value::as_array) {
         for branch in branches {
             let converted = schema_value_with_bytes(value, branch);
-            if matches!(converted, pi_rs_schema::Value::Bytes(_)) {
+            if pi_rs_schema::compile(branch).is_ok_and(|validator| validator.check(&converted)) {
                 return converted;
             }
         }
@@ -311,7 +311,10 @@ fn schema_value_with_bytes(value: &Value, schema: &Value) -> pi_rs_schema::Value
     match value {
         Value::Object(map) => {
             let props = obj.get("properties").and_then(Value::as_object);
-            let additional = obj.get("additionalProperties");
+            let additional = obj
+                .get("patternProperties")
+                .and_then(|patterns| patterns.get("^.*$"))
+                .or_else(|| obj.get("additionalProperties"));
             let mut out = Vec::with_capacity(map.len());
             for (k, v) in map {
                 let converted = if let Some(prop_schema) = props.and_then(|p| p.get(k)) {

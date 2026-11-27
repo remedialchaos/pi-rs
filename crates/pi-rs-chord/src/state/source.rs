@@ -42,6 +42,13 @@ struct Inner {
 }
 #[derive(Clone)]
 pub struct Source(Arc<Inner>);
+#[derive(Clone)]
+pub(crate) struct WeakSource(Weak<Inner>);
+impl WeakSource {
+    pub(crate) fn upgrade(&self) -> Option<Source> {
+        self.0.upgrade().map(Source)
+    }
+}
 pub struct Subscription {
     detach: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -58,6 +65,9 @@ impl Drop for Subscription {
     }
 }
 impl Source {
+    pub(crate) fn downgrade(&self) -> WeakSource {
+        WeakSource(Arc::downgrade(&self.0))
+    }
     fn make(
         batch: Batch,
         label: String,

@@ -22,6 +22,10 @@ use crate::types::{
     ThinkingContent, ToolCall, TranscriptContext,
 };
 
+/// The deadline for the wait for Mistral response headers. It covers only the headers, so
+/// long streams (for example extended thinking) are not cut off.
+const MISTRAL_RESPONSE_HEADER_TIMEOUT_MS: u64 = 60_000;
+
 fn auth<'a>(model: &Model, opts: &'a StreamOptions) -> Result<&'a str> {
     opts.request
         .api_key
@@ -330,6 +334,13 @@ async fn run(
     }
     let mut request = opts.request.clone();
     request.max_retries = Some(0);
+    // The timeout covers only the wait for response headers. Long streams (for example
+    // extended thinking) must not be cut off by a fixed deadline.
+    request.timeout_ms = Some(
+        request
+            .timeout_ms
+            .unwrap_or(MISTRAL_RESPONSE_HEADER_TIMEOUT_MS),
+    );
     let response = send(
         HttpRequest {
             method: Method::POST,

@@ -117,7 +117,6 @@ impl ServerController {
     }
     pub fn can_start(&self) -> bool {
         self.config.source == Source::Own
-            && self.config.checkout.is_some()
             && self.managed.is_none()
             && self.changes.borrow().ownership != Ownership::External
             && matches!(
@@ -201,17 +200,12 @@ impl ServerController {
             .env
             .as_ref()
             .ok_or_else(|| Error::Protocol("could not read login environment".into()))?;
-        let checkout = self
+        let binary = self
             .config
-            .checkout
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("No p2 checkout selected".into()))?;
-        let node = self
-            .config
-            .node
+            .binary
             .clone()
-            .or_else(|| login_environment::which("node", env.get("PATH").map(String::as_str)))
-            .ok_or_else(|| Error::Protocol("No node on the login shell's PATH".into()))?;
+            .or_else(|| login_environment::which("p2", env.get("PATH").map(String::as_str)))
+            .ok_or_else(|| Error::Protocol("No p2 binary on the login shell's PATH".into()))?;
         for file in [&self.log_file, &self.pid_file] {
             if let Some(parent) = file.parent() {
                 private_directory(parent)?;
@@ -222,20 +216,17 @@ impl ServerController {
         if let Some(backup) = self.upgrade.take() {
             writeln!(log, "\n--- {backup}")?;
         }
-        let entry = match self.config.mode {
-            Mode::Start => "src/hosts/server.ts",
-            Mode::Dev => "scripts/dev.mjs",
-        };
         writeln!(
             log,
-            "\n--- starting {} --import ./src/source.ts {entry} in {}",
-            node.display(),
-            checkout.display()
+            "\n--- starting {} in {}",
+            binary.display(),
+            self.config.data_dir.display()
         )?;
-        let mut cmd = Command::new(&node);
-        cmd.args(["--import", "./src/source.ts", entry])
-            .current_dir(checkout)
-            .env_clear()
+        let mut cmd = Command::new(&binary);
+        if self.config.mode == Mode::Dev {
+            cmd.arg("--dev");
+        }
+        cmd.env_clear()
             .envs(env)
             .env("PORT", self.config.port.to_string())
             .env("P2_DATA_DIR", &self.config.data_dir)
@@ -248,7 +239,7 @@ impl ServerController {
         }
         let child = cmd
             .spawn()
-            .map_err(|e| Error::Protocol(format!("Could not start node: {e}")))?;
+            .map_err(|e| Error::Protocol(format!("Could not start p2: {e}")))?;
         if let Some(pid) = child.id() {
             let _ = fs::write(&self.pid_file, pid.to_string());
         }

@@ -156,7 +156,14 @@ async fn files_facet_pages_and_keeps_folder_and_space_state_live() {
     let listing = folder.read("listing").unwrap().to_serde().unwrap();
     assert_eq!(listing["entries"], json!([]));
     assert_eq!(
-        files.read("summary").unwrap().to_serde().unwrap()["other"]["bytes"],
+        files
+            .keyed("summary", &JsonValue::String("other".into()))
+            .unwrap()
+            .value()
+            .unwrap()
+            .to_json()
+            .to_serde()
+            .unwrap()["bytes"],
         3
     );
     call(&files, "removeSpace", json!("other")).await;
@@ -165,8 +172,15 @@ async fn files_facet_pages_and_keeps_folder_and_space_state_live() {
         json!([])
     );
     assert_eq!(
-        files.read("summary").unwrap().to_serde().unwrap(),
-        json!({})
+        files
+            .keyed("summary", &JsonValue::String("other".into()))
+            .unwrap()
+            .value()
+            .unwrap()
+            .to_json()
+            .to_serde()
+            .unwrap(),
+        json!({"files":0,"versions":0,"bytes":0,"newest":[]})
     );
     server.close().await.unwrap();
 }

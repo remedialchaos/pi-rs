@@ -117,3 +117,89 @@ async fn launcher_bootstraps_private_surface_relays_rpc_and_closes_both_ends() {
         host.close(&ctx).await.unwrap();
     }).await.expect("authenticated launcher round trip and close must finish");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn subprocess_receives_start_and_raw_attachment_frames_before_exiting() -> Result<()> {
+    use pi_rs_chord::tui::LauncherMessage;
+    use pi_rs_tui::terminal::Terminal;
+    use std::path::Path;
+    struct MemoryGet;
+    impl SurfaceGet for MemoryGet {
+        async fn get(&self, uri: http::Uri, _: http::HeaderValue, _: usize) -> Result<Vec<u8>> {
+            Ok(match uri.path() {
+                "/_chord/tui/start" => br#"{"base":"b","script":"/_chord/tui/script","combined":"/_chord/tui/plugins"}"#.to_vec(),
+                "/_chord/tui/script" => b"test script".to_vec(),
+                "/_chord/tui/plugins" => b"[]".to_vec(),
+                _ => return Err(Error::Invalid("unexpected path".into())),
+            })
+        }
+    }
+    struct TestHost;
+    impl Terminal for TestHost {
+        fn width(&self) -> usize {
+            80
+        }
+        fn height(&self) -> usize {
+            24
+        }
+        fn is_tty(&self) -> bool {
+            false
+        }
+        fn read_available(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn write(&mut self, _: &str) {}
+    }
+    impl LocalActions for TestHost {
+        fn copy(&mut self, _: &str) -> Result<bool> {
+            Err(Error::Closed)
+        }
+        fn open(&mut self, _: &http::Uri) -> Result<bool> {
+            Err(Error::Closed)
+        }
+        fn attach(&mut self, path: &Path) -> Result<Option<(String, Vec<u8>)>> {
+            assert_eq!(path, Path::new("fixture.bin"));
+            Ok(Some(("fixture.bin".into(), vec![0, 255])))
+        }
+    }
+    let origin = http::Uri::from_static("http://localhost/");
+    let (session, script) =
+        TerminalSession::start(origin, "local".into(), settings(), MemoryGet).await?;
+    let dir = tempfile::tempdir()?;
+    let start = frame(
+        &serde_json::json!({"kind":"start","start":session.channel().start()}),
+        &script,
+    )?;
+    let reply = launcher_frame(&LauncherMessage::Attached {
+        id: 7,
+        name: "fixture.bin".into(),
+        bytes: vec![0, 255],
+    })?;
+    std::fs::write(dir.path().join("start"), &start)?;
+    std::fs::write(dir.path().join("attached"), &reply)?;
+    std::fs::write(
+        dir.path().join("ask"),
+        frame(
+            &serde_json::json!({"kind":"request","id":7,"request":{"kind":"attach","path":"fixture.bin"}}),
+            &[],
+        )?,
+    )?;
+    std::fs::write(
+        dir.path().join("exit"),
+        frame(&serde_json::json!({"kind":"exit","code":17}), &[])?,
+    )?;
+    let mut child = tokio::process::Command::new("/bin/sh");
+    child.current_dir(dir.path()).arg("-c").arg(format!(
+        "dd bs=1 count={} 2>/dev/null | cmp -s - start || exit 1\ncat ask\ndd bs=1 count={} 2>/dev/null | cmp -s - attached || exit 2\ncat exit",
+        start.len(), reply.len()
+    ));
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.run_with_terminal(child, &script, &mut TestHost, TestHost),
+    )
+    .await
+    .map_err(|_| Error::Invalid("subprocess stalled".into()))??;
+    assert_eq!(result, 17);
+    Ok(())
+}
