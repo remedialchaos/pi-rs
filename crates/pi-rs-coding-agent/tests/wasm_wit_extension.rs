@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
-use pi_rs_coding_agent::core::event_bus::EventBus;
+use pi_rs_coding_agent::core::event_bus::{EventBus, ExtensionEvent};
 use pi_rs_coding_agent::core::extensions::context::default_command_actions;
 use pi_rs_coding_agent::core::extensions::types::{
-    Extension, ExtensionCommandContext, ExtensionContext, ExtensionHost, ExtensionInitContext,
-    ExtensionMode, ExtensionRegistration, ExtensionToolContext, ExtensionUi,
+    Extension, ExtensionCommandContext, ExtensionContext, ExtensionHost, ExtensionHostActions,
+    ExtensionInitContext, ExtensionMode, ExtensionRegistration, ExtensionToolContext, ExtensionUi,
 };
 use pi_rs_coding_agent::core::extensions::wasm::{WasmExtension, wit_bindings};
 use serde_json::json;
 
 const ECHO_COMPONENT: &[u8] = include_bytes!("fixtures/echo_extension.wasm");
+const FULL_COMPONENT: &[u8] = include_bytes!("fixtures/full_extension.wasm");
 
 fn test_base_context() -> (Arc<EventBus>, Arc<ExtensionHost>, ExtensionContext) {
     let bus = Arc::new(EventBus::new());
@@ -163,4 +164,102 @@ async fn wit_wasm_component_executes_init_patches_tools_commands_and_reload_inva
             .expect_err("stale run_command")
             .contains("stale")
     );
+}
+
+#[tokio::test]
+async fn wit_full_component_dispatches_subscribed_events_shortcuts_and_host_exec() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cwd = dir.path().to_string_lossy().into_owned();
+
+    let mut extension = WasmExtension::new(
+        "full-wasm",
+        Some(FULL_COMPONENT),
+        ExtensionRegistration::new("full-wasm"),
+        false,
+        false,
+    )
+    .expect("load full WIT component fixture");
+
+    let (bus, host, mut base_ctx) = test_base_context();
+    base_ctx.cwd = cwd.clone();
+    host.set_actions(ExtensionHostActions {
+        get_model: Some(Arc::new(|| Some("openai/gpt-5".to_string()))),
+        ..ExtensionHostActions::default()
+    });
+    host.commit();
+
+    let mut reg = ExtensionRegistration::new("full-wasm");
+    let mut init_ctx = ExtensionInitContext {
+        registration: &mut reg,
+        host: &host,
+        bus: &bus,
+        cwd: &cwd,
+    };
+    extension
+        .init(&mut init_ctx)
+        .await
+        .expect("full guest init");
+    assert_eq!(
+        extension.notifications(),
+        vec![("init".to_string(), cwd.clone())]
+    );
+    assert!(reg.commands.contains_key("check-env"));
+    assert!(reg.shortcuts.contains_key("ctrl+e"));
+
+    let tool_patch = bus
+        .emit_chain(
+            ExtensionEvent::ToolResult,
+            json!({"toolName": "write", "isError": false}),
+            |current, patch| {
+                if let Some(details) = patch.get("details") {
+                    current["details"] = details.clone();
+                }
+            },
+        )
+        .await;
+    assert_eq!(tool_patch["details"]["inspectedBy"], "full-wasm");
+
+    let input_patch = bus
+        .emit_first(
+            ExtensionEvent::Input,
+            json!({"text": "ping hello"}),
+            |value| value.get("action").is_some(),
+        )
+        .await
+        .expect("input handler should return transform patch");
+    assert_eq!(input_patch["action"], "transform");
+    assert_eq!(input_patch["text"], "transformed-by-wasm");
+
+    let (wait_for_idle, new_session, fork, navigate_tree, switch_session, reload) =
+        default_command_actions();
+    let cmd_ctx = ExtensionCommandContext {
+        base: base_ctx,
+        wait_for_idle,
+        new_session,
+        fork,
+        navigate_tree,
+        switch_session,
+        reload,
+    };
+    let shortcut = reg
+        .shortcut_handlers
+        .get("ctrl+e")
+        .expect("ctrl+e shortcut handler");
+    shortcut(String::new(), cmd_ctx)
+        .await
+        .expect("shortcut invoking check-env should succeed");
+    assert_eq!(
+        extension.notifications().last(),
+        Some(&(
+            "exec".to_string(),
+            "code=0;out=cat|0;model=openai/gpt-5;args=".to_string()
+        ))
+    );
+
+    extension.invalidate();
+    let stale_err = extension
+        .call_on_event(ExtensionEvent::ToolResult, &json!({}))
+        .await
+        .expect_err("invalidated guest must reject on-event");
+    assert!(stale_err.contains("stale"));
 }

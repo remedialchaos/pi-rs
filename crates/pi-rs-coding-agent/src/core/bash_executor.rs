@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{Duration, sleep, timeout};
 
-use super::tools::bash::EXIT_STDIO_GRACE_MS;
+use super::tools::bash::{EXIT_STDIO_GRACE_MS, NON_INTERACTIVE_ENV};
 use super::tools::truncate::{DEFAULT_MAX_BYTES, TruncationOptions, truncate_tail};
 use crate::utils::ansi::{split_incomplete_ansi_suffix, strip_ansi};
 use crate::utils::output_files::create_output_file_stream;
@@ -266,6 +266,7 @@ impl BashExecutor {
         process
             .args(shell.args)
             .current_dir(cwd)
+            .envs(NON_INTERACTIVE_ENV.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);

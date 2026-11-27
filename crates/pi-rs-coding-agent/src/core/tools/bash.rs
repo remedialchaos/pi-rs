@@ -21,6 +21,24 @@ pub const EXIT_STDIO_GRACE_MS: u64 = 100;
 pub const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 pub const STRUCTURED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 
+/// Non-interactive environment defaults applied to spawned shell commands so
+/// pagers, editors, and credential prompts fail cleanly instead of hanging.
+/// Inline command assignments (e.g. `PAGER=more ...`) still take precedence.
+pub const NON_INTERACTIVE_ENV: &[(&str, &str)] = &[
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_EDITOR", "true"),
+    ("EDITOR", "true"),
+    ("VISUAL", "true"),
+    ("GH_PROMPT_DISABLED", "1"),
+    ("SSH_ASKPASS", "false"),
+    ("SSH_ASKPASS_REQUIRE", "force"),
+    ("DEBIAN_FRONTEND", "noninteractive"),
+    ("PIP_NO_INPUT", "1"),
+];
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct BashInput {
     pub command: String,
@@ -176,7 +194,11 @@ pub async fn execute_shell(
 
     let started_at = Instant::now();
     let mut command = Command::new(shell);
-    command.args(args).arg(&input.command).current_dir(cwd);
+    command
+        .args(args)
+        .arg(&input.command)
+        .current_dir(cwd)
+        .envs(NON_INTERACTIVE_ENV.iter().copied());
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -418,5 +440,21 @@ mod tests {
         let (text, details) = format_output(&snapshot, "a\nb", Some("/tmp/full.txt"));
         assert!(text.contains("Full output: /tmp/full.txt"));
         assert!(details.is_some());
+    }
+
+    #[tokio::test]
+    async fn sets_non_interactive_env_and_allows_inline_override() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let input = BashInput {
+            command: r#"printf '%s|%s|%s\n' "$PAGER" "$GIT_TERMINAL_PROMPT" "$EDITOR"; PAGER=custom sh -c 'printf "%s\n" "$PAGER"'"#.into(),
+            timeout: None,
+        };
+        let result = match execute_bash(&input, dir.path()).await {
+            Ok(result) => result,
+            Err(error) => return Err(std::io::Error::other(error)),
+        };
+        assert!(!result.is_error, "unexpected error: {}", result.text);
+        assert_eq!(result.text, "cat|0|true\ncustom\n");
+        Ok(())
     }
 }

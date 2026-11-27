@@ -5,19 +5,30 @@
 //! invalidation drops the `wasmtime::Store` so guest memory and host resources
 //! are reclaimed cleanly on `/reload`.
 
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use serde_json::{Value, json};
-use wasmtime::component::{Component, HasSelf, Linker};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::time::{Duration, timeout};
+use wasmtime::component::{Component, HasSelf, Linker, TypedFunc};
 use wasmtime::{Engine, Store};
+
+use crate::core::event_bus::ExtensionEvent;
+use crate::core::tools::bash::{EXIT_STDIO_GRACE_MS, MAX_TIMEOUT_MS, NON_INTERACTIVE_ENV};
 
 use super::types::{
     Extension, ExtensionInitContext, ExtensionRegistration, ExtensionToolContext, STALE_MESSAGE,
     ToolOutcome,
 };
+
+const EXEC_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const EXEC_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 pub mod wit_bindings {
     wasmtime::component::bindgen!({
@@ -213,18 +224,162 @@ struct HostBridge {
 struct GuestRegistrations {
     providers: Vec<(String, Value)>,
     virtual_models: Vec<(String, String, Value)>,
+    mcp_servers: Vec<(String, Value)>,
     tools: Vec<super::types::ToolDefinition>,
     commands: Vec<(String, Option<String>)>,
+    shortcuts: Vec<(String, Option<String>, String)>,
     flags: Vec<super::types::FlagDefinition>,
+    subscriptions: Vec<ExtensionEvent>,
 }
 
 struct WasmState {
     host: Option<std::sync::Weak<super::types::ExtensionHost>>,
     registrations: Option<GuestRegistrations>,
     ui: Option<super::types::ExtensionUi>,
+    cwd: String,
     generation: u64,
     stale: bool,
     bridge: HostBridge,
+}
+
+struct ChildTree(Option<u32>);
+
+impl ChildTree {
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.take().and_then(|pid| i32::try_from(pid).ok()) {
+            use nix::{
+                sys::signal::{Signal, killpg},
+                unistd::Pid,
+            };
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(pid) = self.0.take() {
+            let _ = crate::utils::child_process::kill_process_tree(pid);
+        }
+    }
+}
+
+impl Drop for ChildTree {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+async fn read_capped_pipe<R: AsyncRead + Unpin>(pipe: Option<R>, limit: usize) -> Vec<u8> {
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut bytes = Vec::new();
+    let mut buf = [0_u8; 8192];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if bytes.len() < limit {
+                    let take = (limit - bytes.len()).min(n);
+                    bytes.extend_from_slice(&buf[..take]);
+                }
+            }
+        }
+    }
+    bytes
+}
+
+async fn exec_host_command(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    default_cwd: &str,
+    timeout_ms: Option<u64>,
+) -> Result<wit_bindings::pi::extension::types::ExecResult, String> {
+    if command.trim().is_empty() {
+        return Err("exec command must not be empty".to_string());
+    }
+    let effective_timeout = timeout_ms.unwrap_or(EXEC_DEFAULT_TIMEOUT_MS);
+    if effective_timeout == 0 {
+        return Err("exec timeout_ms must be greater than 0".to_string());
+    }
+    if effective_timeout > MAX_TIMEOUT_MS {
+        return Err(format!(
+            "exec timeout_ms exceeds maximum ({MAX_TIMEOUT_MS})"
+        ));
+    }
+
+    let work_dir = match cwd.filter(|value| !value.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None if !default_cwd.is_empty() => Some(PathBuf::from(default_cwd)),
+        None => None,
+    };
+    if let Some(dir) = &work_dir
+        && !dir.exists()
+    {
+        return Err(format!(
+            "Working directory does not exist: {}",
+            dir.display()
+        ));
+    }
+
+    let mut process = Command::new(command);
+    process
+        .args(args)
+        .envs(NON_INTERACTIVE_ENV.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(dir) = &work_dir {
+        process.current_dir(dir);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.as_std_mut().process_group(0);
+    }
+
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("Failed to spawn \"{command}\": {error}"))?;
+    let mut children = ChildTree(child.id());
+    let mut stdout_task =
+        tokio::spawn(read_capped_pipe(child.stdout.take(), EXEC_MAX_OUTPUT_BYTES));
+    let mut stderr_task =
+        tokio::spawn(read_capped_pipe(child.stderr.take(), EXEC_MAX_OUTPUT_BYTES));
+
+    let mut timed_out = false;
+    let status = match timeout(Duration::from_millis(effective_timeout), child.wait()).await {
+        Ok(result) => {
+            children.0 = None;
+            Some(result.map_err(|error| format!("Failed to wait for \"{command}\": {error}"))?)
+        }
+        Err(_) => {
+            timed_out = true;
+            children.kill();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            None
+        }
+    };
+
+    let drain = Duration::from_millis(EXIT_STDIO_GRACE_MS);
+    let stdout_bytes = timeout(drain, &mut stdout_task)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let stderr_bytes = timeout(drain, &mut stderr_task)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+
+    Ok(wit_bindings::pi::extension::types::ExecResult {
+        exit_code: status.and_then(|s| s.code()).unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        timed_out,
+    })
 }
 
 impl wit_bindings::pi::extension::types::Host for WasmState {}
@@ -251,6 +406,19 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
             .ok_or("Virtual models must be registered during init")?
             .virtual_models
             .push((provider, id, definition));
+        Ok(())
+    }
+    async fn register_mcp_server(
+        &mut self,
+        name: String,
+        config_json: String,
+    ) -> Result<(), String> {
+        let config = serde_json::from_str(&config_json).map_err(|e| e.to_string())?;
+        self.registrations
+            .as_mut()
+            .ok_or("MCP servers must be registered during init")?
+            .mcp_servers
+            .push((name, config));
         Ok(())
     }
     async fn register_tool(
@@ -282,6 +450,22 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
             .ok_or("Commands must be registered during init")?
             .commands
             .push((name, description));
+        Ok(())
+    }
+    async fn register_shortcut(
+        &mut self,
+        key: String,
+        description: Option<String>,
+        command: String,
+    ) -> Result<(), String> {
+        if key.trim().is_empty() || command.trim().is_empty() {
+            return Err("Shortcut key and command name must be non-empty".to_string());
+        }
+        self.registrations
+            .as_mut()
+            .ok_or("Shortcuts must be registered during init")?
+            .shortcuts
+            .push((key, description, command));
         Ok(())
     }
     async fn register_flag(
@@ -317,6 +501,19 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
         Ok(())
     }
 
+    async fn subscribe(&mut self, event: String) -> Result<(), String> {
+        let parsed = ExtensionEvent::parse(&event)?;
+        let subscriptions = &mut self
+            .registrations
+            .as_mut()
+            .ok_or("Events must be subscribed during init")?
+            .subscriptions;
+        if !subscriptions.contains(&parsed) {
+            subscriptions.push(parsed);
+        }
+        Ok(())
+    }
+
     async fn ui_select(&mut self, title: String, items: Vec<String>) -> Option<String> {
         self.ui
             .as_ref()?
@@ -341,6 +538,10 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
             .await
     }
 
+    async fn ui_editor(&mut self, title: String, prefill: Option<String>) -> Option<String> {
+        self.ui.as_ref()?.editor(title, prefill).await
+    }
+
     async fn ui_notify(&mut self, message: String, kind: Option<String>) {
         if let Some(ui) = &self.ui {
             ui.notify_with_type(message, kind.as_deref());
@@ -356,6 +557,18 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
     async fn ui_set_widget(&mut self, key: String, lines: Option<Vec<String>>) {
         if let Some(ui) = &self.ui {
             ui.set_widget(key, lines, None);
+        }
+    }
+
+    async fn ui_set_title(&mut self, title: String) {
+        if let Some(ui) = &self.ui {
+            ui.set_title(title);
+        }
+    }
+
+    async fn ui_set_editor_text(&mut self, text: String) {
+        if let Some(ui) = &self.ui {
+            ui.set_editor_text(text);
         }
     }
 
@@ -390,6 +603,106 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
             .cloned()
     }
 
+    async fn get_cwd(&mut self) -> String {
+        if self.stale {
+            return String::new();
+        }
+        self.cwd.clone()
+    }
+
+    async fn get_model(&mut self) -> Option<String> {
+        if self.stale {
+            return None;
+        }
+        self.host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|host| host.get_model())
+    }
+
+    async fn get_active_tools(&mut self) -> Vec<String> {
+        if self.stale {
+            return Vec::new();
+        }
+        self.host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map(|host| host.get_active_tools())
+            .unwrap_or_default()
+    }
+
+    async fn set_active_tools(&mut self, tools: Vec<String>) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.set_active_tools(tools)
+    }
+
+    async fn send_message(
+        &mut self,
+        custom_type: String,
+        content_json: String,
+        trigger_turn: bool,
+    ) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let content: Value = serde_json::from_str(&content_json)
+            .map_err(|error| format!("invalid send-message content JSON: {error}"))?;
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.send_message(custom_type, content, trigger_turn)
+    }
+
+    async fn append_entry(
+        &mut self,
+        custom_type: String,
+        data_json: Option<String>,
+    ) -> Result<String, String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let data = data_json
+            .map(|raw| {
+                serde_json::from_str::<Value>(&raw)
+                    .map_err(|error| format!("invalid append-entry data JSON: {error}"))
+            })
+            .transpose()?;
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.append_entry(custom_type, data)
+    }
+
+    async fn exec(
+        &mut self,
+        command: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        timeout_ms: Option<u64>,
+    ) -> Result<wit_bindings::pi::extension::types::ExecResult, String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        if let Some(host) = self.host.as_ref().and_then(std::sync::Weak::upgrade) {
+            host.assert_active()?;
+        }
+        exec_host_command(&command, &args, cwd.as_deref(), &self.cwd, timeout_ms).await
+    }
+
     async fn execute_tool(&mut self, name: String, args_json: String) -> Result<String, String> {
         if self.stale {
             return Err(STALE_MESSAGE.to_string());
@@ -407,9 +720,12 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
     }
 }
 
+type OnEventFunc = TypedFunc<(String, String), (Result<Option<String>, String>,)>;
+
 struct InstantiatedGuest {
     store: Store<WasmState>,
     instance: wit_bindings::Extension,
+    on_event: Option<OnEventFunc>,
 }
 
 async fn run_guest_command(
@@ -419,11 +735,39 @@ async fn run_guest_command(
     ctx: &super::types::ExtensionCommandContext,
 ) -> Result<(), String> {
     let mut guard = guest.lock().await;
-    let InstantiatedGuest { store, instance } = &mut *guard;
+    let InstantiatedGuest {
+        store, instance, ..
+    } = &mut *guard;
     store.data_mut().ui = Some(ctx.base.ui.clone());
+    store.data_mut().cwd.clone_from(&ctx.base.cwd);
     let result = instance.call_run_command(&mut *store, name, args).await;
     store.data_mut().ui = None;
     result.map_err(|e| format!("guest run-command trap: {e}"))?
+}
+
+async fn call_guest_event(
+    guest: &tokio::sync::Mutex<InstantiatedGuest>,
+    event_name: &str,
+    payload: &Value,
+) -> Result<Option<Value>, String> {
+    let payload_json = serde_json::to_string(payload).map_err(|error| error.to_string())?;
+    let mut guard = guest.lock().await;
+    let InstantiatedGuest {
+        store, on_event, ..
+    } = &mut *guard;
+    let Some(func) = on_event.as_ref() else {
+        return Ok(None);
+    };
+    let (raw,) = func
+        .call_async(&mut *store, (event_name.to_string(), payload_json))
+        .await
+        .map_err(|error| format!("guest on-event trap: {error}"))?;
+    match raw? {
+        Some(text) => serde_json::from_str::<Value>(&text)
+            .map(Some)
+            .map_err(|error| format!("invalid guest on-event JSON: {error}")),
+        None => Ok(None),
+    }
 }
 
 /// Owner of a single guest `Store`. Dropping the store on invalidation
@@ -470,6 +814,7 @@ impl WasmStore {
                 host: None,
                 ui: None,
                 registrations: None,
+                cwd: String::new(),
                 generation,
                 stale: false,
                 bridge: self.bridge.clone(),
@@ -752,18 +1097,28 @@ impl WasmExtension {
                 host: None,
                 ui: None,
                 registrations: None,
+                cwd: String::new(),
                 generation,
                 stale: false,
                 bridge,
             },
         );
-        let instance =
-            wit_bindings::Extension::instantiate_async(&mut wasm_store, &component, &linker)
-                .await
-                .map_err(|error| format!("instantiate WIT extension: {error}"))?;
+        let raw_instance = linker
+            .instantiate_async(&mut wasm_store, &component)
+            .await
+            .map_err(|error| format!("instantiate WIT extension: {error}"))?;
+        let instance = wit_bindings::Extension::new(&mut wasm_store, &raw_instance)
+            .map_err(|error| format!("bind WIT extension exports: {error}"))?;
+        let on_event = raw_instance
+            .get_typed_func::<(String, String), (Result<Option<String>, String>,)>(
+                &mut wasm_store,
+                "on-event",
+            )
+            .ok();
         let guest = Arc::new(tokio::sync::Mutex::new(InstantiatedGuest {
             store: wasm_store,
             instance,
+            on_event,
         }));
         let installed = self
             .store
@@ -784,7 +1139,9 @@ impl WasmExtension {
         let input_json = serde_json::to_string(input).map_err(|e| e.to_string())?;
         let raw = {
             let mut guard = guest.lock().await;
-            let InstantiatedGuest { store, instance } = &mut *guard;
+            let InstantiatedGuest {
+                store, instance, ..
+            } = &mut *guard;
             instance
                 .call_on_tool_call(store, name, &input_json)
                 .await
@@ -823,7 +1180,9 @@ impl WasmExtension {
         let headers_json = serde_json::to_string(headers).map_err(|e| e.to_string())?;
         let raw = {
             let mut guard = guest.lock().await;
-            let InstantiatedGuest { store, instance } = &mut *guard;
+            let InstantiatedGuest {
+                store, instance, ..
+            } = &mut *guard;
             instance
                 .call_on_before_headers(store, &headers_json)
                 .await
@@ -841,6 +1200,19 @@ impl WasmExtension {
             set,
             delete: raw.delete,
         }))
+    }
+
+    pub async fn call_on_event(
+        &self,
+        event: ExtensionEvent,
+        payload: &Value,
+    ) -> Result<Option<Value>, String> {
+        let Some(guest) = self.ensure_guest().await? else {
+            return Ok(None);
+        };
+        let result = call_guest_event(&guest, event.as_str(), payload).await?;
+        self.assert_current()?;
+        Ok(result)
     }
 
     fn assert_current(&self) -> Result<(), String> {
@@ -893,8 +1265,14 @@ impl Extension for WasmExtension {
         };
         let result = {
             let mut guard = guest.lock().await;
-            let InstantiatedGuest { store, instance } = &mut *guard;
+            let InstantiatedGuest {
+                store,
+                instance,
+                on_event,
+            } = &mut *guard;
+            let has_on_event = on_event.is_some();
             store.data_mut().host = Some(Arc::downgrade(ctx.host));
+            store.data_mut().cwd = ctx.cwd.to_string();
             store.data_mut().registrations = Some(GuestRegistrations::default());
             instance
                 .call_init(&mut *store)
@@ -905,6 +1283,12 @@ impl Extension for WasmExtension {
                 .registrations
                 .take()
                 .ok_or("Missing guest registration state")?;
+            if !registrations.subscriptions.is_empty() && !has_on_event {
+                return Err(
+                    "WASM extension subscribed to events but does not export `on-event`"
+                        .to_string(),
+                );
+            }
             for (name, config) in registrations.providers {
                 ctx.register_provider(super::types::ProviderRegistration {
                     name,
@@ -917,6 +1301,13 @@ impl Extension for WasmExtension {
                     provider,
                     id,
                     definition,
+                    extension_path: ctx.registration.path.clone(),
+                })?;
+            }
+            for (name, config) in registrations.mcp_servers {
+                ctx.register_mcp_server(super::types::McpServerConfig {
+                    name,
+                    config,
                     extension_path: ctx.registration.path.clone(),
                 })?;
             }
@@ -940,9 +1331,46 @@ impl Extension for WasmExtension {
                     }),
                 })?;
             }
+            for (key, description, command) in registrations.shortcuts {
+                let weak = Arc::downgrade(&guest);
+                ctx.register_shortcut_handler(
+                    super::types::ShortcutDefinition {
+                        key,
+                        description,
+                        extension_path: ctx.registration.path.clone(),
+                    },
+                    Arc::new(move |_args, ctx| {
+                        let guest = weak.upgrade();
+                        let command = command.clone();
+                        Box::pin(async move {
+                            ctx.base.host.assert_active()?;
+                            let guest = guest.ok_or(STALE_MESSAGE)?;
+                            run_guest_command(&guest, &command, "", &ctx).await
+                        })
+                    }),
+                )?;
+            }
             for mut flag in registrations.flags {
                 flag.extension_path.clone_from(&ctx.registration.path);
                 ctx.register_flag(flag)?;
+            }
+            for event in registrations.subscriptions {
+                let weak_guest = Arc::downgrade(&guest);
+                let weak_host = Arc::downgrade(ctx.host);
+                let event_name = event.as_str();
+                ctx.on(
+                    event,
+                    Arc::new(move |payload| {
+                        let guest = weak_guest.upgrade();
+                        let host = weak_host.upgrade();
+                        Box::pin(async move {
+                            let host = host.ok_or_else(|| STALE_MESSAGE.to_string())?;
+                            host.assert_active()?;
+                            let guest = guest.ok_or_else(|| STALE_MESSAGE.to_string())?;
+                            call_guest_event(&guest, event_name, &payload).await
+                        })
+                    }),
+                )?;
             }
             Ok(())
         };
@@ -966,8 +1394,11 @@ impl Extension for WasmExtension {
         let args_json = serde_json::to_string(&args).map_err(|e| e.to_string())?;
         let raw = {
             let mut guard = guest.lock().await;
-            let InstantiatedGuest { store, instance } = &mut *guard;
+            let InstantiatedGuest {
+                store, instance, ..
+            } = &mut *guard;
             store.data_mut().ui = Some(ctx.base.ui.clone());
+            store.data_mut().cwd.clone_from(&ctx.base.cwd);
             let result = instance
                 .call_execute_tool(&mut *store, name, &args_json)
                 .await;
@@ -1063,6 +1494,7 @@ mod tests {
             host: None,
             registrations: None,
             ui: Some(ui),
+            cwd: "/work".to_string(),
             generation: 0,
             stale: false,
             bridge: HostBridge::default(),
@@ -1233,5 +1665,224 @@ mod tests {
         assert_eq!(extension.path(), "guest");
         assert!(!extension.replaceable());
         assert!(!extension.hidden());
+    }
+
+    #[tokio::test]
+    async fn host_exec_runs_command_with_non_interactive_env_and_timeout() {
+        use super::wit_bindings::pi::extension::host::Host;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = WasmState {
+            host: None,
+            registrations: None,
+            ui: None,
+            cwd: dir.path().to_string_lossy().into_owned(),
+            generation: 1,
+            stale: false,
+            bridge: HostBridge::default(),
+        };
+
+        let ok = state
+            .exec(
+                "sh".into(),
+                vec![
+                    "-c".into(),
+                    r#"printf '%s|%s' "$PAGER" "$GIT_TERMINAL_PROMPT""#.into(),
+                ],
+                None,
+                Some(5_000),
+            )
+            .await
+            .expect("exec should succeed");
+        assert_eq!(ok.exit_code, 0);
+        assert_eq!(ok.stdout, "cat|0");
+        assert!(!ok.timed_out);
+
+        let timed = state
+            .exec(
+                "sh".into(),
+                vec!["-c".into(), "sleep 5".into()],
+                None,
+                Some(50),
+            )
+            .await
+            .expect("timed-out exec returns structured result");
+        assert!(timed.timed_out);
+        assert_eq!(timed.exit_code, -1);
+
+        state.stale = true;
+        let stale_err = state
+            .exec("sh".into(), vec!["-c".into(), "echo hi".into()], None, None)
+            .await
+            .expect_err("stale guest must not exec");
+        assert!(stale_err.contains("stale"));
+    }
+
+    #[tokio::test]
+    async fn host_exec_drains_large_output_without_sigpipe() {
+        use super::wit_bindings::pi::extension::host::Host;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = WasmState {
+            host: None,
+            registrations: None,
+            ui: None,
+            cwd: dir.path().to_string_lossy().into_owned(),
+            generation: 1,
+            stale: false,
+            bridge: HostBridge::default(),
+        };
+
+        let large = state
+            .exec(
+                "sh".into(),
+                vec![
+                    "-c".into(),
+                    "head -c 2000000 /dev/zero | tr '\\0' 'a'".into(),
+                ],
+                None,
+                Some(5_000),
+            )
+            .await
+            .expect("large output command should succeed");
+        assert_eq!(large.exit_code, 0);
+        assert!(!large.timed_out);
+        assert_eq!(large.stdout.len(), EXEC_MAX_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn host_exec_honors_host_invalidation() {
+        use super::wit_bindings::pi::extension::host::Host;
+        use crate::core::event_bus::EventBus;
+        use crate::core::extensions::types::ExtensionHost;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = Arc::new(EventBus::new());
+        let host = Arc::new(ExtensionHost::new(bus));
+        host.commit();
+
+        let mut state = WasmState {
+            host: Some(Arc::downgrade(&host)),
+            registrations: None,
+            ui: None,
+            cwd: dir.path().to_string_lossy().into_owned(),
+            generation: 1,
+            stale: false,
+            bridge: HostBridge::default(),
+        };
+
+        host.invalidate(None);
+        let err = state
+            .exec("sh".into(), vec!["-c".into(), "echo hi".into()], None, None)
+            .await
+            .expect_err("invalidated host must reject exec");
+        assert!(err.contains("stale"));
+    }
+
+    #[tokio::test]
+    async fn host_subscribe_and_session_actions_enforce_contracts() {
+        use super::wit_bindings::pi::extension::host::Host;
+        use crate::core::event_bus::EventBus;
+        use crate::core::extensions::types::{ExtensionHost, ExtensionHostActions};
+
+        let bus = Arc::new(EventBus::new());
+        let host = Arc::new(ExtensionHost::new(bus));
+        host.commit();
+
+        let active_tools = Arc::new(Mutex::new(vec!["read".to_string(), "bash".to_string()]));
+        let sent_messages = Arc::new(Mutex::new(Vec::<(String, Value, bool)>::new()));
+        let appended = Arc::new(Mutex::new(Vec::<(String, Option<Value>)>::new()));
+
+        let tools_get = active_tools.clone();
+        let tools_set = active_tools.clone();
+        let sent_ref = sent_messages.clone();
+        let appended_ref = appended.clone();
+        host.set_actions(ExtensionHostActions {
+            get_model: Some(Arc::new(|| Some("anthropic/claude-sonnet-4".to_string()))),
+            get_active_tools: Some(Arc::new(move || {
+                tools_get.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            })),
+            set_active_tools: Some(Arc::new(move |next| {
+                *tools_set.lock().unwrap_or_else(|e| e.into_inner()) = next;
+                Ok(())
+            })),
+            send_message: Some(Arc::new(move |kind, content, trigger| {
+                sent_ref
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((kind, content, trigger));
+                Ok(())
+            })),
+            append_entry: Some(Arc::new(move |kind, data| {
+                appended_ref
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((kind, data));
+                Ok("entry-42".to_string())
+            })),
+        });
+
+        let mut state = WasmState {
+            host: Some(Arc::downgrade(&host)),
+            registrations: Some(GuestRegistrations::default()),
+            ui: None,
+            cwd: "/workspace".to_string(),
+            generation: 1,
+            stale: false,
+            bridge: HostBridge::default(),
+        };
+
+        assert_eq!(state.get_cwd().await, "/workspace");
+        assert_eq!(
+            state.get_model().await.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert_eq!(state.get_active_tools().await, vec!["read", "bash"]);
+        state
+            .set_active_tools(vec!["read".to_string()])
+            .await
+            .expect("set_active_tools");
+        assert_eq!(state.get_active_tools().await, vec!["read"]);
+
+        state
+            .send_message("self-update".into(), r#"{"version":"v1.7.0"}"#.into(), true)
+            .await
+            .expect("send_message");
+        assert_eq!(
+            *sent_messages.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![(
+                "self-update".to_string(),
+                json!({"version": "v1.7.0"}),
+                true
+            )]
+        );
+
+        let entry_id = state
+            .append_entry("audit".into(), Some(r#"{"ok":true}"#.into()))
+            .await
+            .expect("append_entry");
+        assert_eq!(entry_id, "entry-42");
+
+        state
+            .subscribe("tool_result".into())
+            .await
+            .expect("valid event");
+        state
+            .subscribe("tool_result".into())
+            .await
+            .expect("dedup event");
+        assert!(state.subscribe("not_a_real_event".into()).await.is_err());
+        state
+            .register_shortcut("ctrl+u".into(), Some("Update".into()), "self-update".into())
+            .await
+            .expect("register_shortcut");
+        state
+            .register_mcp_server("docs".into(), r#"{"command":"docs-mcp"}"#.into())
+            .await
+            .expect("register_mcp_server");
+
+        let regs = state.registrations.take().expect("registrations");
+        assert_eq!(regs.subscriptions, vec![ExtensionEvent::ToolResult]);
+        assert_eq!(regs.shortcuts.len(), 1);
+        assert_eq!(regs.mcp_servers.len(), 1);
     }
 }

@@ -277,6 +277,22 @@ pub enum LoadPhase {
     Failed,
 }
 
+pub type GetModelFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+pub type GetActiveToolsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+pub type SetActiveToolsFn = Arc<dyn Fn(Vec<String>) -> Result<(), String> + Send + Sync>;
+pub type SendMessageFn = Arc<dyn Fn(String, Value, bool) -> Result<(), String> + Send + Sync>;
+pub type AppendEntryFn = Arc<dyn Fn(String, Option<Value>) -> Result<String, String> + Send + Sync>;
+
+/// Session-level callbacks bound onto `ExtensionHost` once an `AgentSession` is live.
+#[derive(Clone, Default)]
+pub struct ExtensionHostActions {
+    pub get_model: Option<GetModelFn>,
+    pub get_active_tools: Option<GetActiveToolsFn>,
+    pub set_active_tools: Option<SetActiveToolsFn>,
+    pub send_message: Option<SendMessageFn>,
+    pub append_entry: Option<AppendEntryFn>,
+}
+
 /// Shared runtime state. All extension APIs reference one `ExtensionHost`, so
 /// flags, MCP servers, provider queues, and invalidation behave identically for
 /// native and WASM extensions.
@@ -295,6 +311,7 @@ pub struct ExtensionHost {
     error_listeners: Mutex<Vec<(usize, ErrorListener)>>,
     bus_unsubscribers: Mutex<Vec<usize>>,
     refresh_tools: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    actions: Mutex<ExtensionHostActions>,
     pub event_bus: Arc<EventBus>,
 }
 
@@ -315,6 +332,7 @@ impl ExtensionHost {
             error_listeners: Mutex::new(Vec::new()),
             bus_unsubscribers: Mutex::new(Vec::new()),
             refresh_tools: Mutex::new(None),
+            actions: Mutex::new(ExtensionHostActions::default()),
             event_bus,
         }
     }
@@ -617,6 +635,74 @@ impl ExtensionHost {
         {
             callback();
         }
+    }
+
+    pub fn set_actions(&self, actions: ExtensionHostActions) {
+        *self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = actions;
+    }
+
+    pub fn get_model(&self) -> Option<String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_model
+            .clone()?;
+        callback()
+    }
+
+    pub fn get_active_tools(&self) -> Vec<String> {
+        let Some(callback) = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_active_tools
+            .clone()
+        else {
+            return Vec::new();
+        };
+        callback()
+    }
+
+    pub fn set_active_tools(&self, tools: Vec<String>) -> Result<(), String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_active_tools
+            .clone()
+            .ok_or_else(|| "set_active_tools is unavailable before session binding".to_string())?;
+        callback(tools)
+    }
+
+    pub fn send_message(
+        &self,
+        custom_type: String,
+        content: Value,
+        trigger_turn: bool,
+    ) -> Result<(), String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .send_message
+            .clone()
+            .ok_or_else(|| "send_message is unavailable before session binding".to_string())?;
+        callback(custom_type, content, trigger_turn)
+    }
+
+    pub fn append_entry(&self, custom_type: String, data: Option<Value>) -> Result<String, String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .append_entry
+            .clone()
+            .ok_or_else(|| "append_entry is unavailable before session binding".to_string())?;
+        callback(custom_type, data)
     }
 
     pub fn track_unsubscribe(&self, id: usize) {

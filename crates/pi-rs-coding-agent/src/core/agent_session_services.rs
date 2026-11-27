@@ -885,14 +885,87 @@ async fn create_services(
     // Declare the initial loadout on the first prompt, not as hidden history.
     agent.set_tools(tools);
     {
-        let agent = agent.clone();
+        let agent_refresh = agent.clone();
         let runner_weak = Arc::downgrade(&runner);
-        let args = args.clone();
+        let args_refresh = args.clone();
+        let builtins_refresh = builtin_tools.clone();
         runner.host.set_refresh_tools(Arc::new(move || {
             if let Some(runner) = runner_weak.upgrade() {
-                agent.set_tools(collect_session_tools(&builtin_tools, &runner, &args));
+                agent_refresh.set_tools(collect_session_tools(
+                    &builtins_refresh,
+                    &runner,
+                    &args_refresh,
+                ));
             }
         }));
+
+        let agent_model = agent.clone();
+        let agent_tools = agent.clone();
+        let agent_set_tools = agent.clone();
+        let runner_set_tools = Arc::downgrade(&runner);
+        let args_set_tools = args.clone();
+        let session_for_entry = target.session_manager.clone();
+        let session_for_message = target.session_manager.clone();
+        let agent_for_message = agent.clone();
+        runner
+            .host
+            .set_actions(super::extensions::types::ExtensionHostActions {
+                get_model: Some(Arc::new(move || {
+                    let model = agent_model.model();
+                    Some(format!("{}/{}", model.provider, model.id))
+                })),
+                get_active_tools: Some(Arc::new(move || {
+                    agent_tools
+                        .tools()
+                        .into_iter()
+                        .map(|tool| tool.declaration().name.clone())
+                        .collect()
+                })),
+                set_active_tools: Some(Arc::new(move |names| {
+                    let Some(runner) = runner_set_tools.upgrade() else {
+                        return Err(super::extensions::types::STALE_MESSAGE.to_string());
+                    };
+                    let available = collect_session_tools(&builtin_tools, &runner, &args_set_tools);
+                    let selected = resolve_active_tools(&available, &names)?;
+                    agent_set_tools.set_tools(selected);
+                    Ok(())
+                })),
+                send_message: Some(Arc::new(move |custom_type, content, trigger_turn| {
+                    let display = true;
+                    if let Some(disk) = session_for_message.disk() {
+                        disk.lock().append_custom_message_entry(
+                            &custom_type,
+                            content.clone(),
+                            display,
+                            None,
+                        )?;
+                    }
+                    let mut fields = serde_json::Map::new();
+                    fields.insert("customType".to_string(), Value::String(custom_type));
+                    fields.insert("content".to_string(), content);
+                    fields.insert("display".to_string(), Value::Bool(display));
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0_u64, |duration| {
+                            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+                        });
+                    fields.insert("timestamp".to_string(), Value::from(timestamp));
+                    let message = AgentMessage::custom("custom", fields)
+                        .map_err(|error| error.to_string())?;
+                    if trigger_turn {
+                        agent_for_message.follow_up(message);
+                    } else {
+                        agent_for_message.append_message(message);
+                    }
+                    Ok(())
+                })),
+                append_entry: Some(Arc::new(move |custom_type, data| {
+                    let Some(disk) = session_for_entry.disk() else {
+                        return Err("Session does not support custom entries".to_string());
+                    };
+                    disk.lock().append_custom_entry(&custom_type, data)
+                })),
+            });
     }
     let compactor = Arc::new(ModelCompactor {
         runtime: model_runtime.clone(),
@@ -1277,6 +1350,33 @@ pub fn export_to_html(
     Ok(output)
 }
 
+fn resolve_active_tools(
+    available: &[Arc<dyn AgentTool>],
+    names: &[String],
+) -> Result<Vec<Arc<dyn AgentTool>>, String> {
+    let mut selected = Vec::with_capacity(names.len());
+    let mut seen_valid = std::collections::HashSet::with_capacity(names.len());
+    let mut unknown = Vec::new();
+    let mut seen_unknown = std::collections::HashSet::new();
+    for name in names {
+        let name_str = name.as_str();
+        if let Some(tool) = available
+            .iter()
+            .find(|tool| tool.declaration().name == name_str)
+        {
+            if seen_valid.insert(name_str) {
+                selected.push(tool.clone());
+            }
+        } else if seen_unknown.insert(name_str) {
+            unknown.push(name_str);
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(format!("Unknown tool(s): {}", unknown.join(", ")));
+    }
+    Ok(selected)
+}
+
 #[cfg(test)]
 mod tool_tests {
     use super::*;
@@ -1299,6 +1399,52 @@ mod tool_tests {
             .map(|tool| tool.declaration().name.as_str())
             .collect();
         assert_eq!(names, ["write", "read", "edit", "grep"]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_tools(dir: &Path) -> Vec<Arc<dyn AgentTool>> {
+        vec![
+            Arc::new(ReadTool::new(dir)),
+            Arc::new(BashTool::new(dir)),
+            Arc::new(WriteTool::new(dir)),
+        ]
+    }
+
+    #[test]
+    fn resolve_active_tools_preserves_order_and_deduplicates() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let available = sample_tools(dir.path());
+        let requested = ["write", "read", "write", "bash", "read"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let resolved = resolve_active_tools(&available, &requested)?;
+        let names: Vec<_> = resolved
+            .iter()
+            .map(|tool| tool.declaration().name.as_str())
+            .collect();
+        assert_eq!(names, ["write", "read", "bash"]);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_active_tools_rejects_unknown_names_without_silent_drop() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let available = sample_tools(dir.path());
+        let requested = ["read", "missing_one", "bash", "missing_one", "missing_two"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let err = match resolve_active_tools(&available, &requested) {
+            Ok(_) => return Err("unknown tool names must return an error".to_string()),
+            Err(err) => err,
+        };
+        assert_eq!(err, "Unknown tool(s): missing_one, missing_two");
         Ok(())
     }
 }

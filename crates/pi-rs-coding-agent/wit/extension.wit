@@ -1,22 +1,5 @@
 package pi:extension@0.1.0;
 
-interface host {
-    register-provider: func(name: string, config-json: string) -> result<_, string>;
-    register-virtual-model: func(provider: string, id: string, definition-json: string) -> result<_, string>;
-    register-tool: func(name: string, description: string, schema-json: string) -> result<_, string>;
-    register-command: func(name: string, description: option<string>) -> result<_, string>;
-    register-flag: func(name: string, description: option<string>, boolean: bool, default-value: option<string>) -> result<_, string>;
-    ui-select: func(title: string, items: list<string>) -> option<string>;
-    ui-confirm: func(title: string, message: string) -> bool;
-    ui-input: func(title: string, placeholder: option<string>) -> option<string>;
-    ui-notify: func(message: string, kind: option<string>);
-    ui-set-status: func(key: string, text: option<string>);
-    ui-set-widget: func(key: string, lines: option<list<string>>);
-    notify: func(level: string, message: string);
-    get-flag: func(name: string) -> option<string>;
-    execute-tool: func(name: string, args-json: string) -> result<string, string>;
-}
-
 interface types {
     record header-entry {
         name: string,
@@ -40,6 +23,45 @@ interface types {
         payload-json: string,
         error: option<string>,
     }
+
+    record exec-result {
+        exit-code: s32,
+        stdout: string,
+        stderr: string,
+        timed-out: bool,
+    }
+}
+
+interface host {
+    use types.{exec-result};
+
+    register-provider: func(name: string, config-json: string) -> result<_, string>;
+    register-virtual-model: func(provider: string, id: string, definition-json: string) -> result<_, string>;
+    register-mcp-server: func(name: string, config-json: string) -> result<_, string>;
+    register-tool: func(name: string, description: string, schema-json: string) -> result<_, string>;
+    register-command: func(name: string, description: option<string>) -> result<_, string>;
+    register-shortcut: func(key: string, description: option<string>, command: string) -> result<_, string>;
+    register-flag: func(name: string, description: option<string>, boolean: bool, default-value: option<string>) -> result<_, string>;
+    subscribe: func(event: string) -> result<_, string>;
+    ui-select: func(title: string, items: list<string>) -> option<string>;
+    ui-confirm: func(title: string, message: string) -> bool;
+    ui-input: func(title: string, placeholder: option<string>) -> option<string>;
+    ui-editor: func(title: string, prefill: option<string>) -> option<string>;
+    ui-notify: func(message: string, kind: option<string>);
+    ui-set-status: func(key: string, text: option<string>);
+    ui-set-widget: func(key: string, lines: option<list<string>>);
+    ui-set-title: func(title: string);
+    ui-set-editor-text: func(text: string);
+    notify: func(level: string, message: string);
+    get-flag: func(name: string) -> option<string>;
+    get-cwd: func() -> string;
+    get-model: func() -> option<string>;
+    get-active-tools: func() -> list<string>;
+    set-active-tools: func(tools: list<string>) -> result<_, string>;
+    send-message: func(custom-type: string, content-json: string, trigger-turn: bool) -> result<_, string>;
+    append-entry: func(custom-type: string, data-json: option<string>) -> result<string, string>;
+    exec: func(command: string, args: list<string>, cwd: option<string>, timeout-ms: option<u64>) -> result<exec-result, string>;
+    execute-tool: func(name: string, args-json: string) -> result<string, string>;
 }
 
 world extension {
@@ -51,4 +73,9 @@ world extension {
     export on-before-headers: func(headers-json: string) -> result<option<headers-patch>, string>;
     export execute-tool: func(name: string, args-json: string) -> result<tool-outcome, string>;
     export run-command: func(name: string, args: string) -> result<_, string>;
+}
+
+world extension-full {
+    include extension;
+    export on-event: func(name: string, payload-json: string) -> result<option<string>, string>;
 }
