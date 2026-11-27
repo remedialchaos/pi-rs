@@ -272,7 +272,6 @@ impl TuiMainScreen {
             .clone()
             .unwrap_or_else(std::env::temp_dir)
             .join("pi-tui-crash.log");
-        let _ = path.parent().map(std::fs::create_dir_all);
         let mut log = format!(
             "Crash at {}\nTerminal width: {width}\nLine {index} visible width: {actual}\n\n=== All rendered lines ===\n",
             chrono::Utc::now()
@@ -280,14 +279,19 @@ impl TuiMainScreen {
         for (i, line) in lines.iter().enumerate() {
             let _ = writeln!(log, "[{i}] (w={}) {line}", visible_width(line));
         }
-        let logged = std::fs::write(&path, log).is_ok();
+        // A failed write (full or unwritable temp dir) must not hide the width error or skip `stop()`.
+        let write_result = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, log));
+        let crash_log_status = match write_result {
+            Ok(()) => format!("Debug log written to: {}", path.display()),
+            Err(error) => format!("Could not write debug log to {}: {error}", path.display()),
+        };
         let _ = self.stop(TuiStopOptions::default());
-        let mut error = format!(
-            "Rendered line {index} exceeds terminal width ({actual} > {width}).\n\nThis is likely caused by a custom TUI component not truncating its output.\nUse visibleWidth() to measure and truncateToWidth() to truncate lines."
+        let error = format!(
+            "Rendered line {index} exceeds terminal width ({actual} > {width}).\n\nThis is likely caused by a custom TUI component not truncating its output.\nUse visibleWidth() to measure and truncateToWidth() to truncate lines.\n\n{crash_log_status}"
         );
-        if logged {
-            let _ = write!(error, "\n\nDebug log written to: {}", path.display());
-        }
         io::Error::new(io::ErrorKind::InvalidData, error)
     }
 

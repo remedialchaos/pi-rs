@@ -251,6 +251,46 @@ async fn text_lines_are_strict_lf_and_expose_termination() -> EnvConformanceResu
 }
 
 #[tokio::test]
+async fn local_text_line_reader_handles_large_multi_chunk_line_and_utf8_boundaries()
+-> EnvConformanceResult {
+    let dir = TempDir::new()?;
+    let env = LocalExecutionEnv::new(dir.path().to_string_lossy());
+    let context = &Context::background();
+    let mut prefix = "x".repeat(65_534);
+    prefix.push('🌳');
+    let suffix = "y".repeat(1_024 * 1024);
+    let long_line = format!("{prefix}{suffix}");
+    let content = format!("{long_line}\nshort\ntail");
+    env.write_file("large.txt", content.as_bytes(), context)
+        .await?;
+    let mut reader = env.open_text_line_reader("large.txt", context).await?;
+    assert_eq!(
+        reader.read_line(context).await?,
+        Some(TextLine {
+            text: long_line,
+            terminated: true,
+        })
+    );
+    assert_eq!(
+        reader.read_line(context).await?,
+        Some(TextLine {
+            text: "short".into(),
+            terminated: true,
+        })
+    );
+    assert_eq!(
+        reader.read_line(context).await?,
+        Some(TextLine {
+            text: "tail".into(),
+            terminated: false,
+        })
+    );
+    assert_eq!(reader.read_line(context).await?, None);
+    reader.close(context).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_file_lifecycle_and_bounds() -> EnvConformanceResult {
     let dir = TempDir::new()?;
     let env = LocalExecutionEnv::new(dir.path().to_string_lossy());

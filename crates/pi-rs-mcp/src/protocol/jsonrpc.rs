@@ -48,6 +48,21 @@ impl JsonRpcId {
     }
 }
 
+/// The client's request IDs and progress tokens are integers. Some servers echo them back as
+/// strings ("1" for 1); map canonical non-negative decimal strings to their integer so they
+/// match, like other MCP clients do.
+pub(crate) fn normalize_own_request_id(id: &JsonRpcId) -> JsonRpcId {
+    if let JsonRpcId::String(text) = id {
+        let bytes = text.as_bytes();
+        let canonical = bytes == b"0"
+            || (!bytes.is_empty() && bytes[0] != b'0' && bytes.iter().all(u8::is_ascii_digit));
+        if canonical && let Ok(number) = text.parse::<i64>() {
+            return JsonRpcId::number(number);
+        }
+    }
+    id.clone()
+}
+
 /// A request: has an id and a method.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JsonRpcRequest {
@@ -363,4 +378,49 @@ pub fn parse_json_rpc_message(value: &Value) -> Result<JsonRpcMessage, McpError>
 pub fn parse_json(text: &str) -> Result<Value, String> {
     let stripped = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     serde_json::from_str(stripped).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_canonical_non_negative_decimal_string_ids_only() {
+        for (input, expected) in [
+            (JsonRpcId::String("0".into()), JsonRpcId::number(0)),
+            (JsonRpcId::String("1".into()), JsonRpcId::number(1)),
+            (JsonRpcId::String("42".into()), JsonRpcId::number(42)),
+            (JsonRpcId::number(7), JsonRpcId::number(7)),
+            (
+                JsonRpcId::String("01".into()),
+                JsonRpcId::String("01".into()),
+            ),
+            (
+                JsonRpcId::String("-1".into()),
+                JsonRpcId::String("-1".into()),
+            ),
+            (
+                JsonRpcId::String("1.0".into()),
+                JsonRpcId::String("1.0".into()),
+            ),
+            (
+                JsonRpcId::String(" 1 ".into()),
+                JsonRpcId::String(" 1 ".into()),
+            ),
+            (
+                JsonRpcId::String(String::new()),
+                JsonRpcId::String(String::new()),
+            ),
+            (
+                JsonRpcId::String("abc".into()),
+                JsonRpcId::String("abc".into()),
+            ),
+            (
+                JsonRpcId::String("99999999999999999999999".into()),
+                JsonRpcId::String("99999999999999999999999".into()),
+            ),
+        ] {
+            assert_eq!(normalize_own_request_id(&input), expected);
+        }
+    }
 }

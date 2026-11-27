@@ -1,7 +1,7 @@
 use pi_rs_tui::terminal_image::{
     ImageProtocol, Iterm2Options, ItermSize, KittyImageMetadata, KittyOptions,
     crop_kitty_image_line, detect_capabilities_with, encode_iterm2, encode_kitty,
-    get_image_line_extent, get_kitty_image_placement, register_kitty_image_metadata,
+    get_image_line_extent, get_kitty_image_placement, hyperlink, register_kitty_image_metadata,
     strip_image_sequences,
 };
 
@@ -89,4 +89,18 @@ fn multiplexer_detection_beats_leaked_terminal_identity() {
     assert_eq!(standalone.images, Some(ImageProtocol::Kitty));
     assert!(standalone.hyperlinks);
     assert!(!standalone.true_color);
+}
+
+#[test]
+fn hyperlink_skips_osc8_above_8192_characters() {
+    let at_limit = format!("https://example.com/{}", "a".repeat(8192 - 20));
+    assert_eq!(at_limit.encode_utf16().count(), 8192);
+    assert_eq!(
+        hyperlink("link", &at_limit),
+        format!("\x1b]8;;{at_limit}\x1b\\link\x1b]8;;\x1b\\")
+    );
+
+    let over_limit = format!("{at_limit}b");
+    assert_eq!(over_limit.encode_utf16().count(), 8193);
+    assert_eq!(hyperlink("link", &over_limit), "link");
 }

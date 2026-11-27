@@ -20,7 +20,7 @@ use crate::protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LATEST_PROTOCOL_VERSION, McpError,
     McpErrorEvent, McpTransportError, ProgressNotification, ReadResourceResult, Resource,
     ResourceTemplate, Root, ServerCapabilities, Tool, is_json_rpc_id, is_object,
-    is_supported_protocol_version, json_rpc_error_codes,
+    is_supported_protocol_version, json_rpc_error_codes, normalize_own_request_id,
 };
 use crate::transports::{McpTransport, McpTransportSendOptions};
 
@@ -1019,20 +1019,21 @@ fn handle_message(shared: &Arc<ClientShared>, message: &JsonRpcMessage) {
 }
 
 fn handle_response(shared: &Arc<ClientShared>, response: &JsonRpcResponse) {
-    let id = response.id();
+    let raw_id = response.id();
+    let id = normalize_own_request_id(raw_id);
     let entry = {
         let mut inner = shared
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.pending.shift_remove(id)
+        inner.pending.shift_remove(&id)
     };
     let Some(entry) = entry else {
         emit_error(
             shared,
             McpErrorEvent::message(format!(
                 "Received response for unknown MCP request {}",
-                json_rpc_id_string(id)
+                json_rpc_id_string(raw_id)
             )),
         );
         return;
@@ -1220,6 +1221,8 @@ fn handle_progress(shared: &Arc<ClientShared>, params: &Value) {
     }
     let Some(progress) = progress else { return };
     let Some(token) = token else { return };
+    let token_id = json_rpc_id(token);
+    let normalized_token = normalize_own_request_id(&token_id);
     let entry = {
         let inner = shared
             .inner
@@ -1228,7 +1231,7 @@ fn handle_progress(shared: &Arc<ClientShared>, params: &Value) {
 
         inner
             .progress_requests
-            .get(&json_rpc_id(token))
+            .get(&normalized_token)
             .and_then(|request_id| inner.pending.get(request_id))
             .map(|entry| (entry.renew.clone(), entry.on_progress.clone()))
     };
@@ -1238,7 +1241,7 @@ fn handle_progress(shared: &Arc<ClientShared>, params: &Value) {
     renew.notify_one();
     if let Some(on_progress) = on_progress {
         let notification = crate::protocol::ProgressNotification {
-            progress_token: json_rpc_id(token),
+            progress_token: token_id,
             progress,
             total: params.get("total").and_then(Value::as_f64),
             message: params

@@ -5,6 +5,7 @@ pub mod jsonrpc;
 pub mod types;
 
 pub use content::{CallToolResult, LlmContent, to_llm_content};
+pub(crate) use jsonrpc::normalize_own_request_id;
 pub use jsonrpc::{
     JsonRpcErrorObject, JsonRpcErrorResponse, JsonRpcId, JsonRpcMessage, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, JsonRpcSuccessResponse, JsonRpcVersion, McpError,

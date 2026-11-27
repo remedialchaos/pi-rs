@@ -420,7 +420,22 @@ fn math(
     let shell_variable = tail.starts_with('{')
         || tail.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             && !tail.contains(['\\', '^', '=']);
-    if open.starts_with('\\') || !shell_variable && !tail.contains('$') && pending_math(tail) {
+    // A closed dollar formula cannot span lines, and "$" before a digit is usually currency:
+    // neither can be a formula still streaming, so leave the rest of the paragraph to Markdown.
+    let currency = tail.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    let has_following_paragraph_line = rest.get(limit..).is_some_and(|after| {
+        after.strip_prefix('\n').is_some_and(|next| {
+            let trimmed = next.trim_start_matches([' ', '\t', '\r']);
+            !trimmed.is_empty() && !trimmed.starts_with('\n')
+        })
+    });
+    if open.starts_with('\\')
+        || (!currency
+            && !has_following_paragraph_line
+            && !shell_variable
+            && !tail.contains('$')
+            && pending_math(tail))
+    {
         return Some(Extension::Math {
             raw: line,
             body: tail,

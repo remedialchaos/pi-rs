@@ -127,12 +127,12 @@ fn kill_tree(_pid: u32) -> bool {
     false
 }
 
-async fn bash_on_path() -> Option<PathBuf> {
+async fn find_executable_on_path(executable: &str) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let mut where_command = Command::new("where.exe");
         where_command
-            .arg("bash.exe")
+            .arg(executable)
             .creation_flags(0x0800_0000)
             .kill_on_drop(true)
             .stdin(Stdio::null());
@@ -156,7 +156,7 @@ async fn bash_on_path() -> Option<PathBuf> {
     {
         let path = env::var_os("PATH")?;
         for dir in env::split_paths(&path) {
-            let candidate = dir.join("bash");
+            let candidate = dir.join(executable);
             let Ok(metadata) = fs::metadata(&candidate).await else {
                 continue;
             };
@@ -175,6 +175,133 @@ async fn bash_on_path() -> Option<PathBuf> {
     }
 }
 
+#[cfg(any(windows, test))]
+// Git for Windows reports its POSIX shell as `<root>/usr/bin/sh.exe`.
+const GIT_FOR_WINDOWS_SHELL_SUFFIX: &str = r"usr\bin\sh.exe";
+
+#[cfg(any(windows, test))]
+fn normalize_win32_path(raw: &str) -> String {
+    let slash_normalized = raw.replace('/', "\\");
+    let (prefix, rest, is_absolute) = if let Some(after) = slash_normalized.strip_prefix(r"\\") {
+        (r"\\".to_owned(), after, true)
+    } else if slash_normalized
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && slash_normalized.as_bytes().get(1) == Some(&b':')
+    {
+        let drive = &slash_normalized[..2];
+        let after = &slash_normalized[2..];
+        if let Some(after) = after.strip_prefix('\\') {
+            (format!(r"{drive}\"), after, true)
+        } else {
+            (drive.to_owned(), after, false)
+        }
+    } else if let Some(after) = slash_normalized.strip_prefix('\\') {
+        (r"\".to_owned(), after, true)
+    } else {
+        (String::new(), slash_normalized.as_str(), false)
+    };
+    let trailing_sep = !rest.is_empty() && rest.ends_with('\\');
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in rest.split('\\') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if matches!(parts.last(), Some(&last) if last != "..") {
+                    parts.pop();
+                } else if !is_absolute {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = prefix;
+    out.push_str(&parts.join(r"\"));
+    if trailing_sep && !parts.is_empty() {
+        out.push('\\');
+    }
+    if out.is_empty() { ".".to_owned() } else { out }
+}
+
+#[cfg(any(windows, test))]
+fn git_bash_from_git_shell_path(git_shell_path: &str) -> Option<String> {
+    let git_shell = normalize_win32_path(git_shell_path.trim());
+    let expected = format!(r"\{GIT_FOR_WINDOWS_SHELL_SUFFIX}");
+    if !git_shell.to_ascii_lowercase().ends_with(&expected) {
+        return None;
+    }
+    let root = &git_shell[..git_shell.len() - GIT_FOR_WINDOWS_SHELL_SUFFIX.len()];
+    Some(format!(r"{root}bin\bash.exe"))
+}
+
+#[cfg(windows)]
+async fn run_git_var_shell_path(git: PathBuf) -> Option<String> {
+    let mut command = Command::new(git);
+    command
+        .args(["var", "GIT_SHELL_PATH"])
+        .creation_flags(0x0800_0000)
+        .kill_on_drop(true)
+        .stdin(Stdio::null());
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+#[cfg(any(windows, test))]
+async fn resolve_windows_shell_with<FEnv, FExists, FFind, FGit, FutExists, FutFind, FutGit>(
+    mut get_env: FEnv,
+    mut exists: FExists,
+    mut find_executable: FFind,
+    mut git_var_shell_path: FGit,
+) -> Result<PathBuf, ExecutionError>
+where
+    FEnv: FnMut(&str) -> Option<std::ffi::OsString>,
+    FExists: FnMut(PathBuf) -> FutExists,
+    FutExists: std::future::Future<Output = bool>,
+    FFind: FnMut(&'static str) -> FutFind,
+    FutFind: std::future::Future<Output = Option<PathBuf>>,
+    FGit: FnMut(PathBuf) -> FutGit,
+    FutGit: std::future::Future<Output = Option<String>>,
+{
+    let mut searched = String::new();
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(path) = get_env(key) {
+            let candidate = PathBuf::from(path).join(r"Git\bin\bash.exe");
+            if exists(candidate.clone()).await {
+                return Ok(candidate);
+            }
+            searched.push_str("\n  ");
+            searched.push_str(&candidate.to_string_lossy());
+        }
+    }
+    // Must precede the generic bash.exe lookup, which usually finds the WSL launcher in System32 first.
+    if let Some(git) = find_executable("git.exe").await
+        && let Some(stdout) = git_var_shell_path(git).await
+        && let Some(bash) = git_bash_from_git_shell_path(&stdout)
+    {
+        let candidate = PathBuf::from(bash);
+        if exists(candidate.clone()).await {
+            return Ok(candidate);
+        }
+    }
+    if let Some(path) = find_executable("bash.exe").await {
+        return Ok(path);
+    }
+    Err(ExecutionError::new(
+        ExecutionErrorCode::ShellUnavailable,
+        format!(
+            "No bash shell found. Options:\n  1. Install Git for Windows: https://git-scm.com/download/win\n  2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n  3. Configure an explicit shellPath\n\nSearched Git Bash in:{searched}\n  the Git for Windows installation of git.exe on PATH"
+        ),
+    ))
+}
+
 async fn shell_path(configured: Option<&str>) -> Result<PathBuf, ExecutionError> {
     if let Some(path) = configured.filter(|path| !path.is_empty()) {
         return if fs::metadata(path).await.is_ok() {
@@ -186,35 +313,26 @@ async fn shell_path(configured: Option<&str>) -> Result<PathBuf, ExecutionError>
             ))
         };
     }
-    #[cfg(not(windows))]
-    if fs::metadata("/bin/bash").await.is_ok() {
-        return Ok(PathBuf::from("/bin/bash"));
+    #[cfg(windows)]
+    {
+        resolve_windows_shell_with(
+            |key| env::var_os(key),
+            |path| async move { fs::metadata(&path).await.is_ok() },
+            find_executable_on_path,
+            run_git_var_shell_path,
+        )
+        .await
     }
-    #[cfg(windows)]
-    let mut searched = String::new();
-    #[cfg(windows)]
-    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(path) = env::var_os(key) {
-            let candidate = PathBuf::from(path).join(r"Git\bin\bash.exe");
-            if fs::metadata(&candidate).await.is_ok() {
-                return Ok(candidate);
-            }
-            searched.push_str("\n  ");
-            searched.push_str(&candidate.to_string_lossy());
+    #[cfg(not(windows))]
+    {
+        if fs::metadata("/bin/bash").await.is_ok() {
+            return Ok(PathBuf::from("/bin/bash"));
         }
+        if let Some(path) = find_executable_on_path("bash").await {
+            return Ok(path);
+        }
+        Ok(PathBuf::from("sh"))
     }
-    if let Some(path) = bash_on_path().await {
-        return Ok(path);
-    }
-    #[cfg(not(windows))]
-    return Ok(PathBuf::from("sh"));
-    #[cfg(windows)]
-    Err(ExecutionError::new(
-        ExecutionErrorCode::ShellUnavailable,
-        format!(
-            "No bash shell found. Options:\n  1. Install Git for Windows: https://git-scm.com/download/win\n  2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n  3. Configure an explicit shellPath\n\nSearched Git Bash in:{searched}"
-        ),
-    ))
 }
 
 #[cfg(windows)]
@@ -731,5 +849,170 @@ impl LocalExecutionEnv {
                 )
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    fn has_win_path(existing: &[&str], candidate: &Path) -> bool {
+        let normalized = normalize_win32_path(&candidate.to_string_lossy());
+        existing
+            .iter()
+            .any(|path| normalize_win32_path(path).eq_ignore_ascii_case(&normalized))
+    }
+
+    #[tokio::test]
+    async fn windows_shell_prefers_git_bash_of_git_on_path_over_wsl_launcher() {
+        let existing = [
+            r"C:\Scoop\apps\git\current\bin\bash.exe",
+            r"C:\Windows\System32\bash.exe",
+        ];
+        let resolved = resolve_windows_shell_with(
+            |key| match key {
+                "ProgramFiles" => Some(OsString::from(r"C:\Program Files")),
+                "ProgramFiles(x86)" => Some(OsString::from(r"C:\Program Files (x86)")),
+                _ => None,
+            },
+            |path| async move { has_win_path(&existing, &path) },
+            |exe| async move {
+                match exe {
+                    "git.exe" => Some(PathBuf::from(r"C:\Scoop\shims\git.exe")),
+                    "bash.exe" => Some(PathBuf::from(r"C:\Windows\System32\bash.exe")),
+                    _ => None,
+                }
+            },
+            |_git| async move { Some("C:/Scoop/apps/git/current/usr/bin/SH.EXE\r\n".into()) },
+        )
+        .await
+        .expect("git bash resolves");
+        assert_eq!(
+            normalize_win32_path(&resolved.to_string_lossy()),
+            r"C:\Scoop\apps\git\current\bin\bash.exe"
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_shell_uses_program_files_without_spawning_git() {
+        let existing = [r"C:\Program Files\Git\bin\bash.exe"];
+        let probed_path = Arc::new(AtomicBool::new(false));
+        let probed_git = Arc::new(AtomicBool::new(false));
+        let resolved = resolve_windows_shell_with(
+            |key| match key {
+                "ProgramFiles" => Some(OsString::from(r"C:\Program Files")),
+                _ => None,
+            },
+            |path| async move { has_win_path(&existing, &path) },
+            |_exe| {
+                let probed_path = probed_path.clone();
+                async move {
+                    probed_path.store(true, Ordering::SeqCst);
+                    None
+                }
+            },
+            |_git| {
+                let probed_git = probed_git.clone();
+                async move {
+                    probed_git.store(true, Ordering::SeqCst);
+                    None
+                }
+            },
+        )
+        .await
+        .expect("program files bash resolves");
+        assert_eq!(
+            normalize_win32_path(&resolved.to_string_lossy()),
+            r"C:\Program Files\Git\bin\bash.exe"
+        );
+        assert!(!probed_path.load(Ordering::SeqCst));
+        assert!(!probed_git.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn windows_shell_falls_back_to_bash_on_path_when_git_var_fails_or_is_nonstandard() {
+        let existing = [
+            r"C:\Custom\Git\bin\bash.exe",
+            r"C:\Windows\System32\bash.exe",
+        ];
+        // Old Git (<2.47): git var returns None.
+        let old_git = resolve_windows_shell_with(
+            |_| None,
+            |path| async move { has_win_path(&existing, &path) },
+            |exe| async move {
+                match exe {
+                    "git.exe" => Some(PathBuf::from(r"C:\Custom\Git\cmd\git.exe")),
+                    "bash.exe" => Some(PathBuf::from(r"C:\Windows\System32\bash.exe")),
+                    _ => None,
+                }
+            },
+            |_| async move { None },
+        )
+        .await
+        .expect("fallback bash");
+        assert_eq!(old_git, PathBuf::from(r"C:\Windows\System32\bash.exe"));
+
+        // Unexpected shell path outside usr\bin\sh.exe layout.
+        for bad_shell in ["C:/msys64/usr/bin/bash.exe\n", "/bin/sh\n"] {
+            let fallback = resolve_windows_shell_with(
+                |_| None,
+                |path| async move { has_win_path(&existing, &path) },
+                |exe| async move {
+                    match exe {
+                        "git.exe" => Some(PathBuf::from(r"C:\Custom\Git\cmd\git.exe")),
+                        "bash.exe" => Some(PathBuf::from(r"C:\Windows\System32\bash.exe")),
+                        _ => None,
+                    }
+                },
+                |_| async move { Some(bad_shell.to_owned()) },
+            )
+            .await
+            .expect("fallback bash");
+            assert_eq!(fallback, PathBuf::from(r"C:\Windows\System32\bash.exe"));
+        }
+
+        // Valid layout, but `<root>\bin\bash.exe` does not exist on disk.
+        let missing_launcher = resolve_windows_shell_with(
+            |_| None,
+            |path| async move { has_win_path(&[r"C:\Windows\System32\bash.exe"], &path) },
+            |exe| async move {
+                match exe {
+                    "git.exe" => Some(PathBuf::from(r"C:\Missing\Git\cmd\git.exe")),
+                    "bash.exe" => Some(PathBuf::from(r"C:\Windows\System32\bash.exe")),
+                    _ => None,
+                }
+            },
+            |_| async move { Some("C:/Missing/Git/usr/bin/sh.exe\n".into()) },
+        )
+        .await
+        .expect("fallback bash");
+        assert_eq!(
+            missing_launcher,
+            PathBuf::from(r"C:\Windows\System32\bash.exe")
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_shell_unavailable_error_documents_git_on_path_probe() {
+        let error = resolve_windows_shell_with(
+            |key| (key == "ProgramFiles").then(|| OsString::from(r"C:\Program Files")),
+            |_| async move { false },
+            |_| async move { None },
+            |_| async move { None },
+        )
+        .await
+        .expect_err("no shell found");
+        assert_eq!(error.code, ExecutionErrorCode::ShellUnavailable);
+        assert!(
+            error
+                .message
+                .contains("the Git for Windows installation of git.exe on PATH"),
+            "{}",
+            error.message
+        );
     }
 }

@@ -86,6 +86,55 @@ fn display_math_and_single_dollar_punctuation_keep_their_contract() {
 }
 
 #[test]
+fn keeps_markdown_after_an_unclosed_currency_dollar_sign() {
+    let bold_theme = || MarkdownTheme {
+        bold: Rc::new(|text| format!("<b>{text}</b>")),
+        ..MarkdownTheme::default()
+    };
+    for (source, expected_plain, expected_styled) in [
+        (
+            "Costs +$50 for **this** option.",
+            vec!["Costs +$50 for this option."],
+            vec!["Costs +$50 for <b>this</b> option."],
+        ),
+        (
+            "**A:** costs +$50 (once).\n**B:** next.",
+            vec!["A: costs +$50 (once).", "B: next."],
+            vec!["<b>A:</b> costs +$50 (once).", "<b>B:</b> next."],
+        ),
+        (
+            "**A:** costs $x + y\n**B:** next.",
+            vec!["A: costs $x + y", "B: next."],
+            vec!["<b>A:</b> costs $x + y", "<b>B:</b> next."],
+        ),
+        (
+            "**A:** costs $x + y **bold**\n**B:** next.",
+            vec!["A: costs $x + y bold", "B: next."],
+            vec!["<b>A:</b> costs $x + y <b>bold</b>", "<b>B:</b> next."],
+        ),
+    ] {
+        assert_eq!(plain(source, 80), expected_plain, "{source}");
+        let styled: Vec<String> = Markdown::new(
+            source,
+            0,
+            0,
+            bold_theme(),
+            DefaultTextStyle::default(),
+            MarkdownOptions::default(),
+        )
+        .render(80)
+        .into_iter()
+        .map(|line| line.trim_end().to_owned())
+        .collect();
+        assert_eq!(styled, expected_styled, "{source}");
+    }
+    assert_eq!(
+        plain(r"Streaming $\mathbb{C}^3", 80),
+        [r"Streaming $\mathbb{C}^3"]
+    );
+}
+
+#[test]
 fn an_unclosed_math_block_does_not_swallow_the_table() {
     let lines = plain(
         "\\[\nx^2\n\n| Value |\n| --- |\n| $\\mathbb{C}^3$ |\n\n$$ y^2 $$",

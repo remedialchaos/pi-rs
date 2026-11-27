@@ -17,7 +17,8 @@ use crate::fetch::{
     McpFetchError, McpFetchRequest, McpFetchResponse, StreamingDecoder, read_body_text,
 };
 use crate::protocol::{
-    JsonRpcId, JsonRpcMessage, McpErrorEvent, McpTransportError, parse_json, parse_json_rpc_message,
+    JsonRpcId, JsonRpcMessage, McpErrorEvent, McpTransportError, normalize_own_request_id,
+    parse_json, parse_json_rpc_message,
 };
 use crate::transports::{
     DEFAULT_MAX_MESSAGE_BYTES, McpTransport, McpTransportSendOptions, Subscription, TransportEvents,
@@ -60,41 +61,40 @@ pub async fn consume_sse_stream(
     let max_event_bytes = options.max_event_bytes.unwrap_or(DEFAULT_MAX_MESSAGE_BYTES) as usize;
     let mut state = SseState {
         decoder: StreamingDecoder::default(),
-        buffered: String::new(),
+        pending_line: String::new(),
         skip_leading_lf: false,
         event_name: None,
         event_id: None,
         data_lines: Vec::new(),
         data_bytes: 0,
         max_event_bytes,
+        #[cfg(test)]
+        scanned_bytes: 0,
     };
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
-        let mut text = state.decoder.push(&chunk);
+        let text = state.decoder.push(&chunk);
         // A CRLF split across chunks: the CR already ended the line, so drop the LF.
-        if state.skip_leading_lf && !text.is_empty() {
-            if let Some(rest) = text.strip_prefix('\n') {
-                text = rest.to_string();
-            }
+        let text_slice = if state.skip_leading_lf && !text.is_empty() {
             state.skip_leading_lf = false;
-        }
-        state.buffered.push_str(&text);
-        state.consume_lines(&options)?;
-        if state.buffered.len() > max_event_bytes {
+            text.strip_prefix('\n').unwrap_or(&text)
+        } else {
+            &text
+        };
+        state.consume_lines(text_slice, &options)?;
+        if state.pending_line.len() > max_event_bytes {
             return Err(format!("MCP SSE event exceeds {max_event_bytes} bytes"));
         }
     }
     let tail = state.decoder.finish();
-    if state.skip_leading_lf {
-        if let Some(rest) = tail.strip_prefix('\n') {
-            state.buffered.push_str(rest);
-        }
+    let tail_slice = if state.skip_leading_lf {
+        tail.strip_prefix('\n').unwrap_or(&tail)
     } else {
-        state.buffered.push_str(&tail);
-    }
-    state.consume_lines(&options)?;
-    if !state.buffered.is_empty() {
-        let line = std::mem::take(&mut state.buffered);
+        &tail
+    };
+    state.consume_lines(tail_slice, &options)?;
+    if !state.pending_line.is_empty() {
+        let line = std::mem::take(&mut state.pending_line);
         state.process_line(&line, &options)?;
     }
     state.dispatch(&options);
@@ -104,7 +104,9 @@ pub async fn consume_sse_stream(
 /// The SSE parsing state, kept across chunks.
 struct SseState {
     decoder: StreamingDecoder,
-    buffered: String,
+    /// Incomplete last line. Only new text is scanned and the line is read once when it ends, so a
+    /// large line arriving in many chunks costs time linear in its size.
+    pending_line: String,
     skip_leading_lf: bool,
     event_name: Option<String>,
     event_id: Option<String>,
@@ -113,6 +115,8 @@ struct SseState {
     /// short `data:` lines without a terminating blank line cannot grow without bound.
     data_bytes: usize,
     max_event_bytes: usize,
+    #[cfg(test)]
+    scanned_bytes: usize,
 }
 
 impl SseState {
@@ -181,18 +185,27 @@ impl SseState {
     }
 
     /// SSE lines end with CRLF, LF, or a lone CR.
-    fn consume_lines(&mut self, options: &ConsumeSseOptions) -> Result<(), String> {
+    fn consume_lines(&mut self, text: &str, options: &ConsumeSseOptions) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            self.scanned_bytes += text.len();
+        }
         let mut start = 0;
         let mut index = 0;
-        let bytes = self.buffered.as_bytes().to_vec();
+        let bytes = text.as_bytes();
         while index < bytes.len() {
             let character = bytes[index];
             if character != b'\r' && character != b'\n' {
                 index += 1;
                 continue;
             }
-            let line = self.buffered[start..index].to_string();
-            self.process_line(&line, options)?;
+            if self.pending_line.is_empty() {
+                self.process_line(&text[start..index], options)?;
+            } else {
+                self.pending_line.push_str(&text[start..index]);
+                let line = std::mem::take(&mut self.pending_line);
+                self.process_line(&line, options)?;
+            }
             if character == b'\r' {
                 if index + 1 < bytes.len() {
                     if bytes[index + 1] == b'\n' {
@@ -205,7 +218,9 @@ impl SseState {
             start = index + 1;
             index += 1;
         }
-        self.buffered.drain(..start);
+        if start < text.len() {
+            self.pending_line.push_str(&text[start..]);
+        }
         Ok(())
     }
 }
@@ -554,7 +569,7 @@ impl StreamableHttpTransport {
             let watched_id = request_id.clone();
             Arc::new(move |message: &JsonRpcMessage| {
                 if let crate::protocol::JsonRpcMessage::Response(response) = message
-                    && response.id() == &watched_id
+                    && normalize_own_request_id(response.id()) == watched_id
                 {
                     answered.store(true, Ordering::SeqCst);
                 }
@@ -1042,5 +1057,59 @@ impl McpTransport for StreamableHttpTransport {
 
     fn on_close(&self, listener: crate::transports::McpTransportCloseListener) -> Subscription {
         self.events.on_close(listener)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn scans_large_chunked_sse_line_in_linear_time() {
+        let payload = "x".repeat(1024 * 1024);
+        let text = format!("data: {payload}\n\n");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let options = ConsumeSseOptions {
+            max_event_bytes: Some(2 * 1024 * 1024),
+            on_event: Arc::new(move |event: &SseEvent| {
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event.clone());
+            }),
+            on_id: None,
+            on_retry: None,
+        };
+        let mut state = SseState {
+            decoder: StreamingDecoder::default(),
+            pending_line: String::new(),
+            skip_leading_lf: false,
+            event_name: None,
+            event_id: None,
+            data_lines: Vec::new(),
+            data_bytes: 0,
+            max_event_bytes: 2 * 1024 * 1024,
+            scanned_bytes: 0,
+        };
+        for chunk in text.as_bytes().chunks(4096) {
+            let chunk = std::str::from_utf8(chunk).expect("ascii");
+            state.consume_lines(chunk, &options).expect("consume");
+        }
+        state.dispatch(&options);
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: None,
+                data: payload,
+                id: None,
+            }]
+        );
+        assert_eq!(state.scanned_bytes, text.len());
     }
 }

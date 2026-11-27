@@ -239,12 +239,18 @@ async fn run_proxy(
     while let Some(chunk) = abortable(signal, async { Ok(response.chunk().await?) }).await? {
         let mut lines = chunk.split_inclusive(|&b| b == b'\n');
         if let Some(line) = lines.next() {
-            tail.extend_from_slice(line);
-            if line.ends_with(b"\n") {
-                if partial.line(&tail, &mut first_line, tx)? {
+            if tail.is_empty() && line.ends_with(b"\n") {
+                if partial.line(line, &mut first_line, tx)? {
                     return Ok(());
                 }
-                tail.clear();
+            } else {
+                tail.extend_from_slice(line);
+                if line.ends_with(b"\n") {
+                    if partial.line(&tail, &mut first_line, tx)? {
+                        return Ok(());
+                    }
+                    tail.clear();
+                }
             }
         }
         for line in lines {

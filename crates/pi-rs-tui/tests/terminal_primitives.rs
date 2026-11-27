@@ -130,6 +130,36 @@ fn delayed_terminal_replies_do_not_turn_into_keyboard_shortcuts() {
         input.process("1~y", late),
         [StdinEvent::Paste("文".into()), StdinEvent::Data("y".into())]
     );
+    let ascii = "\x1b[200~ab\x1b[201~c";
+    for chunk_size in 1..=ascii.len() {
+        let mut buffer = StdinBuffer::default();
+        let mut events = Vec::new();
+        for chunk in ascii.as_bytes().chunks(chunk_size) {
+            events.extend(buffer.process(std::str::from_utf8(chunk).expect("ascii"), start));
+        }
+        assert_eq!(
+            events,
+            [StdinEvent::Paste("ab".into()), StdinEvent::Data("c".into())],
+            "chunk size {chunk_size}"
+        );
+    }
+    let utf8 = "\x1b[200~a界\x1b[201~c";
+    for split in 1..utf8.len() {
+        if !utf8.is_char_boundary(split) {
+            continue;
+        }
+        let mut buffer = StdinBuffer::default();
+        let mut events = buffer.process(&utf8[..split], start);
+        events.extend(buffer.process(&utf8[split..], start));
+        assert_eq!(
+            events,
+            [
+                StdinEvent::Paste("a界".into()),
+                StdinEvent::Data("c".into())
+            ],
+            "split at {split}"
+        );
+    }
 }
 
 #[test]
