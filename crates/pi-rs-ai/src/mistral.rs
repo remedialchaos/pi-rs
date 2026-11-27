@@ -420,9 +420,6 @@ async fn run(
                     "stop" => Ok(StopReason::Stop),
                     "length" | "model_length" => Ok(StopReason::Length),
                     "tool_calls" => Ok(StopReason::ToolUse),
-                    "error" => Err(Error::Protocol(
-                        "Provider stopped with: error (server error)".into(),
-                    )),
                     r => Err(Error::Protocol(format!("Provider stopped with: {r}"))),
                 });
             }

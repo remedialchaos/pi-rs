@@ -1,13 +1,16 @@
 use std::sync::{Arc, Mutex};
 
-use axum::{Json, Router, extract::State, routing::post};
+use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+use indexmap::IndexMap;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 use crate::common::{Server, TestResult, json_reply, request};
 use pi_rs_ai::{
     ClassifierContext, ClassifierModel, ImageModel, ImagesContext, InputContent, Models,
     ModelsOptions, StopReason,
+    auth::CredentialStore,
     classifier::{self, ClassifierOptions},
     llama_cpp, openai_decisions, openrouter_images,
 };
@@ -40,6 +43,7 @@ async fn typesafe_uses_named_assets_and_prices_reported_usage() -> TestResult {
         &ClassifierOptions {
             request: request()?,
             temperature: Some(0.2),
+            ..Default::default()
         },
     )
     .await;
@@ -74,7 +78,7 @@ async fn cloudflare_workers_materializes_account_and_unwraps_run_record() -> Tes
     let models = Models::builtin(ModelsOptions::default())?;
     let mut opts = ClassifierOptions {
         request: request()?,
-        temperature: None,
+        ..Default::default()
     };
     opts.request
         .env
@@ -99,7 +103,7 @@ async fn openai_decisions_splits_cache_and_maps_predicate_by_name() -> TestResul
         &questions()?,
         &ClassifierOptions {
             request: request()?,
-            temperature: None,
+            ..Default::default()
         },
     )
     .await;
@@ -174,6 +178,7 @@ async fn llama_classifier_requests_deeper_probabilities_for_missing_labels() -> 
         &ClassifierOptions {
             request: request()?,
             temperature: Some(1.0),
+            ..Default::default()
         },
     )
     .await;
@@ -219,5 +224,195 @@ async fn openrouter_image_generation_decodes_data_urls_and_uses_catalog_cost() -
         wire["messages"][0]["content"][1]["image_url"]["url"],
         "data:image/png;base64,Yg=="
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pi_decision_posts_to_decision_validates_answers_and_handles_images() -> TestResult {
+    let mut ctx = questions()?;
+    ctx.questions.insert(
+        "sentiment".into(),
+        pi_rs_ai::ClassifierQuestion::Choice {
+            instructions: "Sentiment?".into(),
+            criteria: IndexMap::from([
+                ("positive".into(), "Positive".into()),
+                ("negative".into(), "Negative".into()),
+            ]),
+        },
+    );
+    ctx.questions.insert(
+        "urgency".into(),
+        pi_rs_ai::ClassifierQuestion::Score {
+            instructions: "Urgency?".into(),
+            criteria: vec!["low".into(), "medium".into(), "high".into()],
+        },
+    );
+    let server = Server::start(vec![
+        json_reply(json!({
+            "answers": {
+                "ok": { "type": "bool", "probability": 0.96 },
+                "sentiment": {
+                    "type": "choice",
+                    "choice": "positive",
+                    "probabilities": { "positive": 0.95, "negative": 0.05 },
+                    "confidence": 0.9
+                },
+                "urgency": { "type": "score", "score": 0.4, "confidence": 0.8 }
+            },
+            "usage": {
+                "input": 120,
+                "output": 3,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 123,
+                "cost": { "input": 0.0001, "output": 0.00001, "cacheRead": 0, "cacheWrite": 0, "total": 0.00011 }
+            },
+            "responseId": "gen-dec-1"
+        })),
+        (
+            axum::http::StatusCode::PAYMENT_REQUIRED,
+            Json(json!({ "error": { "message": "Insufficient credits", "code": "insufficient_credits" } })),
+        )
+            .into_response(),
+        json_reply(json!({
+            "answers": {
+                "ok": { "type": "bool", "probability": 1.5 },
+                "sentiment": {
+                    "type": "choice",
+                    "choice": "positive",
+                    "probabilities": { "positive": 0.9, "negative": 0.1 },
+                    "confidence": 0.8
+                },
+                "urgency": { "type": "score", "score": 1, "confidence": 0.5 }
+            }
+        })),
+    ])
+    .await?;
+    let m = classifier_model("pi-decision", "radius", &format!("{}/v1", server.url))?;
+    let mut opts = ClassifierOptions {
+        request: request()?,
+        session_id: Some("sess-1".into()),
+        ..Default::default()
+    };
+    let ok = pi_rs_ai::pi_decision::classify(&m, &ctx, &opts).await;
+    assert_eq!(ok.stop_reason, StopReason::Stop, "{ok:?}");
+    assert_eq!(ok.response_id.as_deref(), Some("gen-dec-1"));
+    assert!((ok.usage.ok_or("missing usage")?.cost.total - 0.00011).abs() < 1e-12);
+    let calls = server.drain()?;
+    assert_eq!(calls[0].path, "/v1/decision");
+    assert_eq!(calls[0].json()?["options"]["sessionId"], "sess-1");
+
+    opts.request.max_retries = Some(0);
+    let err_env = pi_rs_ai::pi_decision::classify(&m, &ctx, &opts).await;
+    assert_eq!(err_env.stop_reason, StopReason::Error);
+    assert!(
+        err_env
+            .error_message
+            .as_deref()
+            .is_some_and(|s| s.contains("Insufficient credits"))
+    );
+
+    let bad_prob = pi_rs_ai::pi_decision::classify(&m, &ctx, &opts).await;
+    assert_eq!(bad_prob.stop_reason, StopReason::Error);
+    assert!(bad_prob.answers.is_empty());
+    assert!(
+        bad_prob
+            .error_message
+            .as_deref()
+            .is_some_and(|s| s.contains("out-of-range probability"))
+    );
+
+    let mut img_ctx = ctx.clone();
+    img_ctx.images.push(pi_rs_ai::ImageContent {
+        kind: Default::default(),
+        data: "AAAA".into(),
+        mime_type: "image/png".into(),
+    });
+    let mut text_only = m.clone();
+    text_only.input = vec![pi_rs_ai::ModelInputModality::Text];
+    let rejected = pi_rs_ai::pi_decision::classify(&text_only, &img_ctx, &opts).await;
+    assert_eq!(rejected.stop_reason, StopReason::Error);
+    assert!(
+        rejected
+            .error_message
+            .as_deref()
+            .is_some_and(|s| s.contains("does not support image input"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn openrouter_system_one_exposes_response_id_and_billed_cost() -> TestResult {
+    let server = Server::start(vec![json_reply(json!({
+        "id": "gen-dec-or-1",
+        "answers": { "ok": { "type": "noul", "noul": 0.95 } },
+        "usage": {
+            "input_tokens": 304,
+            "output_tokens": 20,
+            "cost": 0.000012768,
+            "is_byok": false
+        }
+    }))])
+    .await?;
+    let m = classifier_model("typesafe-system-one", "openrouter", &server.url)?;
+    let out = classifier::classify_system_one(
+        &m,
+        &questions()?,
+        &ClassifierOptions {
+            request: request()?,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(out.stop_reason, StopReason::Stop, "{out:?}");
+    assert_eq!(out.response_id.as_deref(), Some("gen-dec-or-1"));
+    let usage = out.usage.ok_or("missing usage")?;
+    assert!((usage.cost.total - 0.000012768).abs() < 1e-12);
+    assert_eq!(usage.cost.total_from_provider, Some(true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_gpt6_luna_decisions_routes_v1_and_filters_by_account() -> TestResult {
+    let creds = Arc::new(pi_rs_ai::auth::InMemoryCredentialStore::default());
+    let mut details = serde_json::Map::new();
+    details.insert("availableModelIds".into(), json!(["gpt-6-luna"]));
+    details.insert(
+        "availableClassifierModelIds".into(),
+        json!(["gpt-6-luna-decisions"]),
+    );
+    creds
+        .modify(
+            "github-copilot",
+            Box::new(move |_| {
+                Box::pin(async move {
+                    Ok(Some(pi_rs_ai::auth::Credential::OAuth(
+                        pi_rs_ai::auth::OAuthCredential {
+                            access:
+                                "tid=test;exp=9999999999;proxy-ep=proxy.business.githubcopilot.com;"
+                                    .into(),
+                            refresh: "refresh".into(),
+                            expires: u64::MAX,
+                            details,
+                        },
+                    )))
+                })
+            }),
+            &CancellationToken::new(),
+        )
+        .await?;
+    let models = Models::builtin(ModelsOptions {
+        credentials: creds,
+        ..Default::default()
+    })?;
+    let available = models
+        .get_available_of_type(
+            pi_rs_ai::ModelType::Classifier,
+            Some("github-copilot"),
+            &CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(available.len(), 1);
+    assert_eq!(available[0].id(), "gpt-6-luna-decisions");
     Ok(())
 }

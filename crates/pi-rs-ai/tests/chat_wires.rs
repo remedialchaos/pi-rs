@@ -625,3 +625,268 @@ async fn mistral_times_out_after_sixty_seconds_waiting_for_response_headers() ->
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn openrouter_native_finish_reason_and_empty_stop_retry() -> TestResult {
+    let server = Server::start(vec![
+        sse(
+            &[
+                json!({"id":"gen-1","choices":[{"index":0,"delta":{"content":"Done."},"finish_reason":null}]}),
+                json!({"id":"gen-1","choices":[{"index":0,"delta":{},"finish_reason":"stop","native_finish_reason":"MALFORMED_RESPONSE"}]}),
+                Value::String("[DONE]".into()),
+            ],
+            "\n",
+        ),
+        sse(
+            &[
+                json!({"id":"gen-2","choices":[{"index":0,"delta":{"reasoning":"Let me think."},"finish_reason":null}]}),
+                json!({"id":"gen-2","choices":[{"index":0,"delta":{},"finish_reason":"stop","native_finish_reason":"MALFORMED_RESPONSE"}]}),
+                Value::String("[DONE]".into()),
+            ],
+            "\n",
+        ),
+        sse(
+            &[
+                json!({"id":"gen-3","choices":[{"index":0,"delta":{},"finish_reason":"stop","native_finish_reason":"End_Turn"}]}),
+                Value::String("[DONE]".into()),
+            ],
+            "\n",
+        ),
+    ])
+    .await?;
+    let m = model(
+        Api::OpenAiCompletions,
+        "openrouter",
+        "google/gemini-4-neon",
+        &server.url,
+    )?;
+    let with_text = openai_completions::stream_simple(
+        m.clone(),
+        normalize_context(context()?),
+        stream_options()?,
+    )?
+    .result()
+    .await?;
+    assert_eq!(with_text.stop_reason, StopReason::Stop);
+    assert_eq!(
+        with_text.raw_stop_reason.as_deref(),
+        Some("stop.MALFORMED_RESPONSE")
+    );
+
+    let reasoning_only = openai_completions::stream_simple(
+        m.clone(),
+        normalize_context(context()?),
+        stream_options()?,
+    )?
+    .result()
+    .await?;
+    assert_eq!(reasoning_only.stop_reason, StopReason::Error);
+    assert!(pi_rs_ai::is_retryable_assistant_error(&reasoning_only));
+
+    let clean_empty =
+        openai_completions::stream_simple(m, normalize_context(context()?), stream_options()?)?
+            .result()
+            .await?;
+    assert_eq!(clean_empty.stop_reason, StopReason::Stop);
+    Ok(())
+}
+
+#[tokio::test]
+async fn google_xhigh_and_prompt_block_vs_empty_stream() -> TestResult {
+    let server = Server::start(vec![
+        sse(
+            &[
+                json!({"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}),
+            ],
+            "\n",
+        ),
+        sse(
+            &[
+                json!({"promptFeedback":{"blockReason":"PROHIBITED_CONTENT","blockReasonMessage":"Blocked by policy","safetyRatings":[{"category":"HARM_CATEGORY_SEXUALLY_EXPLICIT","probability":"HIGH"}]}}),
+            ],
+            "\n",
+        ),
+        sse(&[], "\n"),
+    ])
+    .await?;
+    let mut m = model(
+        Api::GoogleGenerativeAi,
+        "google",
+        "gemini-4-hydrogen",
+        &server.url,
+    )?;
+    m.reasoning = true;
+    m.thinking_level_map = Some(indexmap::IndexMap::from([(
+        pi_rs_ai::ThinkingLevel::Xhigh,
+        Some("xhigh".into()),
+    )]));
+    let mut opts = stream_options()?;
+    opts.reasoning = Some(pi_rs_ai::ThinkingLevel::Xhigh);
+    let ok = google::stream_simple(m.clone(), normalize_context(context()?), opts)?
+        .result()
+        .await?;
+    assert_eq!(ok.stop_reason, StopReason::Stop);
+    let req = server.drain()?[0].json()?;
+    assert_eq!(
+        req["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "XHIGH"
+    );
+
+    let blocked =
+        google::stream_simple(m.clone(), normalize_context(context()?), stream_options()?)?
+            .result()
+            .await?;
+    assert_eq!(blocked.stop_reason, StopReason::Error);
+    assert!(!pi_rs_ai::is_retryable_assistant_error(&blocked));
+    assert!(
+        blocked
+            .error_message
+            .as_deref()
+            .is_some_and(|s| s.contains("Google prompt blocked: PROHIBITED_CONTENT"))
+    );
+
+    let empty = google::stream_simple(m, normalize_context(context()?), stream_options()?)?
+        .result()
+        .await?;
+    assert_eq!(empty.stop_reason, StopReason::Error);
+    assert!(pi_rs_ai::is_retryable_assistant_error(&empty));
+    assert!(
+        empty
+            .error_message
+            .as_deref()
+            .is_some_and(|s| s.contains("after receiving 0 chunks"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_send_reports_429_retries_to_on_response() -> TestResult {
+    use std::sync::{Arc, Mutex};
+    let server = Server::start(vec![
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "0")],
+            "rate limited",
+        )
+            .into_response(),
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "0")],
+            "rate limited",
+        )
+            .into_response(),
+    ])
+    .await?;
+    let statuses = Arc::new(Mutex::new(Vec::new()));
+    let captured = statuses.clone();
+    let m = model(Api::OpenAiCompletions, "openai", "gpt-6-luna", &server.url)?;
+    let mut opts = stream_options()?;
+    opts.request.max_retries = Some(1);
+    opts.request.on_response = Some(Arc::new(move |resp, _| {
+        let captured = captured.clone();
+        let status = resp.status;
+        Box::pin(async move {
+            if let Ok(mut guard) = captured.lock() {
+                guard.push(status);
+            }
+            Ok(())
+        })
+    }));
+    let res = openai_completions::stream_simple(m, normalize_context(context()?), opts)?
+        .result()
+        .await?;
+    assert_eq!(res.stop_reason, StopReason::Error);
+    assert_eq!(
+        *statuses.lock().unwrap_or_else(|e| e.into_inner()),
+        vec![429, 429]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn anthropic_non_strict_tool_preserves_declared_schema_dialect() -> TestResult {
+    let server = Server::start(vec![sse(
+        &[
+            json!({"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+            json!({"type":"message_stop"}),
+        ],
+        "\n",
+    )])
+    .await?;
+    let m = model(
+        Api::AnthropicMessages,
+        "anthropic",
+        "claude-sonnet-5",
+        &server.url,
+    )?;
+    let mut ctx = context()?;
+    ctx.tools = Some(vec![pi_rs_ai::Tool {
+        name: "pair_tool".into(),
+        description: "tuple".into(),
+        parameters: json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": { "pair": { "type": "array", "items": [{ "type": "string" }, { "type": "string" }] } },
+            "required": ["pair"]
+        }),
+        constrained_sampling: None,
+    }]);
+    let res = anthropic::stream_simple(m, normalize_context(ctx), stream_options()?)?
+        .result()
+        .await?;
+    assert_eq!(res.stop_reason, StopReason::Stop);
+    let body = server.drain()?[0].json()?;
+    assert_eq!(
+        body["tools"][0]["input_schema"]["$schema"],
+        "http://json-schema.org/draft-07/schema#"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pi_messages_skips_null_sse_events() -> TestResult {
+    let server = Server::start(vec![sse(
+        &[
+            json!({"type":"start"}),
+            Value::Null,
+            json!({"type":"done","reason":"stop","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"responseId":"resp_1"}),
+        ],
+        "\n",
+    )])
+    .await?;
+    let m = model(Api::PiMessages, "radius", "balanced", &server.url)?;
+    let res = pi_messages::stream(m, normalize_context(context()?), stream_options()?)
+        .result()
+        .await?;
+    assert_eq!(res.stop_reason, StopReason::Stop);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mistral_finish_reason_error_is_retryable_without_server_error_suffix() -> TestResult {
+    let server = Server::start(vec![sse(
+        &[
+            json!({"id":"cmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"error"}]}),
+            Value::String("[DONE]".into()),
+        ],
+        "\n",
+    )])
+    .await?;
+    let m = model(
+        Api::MistralConversations,
+        "mistral",
+        "mistral-medium-latest",
+        &server.url,
+    )?;
+    let res = mistral::stream_simple(m, normalize_context(context()?), stream_options()?)?
+        .result()
+        .await?;
+    assert_eq!(res.stop_reason, StopReason::Error);
+    assert_eq!(
+        res.error_message.as_deref(),
+        Some("Provider stopped with: error")
+    );
+    assert!(pi_rs_ai::is_retryable_assistant_error(&res));
+    Ok(())
+}

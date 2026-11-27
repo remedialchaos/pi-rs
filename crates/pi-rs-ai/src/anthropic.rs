@@ -308,6 +308,7 @@ impl Builder<'_> {
             "properties",
             "required",
             "additionalProperties",
+            "$schema",
             "$defs",
             "definitions",
         ] {

@@ -344,9 +344,9 @@ pub(crate) fn replay_assistant(
                 let mut wire = if let Some(field) = custom {
                     let input = t.arguments.get(field).and_then(Value::as_str).ok_or_else(||
                         Error::Protocol(format!("Grammar tool call \"{}\" requires argument \"{field}\" to be a string.", t.name)))?;
-                    json!({"type":"custom_tool_call","call_id":call,"name":t.name,"input":input})
+                    json!({"type":"custom_tool_call","call_id":call,"name":t.name,"input":input,"status":"completed"})
                 } else {
-                    json!({"type":"function_call","call_id":call,"name":t.name,"arguments":serde_json::to_string(&t.arguments)?})
+                    json!({"type":"function_call","call_id":call,"name":t.name,"arguments":serde_json::to_string(&t.arguments)?,"status":"completed"})
                 };
                 if !different
                     && let Some(item) = item
@@ -376,6 +376,7 @@ struct Conversion<'a> {
     grammar_tools: bool,
     folded: usize,
     effort: Option<&'a str>,
+    effort_baseline_initial: bool,
 }
 impl Conversion<'_> {
     fn tools<'a>(
@@ -388,7 +389,7 @@ impl Conversion<'_> {
             .map(|tool| tool_wire(tool, self.strict, self.grammar_tools, self.d, deferred))
             .collect()
     }
-    fn convert(&self, context: TranscriptContext) -> Result<Vec<Value>> {
+    fn convert(&self, context: TranscriptContext) -> Result<(Vec<Value>, Option<String>)> {
         let model = self.model;
         let messages = transform_messages(context.into_messages(), model, |id, m, src| {
             normalize_id(id, m, src, self.d)
@@ -407,6 +408,21 @@ impl Conversion<'_> {
         fn config(effort: &str) -> Value {
             json!({"type":"configuration_update","reasoning":{"effort":effort}})
         }
+        let mut request_effort_baseline: Option<String> = None;
+        let mut previous_effort: Option<String> = None;
+        let mut push_config = |effort: &str, out: &mut Vec<Value>| {
+            if self.effort_baseline_initial {
+                if previous_effort.as_deref() == Some(effort) {
+                    return;
+                }
+                previous_effort = Some(effort.to_owned());
+                if request_effort_baseline.is_none() {
+                    request_effort_baseline = Some(effort.to_owned());
+                    return;
+                }
+            }
+            out.push(config(effort));
+        };
         for (source, m) in messages.into_iter().enumerate() {
             let leading = source == 0 && matches!(m, Message::System(_));
             match m {
@@ -505,7 +521,7 @@ impl Conversion<'_> {
                         && !different
                         && let Some(effort) = a.provider_thinking_level.as_deref()
                     {
-                        out.push(config(effort));
+                        push_config(effort, &mut out);
                     }
                     out.extend(parts);
                 }
@@ -546,9 +562,9 @@ impl Conversion<'_> {
             }
         }
         if let Some(effort) = self.effort {
-            out.push(config(effort));
+            push_config(effort, &mut out);
         }
-        Ok(out)
+        Ok((out, request_effort_baseline))
     }
 }
 
@@ -630,9 +646,10 @@ pub(crate) fn build_body(
         grammar_tools,
         folded: state.folded_system_messages,
         effort: provider_effort,
+        effort_baseline_initial: d == Dialect::Codex,
     };
     let tools = convert.tools(state.request_tools, false)?;
-    let messages = convert.convert(context)?;
+    let (messages, request_effort_baseline) = convert.convert(context)?;
     let id = if d == Dialect::Azure {
         azure_deployment(model, opts)
     } else {
@@ -699,7 +716,14 @@ pub(crate) fn build_body(
         .filter(|s| !s.is_empty());
     if model.reasoning || d == Dialect::Codex {
         if let Some(effort) = effort.or_else(|| summary.map(|_| "medium")) {
-            body["reasoning"] = json!({"effort":if provider_effort.is_some(){"medium"}else{effort},"summary":summary.unwrap_or("auto")});
+            let wire_effort = if d == Dialect::Codex {
+                request_effort_baseline.as_deref().unwrap_or(effort)
+            } else if provider_effort.is_some() {
+                "medium"
+            } else {
+                effort
+            };
+            body["reasoning"] = json!({"effort":wire_effort,"summary":summary.unwrap_or("auto")});
             body["include"] = json!(["reasoning.encrypted_content"]);
         } else if model.reasoning && mapped != Some(&None) && model.provider != "github-copilot" {
             body["reasoning"] =

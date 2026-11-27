@@ -69,6 +69,7 @@ fn resolve_level(model: &Model, requested: ThinkingLevel) -> Result<&'static str
         "low" => Ok("LOW"),
         "medium" => Ok("MEDIUM"),
         "high" => Ok("HIGH"),
+        "xhigh" => Ok("XHIGH"),
         _ => Err(Error::Protocol(format!(
             "Unsupported Google thinking level mapping for {}/{}: {} -> {}",
             model.provider,
@@ -91,7 +92,7 @@ fn budget(model: &Model, level: &str, opts: &StreamOptions) -> i64 {
     let id = &model.id;
     if id.contains("2.5-pro") {
         [128, 2048, 8192, 32768][index]
-    } else if model.api != Api::GoogleVertex && id.contains("2.5-flash-lite") {
+    } else if id.contains("2.5-flash-lite") {
         [512, 2048, 8192, 24576][index]
     } else if id.contains("2.5-flash") {
         [128, 2048, 8192, 24576][index]
@@ -601,6 +602,43 @@ fn target(model: &Model, id: &str, project: Option<(&str, &str)>) -> Result<Url>
     url.query_pairs_mut().append_pair("alt", "sse");
     Ok(url)
 }
+fn format_prompt_block_error(provider_name: &str, feedback: &Value) -> String {
+    let reason = feedback["blockReason"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown reason");
+    let mut details = vec![format!("{provider_name} prompt blocked: {reason}")];
+    if let Some(msg) = feedback["blockReasonMessage"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        details.push(msg.to_owned());
+    }
+    if let Some(ratings) = feedback["safetyRatings"].as_array() {
+        let formatted: Vec<String> = ratings
+            .iter()
+            .filter_map(|rating| {
+                let category = rating["category"].as_str().filter(|s| !s.is_empty())?;
+                let prob = rating["probability"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(|p| format!(" ({p})"))
+                    .unwrap_or_default();
+                Some(format!("{category}{prob}"))
+            })
+            .collect();
+        if !formatted.is_empty() {
+            let label = if formatted.len() == 1 {
+                "Safety rating"
+            } else {
+                "Safety ratings"
+            };
+            details.push(format!("{label}: {}", formatted.join(", ")));
+        }
+    }
+    details.join(". ")
+}
+
 async fn run(
     state: &mut ChatState,
     model: &Model,
@@ -647,10 +685,13 @@ async fn run(
     )
     .await?;
     state.start();
+    let provider_name = if vertex { "Google Vertex" } else { "Google" };
     let mut frames = SseReader::new(response.bytes_stream());
     let mut current = None;
     let mut seen = HashSet::<String>::new();
     let mut finish = None;
+    let mut received_chunk_count: usize = 0;
+    let mut prompt_block_error: Option<String> = None;
     while let Some(event) = frames.next(&opts.request.signal).await? {
         if matches!(event.data.trim(), "" | "[DONE]") {
             continue;
@@ -658,6 +699,17 @@ async fn run(
         let chunk: Value = serde_json::from_str(&event.data)?;
         if let Some(watch) = &opts.on_provider_stream_event {
             abortable(&opts.request.signal, watch(&chunk, model)).await?;
+        }
+        received_chunk_count += 1;
+        if prompt_block_error.is_none()
+            && chunk["promptFeedback"]["blockReason"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        {
+            prompt_block_error = Some(format_prompt_block_error(
+                provider_name,
+                &chunk["promptFeedback"],
+            ));
         }
         let candidate = &chunk["candidates"][0];
         {
@@ -758,7 +810,12 @@ async fn run(
                 | "MALFORMED_FUNCTION_CALL"
                 | "UNEXPECTED_TOOL_CALL"
                 | "TOO_MANY_TOOL_CALLS"
-                | "NO_IMAGE" => Err(Error::Protocol(format!("Provider stopped with: {raw}"))),
+                | "NO_IMAGE"
+                | "MISSING_THOUGHT_SIGNATURE"
+                | "MALFORMED_RESPONSE"
+                | "ESCALATION"
+                | "PUP_LIMITED_DISABLED"
+                | "MODEL_ARMOR" => Err(Error::Protocol(format!("Provider stopped with: {raw}"))),
                 _ => Err(Error::Protocol(format!("Unhandled stop reason: {raw}"))),
             });
         }
@@ -777,5 +834,18 @@ async fn run(
     if let Some((i, _)) = current {
         state.end(i);
     }
-    finish.ok_or_else(|| Error::Protocol("Google stream ended without a finish reason".into()))?
+    if let Some(result) = finish {
+        return result;
+    }
+    if let Some(err) = prompt_block_error {
+        return Err(Error::Protocol(err));
+    }
+    let chunk_label = if received_chunk_count == 1 {
+        "chunk"
+    } else {
+        "chunks"
+    };
+    Err(Error::Protocol(format!(
+        "{provider_name} stream ended without a finish reason after receiving {received_chunk_count} {chunk_label}"
+    )))
 }

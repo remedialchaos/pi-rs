@@ -91,6 +91,12 @@ impl BuiltinProviderSpec {
                     Api::OpenAiCompletions,
                     Api::OpenAiResponses,
                 ]);
+                if self.id == "github-copilot" {
+                    provider.classifier_apis.extend([
+                        ClassifierApi::OpenAiDecisions,
+                        ClassifierApi::TypeSafeSystemOne,
+                    ]);
+                }
             }
             "cloudflare-workers-ai" => {
                 provider
@@ -110,6 +116,8 @@ impl BuiltinProviderSpec {
             }
             "radius" => {
                 provider.chat_apis.insert(Api::PiMessages);
+                provider.classifier_apis.insert(ClassifierApi::PiDecision);
+                provider.classifier_apis.insert(ClassifierApi::PiDecision);
                 provider.source = Some(Arc::new(RadiusSource {
                     gateway: Url::parse("https://radius.pi.dev")?,
                 }));
@@ -604,6 +612,7 @@ pub fn radius_provider(
         )),
     };
     provider.chat_apis.insert(Api::PiMessages);
+    provider.classifier_apis.insert(ClassifierApi::PiDecision);
     if gateway.as_str().trim_end_matches('/') == "https://radius.pi.dev" {
         provider.models = Catalog::embedded()?
             .chat_models("radius")
@@ -625,7 +634,7 @@ struct RadiusSource {
 }
 fn radius_models(value: &Value, provider: &str) -> Option<Vec<AnyModel>> {
     let base = value["baseUrl"].as_str()?;
-    let models = value["models"]
+    let mut models: Vec<AnyModel> = value["models"]
         .as_array()?
         .iter()
         .filter_map(|raw| {
@@ -639,6 +648,19 @@ fn radius_models(value: &Value, provider: &str) -> Option<Vec<AnyModel>> {
                 .map(AnyModel::Chat)
         })
         .collect();
+    if let Some(classifiers) = value.get("classifiers").and_then(Value::as_array) {
+        models.extend(classifiers.iter().filter_map(|raw| {
+            let mut payload = raw.clone();
+            let payload_obj = payload.as_object_mut()?;
+            payload_obj.insert("type".into(), Value::String("classifier".into()));
+            payload_obj.insert("api".into(), Value::String("pi-decision".into()));
+            payload_obj.insert("provider".into(), Value::String(provider.into()));
+            payload_obj.insert("baseUrl".into(), Value::String(base.into()));
+            serde_json::from_value::<crate::model::ClassifierModel>(payload)
+                .ok()
+                .map(AnyModel::Classifier)
+        }));
+    }
     Some(models)
 }
 #[async_trait]

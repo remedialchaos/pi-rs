@@ -61,6 +61,7 @@ wire_id!(ClassifierApi {
     CloudflareWorkersAiSystemOne => "cloudflare-workers-ai-system-one",
     LlamaCppClassify => "llama-cpp-classify",
     OpenAiDecisions => "openai-decisions",
+    PiDecision => "pi-decision",
 });
 
 pub type ProviderId = String;

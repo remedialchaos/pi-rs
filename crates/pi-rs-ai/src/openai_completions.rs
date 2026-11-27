@@ -735,6 +735,18 @@ pub fn apply_openrouter_cost(usage: &mut Usage, raw: &Value) {
     usage.cost.total = actual;
     usage.cost.total_from_provider = Some(true);
 }
+const CLEAN_STOP_NATIVE_REASONS: &[&str] = &[
+    "stop",
+    "end_turn",
+    "stop_sequence",
+    "eos",
+    "complete",
+    "completed",
+    "pause_turn",
+    "compaction",
+    "end_of_stream",
+];
+
 fn stop_reason(raw: &str) -> Result<StopReason> {
     match raw {
         "stop" | "end" => Ok(StopReason::Stop),
@@ -796,6 +808,8 @@ async fn consume(
     let mut thinking_index = None;
     let mut details = Vec::new();
     let mut finish = None;
+    let is_openrouter = model.provider == "openrouter" || model.base_url.contains("openrouter.ai");
+    let mut native_finish_reason: Option<String> = None;
     let mut by_index = HashMap::new();
     let mut by_id = HashMap::new();
     let mut custom = HashMap::<usize, Custom>::new();
@@ -837,9 +851,26 @@ async fn consume(
             if let Some(raw) = raw {
                 msg.usage = usage(raw, model);
             }
+            if is_openrouter
+                && let Some(native) = choice["native_finish_reason"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+            {
+                native_finish_reason = Some(native.to_owned());
+            }
             if let Some(reason) = choice["finish_reason"].as_str().filter(|s| !s.is_empty()) {
-                msg.raw_stop_reason = Some(reason.to_owned());
-                finish = Some(stop_reason(reason));
+                let mut mapped = stop_reason(reason);
+                let mut raw = reason.to_owned();
+                if let Some(native) = native_finish_reason.as_deref()
+                    && native != reason
+                {
+                    raw = format!("{reason}.{native}");
+                    if let Err(Error::Protocol(msg_text)) = &mut mapped {
+                        msg_text.push_str(&format!(" (native_finish_reason: {native})"));
+                    }
+                }
+                msg.raw_stop_reason = Some(raw);
+                finish = Some(mapped);
             }
         }
         let delta = &choice["delta"];
@@ -954,10 +985,9 @@ async fn consume(
     for (index, mut x) in custom {
         state.delta(index, x.input.close(&x.field, None)?)?;
     }
-    if let Some(result) = finish {
-        return result;
-    }
-    if require_finish {
+    let result = if let Some(result) = finish {
+        result
+    } else if require_finish {
         Err(Error::Protocol("Stream ended without finish_reason".into()))
     } else {
         Ok(if state.has_tool_calls() {
@@ -965,7 +995,27 @@ async fn consume(
         } else {
             StopReason::Stop
         })
+    };
+    if matches!(result, Ok(StopReason::Stop))
+        && let Some(native) = native_finish_reason.as_deref()
+        && !CLEAN_STOP_NATIVE_REASONS
+            .iter()
+            .any(|clean| native.eq_ignore_ascii_case(clean))
+    {
+        let has_visible_output = crate::event_stream::read_partial(&state.message)
+            .content
+            .iter()
+            .any(|block| {
+                matches!(block, AssistantContent::ToolCall(_))
+                    || matches!(block, AssistantContent::Text(t) if !t.text.trim().is_empty())
+            });
+        if !has_visible_output {
+            return Err(Error::Protocol(format!(
+                "OpenRouter returned an empty response (native_finish_reason: {native})"
+            )));
+        }
     }
+    result
 }
 fn append_detail(out: &mut Vec<Value>, part: &Value) {
     let field = match part["type"].as_str() {

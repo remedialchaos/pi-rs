@@ -557,3 +557,76 @@ async fn compat_dispatches_built_in_providers_through_the_model_registry() -> Te
     assert_eq!(request.headers["x-api-key"], "fixture-key");
     Ok(())
 }
+
+#[test]
+fn overflow_request_too_large_matches_only_whole_identifier() -> TestResult {
+    let m = model(
+        Api::AnthropicMessages,
+        "anthropic",
+        "claude-sonnet-5",
+        "https://api.anthropic.com",
+    )?;
+    let make_err = |msg: &str| {
+        let mut out = AssistantMessage::pending(&m);
+        out.stop_reason = StopReason::Error;
+        out.error_message = Some(msg.to_owned());
+        out
+    };
+    for hit in [
+        "request_too_large",
+        r#"400 {"error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#,
+        "Anthropic error: REQUEST_TOO_LARGE",
+        r#"413: {"code":"plugin_request_too_large","message":"request too large"}"#,
+    ] {
+        assert!(
+            utils::is_context_overflow(&make_err(hit), Some(200_000)),
+            "expected overflow for {hit}"
+        );
+    }
+    for miss in [
+        r#"400 {"code":"plugin_request_too_large","message":"plugin input rejected"}"#,
+        "400 invalid_request_error: my_plugin_request_too_large_flag was set",
+        "Unknown error code xrequest_too_large",
+        "Unknown error code request_too_large2",
+        "Unknown error code request_too_large_flag",
+    ] {
+        assert!(
+            !utils::is_context_overflow(&make_err(miss), Some(200_000)),
+            "expected non-overflow for {miss}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn catalog_v1_6_1_claude_thinking_off_and_retired_models() -> TestResult {
+    let catalog = Catalog::embedded()?;
+    let copilot_sonnet55 = catalog
+        .get_model("github-copilot", "claude-sonnet-5.5")
+        .ok_or("missing github-copilot/claude-sonnet-5.5")?;
+    assert!(
+        !copilot_sonnet55
+            .supported_thinking_levels()
+            .any(|l| l == pi_rs_ai::ThinkingLevel::Off)
+    );
+    for (provider, retired) in [
+        ("openai", "gpt-5-chat-latest"),
+        ("azure", "gpt-5-chat-latest"),
+        ("groq", "llama-3.1-8b-instant"),
+        ("groq", "llama-3.3-70b-versatile"),
+        ("groq", "qwen/qwen3.6-27b"),
+        ("mistral", "mistral-medium-3.5"),
+        ("mistral", "devstral-medium-latest"),
+        ("mistral", "pixtral-12b"),
+        ("github-copilot", "claude-opus-5"),
+        ("github-copilot", "gpt-5.6-terra"),
+        ("opencode", "kimi-k2.5"),
+        ("opencode", "kimi-k2.6"),
+    ] {
+        assert!(
+            catalog.get_model(provider, retired).is_none(),
+            "retired model {provider}/{retired} should be absent"
+        );
+    }
+    Ok(())
+}

@@ -238,6 +238,9 @@ async fn run(
             continue;
         }
         let raw: Value = serde_json::from_str(&frame.data)?;
+        if raw.is_null() {
+            continue;
+        }
         if let Some(watch) = &opts.on_provider_stream_event {
             abortable(&opts.request.signal, watch(&raw, model)).await?;
         }

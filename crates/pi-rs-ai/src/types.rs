@@ -497,6 +497,8 @@ pub struct ClassifierResult {
     pub answers: IndexMap<String, ClassifierAnswer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: OptionalString,
     pub stop_reason: StopReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: OptionalString,

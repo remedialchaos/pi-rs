@@ -17,6 +17,7 @@ use crate::types::{
 pub struct ClassifierOptions {
     pub request: ProviderRequestOptions<ClassifierModel>,
     pub temperature: Option<f64>,
+    pub session_id: Option<String>,
 }
 
 pub async fn classify_system_one(
@@ -38,6 +39,7 @@ pub(crate) fn classifier_output(model: &ClassifierModel) -> ClassifierResult {
         model: model.id.clone(),
         answers: IndexMap::new(),
         usage: None,
+        response_id: None,
         stop_reason: StopReason::Stop,
         error_message: None,
         timestamp: unix_millis(),
@@ -255,7 +257,18 @@ async fn run_system_one(
     } else {
         &response
     };
-    output.usage = parse_classifier_usage(&result["usage"], model);
+    output.response_id = result["id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    if let Some(mut usage) = parse_classifier_usage(&result["usage"], model) {
+        if !cloudflare
+            && (model.provider == "openrouter" || model.base_url.contains("openrouter.ai"))
+        {
+            crate::openai_completions::apply_openrouter_cost(&mut usage, &result["usage"]);
+        }
+        output.usage = Some(usage);
+    }
     output.answers = parse_answers(&result["answers"], &context.questions, label)?;
     Ok(())
 }

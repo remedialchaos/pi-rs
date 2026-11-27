@@ -280,7 +280,7 @@ pub async fn send<M>(
     let client = client_for(&request.url, options, request.force_http1)?;
     let body = request.body.map(bytes::Bytes::from);
     let duration = Duration::from_millis(options.timeout_ms.unwrap_or(PROVIDER_TIMEOUT_MS));
-    let response = retry(
+    retry(
         options,
         request.default_retries,
         &request.no_retry_statuses,
@@ -295,6 +295,17 @@ pub async fn send<M>(
                 .await
                 .map_err(|_| Error::Timeout(duration))??;
             let status = response.status();
+            if let Some(observer) = &options.on_response {
+                let metadata = ProviderResponse {
+                    status: status.as_u16(),
+                    headers: response
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_owned())))
+                        .collect(),
+                };
+                abortable(&options.signal, observer(&metadata, model)).await?;
+            }
             if status.is_success() {
                 return Ok(response);
             }
@@ -312,19 +323,7 @@ pub async fn send<M>(
             })
         },
     )
-    .await?;
-    if let Some(observer) = &options.on_response {
-        let metadata = ProviderResponse {
-            status: response.status().as_u16(),
-            headers: response
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_owned())))
-                .collect(),
-        };
-        abortable(&options.signal, observer(&metadata, model)).await?;
-    }
-    Ok(response)
+    .await
 }
 
 pub async fn payload<M>(

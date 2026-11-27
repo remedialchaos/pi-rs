@@ -334,4 +334,60 @@ mod tests {
             .expect_err("stalled stream must hit idle timeout");
         assert!(matches!(err, Error::Timeout(d) if d == Duration::from_millis(25)));
     }
+
+    #[test]
+    fn decoder_gives_same_events_across_chunk_sizes_and_line_endings() {
+        for sep in ["\n", "\r\n", "\r"] {
+            let text = [
+                ": keepalive",
+                "event: delta",
+                "data: {\"a\":",
+                "data:  \"e\"}",
+                "",
+                "data: tail",
+            ]
+            .join(sep);
+            let bytes = text.as_bytes();
+            for chunk_size in 1..=bytes.len() {
+                let mut decoder = SseDecoder::default();
+                let mut queue = VecDeque::new();
+                for chunk in bytes.chunks(chunk_size) {
+                    decoder.push(chunk, &mut queue).expect("push");
+                }
+                decoder.finish(&mut queue).expect("finish");
+                let events: Vec<_> = queue.into_iter().collect();
+                assert_eq!(events.len(), 2, "sep={sep:?} chunk_size={chunk_size}");
+                assert_eq!(events[0].name, "delta");
+                assert_eq!(events[0].data, "{\"a\":\n \"e\"}");
+                assert_eq!(events[1].name, "");
+                assert_eq!(events[1].data, "tail");
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_handles_split_crlf_empty_event_comment_only_and_large_line() {
+        let mut decoder = SseDecoder::default();
+        let mut queue = VecDeque::new();
+        decoder.push(b"data: a\r", &mut queue).expect("push 1");
+        assert!(queue.is_empty());
+        decoder
+            .push(b"\ndata: b\r\n\r\n", &mut queue)
+            .expect("push 2");
+        let ev = queue.pop_front().expect("split crlf event");
+        assert_eq!(ev.data, "a\nb");
+
+        decoder
+            .push(b"event:\n\ndata: x\n\n: ping\n\ndata: y\n\n", &mut queue)
+            .expect("push 3");
+        assert_eq!(queue.pop_front().expect("ev1").name, "");
+        assert_eq!(queue.pop_front().expect("ev2").data, "y");
+
+        let large = format!("data: {}\n\n", "a".repeat(1024 * 1024));
+        for chunk in large.as_bytes().chunks(4096) {
+            decoder.push(chunk, &mut queue).expect("large chunk");
+        }
+        let ev = queue.pop_front().expect("large event");
+        assert_eq!(ev.data.len(), 1024 * 1024);
+    }
 }

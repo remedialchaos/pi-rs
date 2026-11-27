@@ -444,26 +444,43 @@ impl Models {
                 None
             };
             let mut available = None;
-            if let Some(Credential::OAuth(saved)) = &saved
-                && let Some(ids) = saved
+            let mut available_classifiers = None;
+            if let Some(Credential::OAuth(saved)) = &saved {
+                if let Some(ids) = saved
                     .details
                     .get("availableModelIds")
                     .and_then(serde_json::Value::as_array)
-                && ids.iter().all(serde_json::Value::is_string)
-            {
-                available = Some(
-                    ids.iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .collect::<IndexSet<_>>(),
-                );
+                    && ids.iter().all(serde_json::Value::is_string)
+                {
+                    available = Some(
+                        ids.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<IndexSet<_>>(),
+                    );
+                }
+                if let Some(ids) = saved
+                    .details
+                    .get("availableClassifierModelIds")
+                    .and_then(serde_json::Value::as_array)
+                    && ids.iter().all(serde_json::Value::is_string)
+                {
+                    available_classifiers = Some(
+                        ids.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<IndexSet<_>>(),
+                    );
+                }
             }
             models.extend(
                 entry
                     .catalog()
                     .iter()
-                    .filter(|m| {
-                        m.model_type() != ModelType::Chat
-                            || available.as_ref().is_none_or(|a| a.contains(m.id()))
+                    .filter(|m| match m.model_type() {
+                        ModelType::Chat => available.as_ref().is_none_or(|a| a.contains(m.id())),
+                        ModelType::Classifier => available_classifiers
+                            .as_ref()
+                            .is_none_or(|a| a.contains(m.id())),
+                        ModelType::Image => true,
                     })
                     .cloned(),
             );
@@ -483,6 +500,19 @@ impl Models {
                 AnyModel::Chat(m) => Some(m),
                 _ => None,
             })
+            .collect())
+    }
+    pub async fn get_available_of_type(
+        &self,
+        kind: ModelType,
+        id: Option<&str>,
+        signal: &CancellationToken,
+    ) -> Result<Vec<AnyModel>> {
+        Ok(self
+            .get_all_available(id, signal)
+            .await?
+            .into_iter()
+            .filter(|m| m.model_type() == kind)
             .collect())
     }
     pub async fn get_auth(&self, id: &str, opts: &AuthOverrides) -> Result<Option<AuthResult>> {
@@ -891,7 +921,10 @@ impl Models {
             self.apply(p, &mut model.base, &mut opts.request, None)
                 .await?;
             if model.provider == "github-copilot"
-                && model.api == ClassifierApi::TypeSafeSystemOne
+                && matches!(
+                    model.api,
+                    ClassifierApi::TypeSafeSystemOne | ClassifierApi::OpenAiDecisions
+                )
                 && !model.base_url.trim_end_matches('/').ends_with("/v1")
             {
                 let end = model.base.base_url.trim_end_matches('/').len();
@@ -910,6 +943,9 @@ impl Models {
                 }
                 ClassifierApi::OpenAiDecisions => {
                     Ok(crate::openai_decisions::classify(&model, context, &opts).await)
+                }
+                ClassifierApi::PiDecision => {
+                    Ok(crate::pi_decision::classify(&model, context, &opts).await)
                 }
                 _ => Err(unsupported(p, "classification")),
             }

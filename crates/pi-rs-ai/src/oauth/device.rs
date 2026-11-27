@@ -433,9 +433,21 @@ impl BuiltinOAuth {
                 }
             }
         }
+        let classifier_ids = accounts
+            .iter()
+            .filter_map(|item| {
+                let id = item["id"].as_str()?;
+                let kind = item["capabilities"]["type"].as_str()?;
+                let state = item["policy"]["state"].as_str().unwrap_or_default();
+                (kind == "decisions" && state != "disabled").then_some(id)
+            })
+            .collect::<IndexSet<_>>();
         creds
             .details
             .insert("availableModelIds".into(), json!(selected));
+        creds
+            .details
+            .insert("availableClassifierModelIds".into(), json!(classifier_ids));
         Ok(creds)
     }
     pub(super) async fn copilot_refresh(

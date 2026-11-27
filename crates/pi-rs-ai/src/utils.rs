@@ -13,7 +13,7 @@ use crate::types::{AssistantMessage, StopReason, Tool, ToolCall};
 pub const OVERFLOW_PATTERNS: &[&str] = &[
     r"prompt (?:is )?too long",
     r"prompt exceeds max length",
-    r"request_too_large",
+    r"(?:^|[^A-Za-z0-9_])request_too_large(?:[^A-Za-z0-9_]|$)",
     r"input is too long for requested model",
     r"exceeds the context window",
     r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [0-9,]+ tokens?|\s*\([0-9,]+\))",
