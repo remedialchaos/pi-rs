@@ -20,3 +20,7 @@ members = [
     "crates/pi-rs-p2-mac",
     "crates/pi-rs-voice-server",
 ]
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
