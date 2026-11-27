@@ -345,7 +345,7 @@ pub const HOST_THEME_EVENT: &str = "pi-host-theme";
 /// CustomEvent dispatched by `pi-rs-p2-mac` when a native menu item is triggered.
 pub const HOST_MENU_EVENT: &str = "pi-host-menu";
 /// `localStorage` key for browser theme preference when not hosted in `p2-mac`.
-pub const THEME_STORAGE_KEY: &str = "p2-theme";
+pub const THEME_STORAGE_KEY: &str = "pi-theme";
 
 /// Resolved concrete color scheme applied to `<html data-theme="..." data-color-scheme="...">`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

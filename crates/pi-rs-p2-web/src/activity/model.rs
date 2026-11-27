@@ -91,6 +91,183 @@ pub enum ResultPlacement {
 /// Contributions by tool name.
 pub type ToolActivityTable = HashMap<String, ToolActivity>;
 
+fn bash_summary(count: usize) -> String {
+    if count == 1 {
+        "ran a command".to_owned()
+    } else {
+        format!("ran {count} commands")
+    }
+}
+
+fn read_summary(count: usize) -> String {
+    if count == 1 {
+        "read a file".to_owned()
+    } else {
+        format!("read {count} files")
+    }
+}
+
+fn write_summary(count: usize) -> String {
+    if count == 1 {
+        "wrote a file".to_owned()
+    } else {
+        format!("wrote {count} files")
+    }
+}
+
+fn edit_summary(count: usize) -> String {
+    if count == 1 {
+        "edited a file".to_owned()
+    } else {
+        format!("edited {count} files")
+    }
+}
+
+fn search_summary(count: usize) -> String {
+    if count == 1 {
+        "searched".to_owned()
+    } else {
+        format!("ran {count} searches")
+    }
+}
+
+fn artifact_summary(count: usize) -> String {
+    if count == 1 {
+        "updated an artifact".to_owned()
+    } else {
+        format!("updated {count} artifacts")
+    }
+}
+
+fn terminal_summary(count: usize) -> String {
+    if count == 1 {
+        "used a terminal".to_owned()
+    } else {
+        format!("used terminals {count} times")
+    }
+}
+
+fn subagent_summary(count: usize) -> String {
+    if count == 1 {
+        "ran a subagent".to_owned()
+    } else {
+        format!("ran {count} subagents")
+    }
+}
+
+/// Built-in tool activity descriptors matching upstream `coding-tools`, `artifacts`,
+/// `terminals`, and `subagents` web facets.
+pub fn default_tool_activities() -> ToolActivityTable {
+    let mut table = ToolActivityTable::new();
+    table.insert(
+        "bash".to_owned(),
+        ToolActivity {
+            brief: Some("Running".to_owned()),
+            failure: None,
+            summary: Some(bash_summary),
+            repeated: None,
+            result_placement: None,
+        },
+    );
+    table.insert(
+        "read".to_owned(),
+        ToolActivity {
+            brief: Some("Reading".to_owned()),
+            failure: None,
+            summary: Some(read_summary),
+            repeated: None,
+            result_placement: None,
+        },
+    );
+    table.insert(
+        "write".to_owned(),
+        ToolActivity {
+            brief: Some("Writing".to_owned()),
+            failure: None,
+            summary: Some(write_summary),
+            repeated: None,
+            result_placement: None,
+        },
+    );
+    table.insert(
+        "edit".to_owned(),
+        ToolActivity {
+            brief: Some("Editing".to_owned()),
+            failure: None,
+            summary: Some(edit_summary),
+            repeated: None,
+            result_placement: None,
+        },
+    );
+    for name in ["grep", "find", "ls"] {
+        table.insert(
+            name.to_owned(),
+            ToolActivity {
+                brief: Some("Searching".to_owned()),
+                failure: None,
+                summary: Some(search_summary),
+                repeated: None,
+                result_placement: None,
+            },
+        );
+    }
+    for name in [
+        "artifact_list",
+        "artifact_read",
+        "artifact_write",
+        "artifact_edit",
+        "artifact_open",
+        "artifact_delete",
+        "artifact_html_errors",
+        "artifact_html_logs",
+        "artifact_html_eval",
+        "artifact_html_state",
+        "artifact_html_set_state",
+    ] {
+        table.insert(
+            name.to_owned(),
+            ToolActivity {
+                brief: Some("Artifact".to_owned()),
+                failure: None,
+                summary: Some(artifact_summary),
+                repeated: None,
+                result_placement: None,
+            },
+        );
+    }
+    table.insert(
+        "artifact_show".to_owned(),
+        ToolActivity {
+            brief: Some("Showing artifact".to_owned()),
+            failure: None,
+            summary: Some(artifact_summary),
+            repeated: None,
+            result_placement: Some(ResultPlacement::Inline),
+        },
+    );
+    table.insert(
+        "terminal".to_owned(),
+        ToolActivity {
+            brief: Some("Terminal".to_owned()),
+            failure: None,
+            summary: Some(terminal_summary),
+            repeated: None,
+            result_placement: None,
+        },
+    );
+    table.insert(
+        "subagent".to_owned(),
+        ToolActivity {
+            brief: Some("Subagent".to_owned()),
+            failure: None,
+            summary: Some(subagent_summary),
+            repeated: None,
+            result_placement: None,
+        },
+    );
+    table
+}
+
 /// The tool status of a raw status string (`toolStatus` / `callStatus`).
 pub fn call_status(status: &str) -> StepStatus {
     match status {
@@ -408,5 +585,30 @@ mod tests {
         assert!(details_of(Some(&serde_json::json!([]))).is_empty());
         assert_eq!(details_of(Some(&serde_json::json!({"a": 1}))).len(), 1);
         assert_eq!(parsed_args(&serde_json::json!(r#"{"path":"a"}"#)).len(), 1);
+    }
+
+    #[test]
+    fn default_tool_activities_cover_core_tools() {
+        let table = default_tool_activities();
+        assert_eq!(
+            table.get("bash").and_then(|t| t.brief.as_deref()),
+            Some("Running")
+        );
+        assert_eq!(
+            table.get("read").and_then(|t| t.brief.as_deref()),
+            Some("Reading")
+        );
+        assert_eq!(
+            table.get("artifact_show").and_then(|t| t.result_placement),
+            Some(ResultPlacement::Inline)
+        );
+        let steps = vec![
+            Step::new("1", "bash", StepStatus::Done),
+            Step::new("2", "edit", StepStatus::Done),
+        ];
+        assert_eq!(
+            summary(&steps, &table, false),
+            "Ran a command, edited a file"
+        );
     }
 }

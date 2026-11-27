@@ -9,3 +9,7 @@ pub mod composer_state;
 pub mod conversation_cache;
 pub mod file_completion;
 pub mod highlight_lines;
+pub mod navigation;
+pub mod virtual_list;
+pub mod voice_audio;
+pub mod vt;

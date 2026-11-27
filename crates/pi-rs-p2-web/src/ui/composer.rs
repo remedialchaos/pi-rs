@@ -208,7 +208,8 @@ fn handle_paste_files(
 ) {
 }
 
-/// The message composer: a textarea with reactive draft state, file attachment controls, and a send button.
+/// The message composer: a textarea with reactive draft state, file attachment controls,
+/// file completion popover, and send/stop buttons.
 #[component]
 pub fn Composer(
     draft: RwSignal<String>,
@@ -216,6 +217,10 @@ pub fn Composer(
     #[prop(default = true)] clear_on_send: bool,
     #[prop(optional)] on_attach_files: Option<Callback<Vec<SelectedUploadFile>>>,
     #[prop(optional)] can_send_empty: Option<Signal<bool>>,
+    #[prop(optional)] streaming: Option<Signal<bool>>,
+    #[prop(optional)] on_stop: Option<Callback<()>>,
+    #[prop(optional)] completion: Option<RwSignal<Option<Popover>>>,
+    #[prop(optional)] on_choose_completion: Option<Callback<usize>>,
 ) -> impl IntoView {
     let file_input = NodeRef::<leptos::html::Input>::new();
     let dragging = RwSignal::new(false);
@@ -247,6 +252,13 @@ pub fn Composer(
                 handle_drop_files(ev, on_attach_files);
             }
         >
+            {move || {
+                let pop = completion.and_then(|c| c.get());
+                pop.map(|p| {
+                    let choose = on_choose_completion.unwrap_or_else(|| Callback::new(move |_| {}));
+                    view! { <FileCompletionPopover popover=p on_choose=choose /> }
+                })
+            }}
             {move || dragging.get().then(|| view! {
                 <div class="drop-overlay" data-testid="composer-drop-overlay">"Drop files to attach"</div>
             })}
@@ -281,6 +293,31 @@ pub fn Composer(
                 on:input=move |event| draft.set(event_target_value(&event))
                 on:paste=move |event| handle_paste_files(event, on_attach_files)
                 on:keydown=move |event| {
+                    if let (Some(comp_sig), Some(mapped)) =
+                        (completion, popover_key(&event.key(), event.shift_key()))
+                    {
+                        let has_popover = comp_sig.with_untracked(Option::is_some);
+                        if has_popover {
+                            event.prevent_default();
+                            match mapped {
+                                PopoverKey::ArrowDown | PopoverKey::ArrowUp => {
+                                    comp_sig.update(|slot| {
+                                        if let Some(p) = slot.as_mut() {
+                                            let _ = p.on_key(mapped, event.shift_key());
+                                        }
+                                    });
+                                }
+                                PopoverKey::Escape => comp_sig.set(None),
+                                PopoverKey::Enter | PopoverKey::Tab => {
+                                    let idx = comp_sig.with_untracked(|slot| slot.as_ref().map(|p| p.selected));
+                                    if let (Some(idx), Some(choose)) = (idx, on_choose_completion) {
+                                        choose.run(idx);
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                    }
                     if event.key() == "Enter" && !event.shift_key() {
                         event.prevent_default();
                         let text = draft.get();
@@ -291,7 +328,27 @@ pub fn Composer(
                     }
                 }
             ></textarea>
-            <button type="button" class="composer-send" aria-label="Send" on:click=send>"↑"</button>
+            {move || {
+                if streaming.is_some_and(|s| s.get()) {
+                    view! {
+                        <button
+                            type="button"
+                            class="composer-stop"
+                            aria-label="Stop"
+                            data-testid="composer-stop-btn"
+                            on:click=move |_| {
+                                if let Some(cb) = on_stop {
+                                    cb.run(());
+                                }
+                            }
+                        >"■"</button>
+                    }.into_any()
+                } else {
+                    view! {
+                        <button type="button" class="composer-send" aria-label="Send" on:click=send>"↑"</button>
+                    }.into_any()
+                }
+            }}
         </div>
     }
 }

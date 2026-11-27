@@ -168,7 +168,7 @@ fn all_builtin_contracts_encode_canonical_hold_frames() {
     use pi_rs_p2_web::browser_plugins::{ALL_CONTRACTS, hold_for_contract};
     use pi_rs_p2_web::chord_bridge::decode_varint;
 
-    assert_eq!(ALL_CONTRACTS.len(), 16);
+    assert_eq!(ALL_CONTRACTS.len(), 38);
     for (idx, spec) in ALL_CONTRACTS.iter().enumerate() {
         let hold_id = (idx + 1) as u64;
         let frame = hold_for_contract(hold_id, spec, Some("s-1"), Some(2), Some("web"));
@@ -325,4 +325,57 @@ fn rich_chat_projection_and_plugin_decoders_and_fault_isolation() {
         tracker.mark_failed(3, "chat gone".into()),
         Some("chat gone".into())
     );
+}
+
+#[test]
+fn wave_1_6_routing_storage_tools_and_dynamic_plugin_url_validation() {
+    use pi_rs_p2_web::activity::model::default_tool_activities;
+    use pi_rs_p2_web::browser_plugins::{project_chat_transcript, safe_plugin_url};
+    use pi_rs_p2_web::chord_bridge::THEME_STORAGE_KEY;
+    use pi_rs_p2_web::state::conversation_cache::{INDEXED_DB_NAME, INDEXED_DB_VERSION};
+    use pi_rs_p2_web::state::navigation::{path_route, route_href};
+    use serde_json::json;
+
+    assert_eq!(THEME_STORAGE_KEY, "pi-theme");
+    assert_eq!(INDEXED_DB_NAME, "p2-conversations");
+    assert_eq!(INDEXED_DB_VERSION, 2);
+
+    let route = path_route("/s/s-9/c/3", "?viewer=artifact&at=plan");
+    assert_eq!(route_href(&route), "/s/s-9/c/3?viewer=artifact&at=plan");
+
+    let view = json!({
+        "entries": [{
+            "id": 1,
+            "data": {},
+            "model": [{
+                "role": "assistant",
+                "content": [
+                    { "type": "toolCall", "id": "c1", "name": "bash", "arguments": { "command": "ls" } }
+                ]
+            }]
+        }]
+    });
+    let tools = default_tool_activities();
+    let rows = project_chat_transcript(&view, &tools);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        pi_rs_p2_web::activity::model::summary(
+            &[rows[0].activities[0].step.clone()],
+            &tools,
+            false
+        ),
+        "Ran a command"
+    );
+
+    assert_eq!(
+        safe_plugin_url("/plugins/a/index.html").as_deref(),
+        Some("/plugins/a/index.html")
+    );
+    assert_eq!(
+        safe_plugin_url("https://plugins.example/ui.js").as_deref(),
+        Some("https://plugins.example/ui.js")
+    );
+    assert_eq!(safe_plugin_url("javascript:alert(1)"), None);
+    assert_eq!(safe_plugin_url("data:text/html,hi"), None);
+    assert_eq!(safe_plugin_url("http://untrusted.example/x.js"), None);
 }

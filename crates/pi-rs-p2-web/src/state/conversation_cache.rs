@@ -17,7 +17,13 @@ pub const PAGE_SIZE: usize = 100;
 
 /// Schema version for persisted browser transcript caches.
 pub const PERSISTENCE_SCHEMA_VERSION: u32 = 1;
-/// `localStorage` key for persisted transcript snapshots.
+/// IndexedDB database name matching upstream `conversation-cache.ts`.
+pub const INDEXED_DB_NAME: &str = "p2-conversations";
+/// IndexedDB schema version matching upstream `conversation-cache.ts` (`indexedDB.open("p2-conversations", 2)`).
+pub const INDEXED_DB_VERSION: u32 = 2;
+/// IndexedDB object store name.
+pub const INDEXED_DB_STORE: &str = "conversations";
+/// `localStorage` fallback key for persisted transcript snapshots.
 pub const STORAGE_KEY_TRANSCRIPTS: &str = "p2-transcript-cache-v1";
 /// Maximum serialized byte size for the entire persisted transcript store.
 pub const MAX_PERSISTED_STORE_BYTES: usize = 2 * 1024 * 1024;
@@ -395,10 +401,10 @@ pub fn cached_from_projected(messages: &[ProjectedMessage]) -> Vec<CachedMessage
 /// Converts cached messages into renderable `ProjectedMessage`s for immediate offline hydration.
 pub fn projected_from_cached(cached: &[CachedMessage]) -> Vec<ProjectedMessage> {
     use crate::activity::detail::describe;
-    use crate::activity::model::{Step, StepStatus, ToolActivityTable};
+    use crate::activity::model::{Step, StepStatus, default_tool_activities};
     use crate::browser_plugins::ChatActivity;
 
-    let tools = ToolActivityTable::new();
+    let tools = default_tool_activities();
     cached
         .iter()
         .map(|msg| {

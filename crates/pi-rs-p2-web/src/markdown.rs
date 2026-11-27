@@ -115,76 +115,484 @@ pub fn entities(text: &str) -> String {
     out
 }
 
-/// A very small syntax highlighter for code blocks: keywords, strings, comments and numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LanguageGrammar {
+    Rust,
+    TypeScript,
+    Python,
+    Shell,
+    Json,
+    HtmlXml,
+    Css,
+    Sql,
+    Go,
+    TomlYaml,
+    CFamily,
+    Diff,
+    Generic,
+}
+
+impl LanguageGrammar {
+    fn from_language(language: Option<&str>) -> Self {
+        let Some(raw) = language else {
+            return Self::Generic;
+        };
+        let norm = raw.trim().to_ascii_lowercase();
+        match norm.as_str() {
+            "rust" | "rs" => Self::Rust,
+            "ts" | "tsx" | "typescript" | "js" | "jsx" | "javascript" | "mjs" | "cjs" => {
+                Self::TypeScript
+            }
+            "py" | "python" | "py3" => Self::Python,
+            "sh" | "bash" | "zsh" | "shell" | "fish" => Self::Shell,
+            "json" | "jsonc" | "jsonl" => Self::Json,
+            "html" | "htm" | "xml" | "svg" => Self::HtmlXml,
+            "css" | "scss" | "less" => Self::Css,
+            "sql" | "sqlite" | "postgres" | "mysql" => Self::Sql,
+            "go" | "golang" => Self::Go,
+            "toml" | "yaml" | "yml" | "ini" => Self::TomlYaml,
+            "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Self::CFamily,
+            "diff" | "patch" => Self::Diff,
+            _ => Self::Generic,
+        }
+    }
+
+    fn keywords(self) -> &'static [&'static str] {
+        match self {
+            Self::Rust => &[
+                "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else",
+                "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match",
+                "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
+                "super", "trait", "true", "type", "unsafe", "use", "where", "while",
+            ],
+            Self::TypeScript => &[
+                "as",
+                "async",
+                "await",
+                "break",
+                "case",
+                "catch",
+                "class",
+                "const",
+                "continue",
+                "default",
+                "delete",
+                "do",
+                "else",
+                "enum",
+                "export",
+                "extends",
+                "false",
+                "finally",
+                "for",
+                "from",
+                "function",
+                "if",
+                "implements",
+                "import",
+                "in",
+                "instanceof",
+                "interface",
+                "let",
+                "new",
+                "null",
+                "of",
+                "package",
+                "private",
+                "protected",
+                "public",
+                "readonly",
+                "return",
+                "satisfies",
+                "static",
+                "super",
+                "switch",
+                "this",
+                "throw",
+                "true",
+                "try",
+                "type",
+                "typeof",
+                "undefined",
+                "var",
+                "void",
+                "while",
+                "yield",
+            ],
+            Self::Python => &[
+                "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+                "continue", "def", "del", "elif", "else", "except", "finally", "for", "from",
+                "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass",
+                "raise", "return", "try", "while", "with", "yield",
+            ],
+            Self::Shell => &[
+                "case", "do", "done", "elif", "else", "esac", "export", "fi", "for", "function",
+                "if", "in", "local", "readonly", "return", "select", "then", "until", "while",
+            ],
+            Self::Json => &["true", "false", "null"],
+            Self::HtmlXml => &[],
+            Self::Css => &["important", "from", "to", "and", "or", "not", "only"],
+            Self::Sql => &[
+                "SELECT", "select", "FROM", "from", "WHERE", "where", "INSERT", "insert", "INTO",
+                "into", "VALUES", "values", "UPDATE", "update", "SET", "set", "DELETE", "delete",
+                "CREATE", "create", "TABLE", "table", "INDEX", "index", "JOIN", "join", "LEFT",
+                "left", "RIGHT", "right", "INNER", "inner", "ON", "on", "GROUP", "group", "BY",
+                "by", "ORDER", "order", "LIMIT", "limit", "AS", "as", "AND", "and", "OR", "or",
+                "NOT", "not", "NULL", "null", "PRIMARY", "primary", "KEY", "key",
+            ],
+            Self::Go => &[
+                "break",
+                "case",
+                "chan",
+                "const",
+                "continue",
+                "default",
+                "defer",
+                "else",
+                "fallthrough",
+                "false",
+                "for",
+                "func",
+                "go",
+                "goto",
+                "if",
+                "import",
+                "interface",
+                "map",
+                "nil",
+                "package",
+                "range",
+                "return",
+                "select",
+                "struct",
+                "switch",
+                "true",
+                "type",
+                "var",
+            ],
+            Self::TomlYaml => &["true", "false", "null", "yes", "no"],
+            Self::CFamily => &[
+                "auto",
+                "break",
+                "case",
+                "class",
+                "const",
+                "continue",
+                "default",
+                "do",
+                "else",
+                "enum",
+                "extern",
+                "false",
+                "for",
+                "goto",
+                "if",
+                "inline",
+                "namespace",
+                "nullptr",
+                "private",
+                "public",
+                "return",
+                "sizeof",
+                "static",
+                "struct",
+                "switch",
+                "template",
+                "this",
+                "true",
+                "typedef",
+                "typename",
+                "union",
+                "using",
+                "virtual",
+                "void",
+                "volatile",
+                "while",
+            ],
+            Self::Diff => &[],
+            Self::Generic => &[
+                "fn", "let", "mut", "pub", "if", "else", "for", "while", "return", "const",
+                "class", "def", "import", "from", "async", "await", "match", "use", "struct",
+                "impl", "true", "false", "null", "None", "Some",
+            ],
+        }
+    }
+
+    fn types(self) -> &'static [&'static str] {
+        match self {
+            Self::Rust => &[
+                "bool", "char", "str", "String", "Vec", "Option", "Result", "Box", "Arc", "Rc",
+                "HashMap", "BTreeMap", "usize", "isize", "u8", "u16", "u32", "u64", "i8", "i16",
+                "i32", "i64", "f32", "f64", "Some", "None", "Ok", "Err",
+            ],
+            Self::TypeScript => &[
+                "string", "number", "boolean", "unknown", "never", "any", "object", "Promise",
+                "Record", "Array", "Map", "Set", "Readonly",
+            ],
+            Self::Python => &[
+                "int", "float", "str", "bool", "list", "dict", "set", "tuple", "Any",
+            ],
+            Self::Go => &[
+                "string", "bool", "int", "int64", "uint64", "byte", "rune", "error", "float64",
+            ],
+            Self::CFamily => &[
+                "int", "char", "long", "short", "unsigned", "signed", "float", "double", "bool",
+                "size_t", "uint8_t", "uint32_t", "uint64_t",
+            ],
+            Self::Sql => &[
+                "INTEGER", "TEXT", "BLOB", "REAL", "BOOLEAN", "VARCHAR", "INT",
+            ],
+            _ => &[],
+        }
+    }
+
+    fn supports_slash_comments(self) -> bool {
+        matches!(
+            self,
+            Self::Rust
+                | Self::TypeScript
+                | Self::Go
+                | Self::CFamily
+                | Self::Css
+                | Self::Json
+                | Self::Generic
+        )
+    }
+
+    fn supports_hash_comments(self) -> bool {
+        matches!(
+            self,
+            Self::Python | Self::Shell | Self::TomlYaml | Self::Generic
+        )
+    }
+
+    fn supports_dash_comments(self) -> bool {
+        matches!(self, Self::Sql)
+    }
+}
+
+fn push_span(out: &mut String, class: &str, text: &str) {
+    out.push_str("<span class=\"");
+    out.push_str(class);
+    out.push_str("\">");
+    out.push_str(&escape_html(text));
+    out.push_str("</span>");
+}
+
+fn highlight_diff(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    for (idx, line) in code.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+            push_span(&mut out, "hljs-meta", line);
+        } else if line.starts_with('+') {
+            push_span(&mut out, "hljs-addition", line);
+        } else if line.starts_with('-') {
+            push_span(&mut out, "hljs-deletion", line);
+        } else {
+            out.push_str(&escape_html(line));
+        }
+    }
+    out
+}
+
+/// Per-language lexical syntax highlighter for code blocks.
 /// Emits escaped HTML only (no raw input reaches the output).
 pub fn highlight_code(code: &str, language: Option<&str>) -> String {
-    let _ = language; // the token classes are language-agnostic, as in the generic fallback
+    let grammar = LanguageGrammar::from_language(language);
+    if grammar == LanguageGrammar::Diff {
+        return highlight_diff(code);
+    }
+    let keywords = grammar.keywords();
+    let types = grammar.types();
     let mut out = String::with_capacity(code.len());
     let chars: Vec<char> = code.chars().collect();
     let mut i = 0;
-    const KEYWORDS: &[&str] = &[
-        "fn", "let", "mut", "pub", "if", "else", "for", "while", "return", "const", "class", "def",
-        "import", "from", "async", "await", "match", "use", "struct", "impl", "true", "false",
-        "null", "None", "Some",
-    ];
+
     while i < chars.len() {
         let rest: String = chars[i..].iter().collect();
-        if rest.starts_with("//") || rest.starts_with('#') {
-            let end = rest.find('\n').unwrap_or(rest.len());
-            out.push_str("<span class=\"hljs-comment\">");
-            out.push_str(&escape_html(&rest[..end]));
-            out.push_str("</span>");
+
+        if grammar == LanguageGrammar::HtmlXml && rest.starts_with("<!--") {
+            let end = rest.find("-->").map_or(rest.len(), |pos| pos + 3);
+            push_span(&mut out, "hljs-comment", &rest[..end]);
             i += rest[..end].chars().count();
             continue;
         }
+        if grammar.supports_slash_comments() && rest.starts_with("/*") {
+            let end = rest.find("*/").map_or(rest.len(), |pos| pos + 2);
+            push_span(&mut out, "hljs-comment", &rest[..end]);
+            i += rest[..end].chars().count();
+            continue;
+        }
+        if (grammar.supports_slash_comments() && rest.starts_with("//"))
+            || (grammar.supports_hash_comments() && rest.starts_with('#'))
+            || (grammar.supports_dash_comments() && rest.starts_with("--"))
+        {
+            let end = rest.find('\n').unwrap_or(rest.len());
+            push_span(&mut out, "hljs-comment", &rest[..end]);
+            i += rest[..end].chars().count();
+            continue;
+        }
+
         let ch = chars[i];
+        if grammar == LanguageGrammar::HtmlXml && ch == '<' {
+            let mut end = i + 1;
+            if end < chars.len() && chars[end] == '/' {
+                end += 1;
+            }
+            let name_start = end;
+            while end < chars.len()
+                && (chars[end].is_ascii_alphanumeric() || chars[end] == '-' || chars[end] == ':')
+            {
+                end += 1;
+            }
+            if end > name_start {
+                let prefix: String = chars[i..name_start].iter().collect();
+                let tag_name: String = chars[name_start..end].iter().collect();
+                out.push_str(&escape_html(&prefix));
+                push_span(&mut out, "hljs-name", &tag_name);
+                i = end;
+                continue;
+            }
+        }
+
+        if (grammar == LanguageGrammar::Rust && ch == '#' && chars.get(i + 1) == Some(&'['))
+            || (matches!(
+                grammar,
+                LanguageGrammar::Python | LanguageGrammar::TypeScript
+            ) && ch == '@')
+        {
+            let mut end = i + 1;
+            while end < chars.len() && chars[end] != '\n' && (ch != '#' || chars[end] != ']') {
+                end += 1;
+            }
+            if ch == '#' && end < chars.len() && chars[end] == ']' {
+                end += 1;
+            }
+            let text: String = chars[i..end].iter().collect();
+            push_span(&mut out, "hljs-meta", &text);
+            i = end;
+            continue;
+        }
+
         if ch == '"' || ch == '\'' || ch == '`' {
             let quote = ch;
             let mut end = i + 1;
             while end < chars.len() && chars[end] != quote {
-                if chars[end] == '\\' {
+                if chars[end] == '\\' && end + 1 < chars.len() {
                     end += 1;
                 }
                 end += 1;
             }
-            let text: String = chars[i..end.min(chars.len())].iter().collect();
-            out.push_str("<span class=\"hljs-string\">");
-            out.push_str(&escape_html(&text));
-            out.push_str("</span>");
-            i = (end + 1).min(chars.len());
+            let slice_end = if end < chars.len() { end + 1 } else { end };
+            let text: String = chars[i..slice_end].iter().collect();
+            let is_json_key = grammar == LanguageGrammar::Json
+                && quote == '"'
+                && chars[slice_end..]
+                    .iter()
+                    .find(|c| !c.is_whitespace())
+                    .is_some_and(|&c| c == ':');
+            let class = if is_json_key {
+                "hljs-attr"
+            } else {
+                "hljs-string"
+            };
+            push_span(&mut out, class, &text);
+            i = slice_end;
             continue;
         }
+
         if ch.is_ascii_digit() {
             let mut end = i;
-            while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '.') {
+            while end < chars.len()
+                && (chars[end].is_ascii_alphanumeric() || chars[end] == '.' || chars[end] == '_')
+            {
                 end += 1;
             }
             let text: String = chars[i..end].iter().collect();
-            out.push_str("<span class=\"hljs-number\">");
-            out.push_str(&escape_html(&text));
-            out.push_str("</span>");
+            push_span(&mut out, "hljs-number", &text);
             i = end;
             continue;
         }
+
         if ch.is_alphabetic() || ch == '_' {
             let mut end = i;
             while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
                 end += 1;
             }
             let text: String = chars[i..end].iter().collect();
-            if KEYWORDS.contains(&text.as_str()) {
-                out.push_str("<span class=\"hljs-keyword\">");
-                out.push_str(&escape_html(&text));
-                out.push_str("</span>");
+            if keywords.contains(&text.as_str()) {
+                push_span(&mut out, "hljs-keyword", &text);
+            } else if types.contains(&text.as_str()) {
+                push_span(&mut out, "hljs-type", &text);
+            } else if grammar == LanguageGrammar::Rust && chars.get(end) == Some(&'!') {
+                push_span(&mut out, "hljs-meta", &format!("{text}!"));
+                end += 1;
             } else {
                 out.push_str(&escape_html(&text));
             }
             i = end;
             continue;
         }
+
         out.push_str(&escape_html(&ch.to_string()));
         i += 1;
     }
+    out
+}
+
+/// Renders an HTML-escaped line-by-line unified diff between `before` and `after`.
+pub fn render_diff_html(before: &str, after: &str) -> String {
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut out = String::from("<div class=\"diff-view\">");
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            out.push_str("<div class=\"diff-line diff-ctx\"> ");
+            out.push_str(&escape_html(a[i]));
+            out.push_str("</div>");
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            out.push_str("<div class=\"diff-line diff-del\">-");
+            out.push_str(&escape_html(a[i]));
+            out.push_str("</div>");
+            i += 1;
+        } else {
+            out.push_str("<div class=\"diff-line diff-add\">+");
+            out.push_str(&escape_html(b[j]));
+            out.push_str("</div>");
+            j += 1;
+        }
+    }
+    while i < n {
+        out.push_str("<div class=\"diff-line diff-del\">-");
+        out.push_str(&escape_html(a[i]));
+        out.push_str("</div>");
+        i += 1;
+    }
+    while j < m {
+        out.push_str("<div class=\"diff-line diff-add\">+");
+        out.push_str(&escape_html(b[j]));
+        out.push_str("</div>");
+        j += 1;
+    }
+    out.push_str("</div>");
     out
 }
 
@@ -424,5 +832,31 @@ mod tests {
         let html = render_html("![alt](https://img.example/x.png)");
         assert!(html.contains("href=\"https://img.example/x.png\""));
         assert!(!html.contains("<img"));
+    }
+
+    #[test]
+    fn per_language_highlighting_and_diff_html() {
+        let json_hl = highlight_code(r#"{"port": 8080, "ok": true}"#, Some("json"));
+        assert!(json_hl.contains("hljs-attr"));
+        assert!(json_hl.contains("hljs-number"));
+        assert!(json_hl.contains("hljs-keyword"));
+
+        let py_hl = highlight_code("# note\ndef greet(x: str):\n    return x", Some("python"));
+        assert!(py_hl.contains("hljs-comment"));
+        assert!(py_hl.contains("hljs-keyword"));
+        assert!(py_hl.contains("hljs-type"));
+
+        let rs_hl = highlight_code("let x = println!(\"hi\"); // fn", Some("rust"));
+        assert!(rs_hl.contains("hljs-meta"));
+        assert!(rs_hl.contains("hljs-comment"));
+
+        let diff_hl = highlight_code("-old\n+new\n@@ -1 +1 @@", Some("diff"));
+        assert!(diff_hl.contains("hljs-deletion"));
+        assert!(diff_hl.contains("hljs-addition"));
+        assert!(diff_hl.contains("hljs-meta"));
+
+        let diff_html = render_diff_html("a\nb", "a\nc");
+        assert!(diff_html.contains("diff-del"));
+        assert!(diff_html.contains("diff-add"));
     }
 }

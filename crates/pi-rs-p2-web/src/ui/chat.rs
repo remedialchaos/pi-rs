@@ -1,8 +1,9 @@
 //! Streaming chat transcript and code blocks (upstream `Chat.tsx`, `Code.tsx`).
 
-use crate::activity::model::ToolActivityTable;
+use crate::activity::model::default_tool_activities;
 use crate::browser_plugins::ChatActivity;
 use crate::markdown::{highlight_code, render_html};
+use crate::state::virtual_list::{DEFAULT_ROW_HEIGHT_PX, MIN_OVERSCAN_PX, RowLayout};
 use crate::ui::activity_ui::ActivityRow;
 use leptos::prelude::*;
 
@@ -88,7 +89,7 @@ pub fn MessageRow(message: ChatMessage) -> impl IntoView {
     };
     let text = message.text.clone();
     let activities = message.activities.clone();
-    let tools = ToolActivityTable::new();
+    let tools = default_tool_activities();
     view! {
         <div class="chat-row" data-role=role data-streaming=message.streaming.to_string() data-entry-id=message.id.clone()>
             {(!text.is_empty() && !is_tool).then(|| {
@@ -113,18 +114,53 @@ pub fn MessageRow(message: ChatMessage) -> impl IntoView {
     }
 }
 
+/// Threshold above which transcript windowing renders only visible rows + spacers.
+const VIRTUALIZE_THRESHOLD: usize = 80;
+
 /// The transcript: a scroll container of reactive message rows. Streaming token appends
 /// mutate only the last row through the signal, so a long transcript is never re-diffed.
 #[component]
 pub fn Chat(messages: RwSignal<Vec<ChatMessage>>) -> impl IntoView {
+    let scroll_top = RwSignal::new(0.0f64);
+    let viewport_h = RwSignal::new(720.0f64);
+
+    let windowed = Memo::new(move |_| {
+        let all = messages.get();
+        if all.len() <= VIRTUALIZE_THRESHOLD {
+            return (0.0f64, 0.0f64, all);
+        }
+        let mut layout = RowLayout::new(DEFAULT_ROW_HEIGHT_PX);
+        layout.set_keys(all.iter().map(|m| m.id.clone()).collect());
+        let win = layout.window(scroll_top.get(), viewport_h.get(), MIN_OVERSCAN_PX);
+        let slice = all[win.start..win.end].to_vec();
+        (win.top_spacer_px, win.bottom_spacer_px, slice)
+    });
+
     view! {
-        <div class="chat" data-testid="chat">
+        <div
+            class="chat"
+            data-testid="chat"
+            on:scroll=move |ev| {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    use wasm_bindgen::JsCast;
+                    if let Some(target) = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+                        scroll_top.set(f64::from(target.scroll_top()));
+                        viewport_h.set(f64::from(target.client_height()));
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = ev;
+            }
+        >
             <div class="chat-transcript" role="log" aria-live="polite">
+                <div class="virtual-spacer-top" style=move || format!("height: {}px", windowed.get().0)></div>
                 <For
-                    each=move || messages.get()
+                    each=move || windowed.get().2
                     key=|message| (message.id.clone(), message.text.clone(), message.streaming, message.activities.len())
                     children={move |message: ChatMessage| view! { <MessageRow message=message /> }}
                 />
+                <div class="virtual-spacer-bottom" style=move || format!("height: {}px", windowed.get().1)></div>
             </div>
         </div>
     }

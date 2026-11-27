@@ -10,7 +10,22 @@ pub struct KeyChord {
 pub const DEFAULT_KEYS: &[(&str, &[KeyChord])] = &[
     ("p2.commands.open", &[KeyChord { key: "k" }]),
     ("p2.scope-prompt.toggle", &[KeyChord { key: "." }]),
+    ("p2.sidebar.toggle", &[KeyChord { key: "b" }]),
+    ("p2.terminal.toggle", &[KeyChord { key: "j" }]),
+    ("p2.workspace.toggle", &[KeyChord { key: "e" }]),
 ];
+
+/// Global keyboard shortcut action resolved by [`resolve_shortcut`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutAction {
+    OpenCommandMenu,
+    ToggleScopePrompt,
+    ToggleSidebar,
+    ToggleTerminal,
+    ToggleWorkspace,
+    StopGeneration,
+    CloseModal,
+}
 
 /// The modifier state of a key press.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,6 +48,41 @@ pub fn matches_binding(key: &str, mods: Modifiers, binding: &str, apple: bool) -
         .iter()
         .find(|(id, _)| *id == binding)
         .is_some_and(|(_, chords)| chords.iter().any(|chord| chord.key == key))
+}
+
+/// Resolves global keyboard shortcuts including `Cmd/Ctrl+.` and `Escape`.
+pub fn resolve_shortcut(
+    key: &str,
+    mods: Modifiers,
+    apple: bool,
+    busy: bool,
+    modal_open: bool,
+) -> Option<ShortcutAction> {
+    if key == "Escape" && !mods.meta && !mods.ctrl && !mods.alt {
+        if modal_open {
+            return Some(ShortcutAction::CloseModal);
+        }
+        if busy {
+            return Some(ShortcutAction::StopGeneration);
+        }
+        return None;
+    }
+    if matches_binding(key, mods, "p2.commands.open", apple) {
+        return Some(ShortcutAction::OpenCommandMenu);
+    }
+    if matches_binding(key, mods, "p2.scope-prompt.toggle", apple) {
+        return Some(ShortcutAction::ToggleScopePrompt);
+    }
+    if matches_binding(key, mods, "p2.sidebar.toggle", apple) {
+        return Some(ShortcutAction::ToggleSidebar);
+    }
+    if matches_binding(key, mods, "p2.terminal.toggle", apple) {
+        return Some(ShortcutAction::ToggleTerminal);
+    }
+    if matches_binding(key, mods, "p2.workspace.toggle", apple) {
+        return Some(ShortcutAction::ToggleWorkspace);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -88,5 +138,17 @@ mod tests {
             ..Default::default()
         };
         assert!(matches_binding(".", mods, "p2.scope-prompt.toggle", true));
+        assert_eq!(
+            resolve_shortcut(".", mods, true, false, false),
+            Some(ShortcutAction::ToggleScopePrompt)
+        );
+        assert_eq!(
+            resolve_shortcut("Escape", Modifiers::default(), true, true, false),
+            Some(ShortcutAction::StopGeneration)
+        );
+        assert_eq!(
+            resolve_shortcut("Escape", Modifiers::default(), true, true, true),
+            Some(ShortcutAction::CloseModal)
+        );
     }
 }

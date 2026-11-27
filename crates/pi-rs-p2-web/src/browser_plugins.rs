@@ -4,6 +4,9 @@
 //! binary frame encoder, transcript projection, and plugin view decoder is
 //! unit-tested on native hosts as well as compiled to `wasm32-unknown-unknown`.
 
+pub mod extra;
+pub use extra::*;
+
 use crate::activity::detail::describe;
 use crate::activity::label::Described;
 use crate::activity::model::{Step, StepStatus, ToolActivityTable, call_status};
@@ -184,6 +187,28 @@ pub const ALL_CONTRACTS: &[ContractSpec] = &[
     P2_VOICE_MODE,
     P2_SESSION_FILES,
     P2_PLUGIN_RELOAD,
+    P2_PROVIDER_LOGIN,
+    P2_DEVICES,
+    P2_DISCORD,
+    P2_ENVS,
+    P2_PORTS,
+    P2_LOGS,
+    P2_LOG_NOTICES,
+    P2_TRACES,
+    P2_WORKSPACE,
+    P2_VIEWS,
+    P2_SCOPE_STAGE,
+    P2_SUBAGENTS,
+    P2_CHAT_MODE,
+    P2_FAMILIAR,
+    P2_PROMPT_RESOURCES,
+    P2_PROJECTS,
+    P2_SIDEBAR_ROLLUPS,
+    P2_SIDEBAR_SETTINGS,
+    P2_SEARCH,
+    P2_FILE_INDEX,
+    P2_SESSION_METRICS,
+    P2_SENT_FILES,
 ];
 
 /// Looks up a built-in contract descriptor by canonical name.
@@ -201,7 +226,15 @@ pub mod indexes {
         pub const STATE_OWNER_OPERATIONS: u64 = 2;
         pub const STATE_OWNER_SESSIONS: u64 = 3;
         pub const STATE_GUEST_SESSIONS: u64 = 0;
+        pub const METHOD_ARCHIVE: u64 = 0;
+        pub const METHOD_CLONE: u64 = 1;
         pub const METHOD_CREATE: u64 = 2;
+        pub const METHOD_DISMISS_OPERATION: u64 = 3;
+        pub const METHOD_FORK: u64 = 4;
+        pub const METHOD_PIN: u64 = 5;
+        pub const METHOD_RELOCATE: u64 = 6;
+        pub const METHOD_RENAME: u64 = 7;
+        pub const METHOD_RESTORE: u64 = 8;
     }
 
     pub mod chat {
@@ -210,7 +243,10 @@ pub mod indexes {
         pub const STATE_MODEL: u64 = 1;
         pub const STATE_STATS: u64 = 2;
         pub const STATE_VIEW: u64 = 3;
+        pub const METHOD_COMPACT: u64 = 2;
         pub const METHOD_CONFIGURE: u64 = 3;
+        pub const METHOD_ENTRIES: u64 = 6;
+        pub const METHOD_RESET: u64 = 7;
         pub const METHOD_SEND: u64 = 8;
         pub const METHOD_STOP: u64 = 10;
     }
@@ -390,7 +426,13 @@ pub fn hold_for_contract(
     view: Option<&str>,
 ) -> Vec<u8> {
     let (params, route) = match spec.name {
-        "p2.chat" | "p2.chat-costs" | "p2.voice-mode" => {
+        "p2.chat"
+        | "p2.chat-costs"
+        | "p2.voice-mode"
+        | "p2.chat-mode"
+        | "p2.workspace"
+        | "p2.prompt-resources"
+        | "p2.file-index" => {
             let sid = session.unwrap_or("");
             let conv = conversation.unwrap_or(1);
             (
@@ -398,13 +440,22 @@ pub fn hold_for_contract(
                 json!({ "id": sid }),
             )
         }
-        "p2.tree" | "p2.session-files" => {
+        "p2.tree" | "p2.session-files" | "p2.views" | "p2.scope-stage" | "p2.sent-files" => {
             let sid = session.unwrap_or("");
             (json!({ "session": sid }), json!({ "id": sid }))
         }
         "p2.sharing" | "p2.artifacts" => {
             let sid = session.unwrap_or("");
             (json!({ "session": sid }), json!({}))
+        }
+        "p2.session-metrics" => {
+            let sid = session.unwrap_or("");
+            let v = view.unwrap_or("web");
+            (json!({ "session": sid, "viewer": v }), json!({}))
+        }
+        "p2.logs" => {
+            let src = view.unwrap_or("server");
+            (json!({ "source": src }), json!({}))
         }
         "p2.terminals" => {
             let sid = session.unwrap_or("");
@@ -618,6 +669,20 @@ pub enum SidePanel {
     Sharing,
     Tree,
     Voice,
+    Login,
+    Devices,
+    Discord,
+    Envs,
+    Ports,
+    Logs,
+    Telemetry,
+    Subagents,
+    ChatMode,
+    Familiar,
+    Prompt,
+    History,
+    ScopePrompt,
+    Views,
 }
 
 impl SidePanel {
@@ -636,6 +701,20 @@ impl SidePanel {
             Self::Sharing => "sharing",
             Self::Tree => "tree",
             Self::Voice => "voice",
+            Self::Login => "login",
+            Self::Devices => "devices",
+            Self::Discord => "discord",
+            Self::Envs => "envs",
+            Self::Ports => "ports",
+            Self::Logs => "logs",
+            Self::Telemetry => "telemetry",
+            Self::Subagents => "subagents",
+            Self::ChatMode => "chat-mode",
+            Self::Familiar => "familiar",
+            Self::Prompt => "prompt",
+            Self::History => "history",
+            Self::ScopePrompt => "scope-prompt",
+            Self::Views => "views",
         }
     }
 
@@ -650,6 +729,20 @@ impl SidePanel {
             Self::Sharing => "Sharing",
             Self::Tree => "Session Tree",
             Self::Voice => "Voice",
+            Self::Login => "Provider Login",
+            Self::Devices => "Devices",
+            Self::Discord => "Discord",
+            Self::Envs => "Environments",
+            Self::Ports => "Ports",
+            Self::Logs => "Logs",
+            Self::Telemetry => "Telemetry",
+            Self::Subagents => "Subagents",
+            Self::ChatMode => "Chat Mode",
+            Self::Familiar => "Familiar",
+            Self::Prompt => "Prompt Resources",
+            Self::History => "History",
+            Self::ScopePrompt => "Stage Scope Prompt",
+            Self::Views => "Views",
         }
     }
 
@@ -664,6 +757,20 @@ impl SidePanel {
             "sharing" => Some(Self::Sharing),
             "tree" => Some(Self::Tree),
             "voice" => Some(Self::Voice),
+            "login" => Some(Self::Login),
+            "devices" => Some(Self::Devices),
+            "discord" => Some(Self::Discord),
+            "envs" => Some(Self::Envs),
+            "ports" => Some(Self::Ports),
+            "logs" => Some(Self::Logs),
+            "telemetry" => Some(Self::Telemetry),
+            "subagents" => Some(Self::Subagents),
+            "chat-mode" => Some(Self::ChatMode),
+            "familiar" => Some(Self::Familiar),
+            "prompt" => Some(Self::Prompt),
+            "history" => Some(Self::History),
+            "scope-prompt" => Some(Self::ScopePrompt),
+            "views" => Some(Self::Views),
             _ => None,
         }
     }
@@ -671,74 +778,7 @@ impl SidePanel {
 
 /// Built-in commands exposed in the `CommandMenu`.
 pub fn builtin_commands() -> Vec<CommandItem> {
-    vec![
-        CommandItem {
-            id: "new-session".into(),
-            title: "New session".into(),
-            keywords: vec!["create".into(), "chat".into()],
-            section: "Sessions".into(),
-        },
-        CommandItem {
-            id: "pane-chat".into(),
-            title: "Show chat".into(),
-            keywords: vec!["conversation".into(), "transcript".into()],
-            section: "Panes".into(),
-        },
-        CommandItem {
-            id: "pane-terminal".into(),
-            title: "Open terminal".into(),
-            keywords: vec!["shell".into(), "pty".into()],
-            section: "Panes".into(),
-        },
-        CommandItem {
-            id: "panel-cost".into(),
-            title: "Show cost".into(),
-            keywords: vec!["usage".into(), "spend".into(), "tokens".into()],
-            section: "Panels".into(),
-        },
-        CommandItem {
-            id: "panel-artifacts".into(),
-            title: "Show artifacts".into(),
-            keywords: vec!["files".into(), "preview".into()],
-            section: "Panels".into(),
-        },
-        CommandItem {
-            id: "panel-models".into(),
-            title: "Models".into(),
-            keywords: vec!["provider".into(), "default".into()],
-            section: "Settings".into(),
-        },
-        CommandItem {
-            id: "panel-settings".into(),
-            title: "Settings".into(),
-            keywords: vec!["preferences".into(), "config".into()],
-            section: "Settings".into(),
-        },
-        CommandItem {
-            id: "panel-mcp".into(),
-            title: "MCP servers".into(),
-            keywords: vec!["tools".into(), "oauth".into()],
-            section: "Settings".into(),
-        },
-        CommandItem {
-            id: "panel-sharing".into(),
-            title: "Sharing".into(),
-            keywords: vec!["guests".into(), "links".into()],
-            section: "Session".into(),
-        },
-        CommandItem {
-            id: "panel-tree".into(),
-            title: "Session tree".into(),
-            keywords: vec!["branches".into(), "navigate".into()],
-            section: "Session".into(),
-        },
-        CommandItem {
-            id: "panel-voice".into(),
-            title: "Voice".into(),
-            keywords: vec!["audio".into(), "tts".into(), "mic".into()],
-            section: "Session".into(),
-        },
-    ]
+    PluginRegistryState::builtin().dynamic_commands()
 }
 
 /// Decoded `p2.models` view.
@@ -1355,6 +1395,25 @@ pub fn format_draft_storage(session_id: &str, conversation: u64, text: &str) -> 
     encode_draft(&draft_key_for(session_id, conversation), text)
 }
 
+/// Validates a dynamic plugin surface or WASM URL (same-origin `/...`, `https://`, or local `http://`).
+pub fn safe_plugin_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('/') && !trimmed.starts_with("//") {
+        return Some(trimmed.to_owned());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("https://")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("http://127.0.0.1")
+    {
+        return Some(trimmed.to_owned());
+    }
+    None
+}
+
 /// Dynamic descriptor for a browser plugin panel/command entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginDescriptor {
@@ -1373,6 +1432,14 @@ pub struct PluginDescriptor {
     pub section: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub surface_url: Option<String>,
+    #[serde(default)]
+    pub wasm_url: Option<String>,
+    #[serde(default)]
+    pub mount_kind: Option<String>,
+    #[serde(default)]
+    pub schema: Option<Value>,
 }
 
 fn default_true() -> bool {
@@ -1477,6 +1544,132 @@ impl PluginRegistryState {
                 &["audio", "tts", "mic"][..],
                 "Session",
             ),
+            (
+                "login",
+                "Provider Login",
+                Some(P2_PROVIDER_LOGIN.name),
+                "login",
+                "panel-login",
+                &["oauth", "api key", "auth"][..],
+                "Settings",
+            ),
+            (
+                "devices",
+                "Devices",
+                Some(P2_DEVICES.name),
+                "devices",
+                "panel-devices",
+                &["token", "pair", "cli"][..],
+                "Settings",
+            ),
+            (
+                "discord",
+                "Discord",
+                Some(P2_DISCORD.name),
+                "discord",
+                "panel-discord",
+                &["bot", "guild", "channel"][..],
+                "Settings",
+            ),
+            (
+                "envs",
+                "Environments",
+                Some(P2_ENVS.name),
+                "envs",
+                "panel-envs",
+                &["ssh", "sandbox", "remote"][..],
+                "Settings",
+            ),
+            (
+                "ports",
+                "Ports",
+                Some(P2_PORTS.name),
+                "ports",
+                "panel-ports",
+                &["forward", "tunnel", "preview"][..],
+                "Session",
+            ),
+            (
+                "logs",
+                "Logs",
+                Some(P2_LOGS.name),
+                "logs",
+                "panel-logs",
+                &["output", "diagnostics"][..],
+                "Diagnostics",
+            ),
+            (
+                "telemetry",
+                "Telemetry",
+                Some(P2_TRACES.name),
+                "telemetry",
+                "panel-telemetry",
+                &["traces", "metrics", "spans"][..],
+                "Diagnostics",
+            ),
+            (
+                "subagents",
+                "Subagents",
+                Some(P2_SUBAGENTS.name),
+                "subagents",
+                "panel-subagents",
+                &["workers", "children"][..],
+                "Session",
+            ),
+            (
+                "chat-mode",
+                "Chat Mode",
+                Some(P2_CHAT_MODE.name),
+                "chat-mode",
+                "panel-chat-mode",
+                &["reply", "mentions"][..],
+                "Session",
+            ),
+            (
+                "familiar",
+                "Familiar",
+                Some(P2_FAMILIAR.name),
+                "familiar",
+                "panel-familiar",
+                &["home", "assistant"][..],
+                "Session",
+            ),
+            (
+                "prompt",
+                "Prompt Resources",
+                Some(P2_PROMPT_RESOURCES.name),
+                "prompt",
+                "panel-prompt",
+                &["skills", "templates"][..],
+                "Session",
+            ),
+            (
+                "history",
+                "History",
+                Some(P2_CHAT.name),
+                "history",
+                "panel-history",
+                &["entries", "transcript", "earlier"][..],
+                "Session",
+            ),
+            (
+                "scope-prompt",
+                "Stage Scope Prompt",
+                Some(P2_SCOPE_STAGE.name),
+                "scope-prompt",
+                "scope-prompt-toggle",
+                &["stage", "scope", "note"][..],
+                "Session",
+            ),
+            (
+                "views",
+                "Views",
+                Some(P2_VIEWS.name),
+                "views",
+                "panel-views",
+                &["split", "workbench", "tabs"][..],
+                "Panes",
+            ),
         ];
         let mut plugins = IndexMap::new();
         for (id, title, contract, panel, cmd, kw, section) in entries {
@@ -1492,6 +1685,10 @@ impl PluginRegistryState {
                     keywords: kw.iter().map(|s| (*s).to_owned()).collect(),
                     section: section.to_owned(),
                     enabled: true,
+                    surface_url: None,
+                    wasm_url: None,
+                    mount_kind: None,
+                    schema: None,
                 },
             );
         }
@@ -1569,6 +1766,24 @@ impl PluginRegistryState {
                 title: "Open terminal".into(),
                 keywords: vec!["shell".into(), "pty".into()],
                 section: "Panes".into(),
+            },
+            CommandItem {
+                id: "pane-workspace".into(),
+                title: "Open workspace".into(),
+                keywords: vec!["files".into(), "changes".into(), "diff".into()],
+                section: "Panes".into(),
+            },
+            CommandItem {
+                id: "toggle-sidebar".into(),
+                title: "Toggle sidebar".into(),
+                keywords: vec!["sessions".into(), "drawer".into()],
+                section: "Panes".into(),
+            },
+            CommandItem {
+                id: "stop-generation".into(),
+                title: "Stop generation".into(),
+                keywords: vec!["abort".into(), "cancel".into()],
+                section: "Session".into(),
             },
             CommandItem {
                 id: "toggle-theme".into(),
@@ -1934,6 +2149,10 @@ mod tests {
             keywords: vec!["perf".into()],
             section: "Plugins".into(),
             enabled: true,
+            surface_url: Some("/plugins/metrics/index.html".into()),
+            wasm_url: None,
+            mount_kind: Some("surface".into()),
+            schema: None,
         });
         let report = reg.hot_swap("rev-2".into(), next.clone(), Some("models"));
         assert!(report.revision_changed);
