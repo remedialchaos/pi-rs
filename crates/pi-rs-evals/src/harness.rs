@@ -1,13 +1,14 @@
 //! Pi eval harness ported onto `pi-rs-ai` and `pi-rs-coding-agent`
 //! (port of `harness.ts`).
 //!
-//! Upstream mutates `process.env` and calls POSIX `setuid`. Rust 2024 marks
-//! process-global environment mutation and privilege changes unsafe, so this
-//! port represents both as explicit, inspectable values: environment isolation
-//! produces an [`IsolatedEnvironment`] and sandbox identity is validated here
-//! (the container entrypoint performs the actual privilege drop). Workspace
-//! seeding, transcript capture, usage/timing aggregation, and the
-//! `piSessionJsonl` snapshot are preserved.
+//! Native runs isolate a child Pi process and keep provider credentials in the
+//! parent. A disk-persisted SDK session can also be supplied by a test.
+
+mod broker;
+mod native;
+#[cfg(test)]
+mod tests;
+pub use native::{EvalWorkspace, create_pi_documentation_eval_harness, run_pi_coding_agent};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -81,6 +82,10 @@ pub struct PiCodingAgentHarnessOptions {
     pub model: Option<PiCodingAgentModelSelection>,
     pub workspace_files: BTreeMap<String, String>,
     pub expected_pi_documentation: Option<bool>,
+    pub tools: Option<Vec<String>>,
+    pub extensions: Vec<PathBuf>,
+    /// Explicit fixture values supplied by the evaluator.
+    pub environment: BTreeMap<String, String>,
 }
 
 /// Transcript event captured from an agent session.
@@ -154,7 +159,7 @@ pub struct SimpleHarnessResult<T> {
 #[derive(Debug)]
 pub struct HarnessError {
     pub message: String,
-    pub partial_run: Option<SimpleHarnessResult<JsonValue>>,
+    pub partial_run: Option<Box<SimpleHarnessResult<JsonValue>>>,
 }
 
 impl std::fmt::Display for HarnessError {
@@ -474,16 +479,42 @@ fn llm_messages(session: &AgentSession) -> Vec<Message> {
         .collect()
 }
 
-fn last_assistant(session: &AgentSession) -> Option<(StopReason, String)> {
-    llm_messages(session)
-        .into_iter()
+fn assistant_response(messages: &[Message]) -> EvalResult<String> {
+    let assistant = messages
+        .iter()
         .rev()
         .find_map(|message| match message {
-            Message::Assistant(assistant) => {
-                Some((assistant.stop_reason, assistant_text(&assistant.content)))
-            }
+            Message::Assistant(a) => Some(a),
             _ => None,
         })
+        .ok_or_else(|| EvalError::message("Agent run completed without an assistant message."))?;
+    if !matches!(
+        assistant.stop_reason,
+        StopReason::Stop | StopReason::ToolUse
+    ) {
+        return Err(EvalError::message(
+            assistant.error_message.clone().unwrap_or_else(|| {
+                format!(
+                    "Agent run ended with unexpected stop reason: {}.",
+                    assistant.stop_reason.as_str()
+                )
+            }),
+        ));
+    }
+    let text = assistant_text(&assistant.content);
+    if text.is_empty() && assistant.stop_reason == StopReason::Stop {
+        return Err(EvalError::message("Agent run produced no assistant text."));
+    }
+    Ok(text)
+}
+
+fn snapshot(path: Option<&Path>) -> EvalResult<String> {
+    let missing = || EvalError::message("Pi eval produced no session file.");
+    let path = path.ok_or_else(missing)?;
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(missing()),
+        other => Ok(other?),
+    }
 }
 
 /// Build the default Pi system prompt for a workspace and tool selection.
@@ -566,6 +597,7 @@ pub async fn run_prepared_session(
                 .await
                 .map_err(|error| EvalError::message(format!("{error}")))?,
             HarnessStep::Prompt(text) => {
+                let previous = llm_messages(sdk.session()).len();
                 let disposition = sdk
                     .prompt(text, PromptOptions::default())
                     .await
@@ -575,19 +607,11 @@ pub async fn run_prepared_session(
                         "Agent run was queued instead of started.",
                     ));
                 }
-                let (stop_reason, text) = last_assistant(sdk.session()).ok_or_else(|| {
-                    EvalError::message("Agent run completed without an assistant message.")
-                })?;
-                if !matches!(stop_reason, StopReason::Stop | StopReason::ToolUse) {
-                    return Err(EvalError::message(format!(
-                        "Agent run ended with unexpected stop reason: {}",
-                        stop_reason.as_str()
-                    )));
-                }
-                if text.is_empty() && stop_reason == StopReason::Stop {
-                    return Err(EvalError::message("Agent run produced no assistant text."));
-                }
-                response = Some(text);
+                response = Some(assistant_response(
+                    llm_messages(sdk.session())
+                        .get(previous..)
+                        .unwrap_or_default(),
+                )?);
             }
         }
     }
@@ -602,15 +626,6 @@ pub async fn run_prepared_session(
         options.expected_pi_documentation,
     )?;
     let stats = sdk.stats();
-    let has_pricing = [&model.cost.rates]
-        .into_iter()
-        .chain(model.cost.tiers.iter().map(|tier| &tier.rates))
-        .any(|rates| {
-            rates.input > 0.0
-                || rates.output > 0.0
-                || rates.cache_read > 0.0
-                || rates.cache_write > 0.0
-        });
     let mut metadata = Map::new();
     metadata.insert(
         "systemPromptSha256".to_owned(),
@@ -625,7 +640,7 @@ pub async fn run_prepared_session(
         "cacheWriteTokens".to_owned(),
         json_number(stats.tokens.cache_write),
     );
-    if has_pricing {
+    if has_pricing(model) {
         metrics_metadata.insert("estimatedCostUsd".to_owned(), json_number(stats.cost));
     }
     let usage = UsageSummary {
@@ -645,11 +660,9 @@ pub async fn run_prepared_session(
             "runId".to_owned(),
             Value::String(sdk.session().session_id()),
         );
-        if let Some(path) = sdk.session().session_file()
-            && let Ok(text) = std::fs::read_to_string(&path)
-        {
-            bag.insert(PI_SESSION_SNAPSHOT_ARTIFACT.to_owned(), Value::String(text));
-        }
+        let path = sdk.session().session_file().map(PathBuf::from);
+        let text = snapshot(path.as_deref())?;
+        bag.insert(PI_SESSION_SNAPSHOT_ARTIFACT.to_owned(), Value::String(text));
     }
     let result_artifacts = artifacts
         .lock()
@@ -667,6 +680,18 @@ pub async fn run_prepared_session(
         metadata,
         errors: Vec::new(),
     })
+}
+
+fn has_pricing(model: &Model) -> bool {
+    [&model.cost.rates]
+        .into_iter()
+        .chain(model.cost.tiers.iter().map(|tier| &tier.rates))
+        .any(|rates| {
+            rates.input > 0.0
+                || rates.output > 0.0
+                || rates.cache_read > 0.0
+                || rates.cache_write > 0.0
+        })
 }
 
 fn json_number(value: f64) -> Value {

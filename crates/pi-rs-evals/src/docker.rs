@@ -9,6 +9,9 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
+mod image;
+
 use crate::error::{EvalError, EvalResult};
 use crate::plan::{DOCUMENTATION_VARIANTS, DocumentationVariant, EvalTask};
 use crate::report::sha256_hex;
@@ -279,23 +282,24 @@ fn environment(name: &str, value: &str) -> [String; 2] {
     ["--env".to_owned(), format!("{name}={value}")]
 }
 
-/// Read the current process UID/GID without `unsafe` (Linux `/proc` path).
+/// Read the real process identity using the POSIX id utility on Unix.
 pub fn process_uid_gid() -> Option<(u32, u32)> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        let mut uid = None;
-        let mut gid = None;
-        for line in status.lines() {
-            if let Some(value) = line.strip_prefix("Uid:") {
-                uid = value.split_whitespace().next()?.parse::<u32>().ok();
-            } else if let Some(value) = line.strip_prefix("Gid:") {
-                gid = value.split_whitespace().next()?.parse::<u32>().ok();
+        fn real_id(flag: &str) -> Option<u32> {
+            let output = Command::new("id").args(["-r", flag]).output().ok()?;
+            if !output.status.success() {
+                return None;
             }
+            std::str::from_utf8(&output.stdout)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
         }
-        uid.zip(gid)
+        Some((real_id("-u")?, real_id("-g")?))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         None
     }
@@ -341,8 +345,6 @@ pub fn docker_args(
         "--read-only".to_owned(),
         "--tmpfs".to_owned(),
         "/tmp:rw,exec,mode=1777".to_owned(),
-        "--tmpfs".to_owned(),
-        "/repo/node_modules/.vite-temp:rw,exec,mode=1777".to_owned(),
         "--mount".to_owned(),
         format!(
             "type=bind,source={},target=/artifacts",
@@ -367,6 +369,14 @@ pub fn docker_args(
         "type=bind,source={},target=/run/pi-eval-secrets/auth.json,readonly",
         context.auth_path.display()
     ));
+    let models = context.auth_path.with_file_name("models.json");
+    if models.try_exists()? {
+        args.push("--mount".to_owned());
+        args.push(format!(
+            "type=bind,source={},target=/run/pi-eval-secrets/models.json,readonly",
+            models.display()
+        ));
+    }
     args.push(context.images.get(variant).name.clone());
     args.extend(entrypoint_args.iter().cloned());
     Ok(args)
@@ -395,6 +405,34 @@ pub fn create_docker_context(
 pub fn build_images(
     repository_root: &Path,
     package_root: &Path,
+    runner: &dyn CommandRunner,
+) -> EvalResult<BuiltImages> {
+    #[cfg(target_os = "linux")]
+    {
+        let stage = image::stage(repository_root)?;
+        build_images_from_context(
+            repository_root,
+            &package_root.join("docker/Dockerfile"),
+            stage.path(),
+            runner,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        build_images_from_context(
+            repository_root,
+            &package_root.join("docker/Dockerfile.build"),
+            repository_root,
+            runner,
+        )
+    }
+}
+
+/// Tag and inspect both images using an already prepared OCI build context.
+pub fn build_images_from_context(
+    repository_root: &Path,
+    dockerfile: &Path,
+    context: &Path,
     runner: &dyn CommandRunner,
 ) -> EvalResult<BuiltImages> {
     let prefix = format!(
@@ -426,12 +464,8 @@ pub fn build_images(
             "--tag".to_owned(),
             image.name.clone(),
             "--file".to_owned(),
-            package_root
-                .join("docker")
-                .join("Dockerfile")
-                .to_string_lossy()
-                .into_owned(),
-            repository_root.to_string_lossy().into_owned(),
+            dockerfile.to_string_lossy().into_owned(),
+            context.to_string_lossy().into_owned(),
         ];
         let built = runner.execute(DEFAULT_CONTAINER_RUNTIME, &build_args, false)?;
         if built.status != 0 {
@@ -464,7 +498,7 @@ pub fn discover_cases(
     context: &DockerContext,
     variant: DocumentationVariant,
     files: &[String],
-    vitest_args: &[String],
+    selection_args: &[String],
     runner: &dyn CommandRunner,
     artifact_uid_gid: Option<(u32, u32)>,
 ) -> EvalResult<PathBuf> {
@@ -472,13 +506,9 @@ pub fn discover_cases(
         .artifact_directory
         .join("discovery")
         .join(variant.as_str());
-    let mut entrypoint_args = vec![
-        "--discover".to_owned(),
-        "--project".to_owned(),
-        "docs".to_owned(),
-    ];
+    let mut entrypoint_args = vec!["__discover".to_owned()];
     entrypoint_args.extend(files.iter().cloned());
-    entrypoint_args.extend(vitest_args.iter().cloned());
+    entrypoint_args.extend(selection_args.iter().cloned());
     let args = docker_args(
         context,
         variant,
@@ -486,13 +516,15 @@ pub fn discover_cases(
         &entrypoint_args,
         artifact_uid_gid,
     )?;
-    let result = runner.execute(DEFAULT_CONTAINER_RUNTIME, &args, false)?;
+    let result = runner.execute(DEFAULT_CONTAINER_RUNTIME, &args, true)?;
     if result.status != 0 {
         return Err(EvalError::message(format!(
             "{variant} eval discovery failed."
         )));
     }
-    Ok(output_directory.join("discovered-tests.json"))
+    let path = output_directory.join("discovered-tests.json");
+    std::fs::write(&path, result.stdout)?;
+    Ok(path)
 }
 
 /// SHA-256 directory name for a task identity.
@@ -500,25 +532,7 @@ pub fn task_directory_name(task: &EvalTask) -> String {
     sha256_hex(task.identity_json().as_bytes())
 }
 
-/// Escape a literal string for use in a Vitest `--testNamePattern` regex.
-pub fn escape_regex(pattern: &str) -> String {
-    let mut escaped = String::with_capacity(pattern.len());
-    for character in pattern.chars() {
-        if matches!(
-            character,
-            '.' | '*' | '+' | '?' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\'
-        ) {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
-}
-
-/// Run one eval task in the appropriate image.
-///
-/// The exit status is intentionally ignored (matching upstream `execute`): a
-/// failed eval becomes an errored observation through its missing report.
+/// Run one native task. A container failure has no observation.
 pub fn run_task(
     context: &DockerContext,
     task: &EvalTask,
@@ -529,15 +543,7 @@ pub fn run_task(
         .artifact_directory
         .join("tasks")
         .join(task_directory_name(task));
-    let test_name = format!("{} {}", task.eval_set, task.case_id);
-    let exact_name = format!("^{}$", escape_regex(&test_name));
-    let entrypoint_args = vec![
-        "--project".to_owned(),
-        "docs".to_owned(),
-        task.file.clone(),
-        "--testNamePattern".to_owned(),
-        exact_name,
-    ];
+    let entrypoint_args = vec!["__run".to_owned(), serde_json::to_string(task)?];
     let args = docker_args(
         context,
         task.variant,
@@ -545,7 +551,52 @@ pub fn run_task(
         &entrypoint_args,
         artifact_uid_gid,
     )?;
-    runner.execute(DEFAULT_CONTAINER_RUNTIME, &args, false)?;
-    let report_path = output_directory.join("vitest.json");
-    Ok(report_path.is_file().then_some(report_path))
+    let session = output_directory.join("session.jsonl");
+    // A retry must never pick up a previous invocation's snapshot.
+    if let Err(error) = std::fs::remove_file(&session)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    let result = runner.execute(DEFAULT_CONTAINER_RUNTIME, &args, true)?;
+    if session.try_exists()? {
+        let snapshot = crate::report::session_snapshot_path(&context.artifact_directory, task);
+        let parent = snapshot
+            .parent()
+            .ok_or_else(|| EvalError::message("Invalid session path"))?;
+        create_output_directory(parent)?;
+        std::fs::rename(session, snapshot)?;
+    }
+    if result.status != 0 {
+        return Ok(None);
+    }
+    let path = output_directory.join("observation.json");
+    std::fs::write(&path, result.stdout)?;
+    Ok(Some(path))
+}
+
+/// Publish a private snapshot owned by the operator who owns the artifact mount.
+/// The mount metadata reflects the container's UID mapping under rootless engines.
+pub fn write_container_session(directory: &Path, text: &str) -> EvalResult<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let path = directory.join("session.jsonl");
+    let mut file = options.open(&path)?;
+    file.write_all(text.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, chown};
+        let owner = directory.metadata()?;
+        let current = file.metadata()?;
+        if (current.uid(), current.gid()) != (owner.uid(), owner.gid()) {
+            chown(&path, Some(owner.uid()), Some(owner.gid()))?;
+        }
+    }
+    Ok(())
 }

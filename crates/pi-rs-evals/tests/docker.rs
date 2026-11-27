@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use pi_rs_evals::docker::{
     BuiltImage, BuiltImages, CommandOutput, CommandRunner, DockerContext, SystemCommandRunner,
-    build_images, create_docker_context, docker_args, escape_regex, process_uid_gid,
+    build_images_from_context, create_docker_context, docker_args, process_uid_gid,
     require_eval_auth_file, resolve_container_runtime, run_task, task_directory_name,
 };
 use pi_rs_evals::plan::{DocumentationVariant, EvalTask};
@@ -81,7 +81,7 @@ fn context(root: &Path) -> DockerContext {
 
 fn task() -> EvalTask {
     EvalTask {
-        file: "evals/models.docs.eval.ts".to_owned(),
+        file: "src/suites/models.rs".to_owned(),
         full_name: "tool access > create".to_owned(),
         eval_set: "tool access".to_owned(),
         case_id: "create".to_owned(),
@@ -136,7 +136,7 @@ fn docker_args_are_exact_and_include_uid_gid_when_supplied() {
         &context,
         DocumentationVariant::WithoutDocs,
         &output,
-        &["--project".to_owned(), "docs".to_owned()],
+        &["__discover".to_owned()],
         Some((1000, 1001)),
     )
     .expect("docker args");
@@ -148,8 +148,6 @@ fn docker_args_are_exact_and_include_uid_gid_when_supplied() {
         "--read-only",
         "--tmpfs",
         "/tmp:rw,exec,mode=1777",
-        "--tmpfs",
-        "/repo/node_modules/.vite-temp:rw,exec,mode=1777",
         "--mount",
         &artifacts_mount,
         "--env",
@@ -171,8 +169,7 @@ fn docker_args_are_exact_and_include_uid_gid_when_supplied() {
         "--mount",
         "type=bind,source=/run/pi-eval-secrets/auth.json,target=/run/pi-eval-secrets/auth.json,readonly",
         "pi-evals-abc-without-docs:local",
-        "--project",
-        "docs",
+        "__discover",
     ];
     assert_eq!(args, expected);
 }
@@ -190,10 +187,8 @@ fn docker_args_omit_uid_gid_when_unavailable() {
     .expect("docker args");
     assert!(!args.iter().any(|arg| arg.contains("PI_EVAL_ARTIFACT_UID")));
     assert!(args.contains(&"pi-evals-abc-with-docs:local".to_owned()));
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     assert_eq!(process_uid_gid(), None);
-    #[cfg(target_os = "linux")]
-    let _ = process_uid_gid();
 }
 
 #[test]
@@ -205,18 +200,47 @@ fn task_directory_name_matches_upstream_sha256() {
 }
 
 #[test]
-fn regex_escaping_matches_upstream_test_name_pattern() {
-    assert_eq!(escape_regex("a.b(c)[d]"), "a\\.b\\(c\\)\\[d\\]");
-    let dir = tempfile::tempdir().expect("tempdir");
+fn run_task_preserves_native_identity_and_returns_captured_observation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
     let context = context(dir.path());
-    let runner = RecordingRunner::default();
-    let report = run_task(&context, &task(), &runner, None).expect("run task");
-    assert_eq!(report, None);
+    let value = json!({"outcome":"scored","score":1});
+    let runner = RecordingRunner::with_outputs(vec![CommandOutput {
+        status: 0,
+        stdout: value.to_string(),
+    }]);
+    let task = task();
+    let path = run_task(&context, &task, &runner, None)?.ok_or("missing observation")?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(path)?)?,
+        value
+    );
     let calls = runner.calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0, "docker");
-    assert!(calls[0].1.contains(&"^tool access create$".to_owned()));
-    assert!(calls[0].1.contains(&"--testNamePattern".to_owned()));
+    let [call] = calls.as_slice() else {
+        return Err("expected one command".into());
+    };
+    assert!(call.2);
+    let args = &call.1;
+    assert_eq!(args[args.len() - 2], "__run");
+    assert_eq!(
+        serde_json::from_str::<EvalTask>(&args[args.len() - 1])?,
+        task
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn mount_identity_matches_real_unix_user_and_group() -> Result<(), Box<dyn std::error::Error>> {
+    let id = |option| -> Result<u32, Box<dyn std::error::Error>> {
+        let output = std::process::Command::new("id").arg(option).output()?;
+        if !output.status.success() {
+            return Err("id command failed".into());
+        }
+        Ok(std::str::from_utf8(&output.stdout)?.trim().parse()?)
+    };
+    assert_eq!(process_uid_gid(), Some((id("-ru")?, id("-rg")?)));
+    Ok(())
 }
 
 #[test]
@@ -239,9 +263,10 @@ fn build_images_uses_both_variants_and_inspects_ids() {
             stdout: "sha-with\n".to_owned(),
         },
     ]);
-    let images = build_images(
+    let images = build_images_from_context(
         Path::new("/repo"),
-        Path::new("/repo/packages/evals"),
+        Path::new("/repo/crates/pi-rs-evals/docker/Dockerfile"),
+        Path::new("/staged-runtime"),
         &runner,
     )
     .expect("build images");

@@ -343,6 +343,70 @@ pub fn errored_observation(task: &EvalTask) -> EvalObservation {
     EvalObservation::from_identity(EvalRunIdentity::from_task(task), EvalOutcome::Errored, None)
 }
 
+/// Read the native worker result, requiring it to identify the scheduled task.
+pub fn read_native_observation(task: &EvalTask, path: &Path) -> EvalResult<EvalObservation> {
+    let observation: EvalObservation = serde_json::from_slice(&std::fs::read(path)?)?;
+    if observation.eval_set != task.eval_set
+        || observation.case_id != task.case_id
+        || observation.variant != task.variant
+        || observation.model != task.model
+        || observation.run_number != task.run_number
+    {
+        return Err(EvalError::message(
+            "Native observation does not match the scheduled task.",
+        ));
+    }
+    Ok(observation)
+}
+
+/// Convert a finished run or partial failure to the comparison format.
+pub fn native_observation(
+    task: &EvalTask,
+    run: &crate::harness::SimpleHarnessResult<Value>,
+    score: Option<bool>,
+) -> EvalResult<EvalObservation> {
+    let usage = &run.usage;
+    let actual_model = usage
+        .provider
+        .as_deref()
+        .zip(usage.model.as_deref())
+        .map(|(provider, model)| format!("{provider}/{model}"));
+    if actual_model.as_deref() != Some(task.model.as_str()) {
+        return Ok(errored_observation(task));
+    }
+    let metrics = Metrics {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+        tool_calls: usage.tool_calls,
+        total_ms: Some(run.timings.total_ms),
+        cache_read_tokens: optional_metric(
+            usage.metadata.get("cacheReadTokens"),
+            "cacheReadTokens",
+        )?,
+        cache_write_tokens: optional_metric(
+            usage.metadata.get("cacheWriteTokens"),
+            "cacheWriteTokens",
+        )?,
+        estimated_cost_usd: optional_metric(
+            usage.metadata.get("estimatedCostUsd"),
+            "estimatedCostUsd",
+        )?,
+    };
+    let score = score
+        .filter(|_| run.errors.is_empty())
+        .map(|passed| f64::from(u8::from(passed)));
+    Ok(metrics.into_observation(
+        EvalRunIdentity::from_task(task),
+        if score.is_some() {
+            EvalOutcome::Scored
+        } else {
+            EvalOutcome::Errored
+        },
+        score,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Vitest JSON report parsing
 // ---------------------------------------------------------------------------

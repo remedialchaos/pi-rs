@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!README.md
+!crates
+!crates/**
+**/.*
+**/target
+**/artifacts
+**/auth.json
+**/*.pem
+**/*.key

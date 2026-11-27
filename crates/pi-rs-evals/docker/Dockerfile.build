@@ -1,0 +1,28 @@
+# Non-Linux hosts build Linux executables using the engine's platform.
+FROM docker.io/library/rust:bookworm AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo build --locked --release -p pi-rs-coding-agent --bin pi -p pi-rs-evals --bin pi-evals \
+    && strip target/release/pi target/release/pi-evals
+
+FROM docker.io/library/debian:bookworm-slim AS evaluator
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates util-linux bash \
+    && rm -rf /var/lib/apt/lists/* && mkdir -p /run/pi-eval-secrets /artifacts /opt/pi \
+    && chmod 0700 /run/pi-eval-secrets
+COPY --from=build /build/target/release/pi /usr/local/bin/pi
+COPY --from=build /build/target/release/pi-evals /usr/local/bin/pi-evals
+COPY crates/pi-rs-coding-agent/assets/theme/ /opt/pi/theme/
+COPY crates/pi-rs-coding-agent/wit/ /opt/pi/wit/
+RUN chmod 0700 /usr/local/bin/pi-evals
+ENV PI_PACKAGE_DIR=/opt/pi PI_EVAL_REPO_ROOT=/opt/pi PI_EVAL_PI_BINARY=/usr/local/bin/pi PI_CODING_AGENT_DIR=/run/pi-eval-secrets PI_EVAL_CONTAINER=1 HOME=/tmp
+WORKDIR /tmp
+ENTRYPOINT ["/usr/local/bin/pi-evals"]
+
+FROM evaluator AS without_docs
+ENV PI_EVAL_VARIANT=without_docs
+
+FROM evaluator AS with_docs
+COPY README.md crates/pi-rs-coding-agent/assets/CHANGELOG.md /opt/pi/
+COPY crates/pi-rs-coding-agent/assets/docs/ /opt/pi/docs/
+ENV PI_EVAL_VARIANT=with_docs

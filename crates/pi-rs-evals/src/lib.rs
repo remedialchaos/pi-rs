@@ -7,3 +7,5 @@ pub mod error;
 pub mod harness;
 pub mod plan;
 pub mod report;
+pub mod runner;
+pub mod suites;

@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -18,10 +17,10 @@ use crate::plan::{
 };
 use crate::report::{
     EvalComparisonReport, EvalObservation, errored_observation, format_eval_comparison_report,
-    read_task_observation, summarize_eval_observations,
+    read_native_observation, summarize_eval_observations,
 };
 
-const DISCOVERY_PREFIX: &str = "/repo/packages/evals/";
+use crate::suites::{SuiteGroup, discover};
 
 /// Parsed documentation eval CLI options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +65,7 @@ pub fn parse_eval_cli(
     let mut index = 0;
     while index < args.len() {
         let argument = &args[index];
-        if argument.ends_with(".docs.eval.ts") {
+        if argument.ends_with(".rs") {
             requested_files.push(argument.clone());
             index += 1;
             continue;
@@ -217,15 +216,22 @@ pub fn container_path(package_root: &Path, path: &str) -> EvalResult<String> {
     Ok(relative_text.replace('\\', "/"))
 }
 
-/// Strip the container package prefix from a discovered eval file path.
+/// Validate a crate-relative suite identifier returned by container discovery.
 pub fn normalize_discovered_file(path: &str) -> EvalResult<String> {
-    path.strip_prefix(DISCOVERY_PREFIX)
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            EvalError::message(format!(
-                "Discovered eval path is outside the container package: {path}"
-            ))
-        })
+    let normalized = path.replace('\\', "/");
+    let path = Path::new(&normalized);
+    if normalized.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(EvalError::message(format!(
+            "Discovered eval path is outside the container package: {}",
+            path.display()
+        )));
+    }
+    Ok(path.to_string_lossy().replace('\\', "/"))
 }
 
 /// Assert that two documentation variants discovered identical eval cases.
@@ -264,47 +270,33 @@ pub fn artifact_run_id(timestamp: &str, uuid: &str) -> String {
     format!("{}_{}", timestamp.replace(':', "-"), uuid)
 }
 
-/// Select eval files from explicit CLI arguments or the package glob.
+/// Select documentation suites from the compiled native registry.
 pub fn select_eval_files(
     package_root: &Path,
     requested_files: &[String],
 ) -> EvalResult<Vec<String>> {
-    let files = if !requested_files.is_empty() {
-        requested_files.to_vec()
-    } else {
-        let pattern = Glob::new("evals/**/*.docs.eval.ts")
-            .map_err(|error| EvalError::message(format!("Invalid eval glob: {error}")))?;
-        let mut builder = GlobSetBuilder::new();
-        builder.add(pattern);
-        let set = builder
-            .build()
-            .map_err(|error| EvalError::message(format!("Invalid eval glob: {error}")))?;
-        let mut files = Vec::new();
-        let mut stack = vec![package_root.to_path_buf()];
-        while let Some(directory) = stack.pop() {
-            let entries = match std::fs::read_dir(&directory) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if let Ok(relative) = path.strip_prefix(package_root)
-                    && set.is_match(relative)
-                {
-                    files.push(relative.to_string_lossy().replace('\\', "/"));
-                }
-            }
+    let mut available: Vec<_> = discover(package_root, SuiteGroup::Documentation)?
+        .into_iter()
+        .map(|case| case.file)
+        .collect();
+    available.sort();
+    available.dedup();
+    if requested_files.is_empty() {
+        return Ok(available);
+    }
+    let mut selected = Vec::new();
+    for requested in requested_files {
+        let file = container_path(package_root, requested)?;
+        if !available.contains(&file) {
+            return Err(EvalError::message(format!(
+                "Unknown documentation suite: {file}"
+            )));
         }
-        files
-    };
-    let mut files: Vec<String> = files
-        .iter()
-        .map(|file| container_path(package_root, file))
-        .collect::<EvalResult<_>>()?;
-    files.sort();
-    Ok(files)
+        selected.push(file);
+    }
+    selected.sort();
+    selected.dedup();
+    Ok(selected)
 }
 
 #[derive(Serialize)]
@@ -400,14 +392,6 @@ pub fn execute_eval_run(
             "No documentation eval files were selected.",
         ));
     }
-    for file in &files {
-        if !file.ends_with(".docs.eval.ts") {
-            return Err(EvalError::message(format!(
-                "Documentation runner cannot execute non-doc eval: {file}"
-            )));
-        }
-    }
-
     create_artifact_directory(artifact_directory)?;
     let images = ops.build_images()?;
     if images.with_docs.id == images.without_docs.id {
@@ -484,7 +468,7 @@ pub fn execute_eval_run(
             task.run_number
         );
         let observation = match ops.run_task(task)? {
-            Some(report_path) => read_task_observation(task, &report_path, artifact_directory)?,
+            Some(report_path) => read_native_observation(task, &report_path)?,
             None => errored_observation(task),
         };
         observations.push(observation);

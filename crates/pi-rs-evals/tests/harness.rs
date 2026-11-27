@@ -204,3 +204,83 @@ async fn offline_faux_run_captures_transcript_usage_timings_and_session_artifact
     assert_eq!(faux.state.call_count(), 1);
     sdk.close();
 }
+#[tokio::test]
+async fn aborted_harness_stops_before_agent_launch() -> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_coding_agent::utils::abort::AbortController;
+    use pi_rs_evals::harness::{EvalWorkspace, run_pi_coding_agent};
+    let ws = EvalWorkspace::new(&BTreeMap::new())?;
+    let path = ws.workspace.clone();
+    let controller = AbortController::new();
+    let signal = controller.signal();
+    controller.abort(Some("operator cancelled"));
+    let pi = Path::new("missing-eval-pi");
+    let input = PiCodingAgentInput::from("hello");
+    let options = PiCodingAgentHarnessOptions::default();
+    let early = run_pi_coding_agent(pi, &ws, &input, &options, Some(&signal))
+        .await
+        .err()
+        .ok_or("aborted run succeeded")?;
+    assert_eq!(early.message, "operator cancelled");
+    ws.close()?;
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn isolated_harness_rejects_unexpected_seeded_extensions()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_evals::harness::{EvalWorkspace, run_pi_coding_agent};
+    let ws = EvalWorkspace::new(&BTreeMap::from([(
+        ".pi/extensions/unexpected.wasm".into(),
+        "untrusted".into(),
+    )]))?;
+    let pi = Path::new("missing-eval-pi");
+    let input = PiCodingAgentInput::from("hello");
+    let options = PiCodingAgentHarnessOptions::default();
+    let unexpected = run_pi_coding_agent(pi, &ws, &input, &options, None)
+        .await
+        .err()
+        .ok_or("unexpected extension accepted")?;
+    assert!(
+        unexpected.message.contains("unexpected.wasm"),
+        "{unexpected}"
+    );
+    Ok(())
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn child_process_cannot_read_inherited_credentials_or_eval_settings()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_evals::harness::EvalWorkspace;
+    const MARKER: &str = "PI_EVAL_HARNESS_TEST_HELPER";
+    if std::env::var_os(MARKER).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "child_process_cannot_read_inherited_credentials_or_eval_settings",
+            ])
+            .env(MARKER, "1")
+            .env("AWS_SECRET_ACCESS_KEY", "fixture-value")
+            .status()?;
+        assert!(status.success());
+        return Ok(());
+    }
+    let ws = EvalWorkspace::new(&BTreeMap::new())?;
+    let output = ws
+        .command(Path::new("env"), &BTreeMap::new())?
+        .output()
+        .await?;
+    assert!(output.status.success());
+    let env = String::from_utf8(output.stdout)?;
+    assert!(!env.contains("AWS_SECRET_ACCESS_KEY="));
+    assert!(!env.contains(MARKER));
+    assert!(
+        env.lines()
+            .any(|v| v == format!("HOME={}", ws.home.display()))
+    );
+    assert!(
+        env.lines()
+            .any(|v| v == format!("PI_CODING_AGENT_DIR={}", ws.agent_dir.display()))
+    );
+    Ok(())
+}

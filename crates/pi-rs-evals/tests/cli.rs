@@ -12,7 +12,7 @@ use pi_rs_evals::cli::{
 use pi_rs_evals::docker::{BuiltImage, BuiltImages, task_directory_name};
 use pi_rs_evals::error::EvalResult;
 use pi_rs_evals::plan::{DiscoveredEvalCase, DocumentationVariant, EvalTask};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
@@ -35,7 +35,7 @@ fn parses_space_and_equals_flag_forms() {
             "--runs-per-variant=3",
             "-t",
             "some test",
-            "evals/a.docs.eval.ts",
+            "src/suites/extensions.rs",
             "--testNamePattern=other",
         ]),
         &map_environment(&env(&[])),
@@ -44,7 +44,7 @@ fn parses_space_and_equals_flag_forms() {
     assert_eq!(cli.provider.as_deref(), Some("fixture"));
     assert_eq!(cli.model.as_deref(), Some("fixture/model"));
     assert_eq!(cli.runs_per_variant, 3);
-    assert_eq!(cli.requested_files, vec!["evals/a.docs.eval.ts"]);
+    assert_eq!(cli.requested_files, vec!["src/suites/extensions.rs"]);
     assert_eq!(
         cli.discovery_args,
         vec!["-t", "some test", "--testNamePattern=other"]
@@ -99,17 +99,17 @@ fn falls_back_to_environment_and_validates_errors() {
 
 #[test]
 fn container_path_rejects_traversal_and_normalizes_discovered_files() {
-    let root = Path::new("/repo/packages/evals");
+    let root = Path::new("/repo/crates/pi-rs-evals");
     assert_eq!(
-        container_path(root, "evals/models.docs.eval.ts").expect("inside path"),
-        "evals/models.docs.eval.ts"
+        container_path(root, "src/suites/models.rs").expect("inside path"),
+        "src/suites/models.rs"
     );
     assert_eq!(
-        container_path(root, "./evals/../evals/models.docs.eval.ts").expect("normalized path"),
-        "evals/models.docs.eval.ts"
+        container_path(root, "./src/../src/suites/models.rs").expect("normalized path"),
+        "src/suites/models.rs"
     );
     assert!(
-        container_path(root, "../secret.docs.eval.ts")
+        container_path(root, "../secret.rs")
             .expect_err("escaping path")
             .to_string()
             .contains("Eval file must be inside")
@@ -117,9 +117,8 @@ fn container_path_rejects_traversal_and_normalizes_discovered_files() {
     assert!(container_path(root, "/etc/passwd").is_err());
 
     assert_eq!(
-        normalize_discovered_file("/repo/packages/evals/evals/models.docs.eval.ts")
-            .expect("normalize"),
-        "evals/models.docs.eval.ts"
+        normalize_discovered_file("src/suites/models.rs").expect("normalize"),
+        "src/suites/models.rs"
     );
     assert!(
         normalize_discovered_file("/other/path.ts")
@@ -132,7 +131,7 @@ fn container_path_rejects_traversal_and_normalizes_discovered_files() {
 #[test]
 fn compares_discovery_by_case_identity_and_normalized_file() {
     let left = vec![DiscoveredEvalCase {
-        file: "/repo/packages/evals/evals/a.docs.eval.ts".to_owned(),
+        file: "src/suites/extensions.rs".to_owned(),
         full_name: "Set A > case 1".to_owned(),
         eval_set: "Set A".to_owned(),
         case_id: "case 1".to_owned(),
@@ -225,23 +224,13 @@ impl EvalDockerOps for FakeOps {
             .join("tasks")
             .join(task_directory_name(task));
         std::fs::create_dir_all(&output_dir)?;
-        let report_path = output_dir.join("vitest.json");
-        let meta = json!({
-            "eval": {"avgScore": if task.variant == DocumentationVariant::WithDocs { 1.0 } else { 0.0 }},
-            "harness": {"run": {
-                "usage": {"provider": "fixture", "model": "model", "inputTokens": 10, "outputTokens": 5, "totalTokens": 15, "toolCalls": 1},
-                "timings": {"totalMs": 12.0},
-                "artifacts": {"runId": "run-1"},
-                "errors": []
-            }}
-        });
-        let report = json!({
-            "numTotalTests": 1, "numPassedTests": 1, "numFailedTests": 0, "numPendingTests": 0,
-            "numTodoTests": 0, "startTime": 0, "success": true,
-            "testResults": [{"message": "", "name": "f.ts", "status": "passed", "assertionResults": [{
-                "fullName": format!("{} {}", task.eval_set, task.case_id),
-                "title": task.case_id, "status": "passed", "failureMessages": [], "meta": meta
-            }]}]
+        let report_path = output_dir.join("observation.json");
+        let mut report = pi_rs_evals::report::errored_observation(task);
+        report.outcome = pi_rs_evals::report::EvalOutcome::Scored;
+        report.score = Some(if task.variant == DocumentationVariant::WithDocs {
+            1.0
+        } else {
+            0.0
         });
         std::fs::write(&report_path, serde_json::to_string(&report)?)?;
         Ok(Some(report_path))
@@ -253,16 +242,12 @@ impl EvalDockerOps for FakeOps {
 }
 
 fn setup_package() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let eval_dir = dir.path().join("evals");
-    std::fs::create_dir_all(&eval_dir).expect("create evals dir");
-    std::fs::write(eval_dir.join("models.docs.eval.ts"), "// fixture\n").expect("write eval file");
-    dir
+    tempfile::tempdir().expect("tempdir")
 }
 
 fn discovered_cases() -> Vec<DiscoveredEvalCase> {
     vec![DiscoveredEvalCase {
-        file: "/repo/packages/evals/evals/models.docs.eval.ts".to_owned(),
+        file: "src/suites/models.rs".to_owned(),
         full_name: "Add model > adds the model".to_owned(),
         eval_set: "Add model".to_owned(),
         case_id: "adds the model".to_owned(),
@@ -350,4 +335,43 @@ fn orchestration_marks_blocked_pairs_when_reports_are_missing() {
         execute_eval_run(&cli_run(), package.path(), &artifact_directory, &ops).expect("execute");
     assert_eq!(summary.report.blocked_pairs.len(), 1);
     assert!(summary.report.comparisons[0].lift.is_none());
+}
+
+#[test]
+fn host_audit_and_documentation_discovery_select_their_native_cases()
+-> Result<(), Box<dyn std::error::Error>> {
+    let discover = |mode: &str| -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+        let output = Command::new(binary())
+            .args([mode, "--list"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env_remove("PI_EVAL_REPO_ROOT")
+            .env_remove("PI_MODEL")
+            .env_remove("PI_PROVIDER")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let host = discover("eval:host")?;
+    assert_eq!(host.len(), 1);
+    assert_eq!(host[0]["file"], "src/suites/smoke.rs");
+    let audit = discover("eval:audit")?;
+    assert!(!audit.is_empty());
+    assert!(
+        audit
+            .iter()
+            .all(|c| c["file"] == "src/suites/documentation_audit.rs")
+    );
+    let docs = discover("eval:docs")?;
+    assert_eq!(
+        docs.iter()
+            .filter_map(|c| c["file"].as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        6
+    );
+    Ok(())
 }
