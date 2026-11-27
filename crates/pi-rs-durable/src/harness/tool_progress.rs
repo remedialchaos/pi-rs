@@ -112,6 +112,10 @@ impl Invocation {
         self.publish_tool_progress(ctx).await
     }
     pub(super) async fn publish_tool_progress(&self, ctx: &Context) -> Result<()> {
+        self.write_tool_progress(ctx, false).await
+    }
+
+    pub(super) async fn write_tool_progress(&self, ctx: &Context, closing: bool) -> Result<()> {
         if self.record.input["progress"] == false {
             return Ok(());
         }
@@ -130,7 +134,11 @@ impl Invocation {
                 async |tx| {
                     let current = tx.task(self.record.id).await?;
                     if current.is_none_or(|t| t.state != self.record.state || t.abort_requested) {
-                        return Err(Error::invalid("Tool invocation ended"));
+                        return if closing {
+                            Ok(())
+                        } else {
+                            Err(Error::invalid("Tool invocation ended"))
+                        };
                     }
                     let doc = tx.doc(&LIVE_DOC, &addr, None).await?;
                     let state = serde_json::to_value(doc.value()?.to_json())?;

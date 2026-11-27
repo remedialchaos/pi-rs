@@ -383,3 +383,13 @@ pub async fn add_tools(
     }
     Ok(())
 }
+
+impl super::Invocation {
+    /// Resolve the agent for the conversation that owns this invocation.
+    pub async fn agent(&self, ctx: &pi_rs_chord::context::Context) -> Result<Agent> {
+        self.harness()
+            .handle(self.record.conversation_id)
+            .agent(ctx)
+            .await
+    }
+}

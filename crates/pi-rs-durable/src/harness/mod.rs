@@ -16,8 +16,9 @@ pub(crate) mod telemetry;
 pub const DURABLE_TELEMETRY_SCHEMA: &str = include_str!("telemetry.json");
 mod runtime;
 pub use runtime::{
-    AbortTaskResult, BuildEnv, ClockReport, Conversation, DEFAULT_HARNESS_IDENTITY, EnvTarget,
-    Harness, HarnessOptions, HookError, HookReporter, ModelsInput, safe_now,
+    AbortTaskResult, BuildEnv, ClockReport, Conversation, ConversationCreateOptions,
+    ConversationInit, DEFAULT_HARNESS_IDENTITY, EnvTarget, Harness, HarnessOptions, HookError,
+    HookReporter, ModelsInput, safe_now,
 };
 mod context;
 pub use context::{ContextView, derive_context, order_tool_results};

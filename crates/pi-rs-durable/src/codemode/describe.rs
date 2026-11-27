@@ -34,7 +34,7 @@ pub fn codemode_description(models: bool) -> String {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct CodemodeToolSpec {
     pub name: String,
     pub description: String,
@@ -43,21 +43,21 @@ pub struct CodemodeToolSpec {
     pub deferred: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ToolNamespace {
     pub name: String,
     pub description: String,
     pub instructions: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CodemodeExtensionSpec {
     pub namespace: Option<ToolNamespace>,
     /// Tool names in registration order, including tools that are currently unavailable.
     pub tools: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct CodemodeCatalog {
     pub callable: Vec<CodemodeToolSpec>,
     pub extensions: Vec<CodemodeExtensionSpec>,

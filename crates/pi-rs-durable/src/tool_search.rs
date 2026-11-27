@@ -53,6 +53,29 @@ pub fn create_tool_search_tool() -> ToolSearchTool {
     })
 }
 
+pub fn create_tool_search_extension() -> crate::harness::Extension {
+    let mut registration = create_tool_search_tool().spec().registration(
+        true,
+        std::sync::Arc::new(|args, invocation, ctx| {
+            Box::pin(async move {
+                let args: ToolSearchToolInput = serde_json::from_value(args)?;
+                let limit =
+                    validate(&args).map_err(|e| crate::session::Error::invalid(e.to_string()))?;
+                let agent = invocation.agent(ctx).await?;
+                let candidates: Vec<_> =
+                    agent.deferred.into_iter().map(|t| t.declaration).collect();
+                search(&args.query, limit, &candidates).into_execution()
+            })
+        }),
+    );
+    registration.callers = Some(vec!["model".into()]);
+    crate::harness::Extension {
+        name: TOOL_SEARCH_EXTENSION_NAME.into(),
+        tools: vec![registration],
+        ..Default::default()
+    }
+}
+
 impl ToolSearchTool {
     pub fn spec(&self) -> &ToolSpec {
         &self.0

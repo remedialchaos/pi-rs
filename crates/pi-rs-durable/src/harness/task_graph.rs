@@ -174,11 +174,20 @@ fn can_block(record: &TaskRecord) -> bool {
     ) && (!record.abort_requested || record.abort_reason.is_some())
 }
 
-fn blocked(registry: &super::RegistrySnapshot, kind: &str, version: u64) -> Option<BlockedReason> {
+fn blocked(
+    harness: &Harness,
+    id: TaskId,
+    registry: &super::RegistrySnapshot,
+    kind: &str,
+    version: u64,
+) -> Option<BlockedReason> {
     match registry.task(kind) {
         None => Some(BlockedReason::MissingTask),
         Some(t) if t.version() < version => Some(BlockedReason::TaskTooOld),
-        Some(t) if t.version() > version && t.definition.migrate.is_none() => {
+        Some(t)
+            if t.version() > version
+                && (t.definition.migrate.is_none() || harness.migration_failed(id, t)) =>
+        {
             Some(BlockedReason::MigrationFailed)
         }
         _ => None,
@@ -192,6 +201,7 @@ impl Harness {
         create: impl FnOnce(Arc<TaskGraph>) -> Result<(T, Observer<WatchCall<Arc<TaskGraph>>>)>,
     ) -> Result<(T, Subscription)> {
         let mut changes = self.registry.subscribe();
+        let mut migrations = self.driver.migration_changes.subscribe();
         self.attach_graph(
             |_| None,
             ctx,
@@ -200,7 +210,7 @@ impl Harness {
                 let snapshot = changes.borrow_and_update().clone();
                 for (id, version) in &versions {
                     if let Some(node) = graph.tasks.get_mut(id) {
-                        node.blocked = blocked(&snapshot, &node.kind, *version);
+                        node.blocked = blocked(self, *id, &snapshot, &node.kind, *version);
                     }
                 }
                 let graph = Arc::new(graph);
@@ -209,6 +219,7 @@ impl Harness {
                 let state = Arc::new(Mutex::new((graph, versions)));
                 let current = state.clone();
                 let listener = observer.clone();
+                let harness = self.clone();
                 let registry = self.registry.clone();
                 let commits = self.session.follow_commits(move |publication, context| {
                     let ObservedCommit::Stored(commit) = publication else {
@@ -238,7 +249,7 @@ impl Harness {
                             let next = node(
                                 r,
                                 if can_block(r) {
-                                    blocked(&snapshot, &r.kind, r.version)
+                                    blocked(&harness, r.id, &snapshot, &r.kind, r.version)
                                 } else {
                                     None
                                 },
@@ -290,9 +301,10 @@ impl Harness {
                 let session = self.session.clone();
                 let closing = observer.clone();
                 let refresh_session = session.clone();
+                let harness = self.clone();
                 let refresh = tokio::spawn(async move {
                     let context = Context::background();
-                    while changes.changed().await.is_ok() {
+                    while tokio::select! { result = changes.changed() => result, result = migrations.changed() => result }.is_ok() {
                         let snapshot = changes.borrow_and_update().clone();
                         let result = refresh_session
                             .commit(
@@ -302,7 +314,7 @@ impl Harness {
                                     let mut ops = Vec::new();
                                     for (id, version) in versions.iter() {
                                         if let Some(task) = graph.tasks.get(id) {
-                                            let reason = blocked(&snapshot, &task.kind, *version);
+                                            let reason = blocked(&harness, *id, &snapshot, &task.kind, *version);
                                             if reason != task.blocked
                                                 && let Some(task) =
                                                     Arc::make_mut(graph).tasks.get_mut(id)

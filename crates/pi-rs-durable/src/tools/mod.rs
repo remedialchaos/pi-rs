@@ -2,6 +2,8 @@
 
 mod bash;
 mod edit;
+mod extensions;
+pub use extensions::create_coding_tools_extension;
 pub mod edit_diff;
 mod file_mutation_queue;
 pub mod image;

@@ -1,6 +1,9 @@
 //! Durable JavaScript tools over the `pi-rs-codemode` sandbox and `pi-rs-ai` providers.
 
 mod describe;
+mod extension;
+pub(crate) use extension::catalog;
+pub use extension::create_codemode_harness_extension;
 mod models;
 mod output;
 mod run;

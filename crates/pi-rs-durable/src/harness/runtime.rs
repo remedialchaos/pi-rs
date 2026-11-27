@@ -106,6 +106,44 @@ pub fn safe_now(
     Arc::new(move || read(&handle))
 }
 
+pub type ConversationInit = Box<
+    dyn for<'a, 'tx> FnOnce(
+            &'a mut crate::session::Transaction<'tx>,
+            ConversationId,
+        ) -> futures_util::future::BoxFuture<'a, Result<()>>
+        + Send,
+>;
+
+pub struct ConversationCreateOptions {
+    pub ownership: ConversationOwnership,
+    pub agent: Option<crate::JsonObject>,
+    pub init: Option<ConversationInit>,
+}
+
+impl ConversationCreateOptions {
+    pub fn new(ownership: ConversationOwnership) -> Self {
+        Self {
+            ownership,
+            agent: None,
+            init: None,
+        }
+    }
+
+    async fn initialize(
+        self,
+        tx: &mut crate::session::Transaction<'_>,
+        id: ConversationId,
+    ) -> Result<()> {
+        if let Some(agent) = self.agent {
+            super::configure(tx, id, &agent).await?;
+        }
+        if let Some(init) = self.init {
+            init(tx, id).await?;
+        }
+        Ok(())
+    }
+}
+
 pub struct HarnessOptions {
     /// Receives the owning extension name and one report per failed hook invocation, and for
     /// tool failures the Harness reports on an extension's behalf: invalid structured output
@@ -144,6 +182,7 @@ pub struct Harness {
     pub(super) env: Option<BuildEnv>,
     pub(super) on_wake: Option<Arc<dyn Fn(super::Wake) + Send + Sync>>,
     pub(super) driver: Arc<super::scheduler::Driver>,
+    pub(super) contexts: Arc<std::sync::Mutex<super::context::ContextCache>>,
     pub(super) read_only: bool,
     /// The host's model registry, plain (wrapped once) or a selector read at each use.
     pub models: ModelsInput,
@@ -245,6 +284,7 @@ impl Harness {
             env: host_options.env,
             on_wake: host_options.on_wake,
             driver: Arc::default(),
+            contexts: Arc::default(),
             read_only,
             models,
             identity,
@@ -328,15 +368,36 @@ impl Harness {
         ownership: ConversationOwnership,
         ctx: &Context,
     ) -> Result<Conversation> {
+        self.create_conversation_with(ConversationCreateOptions::new(ownership), ctx)
+            .await
+    }
+
+    pub async fn create_conversation_with(
+        &self,
+        options: ConversationCreateOptions,
+        ctx: &Context,
+    ) -> Result<Conversation> {
         let record = self
             .session
-            .commit(async |tx| tx.create_conversation(ownership).await, ctx)
+            .commit(
+                async |tx| {
+                    let record = tx.create_conversation(options.ownership).await?;
+                    options.initialize(tx, record.id).await?;
+                    Ok(record)
+                },
+                ctx,
+            )
             .await?;
         Ok(self.handle(record.id))
     }
     pub async fn close(&self, ctx: &Context) -> Result<()> {
+        let _closing = self.driver.close_line.lock().await;
         let driver = self.stop_driver().await;
         let session = self.session.close(ctx).await;
+        self.contexts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         driver.and(session)
     }
 }
@@ -347,10 +408,24 @@ impl Conversation {
         ownership: ConversationOwnership,
         ctx: &Context,
     ) -> Result<Self> {
+        self.fork_with(at, ConversationCreateOptions::new(ownership), ctx)
+            .await
+    }
+
+    pub async fn fork_with(
+        &self,
+        at: EntryId,
+        options: ConversationCreateOptions,
+        ctx: &Context,
+    ) -> Result<Self> {
         let record = self
             .session
             .commit(
-                async |tx| tx.fork_conversation(self.id, at, ownership).await,
+                async |tx| {
+                    let record = tx.fork_conversation(self.id, at, options.ownership).await?;
+                    options.initialize(tx, record.id).await?;
+                    Ok(record)
+                },
                 ctx,
             )
             .await?;
@@ -515,14 +590,53 @@ impl Harness {
 
     pub async fn abort_task(&self, id: crate::TaskId, ctx: &Context) -> Result<AbortTaskResult> {
         self.resume()?;
-        self.session
+        let (result, run) = self
+            .session
             .commit(
                 async |tx| {
                     let record = tx.task(id).await?.ok_or_else(|| {
                         crate::session::Error::invalid(format!("Task {id} does not exist"))
                     })?;
                     if matches!(record.state, crate::TaskState::Terminal { .. }) {
-                        return Ok(AbortTaskResult::Terminal);
+                        return Ok((AbortTaskResult::Terminal, None));
+                    }
+                    let snapshot = self.registry.snapshot();
+                    let definition = snapshot.task(&record.kind);
+                    let checkpoint = match &record.state {
+                        crate::TaskState::Pending { checkpoint, .. }
+                        | crate::TaskState::Sleeping { checkpoint, .. }
+                        | crate::TaskState::Waiting { checkpoint, .. } => Some(checkpoint),
+                        _ => None,
+                    };
+                    if let Some(checkpoint) = checkpoint
+                        && !super::ownership::Ownership::read(tx)
+                            .await?
+                            .has_children(id)
+                        && let Some(reason) =
+                            self.blocked_reason(&record, definition).or_else(|| {
+                                let task = definition?;
+                                if task.version() <= record.version {
+                                    return None;
+                                }
+                                let migrate = task.definition.migrate.as_ref()?;
+                                let error = migrate(
+                                    record.input.clone(),
+                                    checkpoint.clone(),
+                                    record.version,
+                                )
+                                .err()?;
+                                self.report_migration_failure(id, &error.to_string(), ctx);
+                                Some("migration_failed")
+                            })
+                    {
+                        let mut record = record.as_ref().clone();
+                        let outcome = crate::TaskOutcome::Orphaned {
+                            reason: reason.into(),
+                        };
+                        super::live::settle_scheduler_outcome(tx, &record, &outcome).await?;
+                        record.state = crate::TaskState::Terminal { outcome };
+                        tx.set_task(record)?;
+                        return Ok((AbortTaskResult::Marked, None));
                     }
                     if !record.abort_requested || record.abort_reason.is_some() {
                         let mut record = record.as_ref().clone();
@@ -530,11 +644,15 @@ impl Harness {
                         record.abort_reason = None;
                         tx.set_task(record)?;
                     }
-                    Ok(AbortTaskResult::Marked)
+                    Ok((AbortTaskResult::Marked, self.running_phase(id)))
                 },
                 ctx,
             )
-            .await
+            .await?;
+        if let Some(mut run) = run {
+            let _ = ctx.await_with(run.changed()).await?;
+        }
+        Ok(result)
     }
 
     pub async fn wait_for_task(

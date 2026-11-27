@@ -152,81 +152,95 @@ impl Harness {
         now: u64,
         ctx: &Context,
     ) -> Result<bool> {
-        let reserved =
-            self.session
-                .commit(
-                    async |tx| {
-                        let Some(current) = tx.task(id).await? else {
-                            return Ok(None);
-                        };
-                        if current.kind != task.name() || current.version > task.version() {
-                            return Ok(None);
+        let reserved = self
+            .session
+            .commit(
+                async |tx| {
+                    let Some(current) = tx.task(id).await? else {
+                        return Ok(None);
+                    };
+                    if current.kind != task.name() || current.version > task.version() {
+                        return Ok(None);
+                    }
+                    let mut record = current.as_ref().clone();
+                    if record.abort_requested && Ownership::read(tx).await?.has_children(id) {
+                        return Ok(None);
+                    }
+                    let (mut checkpoint, wake) = match &record.state {
+                        TaskState::Pending { checkpoint, wake } => {
+                            (checkpoint.clone(), wake.clone())
                         }
-                        let mut record = current.as_ref().clone();
-                        if record.abort_requested && Ownership::read(tx).await?.has_children(id) {
-                            return Ok(None);
+                        TaskState::Sleeping { checkpoint, .. } if record.abort_requested => {
+                            (checkpoint.clone(), None)
                         }
-                        let (mut checkpoint, wake) = match &record.state {
-                            TaskState::Pending { checkpoint, wake } => {
-                                (checkpoint.clone(), wake.clone())
-                            }
-                            TaskState::Sleeping { checkpoint, .. } if record.abort_requested => {
-                                (checkpoint.clone(), None)
-                            }
-                            TaskState::Sleeping { checkpoint, .. } => {
-                                let Some(woke) =
-                                    sleep_wake(&record.state, record.memos.as_ref(), now)
-                                else {
-                                    return Ok(None);
-                                };
-                                record
-                                    .memos
-                                    .get_or_insert_with(Default::default)
-                                    .extend(woke.memos);
-                                (checkpoint.clone(), Some(woke.wake))
-                            }
-                            TaskState::Waiting {
-                                checkpoint,
-                                on,
-                                policy,
-                            } => {
-                                let mut ended = Vec::new();
-                                for child in on {
-                                    if tx.task(*child).await?.is_none_or(|r| {
-                                        matches!(r.state, TaskState::Terminal { .. })
-                                    }) {
-                                        ended.push(*child);
-                                    }
-                                }
-                                if !record.abort_requested
-                                    && ended.len() != on.len()
-                                    && (*policy != crate::JoinPolicy::Any || ended.is_empty())
-                                {
-                                    return Ok(None);
-                                }
-                                (checkpoint.clone(), Some(crate::WakeReason::Tasks { ended }))
-                            }
-                            _ => return Ok(None),
-                        };
-                        if current.version < task.version() {
-                            let Some(migrate) = &task.definition.migrate else {
+                        TaskState::Sleeping { checkpoint, .. } => {
+                            let Some(woke) = sleep_wake(&record.state, record.memos.as_ref(), now)
+                            else {
                                 return Ok(None);
                             };
-                            let migrated = migrate(record.input, checkpoint, current.version)
-                                .map_err(Error::Callback)?;
-                            record.input = migrated.input;
-                            checkpoint = migrated.checkpoint;
-                            record.version = task.version();
+                            record
+                                .memos
+                                .get_or_insert_with(Default::default)
+                                .extend(woke.memos);
+                            (checkpoint.clone(), Some(woke.wake))
                         }
-                        let first = record.started_at.is_none();
-                        record.started_at.get_or_insert(now);
-                        record.state = TaskState::Running { checkpoint, wake };
-                        tx.set_task(record.clone())?;
-                        Ok(Some((record, first)))
-                    },
-                    ctx,
-                )
-                .await?;
+                        TaskState::Waiting {
+                            checkpoint,
+                            on,
+                            policy,
+                        } => {
+                            let mut ended = Vec::new();
+                            for child in on {
+                                if tx
+                                    .task(*child)
+                                    .await?
+                                    .is_none_or(|r| matches!(r.state, TaskState::Terminal { .. }))
+                                {
+                                    ended.push(*child);
+                                }
+                            }
+                            if !record.abort_requested
+                                && ended.len() != on.len()
+                                && (*policy != crate::JoinPolicy::Any || ended.is_empty())
+                            {
+                                return Ok(None);
+                            }
+                            (checkpoint.clone(), Some(crate::WakeReason::Tasks { ended }))
+                        }
+                        _ => return Ok(None),
+                    };
+                    if current.version < task.version() {
+                        let Some(migrate) = &task.definition.migrate else {
+                            return Ok(None);
+                        };
+                        let migrated = match migrate(record.input, checkpoint, current.version) {
+                            Ok(migrated) => migrated,
+                            Err(error) => {
+                                self.driver
+                                    .state
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .failed_migrations
+                                    .insert(id, Arc::downgrade(&task));
+                                self.report_migration_failure(id, &error.to_string(), ctx);
+                                self.driver.migration_changes.send_replace(());
+                                self.driver.notify.notify_one();
+                                return Ok(None);
+                            }
+                        };
+                        record.input = migrated.input;
+                        checkpoint = migrated.checkpoint;
+                        record.version = task.version();
+                    }
+                    let first = record.started_at.is_none();
+                    record.started_at.get_or_insert(now);
+                    record.state = TaskState::Running { checkpoint, wake };
+                    tx.set_task(record.clone())?;
+                    Ok(Some((record, first)))
+                },
+                ctx,
+            )
+            .await?;
         let Some((mut record, mut first)) = reserved else {
             return Ok(false);
         };
@@ -247,6 +261,19 @@ impl Harness {
                 base_parks: Default::default(),
                 harness: self.clone(),
                 record: record.clone(),
+            };
+            let (finished, waiting) = tokio::sync::watch::channel(());
+            self.driver
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .phases
+                .insert(id, (invocation.clone(), waiting));
+            self.retain_context(invocation.record.conversation_id);
+            let _phase = PhaseGuard {
+                driver: &self.driver,
+                id,
+                _finished: finished,
             };
             let mut trace = continued
                 .take()
@@ -288,6 +315,18 @@ impl Harness {
                         let Some(current) = tx.task(id).await? else {
                             return Ok((None, None));
                         };
+                        if current.abort_requested
+                            && !record.abort_requested
+                            && let TaskState::Running { checkpoint, wake } = &current.state
+                        {
+                            let mut pending = current.as_ref().clone();
+                            pending.state = TaskState::Pending {
+                                checkpoint: checkpoint.clone(),
+                                wake: wake.clone(),
+                            };
+                            tx.set_task(pending.clone())?;
+                            return Ok((Some(pending), None));
+                        }
                         if current.state != record.state
                             || current.abort_requested != record.abort_requested
                         {
@@ -300,18 +339,19 @@ impl Harness {
                             )
                         });
                         let mut current = current.as_ref().clone();
-                        current.state = TaskState::Terminal {
-                            outcome: TaskOutcome::Faulted {
-                                error: TaskOutcomeError {
-                                    message: message.clone(),
-                                    detail: None,
-                                },
+                        let outcome = TaskOutcome::Faulted {
+                            error: TaskOutcomeError {
+                                message: message.clone(),
+                                detail: None,
                             },
                         };
-                        if let TaskState::Terminal { outcome } = &current.state {
-                            super::live::settle_scheduler_outcome(tx, &current, outcome).await?;
-                        }
-                        current.ended_at = Some(now);
+                        current.state = if Ownership::read(tx).await?.has_children(id) {
+                            TaskState::Completing { outcome }
+                        } else {
+                            super::live::settle_scheduler_outcome(tx, &current, &outcome).await?;
+                            current.ended_at = Some(now);
+                            TaskState::Terminal { outcome }
+                        };
                         current.memos = None;
                         current.restarts = None;
                         tx.set_task(current.clone())?;
@@ -423,9 +463,14 @@ impl Harness {
 pub(super) struct Driver {
     state: std::sync::Mutex<DriverState>,
     notify: Arc<tokio::sync::Notify>,
+    pub(super) close_line: tokio::sync::Mutex<()>,
+    pub(super) migration_changes: tokio::sync::watch::Sender<()>,
 }
 #[derive(Default)]
 struct DriverState {
+    phases: std::collections::HashMap<TaskId, (Invocation, tokio::sync::watch::Receiver<()>)>,
+    closing_progress: Vec<Invocation>,
+    failed_migrations: std::collections::HashMap<TaskId, std::sync::Weak<Task<Invocation>>>,
     closing: bool,
     last_wake: Option<Wake>,
     active: Option<(
@@ -434,7 +479,88 @@ struct DriverState {
     )>,
 }
 
+struct PhaseGuard<'a> {
+    driver: &'a Driver,
+    id: TaskId,
+    _finished: tokio::sync::watch::Sender<()>,
+}
+
+impl Drop for PhaseGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.driver.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((invocation, _)) = state.phases.remove(&self.id) {
+            if state.closing {
+                if invocation.record.kind == "pi.tool" {
+                    state.closing_progress.push(invocation);
+                }
+            } else {
+                drop(state);
+                invocation
+                    .harness
+                    .retain_context(invocation.record.conversation_id);
+            }
+        }
+    }
+}
+
 impl Harness {
+    pub(super) fn conversation_active(&self, id: crate::ConversationId) -> bool {
+        self.driver
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .phases
+            .values()
+            .any(|(inv, _)| inv.record.conversation_id == id)
+    }
+
+    pub(super) fn report_migration_failure(&self, id: TaskId, message: &str, ctx: &Context) {
+        self.session
+            .harness_report(crate::session::ReportKind::Extension, message);
+        self.telemetry
+            .report("migration_failed", Some(id), Some(ctx.telemetry()));
+    }
+
+    pub(super) fn migration_failed(&self, id: TaskId, task: &Arc<Task<Invocation>>) -> bool {
+        self.driver
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failed_migrations
+            .get(&id)
+            .is_some_and(|failed| failed.ptr_eq(&Arc::downgrade(task)))
+    }
+
+    pub(super) fn running_phase(&self, id: TaskId) -> Option<tokio::sync::watch::Receiver<()>> {
+        self.driver
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .phases
+            .get(&id)
+            .filter(|(inv, _)| !inv.record.abort_requested)
+            .map(|(_, waiting)| waiting.clone())
+    }
+
+    pub(super) fn blocked_reason(
+        &self,
+        record: &TaskRecord,
+        definition: Option<&Arc<Task<Invocation>>>,
+    ) -> Option<&'static str> {
+        let Some(task) = definition else {
+            return Some("missing_task");
+        };
+        if task.version() < record.version {
+            return Some("task_too_old");
+        }
+        if task.version() > record.version
+            && (task.definition.migrate.is_none() || self.migration_failed(record.id, task))
+        {
+            return Some("migration_failed");
+        }
+        None
+    }
+
     pub(super) fn publish_wake(&self, callback: &Arc<dyn Fn(Wake) + Send + Sync>, value: Wake) {
         {
             let mut state = self.driver.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -494,6 +620,19 @@ impl Harness {
         let mut running = tokio::task::JoinSet::new();
         let result = self.drive(&ctx, &mut active, &mut running).await;
         running.shutdown().await;
+        let progress = std::mem::take(
+            &mut self
+                .driver
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .closing_progress,
+        );
+        for invocation in progress {
+            invocation
+                .write_tool_progress(&Context::background(), true)
+                .await?;
+        }
         if ctx.check().is_err() && !active.is_empty() {
             self.session
                 .commit(
@@ -571,7 +710,9 @@ impl Harness {
                         let Some(task) = snapshot.task(&record.kind).cloned() else {
                             continue;
                         };
-                        if task.version() < record.version || active.contains(&record.id) {
+                        if self.blocked_reason(&record, Some(&task)).is_some()
+                            || active.contains(&record.id)
+                        {
                             continue;
                         }
                         if let TaskState::Sleeping { until, .. } = &record.state
@@ -621,7 +762,7 @@ impl Harness {
                         tokio::select! {
                             Some(joined) = running.join_next(), if !running.is_empty() => {
                             let (id,result)=joined.map_err(|e|Error::Callback(Box::new(e)))?;
-                                active.remove(&id);
+                                if result.is_ok() { active.remove(&id); }
                                 result
                             }
                             () = self.driver.notify.notified() => Ok(true),
@@ -711,14 +852,7 @@ impl Harness {
                     record.state,
                     TaskState::Completing { .. } | TaskState::Running { .. }
                 ) {
-                    let blocked = match registry.task(&record.kind) {
-                        None => Some("missing_task"),
-                        Some(t) if t.version() < record.version => Some("task_too_old"),
-                        Some(t) if t.version() > record.version && t.definition.migrate.is_none() => {
-                            Some("migration_failed")
-                        }
-                        _ => None,
-                    };
+                    let blocked = self.blocked_reason(record, registry.task(&record.kind));
                     let outcome = if let Some(n) = record.restarts.filter(|n| {
                         let limit = (self.settings)()["restartLimit"]
                             .as_u64()
@@ -919,17 +1053,7 @@ impl Harness {
                     let now = (self.now)();
                     for record in graph.tasks.values() {
                         let definition = registry.task(&record.kind);
-                        let blocked = match definition {
-                            None => Some("missing_task"),
-                            Some(t) if t.version() < record.version => Some("task_too_old"),
-                            Some(t)
-                                if t.version() > record.version
-                                    && t.definition.migrate.is_none() =>
-                            {
-                                Some("migration_failed")
-                            }
-                            _ => None,
-                        };
+                        let blocked = self.blocked_reason(record, definition);
                         let pending = || {
                             serde_json::json!({
                                 "kind": "pending",

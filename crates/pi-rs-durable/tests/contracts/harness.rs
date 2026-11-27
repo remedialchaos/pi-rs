@@ -1360,3 +1360,511 @@ async fn check_cutoff(kind: &str, phases: &[&str]) -> Result<(), Box<dyn std::er
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn create_and_fork_configure_before_init_and_roll_back_on_error() -> Result<(), Error> {
+    let ctx = Context::background();
+    let harness = Harness::open(
+        Arc::new(pi_rs_durable::MemoryStorage::new()),
+        Default::default(),
+        &ctx,
+    )
+    .await?;
+    let agent: pi_rs_durable::JsonObject =
+        [("cwd".into(), json!("/created"))].into_iter().collect();
+    let conversation = harness
+        .create_conversation_with(
+            pi_rs_durable::ConversationCreateOptions {
+                ownership: ConversationOwnership::Ownerless,
+                agent: Some(agent.clone()),
+                init: Some(Box::new(|tx, id| {
+                    Box::pin(async move {
+                        let address = resolve_address(&AGENT_DOC, Some(id), None)?;
+                        let state = tx.doc(&AGENT_DOC, &address, None).await?.value()?.to_json();
+                        assert_eq!(serde_json::to_value(state)?["cwd"], "/created");
+                        tx.append_entry(
+                            id,
+                            EntryDraft {
+                                kind: "seed".into(),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                })),
+            },
+            &ctx,
+        )
+        .await?;
+    let at = harness
+        .session
+        .commit(async |tx| tx.latest_entry_id(conversation.id).await, &ctx)
+        .await?
+        .ok_or_else(|| Error::invalid("init entry missing"))?;
+    let (send, rolled_back) = tokio::sync::oneshot::channel();
+    let fork = conversation
+        .fork_with(
+            at,
+            pi_rs_durable::ConversationCreateOptions {
+                ownership: ConversationOwnership::Ownerless,
+                agent: Some(agent),
+                init: Some(Box::new(move |_, id| {
+                    Box::pin(async move {
+                        let _ = send.send(id);
+                        Err(Error::invalid("init failed"))
+                    })
+                })),
+            },
+            &ctx,
+        )
+        .await;
+    assert!(fork.is_err());
+    assert!(
+        harness
+            .conversation(
+                rolled_back
+                    .await
+                    .map_err(|e| Error::invalid(e.to_string()))?,
+                &ctx
+            )
+            .await?
+            .is_none()
+    );
+    harness.close(&ctx).await
+}
+
+#[tokio::test]
+async fn failed_migration_blocks_one_task_and_explicit_abort_orphans_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_durable::{
+        Extension, HarnessOptions, HarnessRegistry, Invocation, TaskOutcome, TaskOwnership,
+        TaskState, create_registry, define_task, session::TaskOptions, tasks::TaskDefinition,
+    };
+    let definition = |version| {
+        define_task(TaskDefinition::<Invocation> {
+            name: "test.migration".into(),
+            version,
+            initial: Arc::new(|_| Ok(json!({"phase":"work"}))),
+            phases: Default::default(),
+            abort: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
+            migrate: Some(Arc::new(|_, _, _| Err("bad checkpoint".into()))),
+            hooks: (),
+        })
+    };
+    let registry = create_registry();
+    let new = Arc::new(definition(2));
+    registry.install(Extension {
+        name: "test".into(),
+        tasks: vec![new.clone()],
+        ..Default::default()
+    })?;
+    let ctx = Context::background();
+    let harness = Harness::open_with(
+        Arc::new(pi_rs_durable::MemoryStorage::new()),
+        HarnessOptions {
+            registry: Arc::new(HarnessRegistry::Local(registry)),
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .await?;
+    let conversation = harness.root(&ctx).await?;
+    let old = definition(1);
+    let (id, other) = conversation
+        .commit(
+            async |tx| {
+                let id = tx
+                    .create_task(
+                        &old,
+                        json!(null),
+                        TaskOptions::new(TaskOwnership::Conversation),
+                    )
+                    .await?;
+                let other = tx
+                    .create_task(
+                        &new,
+                        json!(null),
+                        TaskOptions::new(TaskOwnership::Conversation),
+                    )
+                    .await?;
+                Ok((id, other))
+            },
+            &ctx,
+            Default::default(),
+        )
+        .await?;
+    assert!(!harness.dispatch(id, new, 1, &ctx).await?);
+    let inspection = harness.inspect(&ctx).await?;
+    assert!(
+        inspection
+            .tasks
+            .iter()
+            .any(|t| t.record.id == id && t.state["reason"] == "migration_failed")
+    );
+    let (changes, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let _watch = harness.session.follow_commits(move |publication, _| {
+        if let pi_rs_durable::session::ObservedCommit::Stored(commit) = publication {
+            for change in &commit.changes {
+                if let pi_rs_durable::CommitChange::Task { value } = change
+                    && value.id == id
+                {
+                    let _ = changes.send(value.state.clone());
+                }
+            }
+        }
+        Ok(())
+    })?;
+    harness.abort_task(id, &ctx).await?;
+    assert!(matches!(
+        received.try_recv()?,
+        TaskState::Terminal {
+            outcome: TaskOutcome::Orphaned { .. }
+        }
+    ));
+    assert!(
+        matches!(harness.get_task(id,&ctx).await?.ok_or("missing task")?.state, TaskState::Terminal {outcome: TaskOutcome::Orphaned {ref reason}} if reason=="migration_failed")
+    );
+    let unrelated = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        harness.wait_for_task(other, &ctx),
+    )
+    .await??;
+    assert!(matches!(
+        unrelated.state,
+        TaskState::Terminal {
+            outcome: TaskOutcome::Faulted { .. }
+        }
+    ));
+    harness.close(&ctx).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn parent_fault_remains_completing_while_its_child_is_live()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_durable::{
+        Invocation, TaskOutcome, TaskOwnership, TaskState, define_task, session::TaskOptions,
+        tasks::TaskDefinition,
+    };
+    let ctx = Context::background();
+    let harness = Harness::open(
+        Arc::new(pi_rs_durable::MemoryStorage::new()),
+        Default::default(),
+        &ctx,
+    )
+    .await?;
+    let conversation = harness.root(&ctx).await?;
+    let task = Arc::new(define_task(TaskDefinition::<Invocation> {
+        name: "test.fault".into(),
+        version: 1,
+        initial: Arc::new(|_| Ok(json!({"phase":"missing"}))),
+        phases: Default::default(),
+        abort: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
+        hooks: (),
+        migrate: None,
+    }));
+    let parent = conversation
+        .commit(
+            async |tx| {
+                let parent = tx
+                    .create_task(
+                        &task,
+                        json!(null),
+                        TaskOptions::new(TaskOwnership::Conversation),
+                    )
+                    .await?;
+                tx.create_task(
+                    &task,
+                    json!(null),
+                    TaskOptions::new(TaskOwnership::Task { task_id: parent }),
+                )
+                .await?;
+                Ok(parent)
+            },
+            &ctx,
+            Default::default(),
+        )
+        .await?;
+    harness.dispatch(parent, task, 1, &ctx).await?;
+    assert!(matches!(
+        harness
+            .get_task(parent, &ctx)
+            .await?
+            .ok_or("parent missing")?
+            .state,
+        TaskState::Completing {
+            outcome: TaskOutcome::Faulted { .. }
+        }
+    ));
+    harness.close(&ctx).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn closing_persists_unpublished_tool_output_and_returns_task_to_pending()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_ai::faux::{faux_assistant_message, faux_provider, faux_tool_call};
+    use pi_rs_durable::{
+        Extension, HarnessOptions, HarnessRegistry, LIVE_DOC, TaskState, ToolRegistration,
+        create_registry,
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("close.sqlite");
+    let registry = create_registry();
+    let (sender, mut ready) = tokio::sync::mpsc::unbounded_channel();
+    registry.install(Extension {
+        name: "tool:stream".into(),
+        tools: vec![ToolRegistration {
+            declaration: pi_rs_ai::types::Tool {
+                name: "stream".into(),
+                description: "Streams output".into(),
+                parameters: json!({"type":"object","properties":{}}),
+                constrained_sampling: None,
+            },
+            sequential: false,
+            prepare_arguments: None,
+            cancel: None,
+            structured_output_schema: None,
+            output_limits: None,
+            replay_safe: true,
+            callers: None,
+            deferred: false,
+            execute: Arc::new(move |_, inv, _| {
+                let sender = sender.clone();
+                Box::pin(async move {
+                    inv.output("latest bytes", None)?;
+                    sender
+                        .send(inv.record.id)
+                        .map_err(|e| Error::invalid(e.to_string()))?;
+                    std::future::pending().await
+                })
+            }),
+        }],
+        ..Default::default()
+    })?;
+    let fake = faux_provider(Default::default());
+    let models = pi_rs_ai::registry::Models::default();
+    models.set_provider(fake.provider.clone());
+    let mut response = faux_assistant_message(vec![faux_tool_call(
+        "stream",
+        Default::default(),
+        Some("call-1".into()),
+    )]);
+    response.stop_reason = pi_rs_ai::StopReason::ToolUse;
+    fake.set_responses([response.into()]);
+    let ctx = Context::background();
+    let harness = Harness::open_with(
+        Arc::new(SqliteStorage::open(&path)?),
+        HarnessOptions {
+            models: models.into(),
+            registry: Arc::new(HarnessRegistry::Local(registry)),
+            settings: Arc::new(|| json!({"progress":{"outputIntervalMs":60000}})),
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .await?;
+    let root = harness.root(&ctx).await?;
+    let model = &fake.models[0];
+    root.configure(
+        &[(
+            "model".into(),
+            json!({"provider":model.provider,"modelId":model.id}),
+        )]
+        .into_iter()
+        .collect(),
+        &ctx,
+    )
+    .await?;
+    let _submission = root
+        .submit(
+            serde_json::from_value(json!({"type":"input","content":"run stream"}))?,
+            &ctx,
+        )
+        .await?;
+    let id = tokio::time::timeout(std::time::Duration::from_secs(5), ready.recv())
+        .await?
+        .ok_or("stream closed")?;
+    harness.close(&ctx).await?;
+    let reopened = Harness::open(
+        Arc::new(SqliteStorage::open(&path)?),
+        Default::default(),
+        &ctx,
+    )
+    .await?;
+    let address = resolve_address(&LIVE_DOC, Some(root.id), None)?;
+    let live = reopened
+        .snapshot(&LIVE_DOC, &address, &ctx)
+        .await?
+        .ok_or("missing live doc")?;
+    assert_eq!(live["tools"][0]["output"], "latest bytes");
+    let task = reopened
+        .get_task(id, &ctx)
+        .await?
+        .ok_or("missing closed task")?;
+    assert!(matches!(task.state, TaskState::Pending { .. }));
+    assert_eq!(task.restarts.unwrap_or_default(), 0);
+    reopened.close(&ctx).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_context_replaces_missing_tool_results_and_replays_later_edits()
+-> Result<(), Error> {
+    use pi_rs_durable::{ContextEdit, MemoryStorage};
+    let ctx = Context::background();
+    let harness = Harness::open(Arc::new(MemoryStorage::new()), Default::default(), &ctx).await?;
+    let root = harness.root(&ctx).await?;
+    let append = async |draft| {
+        root.commit(
+            async |tx| Ok(tx.append_entry(root.id, draft).await?.id),
+            &ctx,
+            Default::default(),
+        )
+        .await
+    };
+    let assistant = append(EntryDraft {
+        kind: "reply".into(),
+        model: Some(vec![
+            json!({"role":"assistant","content":[{"type":"toolCall","id":"a","name":"read"}]}),
+        ]),
+        ..Default::default()
+    })
+    .await?;
+    let initial = root.context(Some(assistant), &ctx).await?;
+    assert_eq!(initial.messages[1]["details"]["reason"], "missing_result");
+    let result =
+        json!({"role":"toolResult","toolCallId":"a","content":[{"type":"text","text":"read"}]});
+    append(EntryDraft {
+        kind: "result".into(),
+        model: Some(vec![result.clone()]),
+        ..Default::default()
+    })
+    .await?;
+    let extended = root.context(None, &ctx).await?;
+    assert_eq!(extended.messages.get(1), Some(&result));
+    append(EntryDraft {
+        kind: "edit".into(),
+        edits: Some(vec![ContextEdit::Omit { target: assistant }]),
+        ..Default::default()
+    })
+    .await?;
+    assert!(root.context(None, &ctx).await?.messages.is_empty());
+    assert_eq!(
+        root.context(Some(assistant), &ctx).await?.messages,
+        initial.messages
+    );
+    harness.close(&ctx).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn abort_waits_for_the_interrupted_phase_to_finish_teardown()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pi_rs_durable::{
+        Extension, HarnessOptions, HarnessRegistry, Invocation, TaskOutcome, TaskOwnership,
+        TaskState, create_registry, define_task,
+        session::TaskOptions,
+        tasks::{PhaseHandler, TaskDefinition},
+    };
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    struct Teardown {
+        entered: Arc<tokio::sync::Notify>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl Drop for Teardown {
+        fn drop(&mut self) {
+            self.entered.notify_one();
+            let _ = self
+                .release
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .recv_timeout(Duration::from_secs(5));
+        }
+    }
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropping = Arc::new(tokio::sync::Notify::new());
+    let (release, wait) = mpsc::channel();
+    let barrier = Mutex::new(Some(Teardown {
+        entered: dropping.clone(),
+        release: Mutex::new(wait),
+    }));
+    let entered = started.clone();
+    let phase: PhaseHandler<Invocation> = Arc::new(move |_, _, _| {
+        let hold = barrier.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let entered = entered.clone();
+        Box::pin(async move {
+            let _hold = hold;
+            entered.notify_one();
+            std::future::pending().await
+        })
+    });
+    let task = Arc::new(define_task(TaskDefinition {
+        name: "test.abort-barrier".into(),
+        version: 1,
+        initial: Arc::new(|_| Ok(json!({"phase":"run"}))),
+        phases: [("run".into(), phase)].into_iter().collect(),
+        migrate: None,
+        hooks: (),
+        abort: Arc::new(|_, inv, ctx| {
+            Box::pin(async move {
+                inv.commit(ctx, async |_, _| {
+                    Ok(TaskState::Terminal {
+                        outcome: TaskOutcome::Aborted {
+                            reason: None,
+                            result: None,
+                        },
+                    })
+                })
+                .await?;
+                Ok(())
+            })
+        }),
+    }));
+    let registry = create_registry();
+    registry.install(Extension {
+        name: "barrier".into(),
+        tasks: vec![task.clone()],
+        ..Default::default()
+    })?;
+    let ctx = Context::background();
+    let harness = Harness::open_with(
+        Arc::new(pi_rs_durable::MemoryStorage::new()),
+        HarnessOptions {
+            registry: Arc::new(HarnessRegistry::Local(registry)),
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .await?;
+    let root = harness.root(&ctx).await?;
+    let id = root
+        .commit(
+            async |tx| {
+                tx.create_task(
+                    &task,
+                    json!(null),
+                    TaskOptions::new(TaskOwnership::Conversation),
+                )
+                .await
+            },
+            &ctx,
+            Default::default(),
+        )
+        .await?;
+    harness.resume()?;
+    tokio::time::timeout(Duration::from_secs(4), started.notified()).await?;
+    let mut aborting = tokio::spawn({
+        let harness = harness.clone();
+        let ctx = ctx.clone();
+        async move { harness.abort_task(id, &ctx).await }
+    });
+    tokio::time::timeout(Duration::from_secs(4), dropping.notified()).await?;
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut aborting).await;
+    release.send(())?;
+    assert!(early.is_err(), "abort returned while teardown was blocked");
+    tokio::time::timeout(Duration::from_secs(4), aborting).await???;
+    harness.close(&ctx).await?;
+    Ok(())
+}

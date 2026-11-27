@@ -938,11 +938,18 @@ impl Invocation {
             }
             let shown = super::replay_sections(&view.messages);
             let mut desired = indexmap::IndexMap::new();
-            let input = json!({
+            let mut input = json!({
                 "conversationId": conversation.id,
                 "agent": agent.state,
                 "shown": shown
             });
+            if agent
+                .sections
+                .iter()
+                .any(|s| s.key == crate::codemode::CODEMODE_TOOL_NAME)
+            {
+                input["toolCatalog"] = serde_json::to_value(crate::codemode::catalog(&agent))?;
+            }
             for section in &agent.sections {
                 match (section.render)(&input, ctx).await {
                     Ok(Some(text)) => {
