@@ -92,16 +92,12 @@ impl RemoteTerminal {
     fn request(&self, op: &str, extra: Value, payload: &[u8]) {
         let mut json_value = extra.as_object().cloned().unwrap_or_default();
         json_value.insert("target".to_string(), json!(self.id));
-        let mut options = RequestOptions {
-            session: Some(self.session),
-            ..RequestOptions::default()
-        };
-        if !payload.is_empty() {
-            options.payload = payload.to_vec();
-        }
-        let _ = self
-            .connection
-            .request(op, Value::Object(json_value), options);
+        let _ = self.connection.submit(
+            self.session,
+            op,
+            Value::Object(json_value),
+            payload.to_vec(),
+        );
     }
 
     /// Wait for the program's exit code.

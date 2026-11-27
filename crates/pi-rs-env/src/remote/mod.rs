@@ -15,6 +15,7 @@ mod shell;
 pub use local::LocalExecutionEnv;
 use readers::{Directory, Handle, Lines, file_info};
 
+const WRITE_DEPTH: usize = 8;
 const MAX_SAFE: u64 = (1 << 53) - 1;
 pub struct RemoteExecutionEnvOptions {
     pub id: String,
@@ -133,13 +134,38 @@ impl RemoteExecutionEnv {
             ..Default::default()
         };
         if keep {
-            let (h, _) = Handle::acquire(self.connection(), &p, "write", fields, options).await?;
+            let (mut h, _) =
+                Handle::acquire(self.connection(), &p, "write", fields, options).await?;
+            let mut pending = std::collections::VecDeque::new();
+            // Submit each frame before starting the next one to preserve wire order.
+            let mut tail = Ok(());
+            let mut replies = Ok(());
             for chunk in chunks {
-                if !append {
-                    check(ctx, &p)?;
+                if !append && let Err(error) = check(ctx, &p) {
+                    tail = Err(error);
+                    break;
                 }
-                h.send("writeChunk", json!({}), chunk.into()).await?;
+                match h.submit_chunk(chunk).await {
+                    Ok(rx) => pending.push_back(rx),
+                    Err(error) => {
+                        tail = Err(error);
+                        break;
+                    }
+                }
+                if pending.len() == WRITE_DEPTH
+                    && let Some(rx) = pending.pop_front()
+                {
+                    replies = chunk_reply(&p, rx).await;
+                    if replies.is_err() {
+                        break;
+                    }
+                }
             }
+            for rx in pending {
+                replies = replies.and(chunk_reply(&p, rx).await);
+            }
+            h.release().await;
+            replies.and(tail)?;
         } else {
             request(self.connection(), "write", fields, options, &p).await?;
         }
@@ -149,17 +175,25 @@ impl RemoteExecutionEnv {
         Ok(())
     }
 }
+async fn chunk_reply(
+    path: &str,
+    rx: std::sync::mpsc::Receiver<Result<Reply, RemoteError>>,
+) -> Result<(), FileError> {
+    transport(path, move || {
+        rx.recv()
+            .map_err(|_| RemoteError::lost("pi-env connection lost"))?
+            .map(|_| ())
+    })
+    .await
+}
 async fn remote_info(
     connection: &Arc<Connection>,
     path: &str,
     ctx: &Context,
 ) -> Result<RemoteInfo, FileError> {
-    check(ctx, path)?;
-    let connection = connection.clone();
-    ctx.await_with(tokio::task::spawn_blocking(move || connection.info()))
+    connection
+        .info_with_context(ctx)
         .await
-        .map_err(|_| failure(FileErrorCode::Aborted, "aborted", path))?
-        .map_err(|e| failure(FileErrorCode::Unknown, e.to_string(), path))?
         .map_err(|e| translate(e, path))
 }
 pub async fn list_files_over(
@@ -244,9 +278,9 @@ impl FileSystem for RemoteExecutionEnv {
         check(ctx, path)?;
         Ok(paths::resolve(&info, self.cwd(), path))
     }
-    async fn join_path(&self, parts: &[&str], _: &Context) -> Result<String, FileError> {
+    async fn join_path(&self, parts: &[&str], ctx: &Context) -> Result<String, FileError> {
         Ok(paths::join(
-            &remote_info(self.connection(), "", &Context::background()).await?,
+            &remote_info(self.connection(), "", ctx).await?,
             parts,
         ))
     }

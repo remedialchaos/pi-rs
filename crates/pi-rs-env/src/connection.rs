@@ -549,14 +549,13 @@ fn supervisor_loop(session: Arc<SessionShared>) {
     }
 }
 
-/// Send one request and wait for its result, handling cancellation and the abort grace period.
-fn send_request_inner(
+/// Write the frame and return its reply channel, preserving the caller's submission order.
+fn start_request(
     session: &Arc<SessionShared>,
     op: &str,
     json_value: Value,
-    options: RequestOptions,
-    deadline: Option<Instant>,
-) -> Result<Reply, RemoteError> {
+    options: &RequestOptions,
+) -> Result<(u32, Receiver<RequestResult>), RemoteError> {
     if !session.live.load(Ordering::SeqCst) {
         return Err(RemoteError::lost("pi-env connection lost"));
     }
@@ -566,7 +565,7 @@ fn send_request_inner(
         id,
         Pending {
             result: sender,
-            on_event: options.on_event,
+            on_event: options.on_event.clone(),
         },
     );
     if let Some(callback) = &options.on_start {
@@ -585,6 +584,17 @@ fn send_request_inner(
         return Err(error);
     }
 
+    Ok((id, receiver))
+}
+
+fn send_request_inner(
+    session: &Arc<SessionShared>,
+    op: &str,
+    json_value: Value,
+    options: RequestOptions,
+    deadline: Option<Instant>,
+) -> Result<Reply, RemoteError> {
+    let (id, receiver) = start_request(session, op, json_value, &options)?;
     let mut cancel_sent = false;
     let mut grace: Option<Instant> = None;
     loop {
@@ -770,6 +780,21 @@ impl Connection {
         self.connect().map(|(_, info)| info)
     }
 
+    /// Cancel only the caller's wait. Other clients may share the same handshake.
+    pub async fn info_with_context(
+        self: &Arc<Self>,
+        ctx: &pi_rs_chord::context::Context,
+    ) -> Result<RemoteInfo, RemoteError> {
+        if ctx.is_aborted() {
+            return Err(RemoteError::aborted());
+        }
+        let connection = self.clone();
+        ctx.await_with(tokio::task::spawn_blocking(move || connection.info()))
+            .await
+            .map_err(|_| RemoteError::aborted())?
+            .map_err(|e| RemoteError::lost(e.to_string()))?
+    }
+
     /// Connect if needed and return the live session's id.
     pub fn session(&self) -> Result<u64, RemoteError> {
         self.connect().map(|(session, _)| session.id)
@@ -809,17 +834,41 @@ impl Connection {
             return Err(RemoteError::aborted());
         }
         if let Some(session_id) = options.session {
-            let inner = lock(&self.inner);
-            let session = inner.session.as_ref().filter(|session| {
-                session.id == session_id && session.live.load(Ordering::SeqCst) && !inner.closed
-            });
-            let Some(session) = session else {
-                return Err(RemoteError::lost("pi-env connection lost"));
-            };
-            return send_request(session, op, json_value, options);
+            return send_request(&self.pinned_session(session_id)?, op, json_value, options);
         }
         let (session, _) = self.connect()?;
         send_request(&session, op, json_value, options)
+    }
+
+    fn pinned_session(&self, id: u64) -> Result<Arc<SessionShared>, RemoteError> {
+        let inner = lock(&self.inner);
+        inner
+            .session
+            .as_ref()
+            .filter(|s| s.id == id && !inner.closed && s.live.load(Ordering::SeqCst))
+            .cloned()
+            .ok_or_else(|| RemoteError::lost("pi-env connection lost"))
+    }
+
+    /// Submit a frame on an existing session in caller order. The receiver can be dropped when no reply is needed.
+    pub(crate) fn submit(
+        &self,
+        session_id: u64,
+        op: &str,
+        fields: Value,
+        payload: Vec<u8>,
+    ) -> Result<Receiver<RequestResult>, RemoteError> {
+        let session = self.pinned_session(session_id)?;
+        start_request(
+            &session,
+            op,
+            fields,
+            &RequestOptions {
+                payload,
+                ..Default::default()
+            },
+        )
+        .map(|(_, rx)| rx)
     }
 
     /// Stop the daemon; it kills everything it started.

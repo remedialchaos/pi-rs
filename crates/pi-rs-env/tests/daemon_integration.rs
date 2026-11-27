@@ -412,3 +412,45 @@ fn a_lost_connection_fails_in_flight_requests_and_the_next_one_restarts_the_daem
     assert_ne!(restarted.pid, pid);
     assert_eq!(restarted.protocol, 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn watcher_retries_failed_reconnect_and_reports_overflow_after_coverage()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let starts = attempts.clone();
+    let source = pi_rs_env::CommandSource::Dynamic(Arc::new(move || {
+        if starts.fetch_add(1, Ordering::SeqCst) == 1 {
+            return Err(RemoteError::lost("disconnected"));
+        }
+        Ok(vec![env!("CARGO_BIN_EXE_pi-env").into()])
+    }));
+    let connection = Arc::new(Connection::new(ConnectionOptions::new(source)));
+    let directory = TempDir::new()?;
+    let (changes, received) = mpsc::channel();
+    let watcher = pi_rs_env::RemoteWatcher::open(
+        connection.clone(),
+        vec![WatchTarget {
+            path: directory.path().to_string_lossy().into_owned(),
+            recursive: false,
+            exclude: None,
+        }],
+        Arc::new(move |change| {
+            let _ = changes.send((attempts.load(Ordering::SeqCst), change));
+        }),
+        RemoteWatchOptions::default(),
+    )?;
+    let pid = connection.info()?.pid;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()?
+            .success()
+    );
+    let (attempt, change) = received.recv_timeout(Duration::from_secs(10))?;
+    assert!(matches!(change, FileChange::Overflow));
+    assert_eq!(attempt, 3);
+    watcher.stop();
+    Ok(())
+}

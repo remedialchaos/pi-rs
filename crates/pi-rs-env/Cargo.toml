@@ -10,22 +10,38 @@ description = "Remote execution environment daemon and client transport (Rust po
 name = "pi-env"
 path = "src/bin/pi_env.rs"
 
+[features]
+default = ["client"]
+client = [
+    "dep:async-trait",
+    "dep:pi-rs-chord",
+    "dep:pi-rs-durable",
+    "dep:uuid",
+    "dep:url",
+    "dep:percent-encoding",
+    "dep:base64",
+    "dep:rand",
+    "dep:serde",
+    "dep:thiserror",
+    "dep:tokio",
+]
+
 [dependencies]
-async-trait = "0.1"
-pi-rs-chord = { path = "../pi-rs-chord" }
-pi-rs-durable = { path = "../pi-rs-durable" }
-uuid = { version = "1", features = ["v4"] }
-url = "2"
-percent-encoding = "2"
-base64 = "0.22"
+async-trait = { version = "0.1", optional = true }
+pi-rs-chord = { path = "../pi-rs-chord", optional = true }
+pi-rs-durable = { path = "../pi-rs-durable", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+url = { version = "2", optional = true }
+percent-encoding = { version = "2", optional = true }
+base64 = { version = "0.22", optional = true }
 encoding_rs = "0.8"
 ignore = "0.4"
 notify = "9"
-rand = "0.9"
-serde = { version = "1", features = ["derive"] }
+rand = { version = "0.9", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+thiserror = { version = "2", optional = true }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

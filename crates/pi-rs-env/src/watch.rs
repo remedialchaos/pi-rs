@@ -9,7 +9,6 @@ use crate::connection::{
 };
 use crate::errors::{FileErrorCode, to_file_error};
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -73,7 +72,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 struct WatcherState {
     stopped: bool,
     mode: WatchMode,
-    ready: AtomicBool,
+    ready: bool,
 }
 
 /// Shared wake-up and state for the watcher's supervisor thread and its owner.
@@ -93,13 +92,13 @@ impl Shared {
     fn backoff(&self, delay: Duration) -> bool {
         let (state, _) = self
             .wake
-            .wait_timeout(lock(&self.state), delay)
+            .wait_timeout_while(lock(&self.state), delay, |state| !state.stopped)
             .unwrap_or_else(PoisonError::into_inner);
         !state.stopped
     }
 
     fn ready(&self) -> bool {
-        lock(&self.state).ready.load(Ordering::SeqCst)
+        lock(&self.state).ready
     }
 
     fn stopped(&self) -> bool {
@@ -133,7 +132,7 @@ impl Supervisor {
     }
 
     /// One watch request, ending when it is cancelled or the connection is lost. Signals `ready` to the opener.
-    fn watch_request(&self) -> Result<(), RemoteError> {
+    fn watch_request(&self, reconnect: bool) -> Result<(), RemoteError> {
         let mut request = json!({
             "targets": self.targets.iter().map(|target| {
                 let exclude = target.exclude.clone().unwrap_or_default();
@@ -159,6 +158,7 @@ impl Supervisor {
         let on_event: EventCallback =
             Arc::new(
                 move |event, _payload| match event.get("kind").and_then(Value::as_str) {
+                    _ if shared.stopped() => (),
                     Some("ready") => {
                         let mut state = lock(&shared.state);
                         state.mode = if event.get("mode").and_then(Value::as_str) == Some("polling")
@@ -167,9 +167,13 @@ impl Supervisor {
                         } else {
                             WatchMode::Native
                         };
-                        state.ready.store(true, Ordering::SeqCst);
+                        let first = !std::mem::replace(&mut state.ready, true);
                         drop(state);
-                        let _ = status.send(Status::Ready);
+                        if reconnect && first {
+                            deliver(FileChange::Overflow);
+                        } else if first {
+                            let _ = status.send(Status::Ready);
+                        }
                     }
                     Some("change") => {
                         if event.get("mode").and_then(Value::as_str) == Some("polling") {
@@ -222,17 +226,20 @@ impl Supervisor {
 
     fn run(self) {
         let mut delay = Duration::from_millis(RECONNECT_FIRST_MS);
+        let mut ever_ready = false;
         loop {
             if self.shared.stopped() {
                 return;
             }
-            lock(&self.shared.state)
-                .ready
-                .store(false, Ordering::SeqCst);
-            match self.watch_request() {
+            lock(&self.shared.state).ready = false;
+            match self.watch_request(ever_ready) {
                 Ok(()) => return,
                 Err(error) => {
-                    if !self.shared.ready() {
+                    if self.shared.ready() {
+                        ever_ready = true;
+                        delay = Duration::from_millis(RECONNECT_FIRST_MS);
+                    }
+                    if !ever_ready {
                         // The opener is still waiting for readiness; it fails with this error.
                         let _ = self.ready_status.send(Status::Failed(error));
                         return;
@@ -244,8 +251,6 @@ impl Supervisor {
                         if !self.shared.backoff(delay) {
                             return;
                         }
-                        // Changes while disconnected were not seen.
-                        self.deliver(FileChange::Overflow);
                         delay = delay
                             .saturating_mul(2)
                             .min(Duration::from_millis(RECONNECT_MAX_MS));
@@ -283,7 +288,7 @@ impl RemoteWatcher {
             state: Mutex::new(WatcherState {
                 stopped: false,
                 mode: WatchMode::Native,
-                ready: AtomicBool::new(false),
+                ready: false,
             }),
             wake: Condvar::new(),
         });

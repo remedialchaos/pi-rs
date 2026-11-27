@@ -244,3 +244,36 @@ async fn heartbeat_cancels_read_while_daemon_waits_for_fifo_data() -> TestResult
     assert_eq!(result.unwrap_err().code, FileErrorCode::Aborted);
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn chunked_write_returns_after_ordered_bytes_and_daemon_handle_close() -> TestResult {
+    let dir = TempDir::new()?;
+    let env = adapter(&dir.path().to_string_lossy());
+    let ctx = Context::background();
+    let data = (0u8..12)
+        .flat_map(|n| std::iter::repeat_n(n, 512 * 1024))
+        .collect::<Vec<_>>();
+    let pid = env.connection().info()?.pid;
+    let path = dir.path().join("written");
+    env.write_file("written", &data, &ctx).await?;
+    for fd in std::fs::read_dir(format!("/proc/{pid}/fd"))? {
+        if let Ok(target) = std::fs::read_link(fd?.path()) {
+            assert_ne!(target, path);
+        }
+    }
+    assert!(std::fs::read(path)? == data);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_join_returns_aborted_before_resolving_remote_paths() -> TestResult {
+    let env = adapter("/");
+    let (ctx, cancel) = Context::background().with_cancel();
+    cancel.cancel("cancelled");
+    assert_eq!(
+        env.join_path(&["a", "b"], &ctx).await.err().map(|e| e.code),
+        Some(FileErrorCode::Aborted)
+    );
+    Ok(())
+}

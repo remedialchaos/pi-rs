@@ -98,6 +98,20 @@ impl Handle {
         )
         .await
     }
+    pub(super) async fn submit_chunk(
+        &self,
+        chunk: &[u8],
+    ) -> Result<std::sync::mpsc::Receiver<Result<Reply, RemoteError>>, FileError> {
+        let connection = self.connection.clone();
+        let session = self.session;
+        let id = self.id;
+        let bytes = chunk.to_vec();
+        transport(&self.path, move || {
+            connection.submit(session, "writeChunk", json!({"handle": id}), bytes)
+        })
+        .await
+    }
+
     fn take_close(&mut self) -> Option<impl FnOnce() + Send + 'static + use<>> {
         let id = self.id.take()?;
         let c = self.connection.clone();
@@ -113,7 +127,7 @@ impl Handle {
             );
         })
     }
-    async fn release(&mut self) {
+    pub(super) async fn release(&mut self) {
         if let Some(close) = self.take_close() {
             let _ = tokio::task::spawn_blocking(close).await;
         }

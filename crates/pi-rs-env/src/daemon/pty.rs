@@ -24,7 +24,7 @@ const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_CELLS: u64 = 4096;
 
 /// An in-process PTY using the same shell and platform operations as the daemon.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "client"))]
 pub struct LocalTerminal {
     master: Arc<std::fs::File>,
     pid: u32,
@@ -34,7 +34,7 @@ pub struct LocalTerminal {
     result: Mutex<std::sync::mpsc::Receiver<std::io::Result<i32>>>,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "client"))]
 impl LocalTerminal {
     pub fn open(options: crate::TerminalOptions) -> std::io::Result<Self> {
         use std::sync::{atomic::AtomicBool, mpsc};
@@ -132,7 +132,7 @@ impl LocalTerminal {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "client"))]
 impl Drop for LocalTerminal {
     fn drop(&mut self) {
         self.close();

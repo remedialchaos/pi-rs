@@ -11,7 +11,7 @@ mod list;
 mod output;
 mod process;
 mod pty;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "client"))]
 pub use pty::LocalTerminal;
 mod scan;
 mod sys;

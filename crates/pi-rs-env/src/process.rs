@@ -60,17 +60,12 @@ impl RemoteProcess {
     }
 
     fn request(&self, op: &str, payload: &[u8]) {
-        let mut options = RequestOptions {
-            session: Some(self.session),
-            ..RequestOptions::default()
-        };
-        if !payload.is_empty() {
-            options.payload = payload.to_vec();
-        }
-        // Stdin already closed, the program ended, or a lost connection: `wait` reports the end.
-        let _ = self
-            .connection
-            .request(op, json!({ "target": self.id }), options);
+        let _ = self.connection.submit(
+            self.session,
+            op,
+            json!({"target": self.id}),
+            payload.to_vec(),
+        );
     }
 
     /// Wait for the program's exit code. Rejects with the daemon's error, with code `aborted` after `close()`.
