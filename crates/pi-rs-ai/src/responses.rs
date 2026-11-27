@@ -292,12 +292,32 @@ pub(crate) fn replay_assistant(
     let same = a.provider == model.provider && a.api == model.api;
     let different = same && a.model != model.id;
     let mut text_index = 0;
+    let mut reasoning_index = 0;
+    let replay_plain_reasoning = model
+        .compat
+        .as_ref()
+        .and_then(|c| c.get("requiresReasoningContentOnAssistantMessages"))
+        .and_then(Value::as_bool)
+        == Some(true);
     let mut parts = Vec::with_capacity(a.content.len());
     for block in &a.content {
         match block {
             AssistantContent::Thinking(t) => {
                 if let Some(signature) = &t.thinking_signature {
                     parts.push(serde_json::from_str(signature)?);
+                } else if replay_plain_reasoning && !t.thinking.is_empty() {
+                    let id = if reasoning_index == 0 {
+                        format!("rs_pi_{msg_index}")
+                    } else {
+                        format!("rs_pi_{msg_index}_{reasoning_index}")
+                    };
+                    reasoning_index += 1;
+                    parts.push(json!({
+                        "type": "reasoning",
+                        "id": id,
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": t.thinking}],
+                    }));
                 }
             }
             AssistantContent::Text(t) => {
@@ -1207,4 +1227,90 @@ fn service_tier(usage: &mut Usage, model: &str, tier: Option<&str>, d: Dialect) 
     c.cache_read *= multiplier;
     c.cache_write *= multiplier;
     c.total = c.input + c.output + c.cache_read + c.cache_write;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::{Map, Value, json};
+
+    use super::replay_assistant;
+    use crate::model::{Api, BaseModel, Model, ModelCost, ModelInputModality};
+    use crate::types::{AssistantContent, AssistantMessage, StopReason, ThinkingContent};
+
+    fn test_model(compat: Option<Map<String, Value>>) -> Model {
+        Model {
+            base: BaseModel {
+                id: "local-reasoner".into(),
+                name: "Local Reasoner".into(),
+                api: Api::OpenAiResponses,
+                provider: "local".into(),
+                base_url: "http://127.0.0.1:8080/v1".into(),
+                input: vec![ModelInputModality::Text],
+                input_limits: None,
+                cost: ModelCost::default(),
+                headers: None,
+            },
+            kind: None,
+            reasoning: true,
+            thinking_level_map: None,
+            prompt_cache: None,
+            context_window: 32_768,
+            max_tokens: 4_096,
+            sampling_params: None,
+            sampling_params_by_thinking_level: None,
+            compat,
+        }
+    }
+
+    fn assistant_with_unsigned_thinking(model: &Model) -> AssistantMessage {
+        let mut msg = AssistantMessage::pending(model);
+        msg.stop_reason = StopReason::Stop;
+        msg.content
+            .push(AssistantContent::Thinking(ThinkingContent {
+                thinking: "step 1: check prefix cache".into(),
+                ..ThinkingContent::default()
+            }));
+        msg
+    }
+
+    #[test]
+    fn replay_assistant_emits_plain_reasoning_when_compat_flag_enabled() {
+        let mut compat = Map::new();
+        compat.insert(
+            "requiresReasoningContentOnAssistantMessages".into(),
+            Value::Bool(true),
+        );
+        let model = test_model(Some(compat));
+        let parts = replay_assistant(
+            &assistant_with_unsigned_thinking(&model),
+            &model,
+            &HashMap::new(),
+            0,
+        )
+        .expect("replay should succeed");
+        assert_eq!(
+            parts,
+            vec![json!({
+                "type": "reasoning",
+                "id": "rs_pi_0",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "step 1: check prefix cache"}],
+            })]
+        );
+    }
+
+    #[test]
+    fn replay_assistant_omits_unsigned_thinking_by_default() {
+        let model = test_model(None);
+        let parts = replay_assistant(
+            &assistant_with_unsigned_thinking(&model),
+            &model,
+            &HashMap::new(),
+            0,
+        )
+        .expect("replay should succeed");
+        assert!(parts.is_empty());
+    }
 }

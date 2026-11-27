@@ -1125,7 +1125,7 @@ async fn consume(
             return Err(Error::Protocol(frame.data));
         }
         if !matches!(
-            frame.name.as_str(),
+            frame.name.as_ref(),
             "message_start"
                 | "content_block_start"
                 | "content_block_delta"
