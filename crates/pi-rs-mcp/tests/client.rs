@@ -876,3 +876,123 @@ async fn answers_roots_list_and_dispatches_notifications() {
     assert_eq!(changed, vec![None]);
     client.close().await;
 }
+
+#[tokio::test]
+async fn matches_string_echoed_response_ids_and_progress_tokens() {
+    let pair = create_in_memory_transport_pair();
+    let seen_progress = Arc::new(Mutex::new(Vec::<ProgressNotification>::new()));
+    let server_transport = pair.server.clone();
+    pair.server
+        .on_message(Arc::new(move |message: &JsonRpcMessage| {
+            let Some(request) = message_request(message) else {
+                return;
+            };
+            let method = request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            let id_str = match &id {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            let progress_token = request
+                .pointer("/params/_meta/progressToken")
+                .and_then(|value| match value {
+                    Value::String(text) => Some(text.clone()),
+                    Value::Number(number) => Some(number.to_string()),
+                    _ => None,
+                });
+            let transport = server_transport.clone();
+            tokio::spawn(async move {
+                let reply = if method == "initialize" {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id_str,
+                        "result": {
+                            "protocolVersion": LATEST_PROTOCOL_VERSION,
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "string-id-server", "version": "1.0.0" },
+                        },
+                    })
+                } else {
+                    if let Some(token) = progress_token {
+                        tokio::time::sleep(Duration::from_millis(18)).await;
+                        let _ = transport
+                            .send(
+                                &parse_message(&json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/progress",
+                                    "params": {
+                                        "progressToken": token,
+                                        "progress": 1,
+                                        "total": 2,
+                                    },
+                                })),
+                                &Default::default(),
+                            )
+                            .await;
+                        tokio::time::sleep(Duration::from_millis(18)).await;
+                    }
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id_str,
+                        "result": { "content": [{ "type": "text", "text": "ok" }] },
+                    })
+                };
+                let _ = transport
+                    .send(&parse_message(&reply), &Default::default())
+                    .await;
+            });
+        }));
+    let _ = pair.server.start().await;
+
+    let client = McpClient::new(McpClientOptions {
+        name: "test-client".to_string(),
+        version: "2.0.0".to_string(),
+        ..McpClientOptions::default()
+    });
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded_errors = errors.clone();
+    client.on_error(Arc::new(move |error| {
+        recorded_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(error.message.clone());
+    }));
+    client.connect(pair.client).await.expect("connect");
+
+    let captured_progress = seen_progress.clone();
+    let result = client
+        .call_tool(
+            "slow",
+            None,
+            &McpRequestOptions {
+                timeout_ms: Some(30),
+                on_progress: Some(Arc::new(move |notification| {
+                    captured_progress
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(notification.clone());
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("call_tool resolves when progress renews timeout");
+    assert_eq!(result.content.len(), 1);
+    let progress = seen_progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].progress, 1.0);
+    assert!(
+        errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    );
+    client.close().await;
+}

@@ -838,7 +838,15 @@ pub fn render_image(
     })
 }
 
+/// Longest URL that [`hyperlink`] wraps in an OSC 8 sequence. Real links are far shorter.
+const MAX_HYPERLINK_URL_LENGTH: usize = 8192;
+
 pub fn hyperlink(text: &str, url: &str) -> String {
+    if url.len() > MAX_HYPERLINK_URL_LENGTH
+        && url.encode_utf16().nth(MAX_HYPERLINK_URL_LENGTH).is_some()
+    {
+        return text.to_owned();
+    }
     format!("\x1b]8;;{url}{ST}{text}\x1b]8;;{ST}")
 }
 

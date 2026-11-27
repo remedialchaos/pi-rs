@@ -251,10 +251,82 @@ impl BinaryReader for Handle {
         self.release().await;
     }
 }
+struct LineBuffer {
+    buffer: String,
+    start: usize,
+    scanned: usize,
+    decoder: StreamDecoder,
+    #[cfg(test)]
+    scanned_bytes: usize,
+}
+
+impl LineBuffer {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            start: 0,
+            scanned: 0,
+            decoder: StreamDecoder::new(),
+            #[cfg(test)]
+            scanned_bytes: 0,
+        }
+    }
+
+    fn next_line(&mut self) -> Option<TextLine> {
+        let slice = &self.buffer.as_bytes()[self.scanned..];
+        #[cfg(test)]
+        {
+            self.scanned_bytes += slice.len();
+        }
+        let newline = slice.iter().position(|byte| *byte == b'\n')?;
+        let end = self.scanned + newline;
+        let text = self.buffer[self.start..end].to_owned();
+        self.start = end + 1;
+        self.scanned = self.start;
+        Some(TextLine {
+            text,
+            terminated: true,
+        })
+    }
+
+    fn finish_eof(&mut self) -> Option<TextLine> {
+        if self.start == self.buffer.len() {
+            return None;
+        }
+        let mut text = std::mem::take(&mut self.buffer);
+        if self.start != 0 {
+            text.drain(..self.start);
+        }
+        self.start = 0;
+        self.scanned = 0;
+        Some(TextLine {
+            text,
+            terminated: false,
+        })
+    }
+
+    fn prepare_read(&mut self) {
+        if self.start != 0 {
+            self.buffer.drain(..self.start);
+            self.start = 0;
+        }
+        self.scanned = self.buffer.len();
+    }
+
+    fn push_chunk(&mut self, chunk: Option<&[u8]>) {
+        self.buffer.push_str(&self.decoder.decode(chunk));
+    }
+
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.start = 0;
+        self.scanned = 0;
+    }
+}
+
 pub(super) struct Lines {
     handle: Handle,
-    buffer: String,
-    decoder: StreamDecoder,
+    lines: LineBuffer,
     offset: u64,
     eof: bool,
 }
@@ -262,8 +334,7 @@ impl Lines {
     pub fn new(handle: Handle) -> Self {
         Self {
             handle,
-            buffer: String::new(),
-            decoder: StreamDecoder::new(),
+            lines: LineBuffer::new(),
             offset: 0,
             eof: false,
         }
@@ -281,21 +352,13 @@ impl TextLineReader for Lines {
             ));
         }
         loop {
-            if let Some(i) = self.buffer.find('\n') {
-                let tail = self.buffer.split_off(i + 1);
-                let mut text = std::mem::replace(&mut self.buffer, tail);
-                text.pop();
-                return Ok(Some(TextLine {
-                    text,
-                    terminated: true,
-                }));
+            if let Some(line) = self.lines.next_line() {
+                return Ok(Some(line));
             }
             if self.eof {
-                return Ok((!self.buffer.is_empty()).then(|| TextLine {
-                    text: std::mem::take(&mut self.buffer),
-                    terminated: false,
-                }));
+                return Ok(self.lines.finish_eof());
             }
+            self.lines.prepare_read();
             let chunk = self
                 .handle
                 .send(
@@ -308,13 +371,12 @@ impl TextLineReader for Lines {
             check(ctx, &self.handle.path)?;
             self.offset += chunk.len() as u64;
             self.eof = chunk.is_empty();
-            self.buffer
-                .push_str(&self.decoder.decode((!self.eof).then_some(&chunk)));
+            self.lines.push_chunk((!self.eof).then_some(&chunk));
         }
     }
     async fn close(&mut self, _: &Context) {
         self.handle.release().await;
-        self.buffer.clear();
+        self.lines.clear();
     }
 }
 pub(super) struct Directory {
@@ -405,5 +467,65 @@ impl DirReader for Directory {
     }
     async fn close(&mut self, _: &Context) {
         self.handle.release().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scans_large_chunked_lines_in_linear_time() {
+        let long_line = "a".repeat(1024 * 1024);
+        let mut data = Vec::with_capacity(long_line.len() + 32);
+        data.extend_from_slice(long_line.as_bytes());
+        data.extend_from_slice(b"\nsecond\nlast");
+        let mut chunks = data.chunks(65_536);
+        let mut eof = false;
+        let mut reader = LineBuffer::new();
+        let mut out = Vec::new();
+        loop {
+            if let Some(line) = reader.next_line() {
+                out.push(line);
+                continue;
+            }
+            if eof {
+                if let Some(line) = reader.finish_eof() {
+                    out.push(line);
+                }
+                break;
+            }
+            reader.prepare_read();
+            match chunks.next() {
+                Some(chunk) => reader.push_chunk(Some(chunk)),
+                None => {
+                    eof = true;
+                    reader.push_chunk(None);
+                }
+            }
+        }
+        assert_eq!(
+            out,
+            [
+                TextLine {
+                    text: long_line,
+                    terminated: true,
+                },
+                TextLine {
+                    text: "second".into(),
+                    terminated: true,
+                },
+                TextLine {
+                    text: "last".into(),
+                    terminated: false,
+                },
+            ]
+        );
+        assert!(
+            reader.scanned_bytes <= 2 * data.len(),
+            "scanned {} bytes for {} byte input",
+            reader.scanned_bytes,
+            data.len()
+        );
     }
 }

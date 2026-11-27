@@ -1,8 +1,11 @@
 use std::cell::RefCell;
 use std::io;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use pi_rs_tui::Terminal;
 use pi_rs_tui::tui::{
     CURSOR_MARKER, Component, ComponentRef, OverlayAnchor, OverlayOptions, SizeValue, Tui,
 };
@@ -145,5 +148,115 @@ fn differential_frames_match_upstream_xterm_viewports() -> io::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+struct CountingTerminal {
+    inner: VirtualTerminal,
+    stops: Arc<AtomicUsize>,
+}
+
+impl Terminal for CountingTerminal {
+    fn width(&self) -> usize {
+        self.inner.width()
+    }
+    fn height(&self) -> usize {
+        self.inner.height()
+    }
+    fn write(&mut self, data: &str) {
+        self.inner.write(data);
+    }
+    fn read_available(&mut self) -> Vec<u8> {
+        self.inner.read_available()
+    }
+    fn is_tty(&self) -> bool {
+        self.inner.is_tty()
+    }
+    fn stop_session(&mut self) -> io::Result<()> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        self.inner.stop_session()
+    }
+}
+
+struct TempCrashDir(PathBuf);
+
+impl TempCrashDir {
+    fn new() -> io::Result<Self> {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pi-tui-crash-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for TempCrashDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn reports_width_error_and_stops_terminal_when_crash_dump_cannot_be_written() -> io::Result<()> {
+    let crash_dir = TempCrashDir::new()?;
+    // A regular file where the log directory should be makes the dump fail to write.
+    let log_directory = crash_dir.0.join("not-a-directory");
+    std::fs::write(&log_directory, "")?;
+
+    let stops = Arc::new(AtomicUsize::new(0));
+    let terminal = CountingTerminal {
+        inner: VirtualTerminal::new(10, 40),
+        stops: stops.clone(),
+    };
+    let mut tui = TuiMainScreen::new(terminal, false, Some(log_directory));
+    let lines = Rc::new(RefCell::new(TextLines(vec!["ok".into()])));
+    tui.base
+        .content
+        .add_child(ComponentRef::from_shared(lines.clone()));
+    tui.start()?;
+    tui.render_now(false)?;
+
+    lines.borrow_mut().0 = vec!["ok".into(), "x".repeat(60)];
+    let error = tui
+        .render_now(false)
+        .expect_err("over-wide line must fail render");
+    let message = error.to_string();
+    assert!(message.contains("exceeds terminal width"), "{message}");
+    assert!(
+        message.contains("Could not write debug log to "),
+        "{message}"
+    );
+    assert_eq!(stops.load(Ordering::SeqCst), 1);
+
+    // Writable log directory still writes the debug log and stops the terminal once.
+    let writable_dir = crash_dir.0.join("logs");
+    let writable_stops = Arc::new(AtomicUsize::new(0));
+    let mut writable_tui = TuiMainScreen::new(
+        CountingTerminal {
+            inner: VirtualTerminal::new(10, 40),
+            stops: writable_stops.clone(),
+        },
+        false,
+        Some(writable_dir.clone()),
+    );
+    let writable_lines = Rc::new(RefCell::new(TextLines(vec!["ok".into()])));
+    writable_tui
+        .base
+        .content
+        .add_child(ComponentRef::from_shared(writable_lines.clone()));
+    writable_tui.start()?;
+    writable_tui.render_now(false)?;
+    writable_lines.borrow_mut().0 = vec!["ok".into(), "x".repeat(60)];
+    let error = writable_tui
+        .render_now(false)
+        .expect_err("over-wide line must fail render");
+    let message = error.to_string();
+    assert!(message.contains("exceeds terminal width"), "{message}");
+    assert!(message.contains("Debug log written to: "), "{message}");
+    assert!(writable_dir.join("pi-tui-crash.log").is_file());
+    assert_eq!(writable_stops.load(Ordering::SeqCst), 1);
     Ok(())
 }

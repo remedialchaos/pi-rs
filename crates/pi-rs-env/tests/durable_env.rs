@@ -277,3 +277,44 @@ async fn cancelled_join_returns_aborted_before_resolving_remote_paths() -> TestR
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn remote_text_line_reader_handles_large_multi_chunk_line_and_utf8_boundaries() -> TestResult
+{
+    let root = TempDir::new()?;
+    let env = adapter(&root.path().to_string_lossy());
+    let ctx = Context::background();
+    // Crosses >16 64 KiB preads with a 4-byte UTF-8 sequence straddling the first 64 KiB boundary.
+    let mut prefix = "x".repeat(65_534);
+    prefix.push('🌳');
+    let suffix = "y".repeat(1_024 * 1024);
+    let long_line = format!("{prefix}{suffix}");
+    let content = format!("{long_line}\nshort\ntail");
+    env.write_file("large.txt", content.as_bytes(), &ctx)
+        .await?;
+    let mut reader = env.open_text_line_reader("large.txt", &ctx).await?;
+    assert_eq!(
+        reader.read_line(&ctx).await?,
+        Some(TextLine {
+            text: long_line,
+            terminated: true,
+        })
+    );
+    assert_eq!(
+        reader.read_line(&ctx).await?,
+        Some(TextLine {
+            text: "short".into(),
+            terminated: true,
+        })
+    );
+    assert_eq!(
+        reader.read_line(&ctx).await?,
+        Some(TextLine {
+            text: "tail".into(),
+            terminated: false,
+        })
+    );
+    assert_eq!(reader.read_line(&ctx).await?, None);
+    reader.close(&ctx).await;
+    Ok(())
+}

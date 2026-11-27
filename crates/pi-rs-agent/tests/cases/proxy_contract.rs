@@ -389,3 +389,46 @@ async fn reconstructs_large_tool_arguments_without_leaking_raw_json_to_content()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn streams_large_single_line_event_across_many_small_chunks() -> TestResult {
+    let payload = "x".repeat(1024 * 1024);
+    let large_frame = frame(json!({"type":"text_delta","contentIndex":0,"delta":payload}));
+    let chunks: Vec<Bytes> = [
+        frame(json!({"type":"start"})),
+        frame(json!({"type":"text_start","contentIndex":0})),
+    ]
+    .into_iter()
+    .map(Bytes::from)
+    .chain(
+        large_frame
+            .as_bytes()
+            .chunks(4096)
+            .map(Bytes::copy_from_slice),
+    )
+    .chain(std::iter::once(Bytes::from(frame(
+        json!({"type":"done","reason":"stop","usage":usage()}),
+    ))))
+    .collect();
+    let server = serve(Router::new().route(
+        "/api/stream",
+        post(move || {
+            let chunks = chunks.clone();
+            async move {
+                sse(Body::from_stream(stream::iter(
+                    chunks.into_iter().map(Ok::<_, std::io::Error>),
+                )))
+            }
+        }),
+    ))
+    .await?;
+    let events = stream_proxy(
+        model(),
+        normalize_context(Default::default()),
+        options(&server)?,
+    );
+    let result = timeout(Duration::from_secs(10), events.result()).await??;
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(result.content, [faux_text(&payload)]);
+    Ok(())
+}

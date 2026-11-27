@@ -24,6 +24,18 @@ use crate::word_navigation::segment_words;
 const MULTI_CLICK: Duration = Duration::from_millis(500);
 const SCROLL_TICK: Duration = Duration::from_millis(50);
 
+// Terminals that forward the right-click to mouse-tracking apps and also paste
+// the clipboard themselves. pi's synthetic paste would duplicate their paste.
+const RIGHT_CLICK_PASTING_TERMINALS: &[&str] = &["vscode", "tabby"];
+
+fn terminal_pastes_on_right_click(term_program: Option<&str>) -> bool {
+    term_program.is_some_and(|term| {
+        RIGHT_CLICK_PASTING_TERMINALS
+            .iter()
+            .any(|candidate| term.eq_ignore_ascii_case(candidate))
+    })
+}
+
 type View = Rc<dyn ScrollLayoutState>;
 
 #[derive(Clone)]
@@ -362,6 +374,17 @@ impl TuiAltScreen {
     }
 
     fn route_mouse(&mut self, raw: Raw, event: TuiMouseEvent) {
+        let term_program = std::env::var("TERM_PROGRAM").ok();
+        self.route_mouse_with(raw, event, cfg!(windows), term_program.as_deref());
+    }
+
+    fn route_mouse_with(
+        &mut self,
+        raw: Raw,
+        event: TuiMouseEvent,
+        is_windows: bool,
+        term_program: Option<&str>,
+    ) {
         if let Some(mut gesture) = self.mouse.gesture.take() {
             if raw.x != gesture.x || raw.y != gesture.y {
                 gesture.moved = true;
@@ -426,10 +449,10 @@ impl TuiAltScreen {
             }
             return;
         }
-        if cfg!(windows)
+        if is_windows
             && raw.press()
             && raw.button == 2
-            && !std::env::var("TERM_PROGRAM").is_ok_and(|term| term.eq_ignore_ascii_case("vscode"))
+            && !terminal_pastes_on_right_click(term_program)
             && let Some(paste) = &mut self.options.on_right_click_paste
         {
             paste();
@@ -1048,4 +1071,71 @@ fn selection_cells(
         width
     };
     (a.max(min_col), b.min(max_col))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::Terminal;
+    use crate::tui_alt_screen::TuiAltScreenOptions;
+
+    struct DummyTerminal;
+    impl Terminal for DummyTerminal {
+        fn width(&self) -> usize {
+            40
+        }
+        fn height(&self) -> usize {
+            10
+        }
+        fn write(&mut self, _data: &str) {}
+        fn read_available(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn is_tty(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn invokes_right_click_paste_only_on_windows_outside_terminals_that_paste_themselves() {
+        let paste_count = Rc::new(Cell::new(0usize));
+        let counter = paste_count.clone();
+        let mut tui = TuiAltScreen::new(
+            DummyTerminal,
+            false,
+            TuiAltScreenOptions {
+                on_right_click_paste: Some(Box::new(move || {
+                    counter.set(counter.get() + 1);
+                })),
+                ..Default::default()
+            },
+        );
+        let press = Raw::parse("\x1b[<2;1;1M").expect("right press");
+        let press_event = press.event(40, 10, None);
+        let release = Raw::parse("\x1b[<2;1;1m").expect("right release");
+        let release_event = release.event(40, 10, None);
+
+        tui.route_mouse_with(press, press_event, true, None);
+        assert_eq!(paste_count.get(), 1);
+
+        tui.route_mouse_with(press, press_event, true, Some("vscode"));
+        assert_eq!(paste_count.get(), 1);
+
+        tui.route_mouse_with(press, press_event, true, Some("Tabby"));
+        assert_eq!(paste_count.get(), 1);
+
+        tui.route_mouse_with(press, press_event, true, Some("tabby"));
+        assert_eq!(paste_count.get(), 1);
+
+        tui.route_mouse_with(press, press_event, false, None);
+        assert_eq!(paste_count.get(), 1);
+
+        tui.route_mouse_with(press, press_event, true, Some("WindowsTerminal"));
+        assert_eq!(paste_count.get(), 2);
+
+        tui.route_mouse_with(release, release_event, true, Some("WindowsTerminal"));
+        assert_eq!(paste_count.get(), 2);
+    }
 }

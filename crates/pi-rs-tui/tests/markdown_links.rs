@@ -1,7 +1,22 @@
+use std::sync::{Mutex, MutexGuard};
+
 use pi_rs_tui::{
     Component, DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme, TerminalCapabilities,
-    set_capabilities, strip_terminal_sequences,
+    reset_capabilities_cache, set_capabilities, strip_terminal_sequences,
 };
+
+static CAPS_LOCK: Mutex<()> = Mutex::new(());
+
+fn with_hyperlinks(hyperlinks: bool) -> MutexGuard<'static, ()> {
+    let guard = CAPS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_capabilities(TerminalCapabilities {
+        hyperlinks,
+        ..Default::default()
+    });
+    guard
+}
 
 fn render(source: &str) -> String {
     Markdown::new(
@@ -18,10 +33,7 @@ fn render(source: &str) -> String {
 
 #[test]
 fn bare_links_stop_at_cjk_punctuation_but_explicit_destinations_do_not() {
-    set_capabilities(TerminalCapabilities {
-        hyperlinks: true,
-        ..Default::default()
-    });
+    let _guard = with_hyperlinks(true);
     for punctuation in
         "。，；：！？、\u{201c}\u{201d}‘’（）【】《》「」『』…—·・〈〉［］｛｝．｡｢｣､･".chars()
     {
@@ -60,5 +72,31 @@ fn bare_links_stop_at_cjk_punctuation_but_explicit_destinations_do_not() {
     assert_eq!(
         strip_terminal_sequences(&render("Contact user@example.com for help")).trim_end(),
         "Contact user@example.com for help"
+    );
+    reset_capabilities_cache();
+}
+
+#[test]
+fn does_not_hyperlink_a_bare_url_that_runs_into_a_very_long_line() {
+    let _guard = with_hyperlinks(true);
+    let url = format!("https://example.com/path,data:{}", "x".repeat(20_000));
+    let output = Markdown::new(
+        &url,
+        0,
+        0,
+        MarkdownTheme::default(),
+        DefaultTextStyle::default(),
+        MarkdownOptions::default(),
+    )
+    .render(80)
+    .join("");
+    reset_capabilities_cache();
+    assert!(!output.contains("\x1b]8;"));
+    assert!(output.len() < 3 * url.len());
+    assert_eq!(
+        strip_terminal_sequences(&output)
+            .split_whitespace()
+            .collect::<String>(),
+        url
     );
 }

@@ -49,6 +49,8 @@ pub struct StdinBuffer {
     pending: String,
     in_paste: bool,
     paste_searched: usize,
+    #[cfg(test)]
+    paste_scanned_bytes: usize,
     kitty_duplicate: Option<char>,
     deadline: Option<Instant>,
     options: StdinBufferOptions,
@@ -85,7 +87,12 @@ impl StdinBuffer {
     fn extract(&mut self, now: Instant, events: &mut Vec<StdinEvent>) {
         loop {
             if self.in_paste {
-                let Some(end) = self.pending[self.paste_searched..].find(PASTE_END) else {
+                let tail = &self.pending[self.paste_searched..];
+                #[cfg(test)]
+                {
+                    self.paste_scanned_bytes += tail.len();
+                }
+                let Some(end) = tail.find(PASTE_END) else {
                     self.paste_searched = self.pending.len().saturating_sub(PASTE_END.len() - 1);
                     while !self.pending.is_char_boundary(self.paste_searched) {
                         self.paste_searched -= 1;
@@ -109,6 +116,7 @@ impl StdinBuffer {
                 extract_sequences(&self.pending[..start], &mut self.kitty_duplicate, events);
                 self.pending.drain(..start + PASTE_START.len());
                 self.in_paste = true;
+                self.paste_searched = 0;
                 self.kitty_duplicate = None;
             } else {
                 let consumed = extract_sequences(&self.pending, &mut self.kitty_duplicate, events);
@@ -264,5 +272,30 @@ fn escape_end(text: &str) -> Option<(usize, bool)> {
         }
         27 if matches!(bytes.get(2), Some(b'[' | b']' | b'O' | b'P' | b'_')) => Some((1, true)),
         _ => text[1..].chars().next().map(|c| (1 + c.len_utf8(), true)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scans_large_chunked_bracketed_paste_in_linear_time() {
+        let payload = "x".repeat(1024 * 1024);
+        let input = format!("\x1b[200~{payload}\x1b[201~");
+        let now = Instant::now();
+        let mut buffer = StdinBuffer::default();
+        let mut events = Vec::new();
+        for chunk in input.as_bytes().chunks(4096) {
+            let chunk = std::str::from_utf8(chunk).expect("ascii chunk");
+            events.extend(buffer.process(chunk, now));
+        }
+        assert_eq!(events, [StdinEvent::Paste(payload)]);
+        assert!(
+            buffer.paste_scanned_bytes <= 2 * input.len(),
+            "scanned {} bytes for {} byte paste",
+            buffer.paste_scanned_bytes,
+            input.len()
+        );
     }
 }

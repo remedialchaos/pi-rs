@@ -1492,3 +1492,150 @@ async fn classifies_an_expired_established_session() {
     client.close().await;
     close_servers();
 }
+
+#[tokio::test]
+async fn matches_a_streamed_response_that_echoes_the_request_id_as_a_string() {
+    let (url, recording) = start_server(Arc::new(|request, rec| {
+        Box::pin(async move {
+            if request.method != "POST" {
+                return protocol_handler(request, &rec).await;
+            }
+            let message = request.message.clone().unwrap_or(Value::Null);
+            if message.get("method").and_then(Value::as_str) != Some("tools/call") {
+                return protocol_handler(request, &rec).await;
+            }
+            rec.push(&request);
+            let id = message
+                .get("id")
+                .map(|value| match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            let (sender, receiver) = mpsc::channel::<Vec<u8>>(4);
+            let _ = sender.try_send(chunk(&format!(
+                "id: e1\nretry: 5\ndata: {}\n\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "content": [{ "type": "text", "text": "hello" }] },
+                })
+            )));
+            drop(sender);
+            TestResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: TestBody::Chunks(receiver),
+            }
+        })
+    }))
+    .await;
+    let client = client();
+    let errors: Arc<Mutex<Vec<McpErrorEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded_errors = errors.clone();
+    client.on_error(Arc::new(move |error: &McpErrorEvent| {
+        recorded_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(error.clone());
+    }));
+    client
+        .connect(
+            StreamableHttpTransport::new(StreamableHttpTransportOptions {
+                url,
+                open_get_stream: Some(false),
+                ..Default::default()
+            })
+            .expect("transport"),
+        )
+        .await
+        .expect("connect");
+    let result = client
+        .call_tool(
+            "echo",
+            Some(json!({})),
+            &McpRequestOptions {
+                timeout_ms: Some(2_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("callTool");
+    assert_eq!(
+        serde_json::to_value(&result).unwrap_or_default(),
+        json!({ "content": [{ "type": "text", "text": "hello" }] })
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    );
+    assert!(!recording.any_method("GET"));
+    client.close().await;
+    close_servers();
+}
+
+#[tokio::test]
+async fn reads_a_large_event_split_across_many_chunks_in_linear_time() {
+    let payload = "x".repeat(1024 * 1024);
+    let text = format!("data: {payload}\n\n");
+    let chunks = text
+        .as_bytes()
+        .chunks(4096)
+        .map(|slice| String::from_utf8_lossy(slice).into_owned())
+        .collect();
+    let events = collect_events(closing_stream(chunks)).await;
+    assert_eq!(
+        events,
+        vec![SseEvent {
+            event: None,
+            data: payload,
+            id: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn rejects_a_line_that_exceeds_the_limit_before_its_line_ending_arrives() {
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>(1);
+    let stream: ByteStream = Box::pin(futures_util::StreamExt::map(
+        tokio_stream::wrappers::ReceiverStream::new(receiver),
+        Ok::<_, McpFetchError>,
+    ));
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let producer = {
+        let sent = sent.clone();
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            // One data line that never ends.
+            for index in 0..1000 {
+                let bytes = if index == 0 {
+                    chunk("data: ")
+                } else {
+                    chunk("xxxxxxxxxxxxxxxx")
+                };
+                if sender.send(bytes).await.is_err() {
+                    break;
+                }
+                sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    };
+    let error = consume_sse_stream(
+        stream,
+        pi_rs_mcp::ConsumeSseOptions {
+            max_event_bytes: Some(256),
+            on_event: Arc::new(|_event: &SseEvent| {}),
+            on_id: None,
+            on_retry: None,
+        },
+    )
+    .await
+    .expect_err("unterminated line exceeds the limit");
+    assert_eq!(error, "MCP SSE event exceeds 256 bytes");
+    assert!(sent.load(std::sync::atomic::Ordering::SeqCst) < 100);
+    producer.abort();
+    close_servers();
+}
