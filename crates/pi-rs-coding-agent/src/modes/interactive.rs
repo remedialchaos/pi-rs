@@ -66,7 +66,12 @@ enum UiEvent {
     Models(u64, Vec<pi_rs_ai::Model>),
     Session(u64, Box<AgentSessionEvent>),
     Restore(u64),
-    Dialog(Option<u64>, UiDialog, DialogAnswer),
+    Dialog(
+        Option<u64>,
+        UiDialog,
+        Option<pi_rs_tui::ProgramStatusKind>,
+        DialogAnswer,
+    ),
     SecretDialog(String, DialogAnswer),
     ExtensionUpdate(Option<u64>, UiUpdate),
     DialogFinished(u64, Option<UiAnswer>),

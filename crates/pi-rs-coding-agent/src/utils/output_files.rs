@@ -69,6 +69,88 @@ pub fn write_output_file(prefix: &str, extension: &str, data: &[u8]) -> io::Resu
     Ok(path)
 }
 
+/// Where streamed output ended up: a complete file, or why it could not be saved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputFileResult {
+    Saved { path: PathBuf },
+    Failed { error: String },
+}
+
+/// An output file written while output streams in. Open and write failures (full disk, quota,
+/// unwritable temp dir) never fail the caller: the first failure drops the file instead, removes
+/// any partial file we created, and `close()` reports why.
+pub struct OutputFileStream {
+    file: Option<File>,
+    result: OutputFileResult,
+    opened: bool,
+    closed: bool,
+}
+
+impl OutputFileStream {
+    pub fn create(prefix: &str, extension: &str) -> Self {
+        match create_output_file_stream(prefix, extension) {
+            Ok((path, file)) => Self {
+                file: Some(file),
+                result: OutputFileResult::Saved { path },
+                opened: true,
+                closed: false,
+            },
+            Err(error) => Self {
+                file: None,
+                result: OutputFileResult::Failed {
+                    error: error.to_string(),
+                },
+                opened: false,
+                closed: true,
+            },
+        }
+    }
+
+    pub fn result(&self) -> &OutputFileResult {
+        &self.result
+    }
+
+    pub fn write(&mut self, data: &[u8]) {
+        if self.closed || !matches!(self.result, OutputFileResult::Saved { .. }) {
+            return;
+        }
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if let Err(error) = file.write_all(data) {
+            self.fail(error.to_string());
+        }
+    }
+
+    pub fn close(&mut self) -> OutputFileResult {
+        if !self.closed {
+            self.closed = true;
+            if let Some(mut file) = self.file.take()
+                && let Err(error) = file.flush().and_then(|()| file.sync_data().or(Ok(())))
+            {
+                self.fail(error.to_string());
+            }
+        }
+        self.result.clone()
+    }
+
+    fn fail(&mut self, error: String) {
+        let path = match &self.result {
+            OutputFileResult::Saved { path } => Some(path.clone()),
+            OutputFileResult::Failed { .. } => None,
+        };
+        self.file = None;
+        if matches!(self.result, OutputFileResult::Saved { .. }) {
+            self.result = OutputFileResult::Failed { error };
+        }
+        if self.opened
+            && let Some(path) = path
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +204,23 @@ mod tests {
             .map_err(|e| e.to_string())?;
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         assert_eq!(bytes, b"\x00\xffdata");
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn output_file_stream_saves_and_ignores_writes_after_close() -> Result<(), String> {
+        let mut stream = OutputFileStream::create("pi-test-stream", ".log");
+        stream.write(b"hello");
+        let result = stream.close();
+        stream.write(b"late");
+        let OutputFileResult::Saved { path } = result else {
+            return Err(format!("expected Saved, got {result:?}"));
+        };
+        assert_eq!(
+            std::fs::read_to_string(&path).map_err(|e| e.to_string())?,
+            "hello"
+        );
         std::fs::remove_file(&path).map_err(|e| e.to_string())?;
         Ok(())
     }

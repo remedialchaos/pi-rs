@@ -106,7 +106,12 @@ pub fn default_settings() -> Value {
         "httpIdleTimeoutMs": DEFAULT_HTTP_IDLE_TIMEOUT_MS,
         "cacheWarming": "idle",
         "hideThinkingBlock": false,
-        "showCacheMissNotices": false,
+        "notices": {
+            "cacheMisses": false,
+            "cacheWarming": false,
+            "compactionCosts": false,
+            "reasoningDrops": false
+        },
         "quietStartup": false,
         "defaultProjectTrust": "ask",
         "collapseChangelog": false,
@@ -303,6 +308,26 @@ pub fn migrate_settings(settings: &mut Map<String, Value>) {
             retry.shift_remove("maxDelayMs");
         }
     }
+
+    // Legacy showCacheMissNotices -> notices.{cacheMisses,cacheWarming,compactionCosts,reasoningDrops}
+    if let Some(Value::Bool(legacy)) = settings.shift_remove("showCacheMissNotices") {
+        let mut notices = settings
+            .get("notices")
+            .and_then(as_object)
+            .cloned()
+            .unwrap_or_default();
+        for key in [
+            "cacheMisses",
+            "cacheWarming",
+            "compactionCosts",
+            "reasoningDrops",
+        ] {
+            notices
+                .entry(key.to_string())
+                .or_insert(Value::Bool(legacy));
+        }
+        settings.insert("notices".to_string(), Value::Object(notices));
+    }
 }
 
 /// Parse a JSON object, stripping a leading BOM like upstream's `stripBom`.
@@ -423,6 +448,15 @@ pub struct SettingsManager {
     errors: Vec<SettingsError>,
     global_load_error: Option<String>,
     project_load_error: Option<String>,
+}
+
+/// Per-notice transcript toggles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoticeSettings {
+    pub cache_misses: bool,
+    pub cache_warming: bool,
+    pub compaction_costs: bool,
+    pub reasoning_drops: bool,
 }
 
 impl SettingsManager {
@@ -628,6 +662,7 @@ impl SettingsManager {
 
         let result = self.storage.with_lock(scope, |current| {
             let mut settings = parse_settings(current)?;
+            migrate_settings(&mut settings);
             set_nested_value(&mut settings, path, value.clone())?;
             let next = serde_json::to_string_pretty(&Value::Object(settings))
                 .map_err(|error| error.to_string())?;
@@ -682,6 +717,30 @@ impl SettingsManager {
             Some("final") => "final",
             _ => "streaming",
         }
+    }
+
+    pub fn get_notices(&self) -> NoticeSettings {
+        let effective = self.get();
+        let notices = effective.get("notices");
+        let get = |key: &str| {
+            notices
+                .and_then(|n| n.get(key))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        NoticeSettings {
+            cache_misses: get("cacheMisses"),
+            cache_warming: get("cacheWarming"),
+            compaction_costs: get("compactionCosts"),
+            reasoning_drops: get("reasoningDrops"),
+        }
+    }
+
+    pub fn set_notice(&mut self, key: &str, shown: bool) -> Result<(), String> {
+        self.set_value(
+            &["notices".to_string(), key.to_string()],
+            Value::Bool(shown),
+        )
     }
 
     pub fn get_shell_command_prefix(&self) -> Option<String> {
@@ -1491,6 +1550,38 @@ mod tests {
         );
         assert_eq!(manager.get_codemode_inline_budget(), 4200);
         assert!(manager.get_show_hardware_cursor());
+        Ok(())
+    }
+
+    #[test]
+    fn notices_default_false_and_migrate_legacy_setting() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let settings_path = dir.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"showCacheMissNotices": true, "notices": {"cacheWarming": false}}"#,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let mut manager =
+            SettingsManager::create_with_dirs(dir.path(), dir.path(), CreateOptions::default());
+        assert_eq!(
+            manager.get_notices(),
+            NoticeSettings {
+                cache_misses: true,
+                cache_warming: false,
+                compaction_costs: true,
+                reasoning_drops: true,
+            }
+        );
+
+        manager.set_notice("reasoningDrops", false)?;
+        let saved: Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        assert!(saved.get("showCacheMissNotices").is_none());
+        assert_eq!(saved["notices"]["reasoningDrops"], Value::Bool(false));
         Ok(())
     }
 }

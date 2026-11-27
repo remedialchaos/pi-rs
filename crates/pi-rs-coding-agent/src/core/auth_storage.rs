@@ -13,7 +13,9 @@ use indexmap::IndexMap;
 use pi_rs_ai::auth::{Credential, CredentialInfo};
 
 pub use super::resolve_config_value::is_command_config_value;
-use super::resolve_config_value::resolve_config_value_str_with_env;
+use super::resolve_config_value::{
+    clear_config_value_cache_entry, resolve_config_value_str_with_env,
+};
 use crate::lockfile::{LockOptions, lock_sync};
 use crate::utils::text::strip_bom;
 
@@ -114,12 +116,22 @@ impl AuthStorage {
         provider: &str,
         credential: Credential,
     ) -> Result<Option<Credential>, String> {
-        self.with_data_lock(|data| {
+        let written_key = match &credential {
+            Credential::ApiKey(api_key) => api_key.key.clone(),
+            _ => None,
+        };
+        let previous = self.with_data_lock(|data| {
             let previous = data.get(provider).cloned();
             let mut next = data.clone();
             next.insert(provider.to_string(), credential);
             Ok((previous, Some(next)))
-        })
+        })?;
+        // Command results are cached for the process. Saving a `!command` key, even the same one,
+        // runs it again, so signing in to a secrets manager and saving the key again recovers.
+        if let Some(key) = written_key {
+            clear_config_value_cache_entry(&key);
+        }
+        Ok(previous)
     }
 
     /// Remove a credential. Returns the removed value, if any.
@@ -404,11 +416,11 @@ mod tests {
             &path,
             r#"{"openai":{"type":"api_key","key":"old"},"google":{"type":"api_key","key":"external"}}"#,
         )?;
-        storage.set("openai", api_key("new"))?;
+        storage.set("openai", api_key("newer"))?;
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
-        assert_eq!(saved["openai"]["key"], Value::String("new".into()));
+        assert_eq!(saved["openai"]["key"], Value::String("newer".into()));
         assert_eq!(saved["google"]["key"], Value::String("external".into()));
         assert!(storage.get("google") == Some(api_key("external")));
         Ok(())
@@ -494,6 +506,38 @@ mod tests {
                     pi_rs_ai::auth::ApiKeyCredential::default()
                 ))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn command_backed_key_cache_is_cleared_when_saved_again() -> Result<(), String> {
+        let temp = root()?;
+        let path = temp.path().join("auth.json");
+        let marker = temp.path().join("key.txt");
+        let cmd = format!("!cat {}", marker.display());
+        write(
+            &path,
+            &serde_json::json!({ "anthropic": { "type": "api_key", "key": cmd } }).to_string(),
+        )?;
+        let mut storage = AuthStorage::create(path);
+        assert!(
+            storage.get("anthropic")
+                == Some(Credential::ApiKey(pi_rs_ai::auth::ApiKeyCredential {
+                    key: None,
+                    env: IndexMap::new(),
+                }))
+        );
+        std::fs::write(&marker, "fresh-key").map_err(|e| e.to_string())?;
+        // Still cached as None until saved again.
+        assert!(
+            storage.get("anthropic")
+                == Some(Credential::ApiKey(pi_rs_ai::auth::ApiKeyCredential {
+                    key: None,
+                    env: IndexMap::new(),
+                }))
+        );
+        storage.set("anthropic", api_key(&cmd))?;
+        assert!(storage.get("anthropic") == Some(api_key("fresh-key")));
         Ok(())
     }
 }

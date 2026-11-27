@@ -311,12 +311,18 @@ pub fn show_images_items() -> Vec<PickerItem<bool>> {
     ]
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthPickerStatus {
+    Configured(AuthCheck),
+    Unresolved,
+}
+
 pub struct AuthPickerProvider<'a> {
     pub id: &'a str,
     pub name: &'a str,
     pub method_name: Option<&'a str>,
     pub auth_type: AuthType,
-    pub status: Option<&'a AuthCheck>,
+    pub status: Option<&'a AuthPickerStatus>,
     pub subscription: Option<bool>,
 }
 
@@ -362,11 +368,16 @@ pub fn auth_provider_items(
             }
             match status {
                 None => label.push_str(" • not configured"),
-                Some(status) if status.auth_type != auth_type => label.push_str(&format!(
-                    " • {} configured",
-                    auth_provider_type(status.auth_type, subscription)
-                )),
-                Some(status) => match status.source.as_deref() {
+                Some(AuthPickerStatus::Unresolved) => {
+                    label.push_str(" • stored key did not resolve")
+                }
+                Some(AuthPickerStatus::Configured(status)) if status.auth_type != auth_type => {
+                    label.push_str(&format!(
+                        " • {} configured",
+                        auth_provider_type(status.auth_type, subscription)
+                    ))
+                }
+                Some(AuthPickerStatus::Configured(status)) => match status.source.as_deref() {
                     None | Some("OAuth" | "stored credential") => label.push_str(" ✓ configured"),
                     Some(source) if is_env_names(source) => {
                         label.push_str(&format!(" ✓ env: {source}"))

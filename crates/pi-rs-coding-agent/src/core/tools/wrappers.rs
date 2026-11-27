@@ -226,6 +226,10 @@ fn bash_details(details: &super::bash::BashDetails) -> Value {
             "fullOutputPath",
             details.full_output_path.as_ref().map(|path| json!(path)),
         ),
+        (
+            "fullOutputError",
+            details.full_output_error.as_ref().map(|err| json!(err)),
+        ),
     ])
 }
 
@@ -418,6 +422,9 @@ fn shell_structured_output(output: &super::bash::BashOutput) -> Value {
     });
     if let Some(path) = &output.full_output_path {
         value["full_output_path"] = json!(path);
+    }
+    if let Some(error) = &output.full_output_error {
+        value["full_output_error"] = json!(error);
     }
     value
 }

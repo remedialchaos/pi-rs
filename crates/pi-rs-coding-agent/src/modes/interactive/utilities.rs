@@ -24,4 +24,4 @@ pub use presentation::{
     key_display_text, key_hint, key_text, pi_logo_lines, pi_wordmark, provider_brand, raw_key_hint,
     supports_pi_logo,
 };
-pub use status::{BlockedStatus, ProgramStatusReporter};
+pub use status::{BlockedStatus, ProgramStatusReporter, dialog_blocked_status};

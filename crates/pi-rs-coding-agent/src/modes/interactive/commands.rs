@@ -1332,16 +1332,29 @@ fn show_auth(ui: &mut Frontend, logout: bool) -> Result<(), String> {
     } else {
         let mut providers = auth_command::auth_providers(&ui.options.agent_dir)?;
         providers.sort_by(|a, b| a.name.cmp(&b.name));
+        let storage =
+            crate::core::auth_storage::AuthStorage::create(ui.options.agent_dir.join("auth.json"));
         let configured: std::collections::HashMap<_, _> = credentials
             .into_iter()
             .map(|credential| {
-                (
-                    credential.provider_id,
-                    AuthCheck {
+                let unresolved = credential.auth_type == AuthType::ApiKey
+                    && matches!(
+                        storage.data().get(&credential.provider_id),
+                        Some(pi_rs_ai::auth::Credential::ApiKey(raw)) if raw.key.is_some()
+                    )
+                    && matches!(
+                        storage.get(&credential.provider_id),
+                        Some(pi_rs_ai::auth::Credential::ApiKey(resolved)) if resolved.key.is_none()
+                    );
+                let status = if unresolved {
+                    selectors::AuthPickerStatus::Unresolved
+                } else {
+                    selectors::AuthPickerStatus::Configured(AuthCheck {
                         source: Some("stored credential".into()),
                         auth_type: credential.auth_type,
-                    },
-                )
+                    })
+                };
+                (credential.provider_id, status)
             })
             .collect();
         let mut methods = Vec::new();
@@ -1698,6 +1711,7 @@ async fn execute_bash(
             cancelled: result["cancelled"].as_bool().unwrap_or(false),
             truncated: result["truncated"].as_bool().unwrap_or(false),
             full_output_path: result["fullOutputPath"].as_str().map(str::to_owned),
+            full_output_error: result["fullOutputError"].as_str().map(str::to_owned),
         }
     } else {
         let settings = bound.session.settings();
@@ -1736,6 +1750,9 @@ async fn execute_bash(
     }
     if let Some(path) = &result.full_output_path {
         fields.insert("fullOutputPath".into(), json!(path));
+    }
+    if let Some(error) = &result.full_output_error {
+        fields.insert("fullOutputError".into(), json!(error));
     }
     let message =
         AgentMessage::custom("bashExecution", fields).map_err(|error| error.to_string())?;

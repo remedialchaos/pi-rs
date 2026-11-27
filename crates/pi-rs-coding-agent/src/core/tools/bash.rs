@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use pi_rs_agent::CancellationToken;
 use serde::Deserialize;
@@ -55,6 +55,7 @@ pub struct BashOutput {
     pub output: String,
     pub truncated: bool,
     pub full_output_path: Option<String>,
+    pub full_output_error: Option<String>,
     pub exit_code: i32,
     pub wall_time_seconds: f64,
 }
@@ -63,6 +64,7 @@ pub struct BashOutput {
 pub struct BashDetails {
     pub truncation: Option<TruncationResult>,
     pub full_output_path: Option<String>,
+    pub full_output_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,20 +129,21 @@ fn last_line_bytes(output: &str) -> usize {
 }
 
 fn persist_full_output(prefix: &str, content: &str) -> Result<String, String> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}.txt", std::process::id()));
-    std::fs::write(&path, content.as_bytes())
-        .map_err(|error| format!("Failed to persist full output: {error}"))?;
-    Ok(path.to_string_lossy().into_owned())
+    let mut stream = crate::utils::output_files::OutputFileStream::create(prefix, ".txt");
+    stream.write(content.as_bytes());
+    match stream.close() {
+        crate::utils::output_files::OutputFileResult::Saved { path } => {
+            Ok(path.to_string_lossy().into_owned())
+        }
+        crate::utils::output_files::OutputFileResult::Failed { error } => Err(error),
+    }
 }
 
 fn format_output(
     snapshot: &TruncationResult,
     full_output: &str,
     full_output_path: Option<&str>,
+    full_output_error: Option<&str>,
 ) -> (String, Option<BashDetails>) {
     let mut text = if snapshot.content.is_empty() {
         "(no output)".to_string()
@@ -154,24 +157,32 @@ fn format_output(
     let details = BashDetails {
         truncation: Some(snapshot.clone()),
         full_output_path: full_output_path.map(str::to_string),
+        full_output_error: full_output_error.map(str::to_string),
     };
     let start_line = snapshot.total_lines.saturating_sub(snapshot.output_lines) + 1;
     let end_line = snapshot.total_lines;
-    let path = full_output_path.unwrap_or("(no output path)");
+    let full_output_note = if let Some(err) = full_output_error {
+        format!("Could not save the full output: {err}")
+    } else {
+        format!(
+            "Full output: {}",
+            full_output_path.unwrap_or("(no output path)")
+        )
+    };
     if snapshot.last_line_partial {
         text.push_str(&format!(
-            "\n\n[Showing last {} of line {start_line} (line is {}). Full output: {path}]",
+            "\n\n[Showing last {} of line {start_line} (line is {}). {full_output_note}]",
             format_size(snapshot.output_bytes),
             format_size(last_line_bytes(full_output))
         ));
     } else if snapshot.truncated_by == super::truncate::TruncatedBy::Lines {
         text.push_str(&format!(
-            "\n\n[Showing lines {start_line}-{end_line} of {}. Full output: {path}]",
+            "\n\n[Showing lines {start_line}-{end_line} of {}. {full_output_note}]",
             snapshot.total_lines
         ));
     } else {
         text.push_str(&format!(
-            "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit). Full output: {path}]",
+            "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit). {full_output_note}]",
             snapshot.total_lines,
             format_size(DEFAULT_MAX_BYTES)
         ));
@@ -425,12 +436,20 @@ pub async fn execute_shell_with(
     let full_output = String::from_utf8_lossy(&combined).into_owned();
 
     let snapshot = truncate_tail(&full_output, &TruncationOptions::default());
-    let full_output_path = if snapshot.truncated {
-        persist_full_output(temp_file_prefix, &full_output).ok()
+    let (full_output_path, full_output_error) = if snapshot.truncated {
+        match persist_full_output(temp_file_prefix, &full_output) {
+            Ok(path) => (Some(path), None),
+            Err(error) => (None, Some(error)),
+        }
     } else {
-        None
+        (None, None)
     };
-    let (text, details) = format_output(&snapshot, &full_output, full_output_path.as_deref());
+    let (text, details) = format_output(
+        &snapshot,
+        &full_output,
+        full_output_path.as_deref(),
+        full_output_error.as_deref(),
+    );
 
     match outcome {
         ShellWaitOutcome::Aborted => Err(append_status(&text, "Command aborted")),
@@ -445,6 +464,7 @@ pub async fn execute_shell_with(
                     output: full_output,
                     truncated: snapshot.truncated,
                     full_output_path,
+                    full_output_error,
                     exit_code: -1,
                     wall_time_seconds,
                 },
@@ -458,8 +478,9 @@ pub async fn execute_shell_with(
             let (structured_output_text, structured_truncated) = structured_output(&full_output);
             let structured = BashOutput {
                 output: structured_output_text,
-                truncated: structured_truncated || snapshot.truncated,
-                full_output_path: full_output_path.clone(),
+                truncated: structured_truncated,
+                full_output_path: structured_truncated.then_some(full_output_path).flatten(),
+                full_output_error: structured_truncated.then_some(full_output_error).flatten(),
                 exit_code,
                 wall_time_seconds,
             };
@@ -604,7 +625,7 @@ mod tests {
                 max_bytes: None,
             },
         );
-        let (text, details) = format_output(&snapshot, "a\nb", Some("/tmp/full.txt"));
+        let (text, details) = format_output(&snapshot, "a\nb", Some("/tmp/full.txt"), None);
         assert!(text.contains("Full output: /tmp/full.txt"));
         assert!(details.is_some());
     }

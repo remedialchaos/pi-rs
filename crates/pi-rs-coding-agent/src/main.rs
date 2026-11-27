@@ -190,6 +190,7 @@ async fn run(argv: &[String]) -> Result<u8, String> {
                 ("Continue in the current working directory".into(), false),
                 ("Fork into the current working directory".into(), true),
             ],
+            None,
         )
         .await?;
         manager = match choice {

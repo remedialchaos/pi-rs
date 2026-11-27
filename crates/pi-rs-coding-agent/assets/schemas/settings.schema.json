@@ -214,8 +214,8 @@
     },
     "showCacheMissNotices": {
       "type": "boolean",
-      "description": "Show cache cost and provider recovery notices.",
-      "default": false
+      "description": "Legacy notice setting. Use notices instead.",
+      "deprecated": true
     },
     "externalEditor": {
       "type": "string",
@@ -620,6 +620,31 @@
         "anthropicExtraUsage": {
           "type": "boolean",
           "default": true
+        }
+      }
+    },
+    "notices": {
+      "type": "object",
+      "properties": {
+        "cacheMisses": {
+          "type": "boolean",
+          "description": "Show a notice when a response re-bills a significant part of the prompt cache.",
+          "default": false
+        },
+        "cacheWarming": {
+          "type": "boolean",
+          "description": "Show the cost of cache warming requests.",
+          "default": false
+        },
+        "compactionCosts": {
+          "type": "boolean",
+          "description": "Show the cost of compactions and branch summaries.",
+          "default": false
+        },
+        "reasoningDrops": {
+          "type": "boolean",
+          "description": "Show a notice when a provider drops reasoning items from a request.",
+          "default": false
         }
       }
     },

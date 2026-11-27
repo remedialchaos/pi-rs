@@ -57,6 +57,7 @@ impl LoginTerminal for LoginUi {
         let options = UiDialogOptions {
             cancel: Some(signal.clone()),
             timeout_ms: None,
+            blocked_kind: None,
         };
         match self
             .0

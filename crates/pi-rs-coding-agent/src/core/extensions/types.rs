@@ -1182,11 +1182,12 @@ pub struct ExtensionContext {
     pub compact: Arc<dyn Fn(Option<Value>) + Send + Sync>,
 }
 
-/// An optional timeout and cancellation signal for a host dialog.
+/// An optional timeout, cancellation signal, and blocked status kind for a host dialog.
 #[derive(Clone, Default)]
 pub struct UiDialogOptions {
     pub timeout_ms: Option<u64>,
     pub cancel: Option<pi_rs_agent::CancellationToken>,
+    pub blocked_kind: Option<pi_rs_tui::ProgramStatusKind>,
 }
 
 pub enum UiDialog {

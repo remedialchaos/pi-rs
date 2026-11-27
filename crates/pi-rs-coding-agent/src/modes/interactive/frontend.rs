@@ -473,13 +473,24 @@ impl Frontend {
         )
     }
 
-    fn show_dialog(&mut self, dialog: UiDialog, answer: DialogAnswer) {
+    fn show_dialog(
+        &mut self,
+        dialog: UiDialog,
+        blocked_kind: Option<pi_rs_tui::ProgramStatusKind>,
+        answer: DialogAnswer,
+    ) {
         if answer.is_closed() {
             return;
         }
         let id = self.next_dialog;
         self.next_dialog += 1;
         let events = self.send.clone();
+        let default_kind = if matches!(dialog, UiDialog::Confirm(..)) {
+            pi_rs_tui::ProgramStatusKind::Permission
+        } else {
+            pi_rs_tui::ProgramStatusKind::Question
+        };
+        let kind = blocked_kind.unwrap_or(default_kind);
         let title = match &dialog {
             UiDialog::Select(title, _)
             | UiDialog::Confirm(title, _)
@@ -529,10 +540,7 @@ impl Frontend {
         self.dialogs.push(DialogEntry { id, handle, answer });
         self.blocked(
             id,
-            Some(super::utilities::BlockedStatus {
-                kind: pi_rs_tui::ProgramStatusKind::Question,
-                message: title,
-            }),
+            Some(super::utilities::dialog_blocked_status(kind, &title)),
         );
     }
 
@@ -938,10 +946,10 @@ impl Frontend {
                     self.refreshed_models = models;
                 }
             }
-            UiEvent::Dialog(generation, dialog, answer)
+            UiEvent::Dialog(generation, dialog, blocked_kind, answer)
                 if generation.is_none_or(|id| id == self.bound.generation) =>
             {
-                self.show_dialog(dialog, answer)
+                self.show_dialog(dialog, blocked_kind, answer)
             }
             UiEvent::SecretDialog(title, answer) => self.show_secret(title, answer),
             UiEvent::ExtensionUpdate(generation, update)

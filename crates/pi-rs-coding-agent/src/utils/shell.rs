@@ -64,7 +64,50 @@ pub fn find_executable_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Resolve the shell, preferring an explicit path, then the environment, then platform defaults.
+/// Map `git var GIT_SHELL_PATH` output (`<root>/usr/bin/sh.exe`) to `<root>\bin\bash.exe`.
+pub fn resolve_git_for_windows_bash_path(git_shell_path: &str) -> Option<String> {
+    let normalized = git_shell_path.trim().replace('/', "\\");
+    let suffix = "\\usr\\bin\\sh.exe";
+    let lower = normalized.to_ascii_lowercase();
+    if !lower.ends_with(suffix) {
+        return None;
+    }
+    let root = &normalized[..normalized.len() - suffix.len()];
+    if root.is_empty() {
+        return None;
+    }
+    Some(format!("{root}\\bin\\bash.exe"))
+}
+
+#[cfg(any(windows, test))]
+fn find_git_bash_of_git_on_path_with(
+    find_on_path: impl Fn(&str) -> Option<PathBuf>,
+    run_git_var: impl Fn(&Path) -> Option<String>,
+    exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let git = find_on_path("git.exe")?;
+    let git_shell = run_git_var(&git)?;
+    let bash = resolve_git_for_windows_bash_path(&git_shell)?;
+    exists(&bash).then_some(bash)
+}
+
+#[cfg(windows)]
+fn find_git_bash_of_git_on_path() -> Option<String> {
+    find_git_bash_of_git_on_path_with(
+        find_executable_on_path,
+        |git| {
+            let output = std::process::Command::new(git)
+                .args(["var", "GIT_SHELL_PATH"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        },
+        executable_exists,
+    )
+}
 pub fn get_shell_config(custom_shell_path: Option<&str>) -> Result<ShellConfig, String> {
     if let Some(path) = custom_shell_path {
         if !executable_exists(path) {
@@ -111,6 +154,9 @@ pub fn get_shell_config(custom_shell_path: Option<&str>) -> Result<ShellConfig, 
                 }
             }
         }
+        if let Some(git_bash) = find_git_bash_of_git_on_path() {
+            return Ok(bash_config(git_bash));
+        }
         if let Some(path) = find_executable_on_path("bash.exe") {
             return Ok(bash_config(path.to_string_lossy().into_owned()));
         }
@@ -129,6 +175,7 @@ pub fn get_shell_config(custom_shell_path: Option<&str>) -> Result<ShellConfig, 
             message.push_str("\n  ");
             message.push_str(&path);
         }
+        message.push_str("\n  the Git for Windows installation of git.exe on PATH");
         Err(message)
     }
 
@@ -352,5 +399,30 @@ mod tests {
         assert!(!config.shell.is_empty());
         assert!(!config.args.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn resolves_git_for_windows_bash_from_git_shell_path() {
+        assert_eq!(
+            resolve_git_for_windows_bash_path("G:/Programmi Aggiuntivi/Git/usr/bin/sh.exe\n")
+                .as_deref(),
+            Some("G:\\Programmi Aggiuntivi\\Git\\bin\\bash.exe")
+        );
+        assert_eq!(resolve_git_for_windows_bash_path("G:/Tools/sh.exe"), None);
+        assert_eq!(resolve_git_for_windows_bash_path("/usr/bin/sh.exe"), None);
+
+        let found = find_git_bash_of_git_on_path_with(
+            |name| (name == "git.exe").then(|| PathBuf::from("G:\\Git\\cmd\\git.exe")),
+            |_| Some("G:/Git/usr/bin/sh.exe\n".into()),
+            |path| path == "G:\\Git\\bin\\bash.exe",
+        );
+        assert_eq!(found.as_deref(), Some("G:\\Git\\bin\\bash.exe"));
+
+        let missing_launcher = find_git_bash_of_git_on_path_with(
+            |_| Some(PathBuf::from("G:\\Git\\cmd\\git.exe")),
+            |_| Some("G:/Git/usr/bin/sh.exe\n".into()),
+            |_| false,
+        );
+        assert_eq!(missing_launcher, None);
     }
 }

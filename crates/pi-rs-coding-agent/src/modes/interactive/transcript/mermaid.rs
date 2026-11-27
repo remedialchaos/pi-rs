@@ -121,7 +121,44 @@ pub(super) fn transform<'a>(
     let mut list_indent = None;
     let mut replace = |span: std::ops::Range<usize>, body: &str| {
         let replacement = match render(body, width) {
-            Ok(Some(art)) if art.width() <= width => art.into_markdown(theme),
+            Ok(Some(art)) => {
+                let needed = art.width();
+                if needed <= width {
+                    art.into_markdown(theme)
+                } else if !streaming {
+                    let mut original = text[span.clone()].trim_end().to_owned();
+                    original.push_str("\n\n");
+                    code_span(
+                        &theme.fg(
+                            "warning",
+                            &format!("Mermaid diagram not rendered: needs {needed} columns, {width} available"),
+                        ),
+                        &mut original,
+                    );
+                    original
+                } else {
+                    return;
+                }
+            }
+            Ok(None) if !streaming && width > 0 => {
+                let Ok(Some(full)) = render(body, usize::MAX) else {
+                    return;
+                };
+                let needed = full.width();
+                if needed <= width {
+                    return;
+                }
+                let mut original = text[span.clone()].trim_end().to_owned();
+                original.push_str("\n\n");
+                code_span(
+                    &theme.fg(
+                        "warning",
+                        &format!("Mermaid diagram not rendered: needs {needed} columns, {width} available"),
+                    ),
+                    &mut original,
+                );
+                original
+            }
             Err(warning) if !streaming => {
                 let mut original = text[span.clone()].trim_end().to_owned();
                 original.push_str("\n\n");
@@ -337,7 +374,12 @@ mod tests {
         let theme = Theme::load(std::path::Path::new("."), Some("dark"))
             .map_err(|_| "failed to load dark theme")?;
         let narrow = transform(&theme, &fenced, 20, MermaidMode::Final, false);
-        assert_eq!(narrow.as_ref(), fenced);
+        assert!(narrow.contains("subgraph Edge"));
+        assert!(narrow.contains("Mermaid diagram not rendered: needs "));
+        assert!(narrow.contains("20 available"));
+
+        let narrow_streaming = transform(&theme, &fenced, 20, MermaidMode::Streaming, true);
+        assert_eq!(narrow_streaming.as_ref(), fenced);
 
         let unclosed = "flowchart LR\n  subgraph Unclosed\n    A --> B\n";
         assert_eq!(render(unclosed, 80).err(), Some("unclosed subgraph"));

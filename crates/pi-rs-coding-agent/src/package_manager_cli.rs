@@ -1504,17 +1504,34 @@ fn managed_root_at(root: &Path, package_dir: &Path) -> Result<Option<PathBuf>, S
         return Ok(None);
     }
     let marker = root.join("managed-install.json");
-    let valid = read_json(&marker).is_some_and(|marker| {
+    let marker_json = read_json(&marker).filter(|marker| {
         marker["kind"] == "pi-managed-install"
             && marker["schemaVersion"] == 1
             && marker["layout"] == "releases-v1"
     });
-    if !valid {
+    let Some(marker_json) = marker_json else {
         return Err(format!(
             "Managed install marker is missing or invalid: {}",
             marker.display()
         ));
+    };
+    #[cfg(not(windows))]
+    if let Some(entrypoint) = marker_json
+        .pointer("/entrypoint/path")
+        .and_then(Value::as_str)
+        && ((entrypoint.len() >= 3
+            && entrypoint.as_bytes()[0].is_ascii_alphabetic()
+            && entrypoint.as_bytes()[1] == b':'
+            && entrypoint.as_bytes()[2] == b'\\')
+            || entrypoint.starts_with("\\\\"))
+    {
+        return Err(format!(
+            "This is the Windows installation of {}, run from WSL. Running the Windows installation from WSL is unsupported, so it cannot update itself here. Update it from Windows, or install {} in WSL.",
+            config::APP_NAME,
+            config::APP_NAME
+        ));
     }
+    let _ = marker_json;
     Ok(Some(root.to_path_buf()))
 }
 
@@ -2562,6 +2579,23 @@ mod tests {
             r#"{"kind":"pi-managed-install","schemaVersion":1,"layout":"releases-v1"}"#,
         )?;
         assert_eq!(managed_root_at(&root, &package)?, Some(root.clone()));
+
+        #[cfg(not(windows))]
+        {
+            fs::write(
+                root.join("managed-install.json"),
+                r#"{"kind":"pi-managed-install","schemaVersion":1,"layout":"releases-v1","entrypoint":{"type":"script","path":"C:\\Users\\user\\.pi\\agent\\bin\\pi.cmd"}}"#,
+            )?;
+            let err = managed_root_at(&root, &package).unwrap_err();
+            assert!(
+                err.contains("Running the Windows installation from WSL is unsupported"),
+                "{err}"
+            );
+            fs::write(
+                root.join("managed-install.json"),
+                r#"{"kind":"pi-managed-install","schemaVersion":1,"layout":"releases-v1"}"#,
+            )?;
+        }
         let stashed = root.join("staging/update-old");
         fs::create_dir_all(&stashed)?;
         let guard = managed_lock(&root)?;

@@ -1036,6 +1036,7 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
                 super::types::UiDialogOptions {
                     timeout_ms,
                     cancel: None,
+                    blocked_kind: None,
                 },
             )
             .await
@@ -1055,6 +1056,7 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
                     super::types::UiDialogOptions {
                         timeout_ms,
                         cancel: None,
+                        blocked_kind: None,
                     },
                 )
                 .await
@@ -1077,6 +1079,7 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
                 super::types::UiDialogOptions {
                     timeout_ms,
                     cancel: None,
+                    blocked_kind: None,
                 },
             )
             .await

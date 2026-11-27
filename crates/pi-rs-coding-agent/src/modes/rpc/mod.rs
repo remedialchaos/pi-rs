@@ -880,6 +880,7 @@ impl Server<'_> {
                 cancelled,
                 truncated,
                 full_output_path,
+                full_output_error,
             } = result?;
             let mut data = json!({ "output": output });
             if let Some(exit_code) = exit_code {
@@ -889,6 +890,9 @@ impl Server<'_> {
             data["truncated"] = json!(truncated);
             if let Some(path) = full_output_path {
                 data["fullOutputPath"] = json!(path);
+            }
+            if let Some(error) = full_output_error {
+                data["fullOutputError"] = json!(error);
             }
             data
         };

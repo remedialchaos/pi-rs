@@ -34,6 +34,8 @@ pub struct BashExecutionMessage {
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_output_error: Option<String>,
     pub timestamp: u64,
     /// Set by the `!!` prefix; keeps the message out of LLM context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,10 +102,14 @@ impl BashExecutionMessage {
         {
             text.push_str(&format!("\n\nCommand exited with code {code}"));
         }
-        if self.truncated
-            && let Some(path) = &self.full_output_path
-        {
-            text.push_str(&format!("\n\n[Output truncated. Full output: {path}]"));
+        if self.truncated {
+            text.push_str(&format!(
+                "\n\n[{}]",
+                bash_truncation_note(
+                    self.full_output_path.as_deref(),
+                    self.full_output_error.as_deref()
+                )
+            ));
         }
         text
     }
@@ -122,11 +128,28 @@ impl BashExecutionMessage {
         if let Some(path) = &self.full_output_path {
             fields.insert("fullOutputPath".into(), Value::String(path.clone()));
         }
+        if let Some(error) = &self.full_output_error {
+            fields.insert("fullOutputError".into(), Value::String(error.clone()));
+        }
         fields.insert("timestamp".into(), Value::from(self.timestamp));
         if let Some(excluded) = self.exclude_from_context {
             fields.insert("excludeFromContext".into(), Value::Bool(excluded));
         }
         AgentMessage::custom("bashExecution", fields).map_err(|error| error.to_string())
+    }
+}
+
+/// What a truncated bash execution says about its full output: where it is, or why it could not be saved.
+pub fn bash_truncation_note(
+    full_output_path: Option<&str>,
+    full_output_error: Option<&str>,
+) -> String {
+    if let Some(path) = full_output_path {
+        format!("Output truncated. Full output: {path}")
+    } else if let Some(error) = full_output_error {
+        format!("Output truncated. Could not save the full output: {error}")
+    } else {
+        "Output truncated".to_string()
     }
 }
 
@@ -358,6 +381,11 @@ fn custom_agent_to_llm(
                     .get("fullOutputPath")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                full_output_error: custom
+                    .fields
+                    .get("fullOutputError")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 timestamp,
                 exclude_from_context: None,
             }
@@ -450,6 +478,7 @@ mod tests {
             cancelled: false,
             truncated: false,
             full_output_path: None,
+            full_output_error: None,
             timestamp: 42,
             exclude_from_context: None,
         }
@@ -608,5 +637,18 @@ mod tests {
         assert_eq!(bash_command_from_text("!ls"), Some("ls"));
         assert_eq!(bash_command_from_text("!"), None);
         assert_eq!(bash_command_from_text("plain"), None);
+    }
+
+    #[test]
+    fn bash_truncation_note_covers_path_error_and_neither() {
+        assert_eq!(
+            bash_truncation_note(Some("/tmp/out.log"), None),
+            "Output truncated. Full output: /tmp/out.log"
+        );
+        assert_eq!(
+            bash_truncation_note(None, Some("ENOSPC: no space")),
+            "Output truncated. Could not save the full output: ENOSPC: no space"
+        );
+        assert_eq!(bash_truncation_note(None, None), "Output truncated");
     }
 }

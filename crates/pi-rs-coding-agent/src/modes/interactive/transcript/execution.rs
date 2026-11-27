@@ -391,6 +391,7 @@ pub(super) struct Bash {
     excluded: bool,
     truncated: bool,
     full_output_path: Option<String>,
+    full_output_error: Option<String>,
     trailing_cr: bool,
 }
 
@@ -410,6 +411,7 @@ impl Bash {
             excluded,
             truncated: false,
             full_output_path: None,
+            full_output_error: None,
             trailing_cr: false,
         }
     }
@@ -426,6 +428,7 @@ impl Bash {
             excluded: message.exclude_from_context.unwrap_or_default(),
             truncated: message.truncated,
             full_output_path: message.full_output_path,
+            full_output_error: message.full_output_error,
             trailing_cr: false,
         }
     }
@@ -458,6 +461,7 @@ impl Bash {
                 };
                 self.truncated = result.truncated;
                 self.full_output_path.clone_from(&result.full_output_path);
+                self.full_output_error.clone_from(&result.full_output_error);
             }
             Err(error) => self.status = BashStatus::Failed(clean(error).into_owned()),
         }
@@ -497,10 +501,17 @@ impl Bash {
         if let Some(status) = status {
             rows.extend(text_rows(&status, ctx.width, ctx.pad));
         }
-        if (self.truncated || report.truncated)
-            && let Some(path) = &self.full_output_path
-        {
-            let message = format!("Output truncated. Full output: {}", clean(path));
+        if self.truncated || report.truncated {
+            let message = crate::core::messages::bash_truncation_note(
+                self.full_output_path
+                    .as_deref()
+                    .map(|p| clean(p))
+                    .as_deref(),
+                self.full_output_error
+                    .as_deref()
+                    .map(|e| clean(e))
+                    .as_deref(),
+            );
             rows.extend(text_rows(
                 &theme.fg("warning", &message),
                 ctx.width,

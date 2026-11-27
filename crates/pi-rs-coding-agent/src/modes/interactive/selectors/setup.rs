@@ -246,17 +246,12 @@ pub fn trust_picker(
         .hint("↑↓ navigate · Enter save · Esc cancel")
 }
 
-const THEMES: [(&str, &str); 3] = [
-    ("system", "System (matches your terminal colors)"),
-    ("dark", "Dark"),
-    ("light", "Light"),
-];
+pub const FIRST_TIME_SETUP_QUESTION: &str = "Opt-in to anonymous usage data sharing?";
+
 const ANALYTICS: [&str; 2] = ["Share anonymous usage data", "Don't share"];
-const SETUP_LOGO_LINES: [&str; 4] = ["██████", "██  ██", "████  ██", "██    ██"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirstTimeSetupResult {
-    pub theme: &'static str,
     pub share_analytics: bool,
 }
 
@@ -264,8 +259,6 @@ type SetupComplete = Box<dyn FnMut(Option<FirstTimeSetupResult>)>;
 
 pub struct FirstTimeSetup {
     picker: Picker,
-    theme: Theme,
-    chosen_theme: Option<&'static str>,
     result: Rc<Cell<Option<Option<usize>>>>,
     complete: SetupComplete,
 }
@@ -274,32 +267,31 @@ impl FirstTimeSetup {
     pub fn new(theme: Theme, complete: impl FnMut(Option<FirstTimeSetupResult>) + 'static) -> Self {
         let result = Rc::new(Cell::new(None));
         let selection = Rc::clone(&result);
-        let preview = theme.clone();
+        let mode = if pi_rs_tui::get_capabilities().true_color {
+            pi_rs_tui::TerminalColorMode::Truecolor
+        } else {
+            pi_rs_tui::TerminalColorMode::Color256
+        };
+        let logo = if crate::modes::interactive::utilities::supports_pi_logo() {
+            crate::modes::interactive::utilities::pi_logo_lines(mode).join("\n")
+        } else {
+            crate::modes::interactive::utilities::pi_wordmark(mode)
+        };
         let picker = Picker::new(
             format!(
-                "{}\nWelcome to {APP_NAME}, the minimal coding agent.",
-                SETUP_LOGO_LINES.join("\n")
+                "{logo}\n\n{}\n\n{FIRST_TIME_SETUP_QUESTION}",
+                theme.fg("accent", &format!("Welcome to {APP_NAME}, the minimal coding agent.")),
             ),
-            THEMES
-                .iter()
-                .map(|(_, label)| (*label).to_owned())
-                .collect(),
-            theme.clone(),
+            ANALYTICS.iter().map(|label| (*label).to_owned()).collect(),
+            theme,
             move |index| selection.set(Some(index)),
         )
-        .description("Pick a theme.")
+        .description("Opting in stores a tracking identifier in settings.json and enables anonymous\nusage analytics. This helps us to better debug, reproduce, and resolve issues\nand bugs within Pi. You can observe what is shared using /privacy and make\nchanges anytime in settings.json.")
         .without_filter()
         .without_wrap()
-        .hint("↑↓ navigate · Enter continue · Esc skip setup")
-        .on_highlight(move |index| {
-            if let Some((name, _)) = THEMES.get(index) {
-                let _ = preview.select(name);
-            }
-        });
+        .hint("↑↓ navigate · Enter finish · Esc skip setup");
         Self {
             picker,
-            theme,
-            chosen_theme: None,
             result,
             complete: Box::new(complete),
         }
@@ -316,25 +308,11 @@ impl Component for FirstTimeSetup {
         let Some(index) = self.result.take() else {
             return;
         };
-        match (self.chosen_theme, index) {
-            (_, None) => (self.complete)(None),
-            (Some(theme), Some(index)) => (self.complete)(Some(FirstTimeSetupResult {
-                theme,
+        match index {
+            None => (self.complete)(None),
+            Some(index) => (self.complete)(Some(FirstTimeSetupResult {
                 share_analytics: index == 0,
             })),
-            (None, Some(index)) => {
-                let Some((theme, _)) = THEMES.get(index) else {
-                    return;
-                };
-                self.chosen_theme = Some(theme);
-                let selection = Rc::clone(&self.result);
-                let focused = self.picker.is_focused();
-                self.picker = Picker::new("Opt-in to anonymous usage data sharing?".into(), ANALYTICS.iter().map(|label| (*label).to_owned()).collect(), self.theme.clone(), move |index| selection.set(Some(index)))
-                    .description("Opting in stores a tracking identifier in settings.json and enables anonymous\nusage analytics. This helps us to better debug, reproduce, and resolve issues\nand bugs within Pi. You can observe what is shared using /privacy and make\nchanges anytime in settings.json.")
-                    .without_filter().without_wrap()
-                    .hint("↑↓ navigate · Enter finish · Esc skip setup");
-                self.picker.set_focused(focused);
-            }
         }
     }
 
@@ -354,15 +332,47 @@ mod tests {
     fn first_time_setup_renders_logo_and_analytics_prompt() -> Result<(), String> {
         let theme = Theme::load(std::path::Path::new("/nonexistent-agent-dir"), Some("dark"))
             .map_err(|e| e.to_string())?;
-        let mut setup = FirstTimeSetup::new(theme, |_| {});
+        let setup = FirstTimeSetup::new(theme, |_| {});
         let rendered = setup.render(80).join("\n");
-        assert!(rendered.contains(SETUP_LOGO_LINES[0]));
         assert!(rendered.contains("minimal coding agent"));
+        assert!(rendered.contains(FIRST_TIME_SETUP_QUESTION));
+        assert!(rendered.contains("/privacy"));
+        assert!(!rendered.contains("Pick a theme."));
+        Ok(())
+    }
 
+    #[test]
+    fn first_time_setup_submits_and_cancels() -> Result<(), String> {
+        let theme = Theme::load(std::path::Path::new("/nonexistent-agent-dir"), Some("dark"))
+            .map_err(|e| e.to_string())?;
+        let submitted = Rc::new(Cell::new(None));
+        let sink = Rc::clone(&submitted);
+        let mut setup = FirstTimeSetup::new(theme.clone(), move |res| sink.set(Some(res)));
         setup.handle_input("\r");
-        let analytics = setup.render(80).join("\n");
-        assert!(analytics.contains("Opt-in to anonymous usage data sharing?"));
-        assert!(analytics.contains("/privacy"));
+        assert_eq!(
+            submitted.take(),
+            Some(Some(FirstTimeSetupResult {
+                share_analytics: true
+            }))
+        );
+
+        let submitted = Rc::new(Cell::new(None));
+        let sink = Rc::clone(&submitted);
+        let mut setup = FirstTimeSetup::new(theme.clone(), move |res| sink.set(Some(res)));
+        setup.handle_input("\x1b[B");
+        setup.handle_input("\r");
+        assert_eq!(
+            submitted.take(),
+            Some(Some(FirstTimeSetupResult {
+                share_analytics: false
+            }))
+        );
+
+        let submitted = Rc::new(Cell::new(None));
+        let sink = Rc::clone(&submitted);
+        let mut setup = FirstTimeSetup::new(theme, move |res| sink.set(Some(res)));
+        setup.handle_input("\x1b");
+        assert_eq!(submitted.take(), Some(None));
         Ok(())
     }
 }

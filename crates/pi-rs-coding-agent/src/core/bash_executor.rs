@@ -9,9 +9,7 @@
 use pi_rs_agent::CancellationToken;
 use std::{
     collections::VecDeque,
-    fs::File,
-    io::Write as _,
-    path::{Path, PathBuf},
+    path::Path,
     process::{ExitStatus, Stdio},
     sync::Arc,
 };
@@ -22,7 +20,7 @@ use tokio::time::{Duration, sleep, timeout};
 use super::tools::bash::{EXIT_STDIO_GRACE_MS, NON_INTERACTIVE_ENV};
 use super::tools::truncate::{DEFAULT_MAX_BYTES, TruncationOptions, truncate_tail};
 use crate::utils::ansi::{split_incomplete_ansi_suffix, strip_ansi};
-use crate::utils::output_files::create_output_file_stream;
+use crate::utils::output_files::{OutputFileResult, OutputFileStream};
 use crate::utils::shell::{CommandTransport, get_shell_config, sanitize_binary_output};
 
 /// Maximum number of sanitized bytes retained in the rolling buffer.
@@ -51,6 +49,8 @@ pub struct BashOutput {
     pub truncated: bool,
     /// Path to the temp file holding the full output when it was truncated.
     pub full_output_path: Option<String>,
+    /// Why the full output could not be saved to a temp file when truncated.
+    pub full_output_error: Option<String>,
 }
 
 /// Stateless executor for `!` commands and direct mode callers.
@@ -104,46 +104,41 @@ struct Capture {
     bytes: usize,
     discarded: bool,
     ansi: String,
-    file: Option<(PathBuf, File)>,
+    file: Option<OutputFileStream>,
 }
 
 impl Capture {
-    fn ensure_file(&mut self) -> Result<(), String> {
+    fn ensure_file(&mut self) {
         if self.file.is_none() {
-            let (path, mut file) =
-                create_output_file_stream("pi-bash", ".log").map_err(|error| error.to_string())?;
+            let mut stream = OutputFileStream::create("pi-bash", ".log");
             for chunk in &self.chunks {
-                file.write_all(chunk.as_bytes())
-                    .map_err(|error| error.to_string())?;
+                stream.write(chunk.as_bytes());
             }
-            self.file = Some((path, file));
+            self.file = Some(stream);
         }
-        Ok(())
     }
 
-    fn push(&mut self, text: String, callback: &Option<ChunkCallback>) -> Result<(), String> {
+    fn push(&mut self, text: String, callback: &Option<ChunkCallback>) {
         if text.is_empty() {
-            return Ok(());
+            return;
         }
         if self.raw_bytes > DEFAULT_MAX_BYTES {
-            self.ensure_file()?;
+            self.ensure_file();
         }
-        if let Some((_, file)) = &mut self.file {
-            file.write_all(text.as_bytes())
-                .map_err(|error| error.to_string())?;
+        if let Some(file) = &mut self.file {
+            file.write(text.as_bytes());
         }
         if let Some(callback) = callback {
             callback(&text);
         }
         push_rolling(&mut self.chunks, &mut self.bytes, &mut self.discarded, text);
-        Ok(())
     }
 
-    fn ingest(&mut self, bytes: &[u8], callback: &Option<ChunkCallback>) -> Result<(), String> {
+    fn ingest(&mut self, bytes: &[u8], callback: &Option<ChunkCallback>) {
         self.raw_bytes += bytes.len();
         let valid = String::from_utf8_lossy(bytes);
         let text = sanitize_chunk(&valid, &mut self.ansi);
-        self.push(text, callback)
+        self.push(text, callback);
     }
 }
 
@@ -172,7 +167,8 @@ impl<R: AsyncRead + Unpin> Pipe<R> {
         if read == 0 {
             self.reader = None;
             self.pending = 0;
-            return capture.ingest(&self.buf[..end], callback);
+            capture.ingest(&self.buf[..end], callback);
+            return Ok(());
         }
         let mut complete = end;
         // A UTF-8 scalar may straddle pipe reads. Carry its prefix, not the preceding data.
@@ -185,7 +181,7 @@ impl<R: AsyncRead + Unpin> Pipe<R> {
         {
             complete = start;
         }
-        capture.ingest(&self.buf[..complete], callback)?;
+        capture.ingest(&self.buf[..complete], callback);
         self.buf.copy_within(complete..end, 0);
         self.pending = end - complete;
         Ok(())
@@ -359,16 +355,7 @@ impl BashExecutor {
             // should terminate the process tree.
             children.0 = None;
         }
-        let pending = flush_pending(&mut capture.ansi, &None);
-        capture.push(pending, &options.on_chunk)?;
-        let mut output = String::with_capacity(capture.bytes);
-        for chunk in &capture.chunks {
-            output.push_str(chunk);
-        }
-        let snapshot = truncate_tail(&output, &TruncationOptions::default());
-        if snapshot.truncated {
-            capture.ensure_file()?;
-        }
+        // Decide cancellation and exit code when the process settles, before closing the temp file.
         let cancelled = matches!(&outcome, WaitOutcome::Cancelled)
             || options
                 .cancel
@@ -380,6 +367,25 @@ impl BashExecutor {
                 .code(),
             WaitOutcome::TimedOut | WaitOutcome::Cancelled => None,
         };
+        let pending = flush_pending(&mut capture.ansi, &None);
+        capture.push(pending, &options.on_chunk);
+        let mut output = String::with_capacity(capture.bytes);
+        for chunk in &capture.chunks {
+            output.push_str(chunk);
+        }
+        let snapshot = truncate_tail(&output, &TruncationOptions::default());
+        if snapshot.truncated {
+            capture.ensure_file();
+        }
+        let saved = capture.file.as_mut().map(OutputFileStream::close);
+        let truncated = capture.discarded || snapshot.truncated;
+        let (full_output_path, full_output_error) = match saved {
+            Some(OutputFileResult::Saved { path }) => {
+                (Some(path.to_string_lossy().into_owned()), None)
+            }
+            Some(OutputFileResult::Failed { error }) if truncated => (None, Some(error)),
+            _ => (None, None),
+        };
         Ok(BashOutput {
             output: if snapshot.truncated {
                 snapshot.content
@@ -388,10 +394,9 @@ impl BashExecutor {
             },
             exit_code: exit_code.filter(|_| !cancelled),
             cancelled,
-            truncated: capture.discarded || snapshot.truncated,
-            full_output_path: capture
-                .file
-                .map(|(path, _)| path.to_string_lossy().into_owned()),
+            truncated,
+            full_output_path,
+            full_output_error,
         })
     }
 }

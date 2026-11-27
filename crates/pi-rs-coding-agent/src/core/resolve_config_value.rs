@@ -45,6 +45,14 @@ pub fn clear_config_value_cache() {
     cache.clear();
 }
 
+/// Forget the cached result of one config value, so its next resolution runs the command again.
+pub fn clear_config_value_cache_entry(config: &str) {
+    let mut cache = command_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cache.remove(config);
+}
+
 /// True when `config` is a `!command` value. A bare `!` is also a command,
 /// matching upstream's `startsWith("!")`.
 pub fn is_command_config_value(config: &str) -> bool {

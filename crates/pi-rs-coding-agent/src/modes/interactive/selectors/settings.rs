@@ -186,13 +186,6 @@ const FIELDS: &[Field] = &[
         Values::Strings(&["off", "final", "streaming"])
     ),
     field!(
-        "cache-miss-notices",
-        "Cache miss notices",
-        "Show notices for cache costs and provider recovery diagnostics",
-        ["showCacheMissNotices"],
-        Values::Bools
-    ),
-    field!(
         "collapse-changelog",
         "Collapse changelog",
         "Show condensed changelog after updates",
@@ -487,6 +480,7 @@ impl SettingsPicker {
             }
             if field.id == "tui-mode" {
                 items.push(self.warnings());
+                items.push(self.notices());
                 items.push(self.model_thinking());
             }
             let current = field.current(&self.settings);
@@ -569,6 +563,96 @@ impl SettingsPicker {
                         change.borrow_mut()(Some(SettingChange {
                             path: vec!["warnings".into(), "anthropicExtraUsage".into()],
                             value: json!(enabled),
+                        }));
+                    }),
+                    Box::new(move || finish_menu(&done, None)),
+                    SettingsListOptions::default(),
+                ))
+            })),
+        }
+    }
+
+    fn notices(&self) -> SettingItem {
+        let theme = self.theme.clone();
+        let change = Rc::clone(&self.change);
+        let initial = self.settings.get("notices");
+        let current = Rc::new(RefCell::new([
+            (
+                "cacheMisses",
+                "Cache misses",
+                "Show a notice when a response re-bills a significant part of the prompt cache",
+                initial
+                    .and_then(|n| n.get("cacheMisses"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            (
+                "cacheWarming",
+                "Cache warming",
+                "Show the cost of cache warming requests",
+                initial
+                    .and_then(|n| n.get("cacheWarming"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            (
+                "compactionCosts",
+                "Compaction costs",
+                "Show the cost of compactions and branch summaries",
+                initial
+                    .and_then(|n| n.get("compactionCosts"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            (
+                "reasoningDrops",
+                "Reasoning drops",
+                "Show a notice when a provider drops reasoning items from a request",
+                initial
+                    .and_then(|n| n.get("reasoningDrops"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+        ]));
+        SettingItem {
+            id: "notices".into(),
+            label: "Notices".into(),
+            description: Some(
+                "Notices about cache misses, cache warming, compaction costs and dropped reasoning"
+                    .into(),
+            ),
+            current_value: "configure".into(),
+            values: Vec::new(),
+            submenu: Some(Box::new(move |_, done| {
+                let items = current
+                    .borrow()
+                    .iter()
+                    .map(|(key, label, desc, enabled)| SettingItem {
+                        id: (*key).into(),
+                        label: (*label).into(),
+                        description: Some((*desc).into()),
+                        current_value: enabled.to_string(),
+                        values: vec!["true".into(), "false".into()],
+                        submenu: None,
+                    })
+                    .collect();
+                let current = Rc::clone(&current);
+                let change = Rc::clone(&change);
+                let done = Rc::new(RefCell::new(Some(done)));
+                ComponentRef::new(SettingsList::new(
+                    items,
+                    10,
+                    list_theme(&theme),
+                    Box::new(move |id, value| {
+                        let shown = value == "true";
+                        if let Some(entry) =
+                            current.borrow_mut().iter_mut().find(|entry| entry.0 == id)
+                        {
+                            entry.3 = shown;
+                        }
+                        change.borrow_mut()(Some(SettingChange {
+                            path: vec!["notices".into(), id.to_string()],
+                            value: json!(shown),
                         }));
                     }),
                     Box::new(move || finish_menu(&done, None)),

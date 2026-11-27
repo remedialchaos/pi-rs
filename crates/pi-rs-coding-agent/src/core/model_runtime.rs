@@ -307,7 +307,7 @@ impl ModelRuntime {
         }
         if snapshot.stored_providers.contains(provider) {
             return ProviderAuthStatus {
-                configured: true,
+                configured: snapshot.authorized.contains(provider),
                 source: Some(ProviderAuthSource::Stored),
                 label: None,
             };

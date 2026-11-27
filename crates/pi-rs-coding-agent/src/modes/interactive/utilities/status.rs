@@ -13,6 +13,15 @@ pub struct BlockedStatus {
     pub message: String,
 }
 
+/// Blocked status for a dialog. Its message is the first line of the title;
+/// later lines hold details such as paths.
+pub fn dialog_blocked_status(kind: ProgramStatusKind, title: &str) -> BlockedStatus {
+    BlockedStatus {
+        kind,
+        message: title.split(['\r', '\n']).next().unwrap_or("").to_string(),
+    }
+}
+
 #[derive(Default)]
 pub struct ProgramStatusReporter {
     run_active: bool,
@@ -219,5 +228,15 @@ mod tests {
         assert_eq!(error.message.as_deref(), Some("first line"));
         assert_eq!(state(reporter.reset(name)), Some(Idle));
         Ok(())
+    }
+
+    #[test]
+    fn dialog_blocked_status_uses_first_line_of_title() {
+        let status = dialog_blocked_status(
+            ProgramStatusKind::Permission,
+            "Trust project folder?\n/work/project\n\nDetails",
+        );
+        assert_eq!(status.kind, ProgramStatusKind::Permission);
+        assert_eq!(status.message, "Trust project folder?");
     }
 }

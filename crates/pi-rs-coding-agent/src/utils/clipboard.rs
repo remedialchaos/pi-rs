@@ -132,7 +132,7 @@ pub fn write_commands(platform: Platform, env: &ClipboardEnv) -> Vec<ClipboardCo
                 commands.push(command("termux-clipboard-set", &[]));
             }
             if env.wayland_display.is_some() {
-                commands.push(command("wl-copy", &[]));
+                commands.push(command("wl-copy", &["-t", "text/plain"]));
             }
             if env.display.is_some() {
                 commands.push(command("xclip", &["-selection", "clipboard"]));

@@ -44,13 +44,15 @@ pub fn render_shell_result(result: &AgentToolResult) -> String {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let full_path = details.get("fullOutputPath").and_then(Value::as_str);
+    let full_error = details.get("fullOutputError").and_then(Value::as_str);
+    let footer_marker = full_path.or(full_error);
 
     if truncated
         && output.ends_with(']')
         && let Some(start) = output.rfind("\n\n[")
     {
         let notice = &output[start..];
-        if full_path.is_none_or(|path| notice.contains(path)) {
+        if footer_marker.is_none_or(|marker| notice.contains(marker)) {
             output.truncate(start);
         }
     }
@@ -58,6 +60,8 @@ pub fn render_shell_result(result: &AgentToolResult) -> String {
     let mut warnings = Vec::new();
     if let Some(path) = full_path {
         warnings.push(format!("Full output: {path}"));
+    } else if let Some(err) = full_error {
+        warnings.push(format!("Could not save the full output: {err}"));
     }
     if truncated {
         let by_lines = truncation

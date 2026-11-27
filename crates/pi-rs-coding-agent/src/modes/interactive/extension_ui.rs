@@ -32,7 +32,12 @@ impl ExtensionUiHost for UiHost {
             }
             let (answer, receive) = oneshot::channel();
             host.events
-                .send(UiEvent::Dialog(host.generation, dialog, answer))
+                .send(UiEvent::Dialog(
+                    host.generation,
+                    dialog,
+                    options.blocked_kind,
+                    answer,
+                ))
                 .ok()?;
             tokio::select! {
                 biased;

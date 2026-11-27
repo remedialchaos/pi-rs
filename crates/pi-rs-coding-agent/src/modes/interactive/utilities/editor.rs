@@ -58,11 +58,12 @@ where
     F: FnOnce(&Path) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
-    let directory = PrivateTempDir::new("pi-editor").map_err(|error| error.to_string())?;
+    let directory = PrivateTempDir::new("pi-editor")
+        .map_err(|error| format!("External editor failed: {error}; prompt unchanged"))?;
     let file = directory.path().join("prompt.md");
     tokio::fs::write(&file, text)
         .await
-        .map_err(|error| format!("Failed to write editor buffer: {error}"))?;
+        .map_err(|error| format!("External editor failed: {error}; prompt unchanged"))?;
     run(&file).await?;
     let bytes = tokio::fs::read(&file)
         .await

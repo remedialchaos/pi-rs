@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use pi_rs_tui::keybindings::BindingKeys;
 use pi_rs_tui::{
-    ComponentRef, KeybindingDefinition, ProcessTerminal, Terminal, Tui, TuiMainScreen,
-    TuiStopOptions, set_capability_overrides, set_keybindings,
+    ComponentRef, KeybindingDefinition, ProcessTerminal, ProgramStatus, ProgramStatusKind,
+    ProgramStatusState, Terminal, Tui, TuiMainScreen, TuiStopOptions, set_capability_overrides,
+    set_keybindings,
 };
 use serde_json::{Value, json};
 
@@ -17,9 +18,11 @@ use crate::core::keybindings::KeybindingsManager;
 use crate::core::project_trust::format_project_trust_prompt;
 use crate::core::settings_manager::SettingsManager;
 use crate::modes::interactive::selectors::{
-    FirstTimeSetup, FirstTimeSetupResult, InputDialog, Picker, trust_items,
+    FIRST_TIME_SETUP_QUESTION, FirstTimeSetup, FirstTimeSetupResult, InputDialog, Picker,
+    trust_items,
 };
 use crate::modes::interactive::theme::Theme;
+use crate::modes::interactive::utilities::{BlockedStatus, dialog_blocked_status};
 use crate::utils::flush_stdout::flush_stdout;
 
 pub fn should_run_first_time_setup(settings_path: &Path) -> bool {
@@ -81,14 +84,28 @@ pub(super) fn run_dialog<T: 'static>(
 ) -> Result<T, String> {
     install_keybindings(agent_dir);
     setup_terminal(settings);
-    run_on_terminal(
-        ProcessTerminal::new(),
-        settings,
-        agent_dir,
-        theme,
-        create,
-        process,
-    )
+    let terminal = ProcessTerminal::new();
+    run_on_terminal(terminal, settings, agent_dir, theme, create, process)
+}
+
+pub(super) fn run_dialog_blocked<T: 'static>(
+    settings: &Value,
+    agent_dir: &Path,
+    theme: Theme,
+    blocked: BlockedStatus,
+    create: impl FnOnce(Theme, Box<dyn FnMut(T)>) -> ComponentRef,
+    process: impl FnMut() -> Result<(), String>,
+) -> Result<T, String> {
+    install_keybindings(agent_dir);
+    setup_terminal(settings);
+    let mut terminal = ProcessTerminal::new();
+    terminal.set_program_status(ProgramStatus {
+        state: ProgramStatusState::Blocked,
+        app: Some(APP_NAME.into()),
+        kind: Some(blocked.kind),
+        message: Some(blocked.message),
+    });
+    run_on_terminal(terminal, settings, agent_dir, theme, create, process)
 }
 
 fn run_on_terminal<T: 'static>(
@@ -178,6 +195,7 @@ pub async fn show_startup_selector<T>(
     agent_dir: &Path,
     title: String,
     options: Vec<(String, T)>,
+    blocked_kind: Option<ProgramStatusKind>,
 ) -> Result<Option<T>, String> {
     let (labels, values): (Vec<_>, Vec<_>) = options
         .into_iter()
@@ -185,10 +203,13 @@ pub async fn show_startup_selector<T>(
         .unzip();
     let mut values = values;
     let theme = load_theme(settings, agent_dir)?;
-    let result = run_dialog(
+    let blocked =
+        dialog_blocked_status(blocked_kind.unwrap_or(ProgramStatusKind::Question), &title);
+    let result = run_dialog_blocked(
         &settings.get(),
         agent_dir,
         theme,
+        blocked,
         |theme, select| {
             ComponentRef::new(
                 Picker::new(title, labels, theme, select)
@@ -208,12 +229,16 @@ pub async fn show_startup_input(
     agent_dir: &Path,
     title: String,
     placeholder: Option<String>,
+    blocked_kind: Option<ProgramStatusKind>,
 ) -> Result<Option<String>, String> {
     let theme = load_theme(settings, agent_dir)?;
-    run_dialog(
+    let blocked =
+        dialog_blocked_status(blocked_kind.unwrap_or(ProgramStatusKind::Question), &title);
+    run_dialog_blocked(
         &settings.get(),
         agent_dir,
         theme,
+        blocked,
         |theme, submit| ComponentRef::new(InputDialog::new(title, placeholder, theme, submit)),
         || Ok(()),
     )
@@ -234,6 +259,7 @@ pub async fn select_project_trust(
         agent_dir,
         format_project_trust_prompt(cwd),
         options,
+        Some(ProgramStatusKind::Permission),
     )
     .await
 }
@@ -243,10 +269,11 @@ pub async fn show_first_time_setup(
     agent_dir: &Path,
 ) -> Result<(), String> {
     let theme = Theme::load(agent_dir, Some("system")).map_err(|error| error.to_string())?;
-    let setup = run_dialog(
+    let setup = run_dialog_blocked(
         &settings.get(),
         agent_dir,
         theme,
+        dialog_blocked_status(ProgramStatusKind::Permission, FIRST_TIME_SETUP_QUESTION),
         |theme, submit| ComponentRef::new(FirstTimeSetup::new(theme, submit)),
         || Ok(()),
     )?;
@@ -260,7 +287,6 @@ fn persist_setup(
     settings: &mut SettingsManager,
     result: FirstTimeSetupResult,
 ) -> Result<(), String> {
-    settings.set_value(&["theme".into()], json!(result.theme))?;
     if result.share_analytics
         && settings.get_global_settings()["trackingId"]
             .as_str()
@@ -318,7 +344,6 @@ mod tests {
         persist_setup(
             &mut settings,
             FirstTimeSetupResult {
-                theme: "dark",
                 share_analytics: true,
             },
         )?;
@@ -329,12 +354,10 @@ mod tests {
         persist_setup(
             &mut settings,
             FirstTimeSetupResult {
-                theme: "light",
                 share_analytics: false,
             },
         )?;
         let second = settings.get_global_settings();
-        assert_eq!(second["theme"], "light");
         assert_eq!(second["trackingId"], tracking);
         assert_eq!(second["enableAnalytics"], false);
         Ok(())
@@ -345,7 +368,7 @@ mod tests {
         let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
         let theme = Theme::load(dir.path(), Some("system")).map_err(|error| error.to_string())?;
         let terminal = VirtualTerminal(
-            ["\x1b[B", "\r", "\x1b[B", "\r"]
+            ["\x1b[B", "\r"]
                 .into_iter()
                 .map(|input| TerminalEvent::Input(input.into()))
                 .collect(),
@@ -361,7 +384,6 @@ mod tests {
         assert_eq!(
             result,
             Some(FirstTimeSetupResult {
-                theme: "dark",
                 share_analytics: false
             })
         );

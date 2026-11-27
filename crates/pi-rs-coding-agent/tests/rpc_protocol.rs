@@ -337,6 +337,7 @@ impl Extension for DialogExtension {
                             UiDialogOptions {
                                 timeout_ms: Some(10),
                                 cancel: None,
+                                blocked_kind: None,
                             },
                         )
                         .await;

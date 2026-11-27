@@ -157,6 +157,7 @@ fn restore_distinguishes_custom_skills_summaries_and_shell_results() -> Result<(
                 cancelled: false,
                 truncated: false,
                 full_output_path: None,
+                full_output_error: None,
                 timestamp: 0,
                 exclude_from_context: Some(true),
             }
@@ -230,6 +231,45 @@ fn bash_streaming_keeps_visual_tail_and_persisted_status() -> Result<(), Box<dyn
             .iter()
             .all(|line| visible_width(line) <= 1)
     );
+    Ok(())
+}
+
+#[test]
+fn rebuilt_bash_output_follows_ctrl_o_expansion() -> Result<(), Box<dyn Error>> {
+    let mut transcript = Transcript::new(Theme::load(std::path::Path::new("."), Some("dark"))?);
+    // Rebuilt ! output must follow ctrl+o (default_expanded) state.
+    let forty = (1..=40)
+        .map(|i| format!("line-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let entries = vec![persisted(
+        "bash",
+        BashExecutionMessage {
+            command: "seq 1 40".into(),
+            output: forty,
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            full_output_error: None,
+            timestamp: 0,
+            exclude_from_context: None,
+        }
+        .to_agent_message()?,
+    )?];
+    assert!(transcript.toggle_tools());
+    transcript.restore(&entries);
+    let expanded_frame = plain(&mut transcript, 80);
+    assert!(expanded_frame.contains("line-1\n"));
+    assert!(expanded_frame.contains("line-40"));
+    assert!(!expanded_frame.contains("to expand"));
+
+    assert!(!transcript.toggle_tools());
+    transcript.restore(&entries);
+    let collapsed_frame = plain(&mut transcript, 80);
+    assert!(!collapsed_frame.contains("line-1\n"));
+    assert!(collapsed_frame.contains("line-40"));
+    assert!(collapsed_frame.contains("to expand"));
     Ok(())
 }
 

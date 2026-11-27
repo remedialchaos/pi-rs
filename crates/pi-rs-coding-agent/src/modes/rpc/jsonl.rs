@@ -42,3 +42,21 @@ impl<R: AsyncRead + Unpin> JsonlReader<R> {
         Ok(Some(String::from_utf8_lossy(line)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reads_large_line_and_does_not_join_after_caller_error() -> io::Result<()> {
+        let large = "x".repeat(128 * 1024);
+        let payload = format!("prefix\n{large}\nnext\n");
+        let mut reader = JsonlReader::new(io::Cursor::new(payload.into_bytes()));
+        assert_eq!(reader.next_line().await?.as_deref(), Some("prefix"));
+        // Even if the caller rejects/errors on the first line, the next read starts fresh.
+        assert_eq!(reader.next_line().await?.as_deref(), Some(large.as_str()));
+        assert_eq!(reader.next_line().await?.as_deref(), Some("next"));
+        assert!(reader.next_line().await?.is_none());
+        Ok(())
+    }
+}
