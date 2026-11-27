@@ -282,10 +282,31 @@ impl Footer {
                     .push((format!("{prefix}{}", format_tokens(count)), "dim"));
             }
         }
-        if cost > 0. {
-            self.left.push((format!("${cost:.3}"), "dim"));
+        let prompt_tokens = tokens.input + tokens.cache_read + tokens.cache_write;
+        if (tokens.cache_read > 0. || tokens.cache_write > 0.) && prompt_tokens > 0. {
+            let latest_hit = session
+                .messages()
+                .iter()
+                .rev()
+                .find_map(|msg| match msg {
+                    pi_rs_agent::AgentMessage::Assistant(assistant) => {
+                        let p = assistant.usage.input
+                            + assistant.usage.cache_read
+                            + assistant.usage.cache_write;
+                        (p > 0.).then(|| (assistant.usage.cache_read / p) * 100.0)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| (tokens.cache_read / prompt_tokens) * 100.0);
+            self.left.push((format!("CH{latest_hit:.1}%"), "dim"));
         }
         let model = session.model();
+        let using_subscription =
+            model.provider == "kimi-coding" || session.is_using_subscription(&model.provider);
+        if cost > 0. || using_subscription {
+            let suffix = if using_subscription { " (sub)" } else { "" };
+            self.left.push((format!("${cost:.3}{suffix}"), "dim"));
+        }
         let usage = context_usage.as_ref().and_then(|usage| usage.percent);
         let window = context_usage.map_or(model.context_window, |usage| usage.context_window);
         let percent = usage.map_or_else(|| "?".into(), |n| format!("{n:.1}%"));
@@ -303,6 +324,10 @@ impl Footer {
             format!("{percent}/{}{auto}", format_tokens(window as f64)),
             color,
         ));
+        if std::env::var("PI_EXPERIMENTAL").as_deref() == Ok("1") {
+            self.left.push(("•".to_owned(), "dim"));
+            self.left.push(("xp".to_owned(), "warning"));
+        }
         self.model = replace_control_characters(&model.id);
         self.provider.clear();
         if session
@@ -320,6 +345,15 @@ impl Footer {
                 self.model.push_str(" • ");
                 self.model.push_str(level.as_str());
             }
+        }
+        if let Some((routed, routed_level)) = session.last_routed_model() {
+            let suffix = routed_level
+                .filter(|l| *l != pi_rs_ai::ThinkingLevel::Off)
+                .map_or_else(String::new, |l| format!(" • {}", l.as_str()));
+            self.model.push_str(&format!(
+                " → {}{suffix}",
+                replace_control_characters(&routed.id)
+            ));
         }
     }
 }
@@ -381,5 +415,122 @@ fn format_tokens(count: f64) -> String {
         format!("{:.1}M", count / 1_000_000.)
     } else {
         format!("{:.0}M", (count / 1_000_000.).round())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use pi_rs_agent::{Agent, AgentInitialState, AgentMessage, AgentOptions};
+    use pi_rs_ai::{
+        Cost, Models, ModelsOptions, ThinkingLevel, Usage,
+        faux::{
+            FauxModelDefinition, FauxOptions, faux_assistant_message, faux_provider, faux_text,
+        },
+    };
+
+    use super::*;
+    use crate::core::agent_session::{
+        AgentSessionConfig, AuthStorage, InMemoryModelRegistry, InMemorySessionManager,
+        InMemorySettings, ModelRegistry, NoopExtensionRunner, SessionManager, StaticAuth,
+        TailCompactor,
+    };
+
+    #[test]
+    fn footer_renders_cache_hit_subscription_and_routed_model() -> Result<(), String> {
+        struct SubRoutedRegistry {
+            inner: InMemoryModelRegistry,
+            routed: pi_rs_ai::Model,
+        }
+        impl ModelRegistry for SubRoutedRegistry {
+            fn get_model(&self, provider: &str, id: &str) -> Option<pi_rs_ai::Model> {
+                self.inner.get_model(provider, id)
+            }
+            fn models(&self) -> Vec<pi_rs_ai::Model> {
+                self.inner.models()
+            }
+            fn has_configured_auth(&self, provider: &str) -> bool {
+                self.inner.has_configured_auth(provider)
+            }
+            fn last_routed_model(&self) -> Option<(pi_rs_ai::Model, Option<ThinkingLevel>)> {
+                Some((self.routed.clone(), Some(ThinkingLevel::High)))
+            }
+            fn is_using_subscription(&self, _provider: &str) -> bool {
+                true
+            }
+        }
+
+        let faux = faux_provider(FauxOptions {
+            api: Some("faux-footer".into()),
+            models: vec![
+                FauxModelDefinition {
+                    id: "router-main".into(),
+                    reasoning: true,
+                    ..FauxModelDefinition::default()
+                },
+                FauxModelDefinition {
+                    id: "routed-fast".into(),
+                    ..FauxModelDefinition::default()
+                },
+            ],
+            ..FauxOptions::default()
+        });
+        let list = faux.models.clone();
+        let main_model = list[0].clone();
+        let routed_model = list[1].clone();
+        let models = Models::new(ModelsOptions::default());
+        models.set_provider(faux.provider.clone());
+        let stream_fn = pi_rs_agent::models_stream_fn(models);
+        let agent = Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(main_model.clone()),
+                ..AgentInitialState::default()
+            },
+            stream_fn: Some(stream_fn),
+            ..AgentOptions::default()
+        })
+        .map_err(|e| e.to_string())?;
+        let manager = Arc::new(InMemorySessionManager::new("/tmp/pi-footer"));
+        let mut assistant = faux_assistant_message(vec![faux_text("ok")]);
+        assistant.usage = Usage {
+            input: 200.0,
+            output: 50.0,
+            cache_read: 800.0,
+            cache_write: 0.0,
+            total_tokens: 1050.0,
+            cost: Cost {
+                total: 0.012,
+                ..Cost::default()
+            },
+            ..Usage::default()
+        };
+        manager.append_message(&AgentMessage::Assistant(assistant.into()));
+        let auth: Arc<dyn AuthStorage> = Arc::new(StaticAuth::allow_all());
+        let registry: Arc<dyn ModelRegistry> = Arc::new(SubRoutedRegistry {
+            inner: InMemoryModelRegistry::new(vec![main_model, routed_model.clone()], auth.clone()),
+            routed: routed_model,
+        });
+        let session = AgentSession::new(AgentSessionConfig {
+            agent,
+            session_manager: manager,
+            settings: Arc::new(InMemorySettings::default()),
+            auth,
+            models: registry,
+            compactor: Arc::new(TailCompactor { keep_recent: 1 }),
+            extensions: Arc::new(NoopExtensionRunner),
+            cwd: "/tmp/pi-footer".into(),
+            retry_prompt: None,
+        })
+        .map_err(|e| e.to_string())?;
+
+        let theme = Theme::load(Path::new("/nonexistent-agent-dir"), Some("dark"))
+            .map_err(|e| e.to_string())?;
+        let footer = Footer::new(theme, &session);
+        let rendered = footer.render(200).join("\n");
+        assert!(rendered.contains("CH80.0%"), "{rendered}");
+        assert!(rendered.contains("$0.012 (sub)"), "{rendered}");
+        assert!(rendered.contains("→ routed-fast • high"), "{rendered}");
+        Ok(())
     }
 }

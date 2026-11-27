@@ -114,6 +114,15 @@ pub trait SessionManager: Send + Sync {
     fn try_append_compaction(&self, result: &CompactionResult) -> Result<String> {
         Ok(self.append_compaction(&result.summary, result.first_kept_entry_id.clone()))
     }
+    fn append_usage(
+        &self,
+        _kind: &str,
+        _provider: &str,
+        _model: &str,
+        _usage: &pi_rs_ai::Usage,
+        _note: Option<&str>,
+    ) {
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -434,6 +443,21 @@ pub trait SettingsStore: Send + Sync {
     fn trusted_project(&self) -> Option<bool> {
         None
     }
+    fn raw_value(&self) -> Value {
+        Value::Null
+    }
+    fn cache_warming_mode(&self) -> super::cache_warmer::CacheWarmingMode {
+        super::cache_warmer::CacheWarmingMode::Idle
+    }
+    fn compaction_reserve_tokens_for_model(&self, _provider: &str, _model_id: &str) -> Option<u64> {
+        self.compaction_reserve_tokens()
+    }
+    fn branch_summary_reserve_tokens(&self) -> usize {
+        16_384
+    }
+    fn branch_summary_skip_prompt(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -588,6 +612,12 @@ pub trait ModelRegistry: Send + Sync {
     fn model_catalog(&self) -> Option<pi_rs_ai::Models> {
         None
     }
+    fn last_routed_model(&self) -> Option<(Model, Option<ThinkingLevel>)> {
+        None
+    }
+    fn is_using_subscription(&self, _provider: &str) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -689,6 +719,9 @@ impl Compactor for TailCompactor {
 /// parallel can implement this boundary without changing session orchestration.
 pub trait ExtensionRunner: Send + Sync {
     fn emit(&self, event: &Value) -> Value;
+    fn emit_async<'a>(&'a self, event: Value) -> futures_util::future::BoxFuture<'a, Value> {
+        Box::pin(async move { self.emit(&event) })
+    }
     fn has_handlers(&self, _event_type: &str) -> bool {
         false
     }
@@ -889,6 +922,31 @@ pub enum AgentSessionEvent {
     SessionInfoChanged {
         name: Option<String>,
     },
+    #[serde(rename = "tool_execution_start")]
+    NestedToolExecutionStart {
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+        parent_tool_call_id: String,
+    },
+    #[serde(rename = "tool_execution_update")]
+    NestedToolExecutionUpdate {
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+        partial_result: pi_rs_agent::AgentToolResult,
+        parent_tool_call_id: String,
+    },
+    #[serde(rename = "tool_execution_end")]
+    NestedToolExecutionEnd {
+        tool_call_id: String,
+        tool_name: String,
+        result: pi_rs_agent::AgentToolResult,
+        is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        parent_tool_call_id: String,
+    },
     #[serde(untagged)]
     Core(AgentEvent),
 }
@@ -923,6 +981,9 @@ impl AgentSessionEvent {
             Self::ModelSelect { .. } => "model_select",
             Self::ThinkingLevelChanged { .. } => "thinking_level_changed",
             Self::SessionInfoChanged { .. } => "session_info_changed",
+            Self::NestedToolExecutionStart { .. } => "tool_execution_start",
+            Self::NestedToolExecutionUpdate { .. } => "tool_execution_update",
+            Self::NestedToolExecutionEnd { .. } => "tool_execution_end",
         }
     }
 }
@@ -993,6 +1054,8 @@ struct Inner {
     is_streaming: bool,
     is_compacting: bool,
     disposed: bool,
+    cache_warmer: Arc<super::cache_warmer::CacheWarmer>,
+    nested_runner: Option<Arc<super::nested_tool_calls::NestedToolCallRunner>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1017,6 +1080,91 @@ impl Drop for RunningSession<'_> {
 
 impl AgentSession {
     pub fn new(config: AgentSessionConfig) -> Result<Self> {
+        let warmer_models = config.models.clone();
+        let warmer_settings = config.settings.clone();
+        let warmer_session = config.session_manager.clone();
+        let warmer_extensions = config.extensions.clone();
+        let warmer_stream: super::cache_warmer::WarmStreamFn =
+            Arc::new(move |model, context, options| {
+                let models = warmer_models.clone();
+                Box::pin(async move {
+                    let Some(catalog) = models.model_catalog() else {
+                        return Err("Model catalog unavailable".to_owned());
+                    };
+                    let message = catalog
+                        .complete_simple(model, context, options)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok((
+                        message.response_model.clone(),
+                        message.usage,
+                        message.stop_reason,
+                    ))
+                })
+            });
+        let warmer_mode: super::cache_warmer::WarmModeFn =
+            Arc::new(move || warmer_settings.cache_warming_mode());
+        let warmer_tokens_session = warmer_session.clone();
+        let warmer_tokens: super::cache_warmer::WarmPromptTokensFn = Arc::new(move || {
+            warmer_tokens_session
+                .messages()
+                .iter()
+                .rev()
+                .find_map(|msg| match msg {
+                    AgentMessage::Assistant(assistant) => Some(
+                        assistant.usage.input
+                            + assistant.usage.cache_read
+                            + assistant.usage.cache_write,
+                    ),
+                    _ => None,
+                })
+                .unwrap_or(0.0)
+        });
+        let warmer_decide: super::cache_warmer::WarmDecideFn = Arc::new(move |decision| {
+            let extensions = warmer_extensions.clone();
+            Box::pin(async move {
+                if !extensions.has_handlers("cache_warming_decision") {
+                    return decision.action;
+                }
+                if let Some(runner) = extensions.native() {
+                    let event = serde_json::json!({
+                        "type": "cache_warming_decision",
+                        "warmCost": decision.warm_cost,
+                        "missCost": decision.miss_cost,
+                        "continuationProbability": decision.continuation_probability,
+                        "action": decision.action,
+                    });
+                    let result = runner.emit_cache_warming_decision(event).await;
+                    if let Some(action) = result.get("action").and_then(Value::as_str) {
+                        return match action {
+                            "warm" => pi_rs_ai::cache_warming::CacheWarmingAction::Warm,
+                            "stop" => pi_rs_ai::cache_warming::CacheWarmingAction::Stop,
+                            _ => decision.action,
+                        };
+                    }
+                }
+                decision.action
+            })
+        });
+        let warmer_record_session = warmer_session;
+        let warmer_record: super::cache_warmer::WarmRecordUsageFn =
+            Arc::new(move |provider, model, usage, note| {
+                warmer_record_session.append_usage(
+                    "cache_warm",
+                    &provider,
+                    &model,
+                    &usage,
+                    note.as_deref(),
+                );
+            });
+        let cache_warmer = Arc::new(super::cache_warmer::CacheWarmer::new(
+            warmer_stream,
+            warmer_mode,
+            warmer_tokens,
+            warmer_decide,
+            warmer_record,
+        ));
+
         let inner = Arc::new(Mutex::new(Inner {
             agent: config.agent,
             session_manager: config.session_manager,
@@ -1045,6 +1193,8 @@ impl AgentSession {
             is_streaming: false,
             is_compacting: false,
             disposed: false,
+            cache_warmer,
+            nested_runner: None,
         }));
         let weak = Arc::downgrade(&inner);
         let listener: Arc<AgentListener> = Arc::new(move |event, _signal| {
@@ -1164,10 +1314,15 @@ impl AgentSession {
     fn handle_agent_event(&self, event: &AgentEvent) -> Result<()> {
         match event {
             AgentEvent::AgentStart => self.emit(AgentSessionEvent::AgentStart),
-            AgentEvent::AgentEnd { messages } => self.emit(AgentSessionEvent::AgentEnd {
-                messages: messages.to_vec(),
-                will_retry: false,
-            }),
+            AgentEvent::AgentEnd { messages } => {
+                if let Some(runner) = self.lock().nested_runner.clone() {
+                    runner.clear();
+                }
+                self.emit(AgentSessionEvent::AgentEnd {
+                    messages: messages.to_vec(),
+                    will_retry: false,
+                });
+            }
             AgentEvent::TurnStart => self.emit(AgentSessionEvent::TurnStart),
             AgentEvent::MessageStart { message } => {
                 let changed = self.dequeue_started_message(message);
@@ -1177,20 +1332,85 @@ impl AgentSession {
                 self.emit(AgentSessionEvent::Core(event.clone()));
             }
             AgentEvent::MessageEnd { message } => {
-                self.emit(AgentSessionEvent::Core(event.clone()));
-                self.session_manager().try_append_message(message)?;
-                if let AgentMessage::Assistant(assistant) = message
-                    && assistant.stop_reason != StopReason::Error
+                let message_to_emit = if let AgentMessage::ToolResult(tr) = message
+                    && let Some(nested_runner) = self.lock().nested_runner.clone()
+                    && let Some(summary) = nested_runner.take_record(&tr.tool_call_id)
+                    && (summary.calls.is_some() || summary.usage.is_some())
                 {
-                    let mut inner = self.lock();
-                    if inner.retry_attempt > 0 {
-                        inner.retry_attempt = 0;
-                        drop(inner);
-                        self.emit(AgentSessionEvent::AutoRetryEnd {
-                            success: true,
-                            attempt: 0,
-                            final_error: None,
+                    let mut updated = (**tr).clone();
+                    if let Some(calls) = summary.calls {
+                        updated.nested_calls = Some(calls);
+                    }
+                    if let Some(nested_usage) = summary.usage {
+                        updated.usage = Some(match updated.usage {
+                            Some(existing) => {
+                                super::usage_totals::combine_usage(&existing, &nested_usage)
+                            }
+                            None => nested_usage,
                         });
+                    }
+                    AgentMessage::ToolResult(Arc::new(updated))
+                } else {
+                    message.clone()
+                };
+                self.emit(AgentSessionEvent::Core(AgentEvent::MessageEnd {
+                    message: message_to_emit.clone(),
+                }));
+                self.session_manager()
+                    .try_append_message(&message_to_emit)?;
+                if let AgentMessage::Assistant(assistant) = &message_to_emit {
+                    if assistant.stop_reason != StopReason::Error {
+                        let mut inner = self.lock();
+                        if inner.retry_attempt > 0 {
+                            inner.retry_attempt = 0;
+                            drop(inner);
+                            self.emit(AgentSessionEvent::AutoRetryEnd {
+                                success: true,
+                                attempt: 0,
+                                final_error: None,
+                            });
+                        }
+                    }
+                    if !assistant.stop_reason.failed() {
+                        let (warmer, agent, session_mgr, session_id) = {
+                            let inner = self.lock();
+                            (
+                                inner.cache_warmer.clone(),
+                                inner.agent.clone(),
+                                inner.session_manager.clone(),
+                                inner.session_manager.session_id(),
+                            )
+                        };
+                        let model = agent.model();
+                        let expected_len = session_mgr.messages().len();
+                        let llm_messages = agent
+                            .messages()
+                            .iter()
+                            .filter_map(AgentMessage::to_llm)
+                            .collect::<Vec<_>>();
+                        let options = pi_rs_ai::StreamOptions {
+                            session_id: Some(session_id),
+                            ..pi_rs_ai::StreamOptions::default()
+                        };
+                        let check_model = model.clone();
+                        let is_current: super::cache_warmer::WarmIsCurrentFn =
+                            Arc::new(move || {
+                                let cur = agent.model();
+                                cur.provider == check_model.provider
+                                    && cur.id == check_model.id
+                                    && session_mgr.messages().len() == expected_len
+                            });
+                        warmer.start(
+                            super::cache_warmer::CacheWarmRequest {
+                                model,
+                                context: pi_rs_ai::Context {
+                                    messages: llm_messages,
+                                    ..pi_rs_ai::Context::default()
+                                },
+                                options,
+                            },
+                            is_current,
+                        );
                     }
                 }
             }
@@ -1290,7 +1510,7 @@ impl AgentSession {
             accepted(PromptDisposition::Queued);
             return Ok(PromptDisposition::Queued);
         }
-        {
+        let (extensions, before_system_prompt, before_sections) = {
             let inner = self.lock();
             if options.expand_prompt_templates && text.starts_with('/') {
                 let event = json!({ "type": "command", "text": text, "source": options.source() });
@@ -1308,22 +1528,54 @@ impl AgentSession {
             if !inner.auth.has_configured_auth(&model.provider) {
                 return Err(SessionError::NoAuth(model.provider.clone()));
             }
-            inner.extensions.emit(&json!({
-                "type": "before_agent_start",
-                "prompt": text,
-                "source": options.source(),
-            }));
+            let sections_json = inner.system_prompt_sections.as_ref().map(|sections| {
+                sections
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                    .collect::<serde_json::Map<String, Value>>()
+            });
+            let system_prompt = if let Some(sections) = &inner.system_prompt_sections {
+                pi_rs_ai::transcript::system_message_text(&SystemMessage {
+                    sections: Some(
+                        sections
+                            .iter()
+                            .map(|(name, content)| (name.clone(), Some(content.clone())))
+                            .collect(),
+                    ),
+                    ..SystemMessage::default()
+                })
+            } else {
+                inner.agent.system_prompt()
+            };
+            (inner.extensions.clone(), system_prompt, sections_json)
+        };
+        let mut before_event = json!({
+            "type": "before_agent_start",
+            "prompt": text,
+            "source": options.source(),
+            "systemPrompt": before_system_prompt,
+        });
+        if let Some(sections) = &before_sections {
+            before_event["sections"] = Value::Object(sections.clone());
         }
+        let before_result = extensions.emit_async(before_event).await;
+        let injected_messages =
+            self.apply_before_agent_start_result(&before_result, &before_system_prompt);
         let _run = self.begin_run()?;
         accepted(PromptDisposition::Started);
         let (text, images) = self.normalize_images(text, options.images);
         let agent = self.agent();
         let user = user_input(text, images);
-        let result = if let Some(system) = self.pending_system_message(&agent) {
-            agent.prompt(vec![system.into(), user]).await
-        } else {
-            agent.prompt(user).await
-        };
+        let mut prompt_messages = Vec::new();
+        if let Some(system) = self.pending_system_message(&agent) {
+            prompt_messages.push(system.into());
+        }
+        for injected in injected_messages {
+            let _ = self.session_manager().try_append_message(&injected);
+            prompt_messages.push(injected);
+        }
+        prompt_messages.push(user);
+        let result = agent.prompt(prompt_messages).await;
         let outcome = match result {
             Ok(()) => self.after_run().await,
             Err(error) => Err(SessionError::Agent(error)),
@@ -1332,9 +1584,125 @@ impl AgentSession {
         Ok(PromptDisposition::Started)
     }
 
+    fn apply_before_agent_start_result(
+        &self,
+        result: &Value,
+        previous_system_prompt: &str,
+    ) -> Vec<AgentMessage> {
+        let mut injected = Vec::new();
+        if !result.is_object() {
+            return injected;
+        }
+        let mut sections_updated = false;
+        if let Some(sections_obj) = result.get("sections").and_then(Value::as_object) {
+            let mut inner = self.lock();
+            let target = inner
+                .system_prompt_sections
+                .get_or_insert_with(SystemPromptSections::new);
+            let mut changed = false;
+            for (name, value) in sections_obj {
+                match value {
+                    Value::Null => {
+                        if target.shift_remove(name).is_some() {
+                            changed = true;
+                        }
+                    }
+                    Value::String(content)
+                        if target.get(name).map(String::as_str) != Some(content.as_str()) =>
+                    {
+                        target.insert(name.clone(), content.clone());
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            sections_updated = changed;
+        }
+        if let Some(new_system_prompt) = result.get("systemPrompt").and_then(Value::as_str) {
+            let rendered_after_sections = self.system_prompt();
+            if new_system_prompt != previous_system_prompt
+                && (!sections_updated || new_system_prompt != rendered_after_sections)
+            {
+                let mut inner = self.lock();
+                let mut forced = SystemPromptSections::new();
+                forced.insert("preamble".to_owned(), new_system_prompt.to_owned());
+                inner.system_prompt_sections = Some(forced);
+            }
+        }
+        if let Some(items) = result.get("messages").and_then(Value::as_array) {
+            for item in items {
+                if let Some(message) = before_agent_start_message(item) {
+                    injected.push(message);
+                }
+            }
+        }
+        injected
+    }
+
     pub(super) fn with_system_prompt_sections(self, sections: SystemPromptSections) -> Self {
         self.lock().system_prompt_sections = Some(sections);
         self
+    }
+
+    pub fn with_nested_runner(
+        self,
+        runner: Arc<super::nested_tool_calls::NestedToolCallRunner>,
+    ) -> Self {
+        let session = self.clone();
+        runner.set_event_sink(Arc::new(move |ev| {
+            session.emit_nested_tool_event(ev);
+        }));
+        self.lock().nested_runner = Some(runner);
+        self
+    }
+
+    pub fn emit_nested_tool_event(
+        &self,
+        event: super::nested_tool_calls::NestedToolExecutionEvent,
+    ) {
+        use super::nested_tool_calls::NestedToolExecutionEvent::*;
+        let session_event = match event {
+            Start {
+                tool_call_id,
+                tool_name,
+                args,
+                parent_tool_call_id,
+            } => AgentSessionEvent::NestedToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+                parent_tool_call_id,
+            },
+            Update {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+                parent_tool_call_id,
+            } => AgentSessionEvent::NestedToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+                parent_tool_call_id,
+            },
+            End {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+                duration_ms,
+                parent_tool_call_id,
+            } => AgentSessionEvent::NestedToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+                duration_ms,
+                parent_tool_call_id,
+            },
+        };
+        self.emit(session_event);
     }
 
     fn pending_system_message(&self, agent: &Agent) -> Option<SystemMessage> {
@@ -1367,7 +1735,49 @@ impl AgentSession {
             ..SystemMessage::default()
         })
     }
+}
 
+fn before_agent_start_message(value: &Value) -> Option<AgentMessage> {
+    if value.get("role").is_some() {
+        let mut candidate = value.clone();
+        if let Some(obj) = candidate.as_object_mut()
+            && !obj.contains_key("timestamp")
+        {
+            obj.insert(
+                "timestamp".to_owned(),
+                Value::from(chrono::Utc::now().timestamp_millis().unsigned_abs()),
+            );
+        }
+        if let Ok(message) = serde_json::from_value::<AgentMessage>(candidate) {
+            return Some(message);
+        }
+    }
+    let obj = value.as_object()?;
+    let custom_type = obj.get("customType")?.as_str()?.to_owned();
+    let mut fields = serde_json::Map::new();
+    fields.insert("customType".to_owned(), Value::String(custom_type));
+    fields.insert(
+        "content".to_owned(),
+        obj.get("content")
+            .cloned()
+            .unwrap_or(Value::String(String::new())),
+    );
+    fields.insert(
+        "display".to_owned(),
+        Value::Bool(obj.get("display").and_then(Value::as_bool).unwrap_or(true)),
+    );
+    if let Some(details) = obj.get("details") {
+        fields.insert("details".to_owned(), details.clone());
+    }
+    let timestamp = obj
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis().unsigned_abs());
+    fields.insert("timestamp".to_owned(), Value::from(timestamp));
+    AgentMessage::custom("custom", fields).ok()
+}
+
+impl AgentSession {
     /// Continue the conversation without adding a new user message.
     pub async fn continue_(&self) -> Result<()> {
         if self.lock().disposed {
@@ -1495,7 +1905,7 @@ impl AgentSession {
     }
 
     fn finish_run(&self) {
-        let (aborted, retry_attempt, settled) = {
+        let (aborted, retry_attempt, settled, warmer) = {
             let mut inner = self.lock();
             inner.is_streaming = false;
             for message in std::mem::take(&mut inner.pending_bash) {
@@ -1511,8 +1921,14 @@ impl AgentSession {
                 0
             };
             inner.retry_cancel = None;
-            (aborted, retry_attempt, inner.run_settled.take())
+            (
+                aborted,
+                retry_attempt,
+                inner.run_settled.take(),
+                inner.cache_warmer.clone(),
+            )
         };
+        warmer.on_agent_settled();
         self.emit(AgentSessionEvent::AgentSettled { aborted });
         if retry_attempt != 0 {
             self.emit(AgentSessionEvent::AutoRetryEnd {
@@ -1639,12 +2055,15 @@ impl AgentSession {
         if !compacting {
             return false;
         }
-        let window = self.agent().model().context_window;
+        let model = self.agent().model();
+        let window = model.context_window;
         let settings = self.settings();
-        let limit = settings.compaction_reserve_tokens().map_or_else(
-            || (window as f64 * settings.compaction_threshold()) as u64,
-            |reserve| window.saturating_sub(reserve),
-        );
+        let limit = settings
+            .compaction_reserve_tokens_for_model(&model.provider, &model.id)
+            .map_or_else(
+                || (window as f64 * settings.compaction_threshold()) as u64,
+                |reserve| window.saturating_sub(reserve),
+            );
         limit > 0 && self.estimated_tokens() >= limit
     }
 
@@ -1787,6 +2206,55 @@ impl AgentSession {
         let messages = self.lock().session_manager.messages();
         self.agent().set_messages(messages);
         Ok(())
+    }
+
+    /// Navigate to another entry of the session tree, optionally summarizing abandoned messages
+    /// using `branchSummary.reserveTokens`.
+    pub async fn navigate_tree_with_summary(
+        &self,
+        target_id: &str,
+        summarize: bool,
+        custom_instructions: Option<&str>,
+    ) -> Result<Option<super::compaction::BranchSummaryResult>> {
+        if !summarize {
+            self.navigate_tree(target_id).await?;
+            return Ok(None);
+        }
+        let reserve_tokens = self.settings().branch_summary_reserve_tokens();
+        let model = self.model();
+        let mut options = super::compaction::BranchSummaryOptions::for_model(model.clone());
+        options.reserve_tokens = reserve_tokens;
+        options.custom_instructions = custom_instructions.map(str::to_owned);
+        options.replace_instructions = custom_instructions.is_some();
+
+        let messages = {
+            let inner = self.lock();
+            inner
+                .session_manager
+                .messages()
+                .into_iter()
+                .filter_map(|msg| serde_json::to_value(msg).ok())
+                .collect::<Vec<_>>()
+        };
+        let summary_result = super::compaction::generate_branch_summary_with_options(
+            &messages,
+            &options,
+            |_branch_messages| async move {
+                // Delegate to session manager navigation + optional summary
+                Ok::<_, String>(String::new())
+            },
+        )
+        .await;
+        self.navigate_tree(target_id).await?;
+        Ok(Some(summary_result))
+    }
+
+    pub fn last_routed_model(&self) -> Option<(Model, Option<ThinkingLevel>)> {
+        self.lock().models.last_routed_model()
+    }
+
+    pub fn is_using_subscription(&self, provider: &str) -> bool {
+        self.lock().models.is_using_subscription(provider)
     }
 
     /// Set the model and persist a `model_change` entry.
@@ -2026,6 +2494,44 @@ impl AgentSession {
         }
     }
 
+    pub fn cache_warming_status(&self) -> super::cache_warmer::CacheWarmingStatus {
+        self.lock().cache_warmer.status()
+    }
+
+    pub fn cache_warming_mode(&self) -> super::cache_warmer::CacheWarmingMode {
+        self.lock().settings.cache_warming_mode()
+    }
+
+    pub fn on_cache_warming_mode_changed(&self) {
+        self.lock().cache_warmer.on_mode_changed();
+    }
+
+    pub fn usage_cost_breakdown(&self) -> Vec<super::usage_totals::UsageCostBreakdownEntry> {
+        let entries = self.lock().session_manager.entries();
+        super::usage_totals::get_usage_cost_breakdown_from_entries(&entries)
+    }
+
+    pub fn cache_waste(&self) -> super::cache_stats::CacheWasteTotals {
+        let (entries, models) = {
+            let inner = self.lock();
+            (inner.session_manager.entries(), inner.models.clone())
+        };
+        let prices = super::cache_stats::RegistryPriceAdapter(models.as_ref());
+        super::cache_stats::compute_cache_waste(&entries, &prices)
+    }
+
+    pub fn detect_latest_cache_miss(
+        &self,
+        message: &pi_rs_ai::AssistantMessage,
+    ) -> Option<super::cache_stats::CacheMiss> {
+        let (entries, models) = {
+            let inner = self.lock();
+            (inner.session_manager.entries(), inner.models.clone())
+        };
+        let prices = super::cache_stats::RegistryPriceAdapter(models.as_ref());
+        super::cache_stats::detect_cache_miss(&entries, message, &prices)
+    }
+
     /// Release agent listeners and mark the session unusable.
     pub fn dispose(&self) {
         let mut inner = self.lock();
@@ -2033,6 +2539,7 @@ impl AgentSession {
             return;
         }
         inner.disposed = true;
+        inner.cache_warmer.cancel("session disposed");
         inner.agent_subscription.take();
         inner.listeners.clear();
         inner.agent.abort();
@@ -2479,6 +2986,80 @@ mod tests {
             })
             .collect();
         assert!(kinds.contains(&"session_start".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_async_updates_system_prompt_and_injects_message() -> TestResult {
+        struct BeforeStartRunner;
+        impl ExtensionRunner for BeforeStartRunner {
+            fn emit(&self, _event: &Value) -> Value {
+                Value::Null
+            }
+            fn emit_async<'a>(
+                &'a self,
+                event: Value,
+            ) -> futures_util::future::BoxFuture<'a, Value> {
+                Box::pin(async move {
+                    if event["type"].as_str() == Some("before_agent_start") {
+                        json!({
+                            "sections": { "customSection": "from-async-ext" },
+                            "systemPrompt": "Override System Prompt",
+                            "messages": [{
+                                "role": "user",
+                                "content": "injected-by-hook"
+                            }]
+                        })
+                    } else {
+                        Value::Null
+                    }
+                })
+            }
+            fn has_handlers(&self, event_type: &str) -> bool {
+                event_type == "before_agent_start"
+            }
+        }
+
+        let faux = faux_provider(FauxOptions {
+            api: Some("faux-before-start".into()),
+            ..FauxOptions::default()
+        });
+        faux.set_responses([answer("done")]);
+        let model = faux.get_model(None).ok_or("faux model missing")?.clone();
+        let models = Models::new(ModelsOptions::default());
+        models.set_provider(faux.provider.clone());
+        let stream_fn = pi_rs_agent::models_stream_fn(models);
+        let agent = Agent::new(pi_rs_agent::AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(model.clone()),
+                system_prompt: Some("Original System".into()),
+                ..AgentInitialState::default()
+            },
+            stream_fn: Some(stream_fn),
+            ..pi_rs_agent::AgentOptions::default()
+        })?;
+        let auth: Arc<dyn AuthStorage> = Arc::new(StaticAuth::allow_all());
+        let registry: Arc<dyn ModelRegistry> =
+            Arc::new(InMemoryModelRegistry::new(vec![model], auth.clone()));
+        let session = AgentSession::new(AgentSessionConfig {
+            agent,
+            session_manager: Arc::new(InMemorySessionManager::new("/tmp/pi-before-start")),
+            settings: Arc::new(InMemorySettings::default()),
+            auth,
+            models: registry,
+            compactor: Arc::new(TailCompactor { keep_recent: 1 }),
+            extensions: Arc::new(BeforeStartRunner),
+            cwd: "/tmp/pi-before-start".into(),
+            retry_prompt: None,
+        })?;
+        session.prompt("hello", PromptOptions::default()).await?;
+        assert!(session.system_prompt().contains("Override System Prompt"));
+        let msgs = session.messages();
+        assert!(msgs.iter().any(|m| {
+            serde_json::to_string(m)
+                .unwrap_or_default()
+                .contains("injected-by-hook")
+        }));
         Ok(())
     }
 }

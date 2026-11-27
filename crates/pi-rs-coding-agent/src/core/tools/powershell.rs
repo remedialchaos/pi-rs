@@ -5,7 +5,11 @@
 
 use std::path::Path;
 
-use super::bash::{BashDetails, BashInput, BashOutput, BashResult, execute_shell};
+use pi_rs_agent::CancellationToken;
+
+use super::bash::{
+    BashChunkCallback, BashDetails, BashInput, BashOutput, BashResult, execute_shell_with,
+};
 
 pub type PowerShellInput = BashInput;
 pub type PowerShellDetails = BashDetails;
@@ -50,6 +54,15 @@ pub async fn execute_powershell(
     input: &PowerShellInput,
     cwd: &Path,
 ) -> Result<PowerShellResult, String> {
+    execute_powershell_with(input, cwd, None, None).await
+}
+
+pub async fn execute_powershell_with(
+    input: &PowerShellInput,
+    cwd: &Path,
+    signal: Option<&CancellationToken>,
+    on_chunk: Option<BashChunkCallback>,
+) -> Result<PowerShellResult, String> {
     if !cfg!(windows) {
         return Err("The powershell tool is only available on Windows.".to_string());
     }
@@ -71,13 +84,15 @@ pub async fn execute_powershell(
         command,
         timeout: input.timeout,
     };
-    execute_shell(
+    execute_shell_with(
         &wrapped,
         cwd,
         &shell,
         &POWERSHELL_ARGS,
         "PowerShell",
         "pi-powershell",
+        signal,
+        on_chunk,
     )
     .await
 }

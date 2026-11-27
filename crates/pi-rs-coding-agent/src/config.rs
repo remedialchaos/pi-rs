@@ -28,6 +28,19 @@ pub const ENV_SESSION_DIR: &str = "PI_CODING_AGENT_SESSION_DIR";
 
 const DEFAULT_SHARE_VIEWER_URL: &str = "https://pi.dev/session/";
 
+/// Upstream `isTruthyEnvFlag`: `1`, `true`, or `yes` (case-insensitive, trimmed).
+pub fn is_truthy_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed == "1" || trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("yes")
+}
+
+/// True when environment variable `name` is set to `1`, `true`, or `yes` (case-insensitive).
+pub fn is_truthy_env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| is_truthy_value(&value))
+}
+
 /// Result of `detectInstallChange`: the package this process loaded from changed on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallChange {
@@ -461,5 +474,20 @@ mod tests {
             Some(InstallChange::Removed)
         );
         Ok(())
+    }
+
+    #[test]
+    fn truthy_env_values_reject_zero_false_and_empty() {
+        assert!(!is_truthy_value(""));
+        assert!(!is_truthy_value("  "));
+        assert!(!is_truthy_value("0"));
+        assert!(!is_truthy_value("false"));
+        assert!(!is_truthy_value("FALSE"));
+        assert!(!is_truthy_value("no"));
+        assert!(!is_truthy_value("off"));
+        assert!(is_truthy_value("1"));
+        assert!(is_truthy_value("true"));
+        assert!(is_truthy_value("TRUE"));
+        assert!(is_truthy_value("yes"));
     }
 }

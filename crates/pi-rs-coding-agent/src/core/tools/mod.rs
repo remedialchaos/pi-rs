@@ -8,6 +8,7 @@
 pub mod bash;
 pub mod edit;
 pub mod edit_diff;
+pub mod file_mutation_queue;
 pub mod find;
 pub mod grep;
 pub mod ls;

@@ -752,6 +752,414 @@ impl McpConnectionManager {
             .cloned()
             .collect()
     }
+
+    pub fn connected_clients(&self) -> IndexMap<String, McpClient> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .servers
+            .iter()
+            .map(|(name, server)| (name.clone(), server.client.clone()))
+            .collect()
+    }
+
+    pub fn servers_section(
+        &self,
+        agent_dir: &Path,
+        cwd: &Path,
+        project_trusted: bool,
+    ) -> Option<String> {
+        let loaded = crate::cli::mcp::load_config(agent_dir, cwd, project_trusted);
+        let clients = self.connected_clients();
+        let listings: Vec<McpServerListing> = loaded
+            .servers
+            .iter()
+            .map(|(name, entry)| {
+                let mut config = McpServerConfig::new(name);
+                if entry["enabled"] == false {
+                    config = config.disabled();
+                }
+                if let Some(exposure) = entry["exposure"].as_str().and_then(McpExposure::parse) {
+                    config = config.with_exposure(exposure);
+                }
+                if let Some(tool_exp) = entry["toolExposure"].as_object() {
+                    for (tool_name, exp_val) in tool_exp {
+                        if let Some(exp) = exp_val.as_str().and_then(McpExposure::parse) {
+                            config = config.with_tool_exposure(tool_name, exp);
+                        }
+                    }
+                }
+                if let Some(desc) = entry["description"].as_str() {
+                    config = config.with_description(desc);
+                }
+                if let Some(instr) = clients.get(name).and_then(McpClient::instructions) {
+                    config = config.with_instructions(instr);
+                }
+                McpServerListing { config }
+            })
+            .collect();
+        render_servers_section(&listings)
+    }
+
+    pub async fn execute_resource_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        ctx: &ExtensionToolContext,
+    ) -> Option<Result<ToolOutcome, String>> {
+        match name {
+            LIST_MCP_RESOURCES_TOOL => Some(self.run_list_resources(args, ctx).await),
+            LIST_MCP_RESOURCE_TEMPLATES_TOOL => {
+                Some(self.run_list_resource_templates(args, ctx).await)
+            }
+            READ_MCP_RESOURCE_TOOL => Some(self.run_read_resource(args, ctx).await),
+            _ => None,
+        }
+    }
+
+    async fn run_list_resources(
+        &self,
+        args: &Value,
+        ctx: &ExtensionToolContext,
+    ) -> Result<ToolOutcome, String> {
+        let target_server = args.get("server").and_then(Value::as_str);
+        let cursor = args.get("cursor").and_then(Value::as_str);
+        let clients = self.connected_clients();
+        let mut resources = Vec::new();
+        let mut errors = Vec::new();
+        let mut next_cursor = None;
+
+        if let Some(server) = target_server {
+            let Some(client) = clients.get(server) else {
+                return Ok(ToolOutcome::error(
+                    &ctx.tool_call_id,
+                    LIST_MCP_RESOURCES_TOOL,
+                    &format!("Unknown or disconnected MCP server \"{server}\"."),
+                ));
+            };
+            match client
+                .list_resources_page(cursor, &Default::default())
+                .await
+            {
+                Ok(page) => {
+                    next_cursor = page.next_cursor;
+                    for r in page.resources {
+                        let mut val = serde_json::to_value(r).unwrap_or(Value::Null);
+                        if let Some(obj) = val.as_object_mut() {
+                            obj.insert("server".to_owned(), serde_json::json!(server));
+                        }
+                        resources.push(val);
+                    }
+                }
+                Err(error) => errors.push(serde_json::json!({
+                    "server": server,
+                    "error": error.to_string(),
+                })),
+            }
+        } else {
+            for (server, client) in &clients {
+                match client.list_resources(&Default::default()).await {
+                    Ok(page) => {
+                        for r in page {
+                            let mut val = serde_json::to_value(r).unwrap_or(Value::Null);
+                            if let Some(obj) = val.as_object_mut() {
+                                obj.insert("server".to_owned(), serde_json::json!(server));
+                            }
+                            resources.push(val);
+                        }
+                    }
+                    Err(error) => errors.push(serde_json::json!({
+                        "server": server,
+                        "error": error.to_string(),
+                    })),
+                }
+            }
+        }
+        let mut structured = serde_json::json!({ "resources": resources });
+        if let Some(server) = target_server {
+            structured["server"] = serde_json::json!(server);
+        }
+        if let Some(cursor) = next_cursor {
+            structured["nextCursor"] = serde_json::json!(cursor);
+        }
+        if !errors.is_empty() {
+            structured["errors"] = serde_json::json!(errors);
+        }
+        let summary = serde_json::to_string_pretty(&structured).unwrap_or_else(|_| "{}".into());
+        Ok(ToolOutcome::success(
+            serde_json::json!({ "type": "toolCall", "id": ctx.tool_call_id, "name": LIST_MCP_RESOURCES_TOOL, "arguments": args }),
+            serde_json::json!({
+                "content": [{ "type": "text", "text": summary }],
+                "structuredContent": structured,
+            }),
+        ))
+    }
+
+    async fn run_list_resource_templates(
+        &self,
+        args: &Value,
+        ctx: &ExtensionToolContext,
+    ) -> Result<ToolOutcome, String> {
+        let target_server = args.get("server").and_then(Value::as_str);
+        let cursor = args.get("cursor").and_then(Value::as_str);
+        let clients = self.connected_clients();
+        let mut templates = Vec::new();
+        let mut errors = Vec::new();
+        let mut next_cursor = None;
+
+        if let Some(server) = target_server {
+            let Some(client) = clients.get(server) else {
+                return Ok(ToolOutcome::error(
+                    &ctx.tool_call_id,
+                    LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+                    &format!("Unknown or disconnected MCP server \"{server}\"."),
+                ));
+            };
+            match client
+                .list_resource_templates_page(cursor, &Default::default())
+                .await
+            {
+                Ok(page) => {
+                    next_cursor = page.next_cursor;
+                    for t in page.resource_templates {
+                        let mut val = serde_json::to_value(t).unwrap_or(Value::Null);
+                        if let Some(obj) = val.as_object_mut() {
+                            obj.insert("server".to_owned(), serde_json::json!(server));
+                        }
+                        templates.push(val);
+                    }
+                }
+                Err(error) => errors.push(serde_json::json!({
+                    "server": server,
+                    "error": error.to_string(),
+                })),
+            }
+        } else {
+            for (server, client) in &clients {
+                match client.list_resource_templates(&Default::default()).await {
+                    Ok(page) => {
+                        for t in page {
+                            let mut val = serde_json::to_value(t).unwrap_or(Value::Null);
+                            if let Some(obj) = val.as_object_mut() {
+                                obj.insert("server".to_owned(), serde_json::json!(server));
+                            }
+                            templates.push(val);
+                        }
+                    }
+                    Err(error) => errors.push(serde_json::json!({
+                        "server": server,
+                        "error": error.to_string(),
+                    })),
+                }
+            }
+        }
+        let mut structured = serde_json::json!({ "resourceTemplates": templates });
+        if let Some(server) = target_server {
+            structured["server"] = serde_json::json!(server);
+        }
+        if let Some(cursor) = next_cursor {
+            structured["nextCursor"] = serde_json::json!(cursor);
+        }
+        if !errors.is_empty() {
+            structured["errors"] = serde_json::json!(errors);
+        }
+        let summary = serde_json::to_string_pretty(&structured).unwrap_or_else(|_| "{}".into());
+        Ok(ToolOutcome::success(
+            serde_json::json!({ "type": "toolCall", "id": ctx.tool_call_id, "name": LIST_MCP_RESOURCE_TEMPLATES_TOOL, "arguments": args }),
+            serde_json::json!({
+                "content": [{ "type": "text", "text": summary }],
+                "structuredContent": structured,
+            }),
+        ))
+    }
+
+    async fn run_read_resource(
+        &self,
+        args: &Value,
+        ctx: &ExtensionToolContext,
+    ) -> Result<ToolOutcome, String> {
+        let Some(server) = args.get("server").and_then(Value::as_str) else {
+            return Ok(ToolOutcome::error(
+                &ctx.tool_call_id,
+                READ_MCP_RESOURCE_TOOL,
+                "Missing required parameter \"server\".",
+            ));
+        };
+        let Some(uri) = args.get("uri").and_then(Value::as_str) else {
+            return Ok(ToolOutcome::error(
+                &ctx.tool_call_id,
+                READ_MCP_RESOURCE_TOOL,
+                "Missing required parameter \"uri\".",
+            ));
+        };
+        let Some(client) = self.server_client(server) else {
+            return Ok(ToolOutcome::error(
+                &ctx.tool_call_id,
+                READ_MCP_RESOURCE_TOOL,
+                &format!("Unknown or disconnected MCP server \"{server}\"."),
+            ));
+        };
+        let result = match client.read_resource(uri, &Default::default()).await {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(ToolOutcome::error(
+                    &ctx.tool_call_id,
+                    READ_MCP_RESOURCE_TOOL,
+                    &error.to_string(),
+                ));
+            }
+        };
+        let raw_blocks: Vec<pi_rs_mcp::LlmContent> = result
+            .contents
+            .iter()
+            .filter_map(|item| {
+                if let Some(text) = pi_rs_mcp::resource_contents_text(item) {
+                    Some(pi_rs_mcp::LlmContent::Text {
+                        text: text.to_owned(),
+                    })
+                } else if let Some(blob) = item.get("blob").and_then(Value::as_str) {
+                    let mime = item
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("application/octet-stream");
+                    if mime.starts_with("image/") {
+                        Some(pi_rs_mcp::LlmContent::Image {
+                            data: blob.to_owned(),
+                            mime_type: mime.to_owned(),
+                        })
+                    } else {
+                        Some(pi_rs_mcp::LlmContent::Text {
+                            text: format!(
+                                "[Binary resource ({mime}, {} bytes base64)]",
+                                blob.len()
+                            ),
+                        })
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let limited = pi_rs_mcp::limit_mcp_content(raw_blocks, None).await;
+        let content: Vec<Value> = limited
+            .content
+            .into_iter()
+            .map(|block| match block {
+                pi_rs_mcp::LlmContent::Text { text } => {
+                    serde_json::json!({ "type": "text", "text": text })
+                }
+                pi_rs_mcp::LlmContent::Image { data, mime_type } => {
+                    serde_json::json!({ "type": "image", "data": data, "mimeType": mime_type })
+                }
+            })
+            .collect();
+        Ok(ToolOutcome::success(
+            serde_json::json!({ "type": "toolCall", "id": ctx.tool_call_id, "name": READ_MCP_RESOURCE_TOOL, "arguments": args }),
+            serde_json::json!({
+                "content": content,
+                "structuredContent": serde_json::json!({ "contents": result.contents }),
+            }),
+        ))
+    }
+}
+
+pub fn mcp_resource_tool_definitions() -> Vec<ToolDefinition> {
+    let mut list_resources = ToolDefinition::new(
+        LIST_MCP_RESOURCES_TOOL,
+        pi_rs_mcp::create_mcp_result_schema(None),
+    );
+    list_resources.label = LIST_MCP_RESOURCES_TOOL.to_owned();
+    list_resources.description = "List resources exposed by connected MCP servers.".to_owned();
+    list_resources.parameters = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "server": { "type": "string", "description": "Optional MCP server name." },
+            "cursor": { "type": "string", "description": "Optional pagination cursor." },
+        },
+        "additionalProperties": false,
+    });
+    list_resources.exposure = RuntimeToolExposure::ModelOnly;
+
+    let mut list_templates = ToolDefinition::new(
+        LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "Optional MCP server name." },
+                "cursor": { "type": "string", "description": "Optional pagination cursor." },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    list_templates.label = LIST_MCP_RESOURCE_TEMPLATES_TOOL.to_owned();
+    list_templates.description =
+        "List resource templates exposed by connected MCP servers.".to_owned();
+    list_templates.exposure = RuntimeToolExposure::ModelOnly;
+
+    let mut read_resource = ToolDefinition::new(
+        READ_MCP_RESOURCE_TOOL,
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "MCP server name." },
+                "uri": { "type": "string", "description": "Resource URI to read." },
+            },
+            "required": ["server", "uri"],
+            "additionalProperties": false,
+        }),
+    );
+    read_resource.label = READ_MCP_RESOURCE_TOOL.to_owned();
+    read_resource.description = "Read a resource from an MCP server by URI.".to_owned();
+    read_resource.exposure = RuntimeToolExposure::ModelOnly;
+
+    vec![list_resources, list_templates, read_resource]
+}
+
+pub fn update_mcp_server_config_entry(
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    server_name: &str,
+    enabled: Option<bool>,
+    exposure: Option<&str>,
+) -> Result<(), String> {
+    let project_path = cwd.join(crate::config::CONFIG_DIR_NAME).join("mcp.json");
+    let global_path = agent_dir.join("mcp.json");
+    let target_path = if project_trusted
+        && project_path.is_file()
+        && std::fs::read_to_string(&project_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .is_some_and(|v| v["mcpServers"].get(server_name).is_some())
+    {
+        project_path
+    } else {
+        global_path
+    };
+    let mut doc = if target_path.is_file() {
+        let raw = std::fs::read_to_string(&target_path).map_err(|e| e.to_string())?;
+        serde_json::from_str::<Value>(&raw).map_err(|e| e.to_string())?
+    } else {
+        serde_json::json!({ "mcpServers": {} })
+    };
+    let Some(entry) = doc["mcpServers"]
+        .get_mut(server_name)
+        .and_then(Value::as_object_mut)
+    else {
+        return Err(format!("No MCP server named \"{server_name}\" in config."));
+    };
+    if let Some(flag) = enabled {
+        entry.insert("enabled".to_owned(), serde_json::json!(flag));
+    }
+    if let Some(exp) = exposure {
+        entry.insert("exposure".to_owned(), serde_json::json!(exp));
+    }
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let formatted = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(&target_path, formatted).map_err(|e| e.to_string())
 }
 
 fn remove_server_locked(
@@ -1238,6 +1646,41 @@ mod tests {
         runner.invalidate();
         alpha_task.abort();
         beta_task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn resource_tool_definitions_match_exact_three_tools() {
+        let defs = mcp_resource_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                LIST_MCP_RESOURCES_TOOL,
+                LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+                READ_MCP_RESOURCE_TOOL,
+            ]
+        );
+    }
+
+    #[test]
+    fn servers_section_uses_configured_indirect_servers() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(cwd.join(".pi")).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&agent_dir).map_err(|e| e.to_string())?;
+        std::fs::write(
+            cwd.join(".pi").join("mcp.json"),
+            r#"{"mcpServers":{"docs":{"url":"https://docs.example/mcp","exposure":"deferred"}}}"#,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let manager = McpConnectionManager::default();
+        let section = manager
+            .servers_section(&agent_dir, &cwd, true)
+            .ok_or("expected servers section")?;
+        assert!(section.contains("- mcp__docs (tool_search)"));
         Ok(())
     }
 }

@@ -184,12 +184,48 @@ pub struct ProviderRegistration {
     pub extension_path: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
+pub struct VirtualModelRouteRequest {
+    pub reason: String,
+    pub model: pi_rs_ai::Model,
+    pub thinking_level: pi_rs_agent::ThinkingLevel,
+    pub messages: Vec<pi_rs_ai::Message>,
+    pub state: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VirtualModelRouteResult {
+    pub provider: String,
+    pub model_id: String,
+    pub thinking_level: pi_rs_agent::ThinkingLevel,
+    pub state: Option<Value>,
+}
+
+pub type VirtualModelRouter = Arc<
+    dyn Fn(VirtualModelRouteRequest) -> BoxFuture<'static, Result<VirtualModelRouteResult, String>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
 pub struct VirtualModelRegistration {
     pub provider: String,
     pub id: String,
     pub definition: Value,
     pub extension_path: String,
+    pub route: Option<VirtualModelRouter>,
+}
+
+impl std::fmt::Debug for VirtualModelRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VirtualModelRegistration")
+            .field("provider", &self.provider)
+            .field("id", &self.id)
+            .field("extension_path", &self.extension_path)
+            .field("has_route", &self.route.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -279,18 +315,38 @@ pub enum LoadPhase {
 
 pub type GetModelFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 pub type GetActiveToolsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+pub type GetAllToolsFn = Arc<dyn Fn() -> Vec<ToolDefinition> + Send + Sync>;
 pub type SetActiveToolsFn = Arc<dyn Fn(Vec<String>) -> Result<(), String> + Send + Sync>;
 pub type SendMessageFn = Arc<dyn Fn(String, Value, bool) -> Result<(), String> + Send + Sync>;
 pub type AppendEntryFn = Arc<dyn Fn(String, Option<Value>) -> Result<String, String> + Send + Sync>;
+pub type SendUserMessageFn = Arc<dyn Fn(Value, Option<String>) -> Result<(), String> + Send + Sync>;
+pub type SetSessionNameFn = Arc<dyn Fn(String) -> Result<(), String> + Send + Sync>;
+pub type GetSessionNameFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+pub type SetLabelFn = Arc<dyn Fn(String, Option<String>) -> Result<(), String> + Send + Sync>;
+pub type GetSettingsFn = Arc<dyn Fn() -> Value + Send + Sync>;
+pub type GetCommandsFn = Arc<dyn Fn() -> Value + Send + Sync>;
+pub type SetModelFn = Arc<dyn Fn(String, String) -> Result<(), String> + Send + Sync>;
+pub type GetThinkingLevelFn = Arc<dyn Fn() -> String + Send + Sync>;
+pub type SetThinkingLevelFn = Arc<dyn Fn(String) -> Result<(), String> + Send + Sync>;
 
 /// Session-level callbacks bound onto `ExtensionHost` once an `AgentSession` is live.
 #[derive(Clone, Default)]
 pub struct ExtensionHostActions {
     pub get_model: Option<GetModelFn>,
     pub get_active_tools: Option<GetActiveToolsFn>,
+    pub get_all_tools: Option<GetAllToolsFn>,
     pub set_active_tools: Option<SetActiveToolsFn>,
     pub send_message: Option<SendMessageFn>,
     pub append_entry: Option<AppendEntryFn>,
+    pub send_user_message: Option<SendUserMessageFn>,
+    pub set_session_name: Option<SetSessionNameFn>,
+    pub get_session_name: Option<GetSessionNameFn>,
+    pub set_label: Option<SetLabelFn>,
+    pub get_settings: Option<GetSettingsFn>,
+    pub get_commands: Option<GetCommandsFn>,
+    pub set_model: Option<SetModelFn>,
+    pub get_thinking_level: Option<GetThinkingLevelFn>,
+    pub set_thinking_level: Option<SetThinkingLevelFn>,
 }
 
 /// Shared runtime state. All extension APIs reference one `ExtensionHost`, so
@@ -667,6 +723,19 @@ impl ExtensionHost {
         callback()
     }
 
+    pub fn get_all_tools(&self) -> Vec<ToolDefinition> {
+        let Some(callback) = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_all_tools
+            .clone()
+        else {
+            return Vec::new();
+        };
+        callback()
+    }
+
     pub fn set_active_tools(&self, tools: Vec<String>) -> Result<(), String> {
         let callback = self
             .actions
@@ -703,6 +772,116 @@ impl ExtensionHost {
             .clone()
             .ok_or_else(|| "append_entry is unavailable before session binding".to_string())?;
         callback(custom_type, data)
+    }
+
+    pub fn send_user_message(
+        &self,
+        content: Value,
+        deliver_as: Option<String>,
+    ) -> Result<(), String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .send_user_message
+            .clone()
+            .ok_or_else(|| "send_user_message is unavailable before session binding".to_string())?;
+        callback(content, deliver_as)
+    }
+
+    pub fn set_session_name(&self, name: String) -> Result<(), String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_session_name
+            .clone()
+            .ok_or_else(|| "set_session_name is unavailable before session binding".to_string())?;
+        callback(name)
+    }
+
+    pub fn get_session_name(&self) -> Option<String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_session_name
+            .clone()?;
+        callback()
+    }
+
+    pub fn set_label(&self, target_id: String, label: Option<String>) -> Result<(), String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_label
+            .clone()
+            .ok_or_else(|| "set_label is unavailable before session binding".to_string())?;
+        callback(target_id, label)
+    }
+
+    pub fn get_settings(&self) -> Value {
+        let Some(callback) = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_settings
+            .clone()
+        else {
+            return Value::Object(Default::default());
+        };
+        callback()
+    }
+
+    pub fn get_commands(&self) -> Value {
+        let Some(callback) = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_commands
+            .clone()
+        else {
+            return Value::Array(Vec::new());
+        };
+        callback()
+    }
+
+    pub fn set_model(&self, provider: String, model_id: String) -> Result<(), String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_model
+            .clone()
+            .ok_or_else(|| "set_model is unavailable before session binding".to_string())?;
+        callback(provider, model_id)
+    }
+
+    pub fn get_thinking_level(&self) -> String {
+        let Some(callback) = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_thinking_level
+            .clone()
+        else {
+            return "off".to_string();
+        };
+        callback()
+    }
+
+    pub fn set_thinking_level(&self, level: String) -> Result<(), String> {
+        let callback = self
+            .actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_thinking_level
+            .clone()
+            .ok_or_else(|| {
+                "set_thinking_level is unavailable before session binding".to_string()
+            })?;
+        callback(level)
     }
 
     pub fn track_unsubscribe(&self, id: usize) {
@@ -1066,6 +1245,7 @@ pub type ExecuteToolFn = Arc<
 
 /// Context passed to tool `execute()`. Adds `tools` and nested
 /// `execute_tool()` with ids of the form `<parentId>/<n>`.
+#[derive(Clone)]
 pub struct ExtensionToolContext {
     pub base: ExtensionContext,
     pub tool_call_id: String,
@@ -1195,6 +1375,10 @@ pub trait Extension: Send + Sync {
     /// Tear down the instance. Native extensions are no-ops; the WASM adapter
     /// drops its `Store` and bumps the generation token.
     fn invalidate(&self) {}
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// Result of loading a set of extensions.

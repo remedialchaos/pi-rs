@@ -547,11 +547,33 @@ impl ExtensionRunner {
     }
 
     pub async fn emit_tool_call(&self, data: Value) -> Option<Value> {
-        self.bus
-            .emit_first(ExtensionEvent::ToolCall, data, |result| {
-                result.get("block") == Some(&json!(true))
+        let updated_input = std::sync::Mutex::new(false);
+        let blocker = std::sync::Mutex::new(None::<Value>);
+        let (state, blocked) = self
+            .bus
+            .emit_chain_until(ExtensionEvent::ToolCall, data, |state, result| {
+                if let Some(input) = result.get("input").filter(|v| !v.is_null()) {
+                    state["input"] = input.clone();
+                    if let Ok(mut flag) = updated_input.lock() {
+                        *flag = true;
+                    }
+                }
+                if result.get("block") == Some(&json!(true)) {
+                    if let Ok(mut guard) = blocker.lock() {
+                        *guard = Some(result.clone());
+                    }
+                    return true;
+                }
+                false
             })
-            .await
+            .await;
+        if blocked {
+            return blocker.into_inner().ok().flatten();
+        }
+        if updated_input.into_inner().unwrap_or(false) {
+            return Some(json!({ "input": state["input"].clone() }));
+        }
+        None
     }
 
     pub async fn emit_user_bash(&self, data: Value) -> Option<Value> {
@@ -726,6 +748,63 @@ impl ExtensionRunner {
             }
         }
         modified.then_some(current)
+    }
+
+    /// Sequentially dispatch `before_agent_start`, chaining `systemPrompt` / `sections`
+    /// mutations and collecting any injected custom messages.
+    pub async fn emit_before_agent_start(&self, event: Value) -> Value {
+        let mut current_system_prompt = event
+            .get("systemPrompt")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut current_sections = event.get("sections").and_then(Value::as_object).cloned();
+        let mut messages = Vec::new();
+        for handler in self.bus.handlers(ExtensionEvent::BeforeAgentStart) {
+            let mut data = event.clone();
+            if let Some(map) = data.as_object_mut() {
+                map.insert("type".to_owned(), json!("before_agent_start"));
+                if let Some(sp) = &current_system_prompt {
+                    map.insert("systemPrompt".to_owned(), json!(sp));
+                }
+                if let Some(sections) = &current_sections {
+                    map.insert("sections".to_owned(), Value::Object(sections.clone()));
+                }
+            }
+            let Some(result) = self
+                .bus
+                .call(ExtensionEvent::BeforeAgentStart, &handler, data)
+                .await
+            else {
+                continue;
+            };
+            if let Some(message) = result.get("message").filter(|value| !value.is_null()) {
+                messages.push(message.clone());
+            }
+            if let Some(sp) = result.get("systemPrompt").and_then(Value::as_str) {
+                current_system_prompt = Some(sp.to_owned());
+            }
+            if let Some(sections) = result.get("sections").and_then(Value::as_object) {
+                let target = current_sections.get_or_insert_with(serde_json::Map::new);
+                for (name, content) in sections {
+                    if content.is_null() {
+                        target.remove(name);
+                    } else {
+                        target.insert(name.clone(), content.clone());
+                    }
+                }
+            }
+        }
+        let mut out = serde_json::Map::new();
+        if !messages.is_empty() {
+            out.insert("messages".to_owned(), Value::Array(messages));
+        }
+        if let Some(sp) = current_system_prompt {
+            out.insert("systemPrompt".to_owned(), Value::String(sp));
+        }
+        if let Some(sections) = current_sections {
+            out.insert("sections".to_owned(), Value::Object(sections));
+        }
+        Value::Object(out)
     }
 
     pub async fn emit_cache_warming_decision(&self, event: Value) -> Value {

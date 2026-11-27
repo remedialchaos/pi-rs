@@ -6,11 +6,16 @@
 //! Okapi BM25. An exact name query wins before term coverage, and coverage wins before raw score.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
 
 use super::{Extension, ExtensionRegistry, ToolExposure, ToolRegistration};
+use crate::core::extensions::types::{
+    ExtensionHost, ExtensionToolContext, ToolDefinition, ToolExposure as RuntimeToolExposure,
+    ToolOutcome,
+};
 
 pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 pub const DEFAULT_TOOL_SEARCH_LIMIT: usize = 8;
@@ -469,6 +474,97 @@ pub fn search_and_load(
     Ok(ToolSearchExecution { text, loaded })
 }
 
+pub fn tool_search_definition() -> ToolDefinition {
+    let mut def = ToolDefinition::new(
+        TOOL_SEARCH_TOOL_NAME,
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query describing the tool or capability to find.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of tools to load (default: 8).",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": false,
+        }),
+    );
+    def.label = "tool_search".to_owned();
+    def.description = TOOL_SEARCH_DESCRIPTION.to_owned();
+    def.exposure = RuntimeToolExposure::ModelOnly;
+    def
+}
+
+struct HostToolAccess(Arc<ExtensionHost>);
+
+impl ToolAccess for HostToolAccess {
+    fn all_tools(&self) -> Vec<ToolInfo> {
+        self.0
+            .get_all_tools()
+            .into_iter()
+            .filter_map(|def| {
+                let exposure = match def.exposure {
+                    RuntimeToolExposure::Direct => ToolExposure::Model,
+                    RuntimeToolExposure::ModelOnly => ToolExposure::ModelOnly,
+                    RuntimeToolExposure::Codemode => ToolExposure::Codemode,
+                    RuntimeToolExposure::Deferred => ToolExposure::Deferred,
+                    RuntimeToolExposure::Hidden => return None,
+                };
+                let mut info = ToolInfo::new(def.name, def.description, def.parameters)
+                    .with_exposure(exposure);
+                let ns = info
+                    .name
+                    .strip_prefix("mcp__")
+                    .and_then(|rest| rest.split_once("__"))
+                    .map(|(ns, _)| ns.to_owned());
+                if let Some(ns) = ns {
+                    info = info.with_namespace(&ns);
+                }
+                Some(info)
+            })
+            .collect()
+    }
+
+    fn active_tools(&self) -> Vec<String> {
+        self.0.get_active_tools()
+    }
+
+    fn set_active_tools(&self, names: Vec<String>) {
+        let _ = self.0.set_active_tools(names);
+    }
+}
+
+pub async fn execute_tool_search(
+    args: Value,
+    ctx: &ExtensionToolContext,
+) -> Result<ToolOutcome, String> {
+    let query = args["query"].as_str().unwrap_or("");
+    let limit = args["limit"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(DEFAULT_TOOL_SEARCH_LIMIT);
+    let access = HostToolAccess(Arc::clone(&ctx.base.host));
+    match search_and_load(&access, query, limit) {
+        Ok(execution) => Ok(ToolOutcome::success(
+            json!({ "type": "toolCall", "id": ctx.tool_call_id, "name": TOOL_SEARCH_TOOL_NAME, "arguments": args }),
+            json!({
+                "content": [{ "type": "text", "text": execution.text }],
+                "details": { "loaded": execution.loaded },
+            }),
+        )),
+        Err(error) => Ok(ToolOutcome::error(
+            &ctx.tool_call_id,
+            TOOL_SEARCH_TOOL_NAME,
+            &error.to_string(),
+        )),
+    }
+}
+
 /// The built-in `tool_search` extension. Registered inactive by default, exactly like upstream.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ToolSearchExtension;
@@ -639,5 +735,63 @@ mod tests {
         assert_eq!(registry.tools[0].name, TOOL_SEARCH_TOOL_NAME);
         assert!(!registry.tools[0].default_active);
         assert_eq!(registry.tools[0].exposure, ToolExposure::ModelOnly);
+    }
+
+    #[tokio::test]
+    async fn execute_tool_search_activates_matching_deferred_tool_on_host() -> Result<(), String> {
+        let bus = Arc::new(crate::core::event_bus::EventBus::new());
+        let host = Arc::new(crate::core::extensions::types::ExtensionHost::new(bus));
+        host.commit();
+        let active = Arc::new(std::sync::Mutex::new(vec!["read".to_owned()]));
+        let active_get = Arc::clone(&active);
+        let active_set = Arc::clone(&active);
+        let mut hidden_def =
+            crate::core::extensions::types::ToolDefinition::new("secret_tool", json!({}));
+        hidden_def.exposure = RuntimeToolExposure::Hidden;
+        let mut deferred_def =
+            crate::core::extensions::types::ToolDefinition::new("mcp__docs__find", json!({}));
+        deferred_def.exposure = RuntimeToolExposure::Deferred;
+        deferred_def.description = "Find documentation pages".to_owned();
+        host.set_actions(crate::core::extensions::types::ExtensionHostActions {
+            get_all_tools: Some(Arc::new(move || {
+                vec![deferred_def.clone(), hidden_def.clone()]
+            })),
+            get_active_tools: Some(Arc::new(move || {
+                active_get.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            })),
+            set_active_tools: Some(Arc::new(move |next| {
+                *active_set.lock().unwrap_or_else(|e| e.into_inner()) = next;
+                Ok(())
+            })),
+            ..Default::default()
+        });
+        let ext_ctx = crate::core::extensions::types::ExtensionContext {
+            host,
+            cwd: ".".into(),
+            mode: crate::core::extensions::types::ExtensionMode::Print,
+            ui: crate::core::extensions::types::ExtensionUi::no_op(
+                crate::core::extensions::types::ExtensionMode::Print,
+            ),
+            bus: None,
+            is_idle: Arc::new(|| true),
+            is_project_trusted: Arc::new(|| true),
+            has_pending_messages: Arc::new(|| false),
+            get_context_usage: Arc::new(|| None),
+            get_system_prompt: Arc::new(String::new),
+            abort: Arc::new(|| {}),
+            shutdown: Arc::new(|| {}),
+            compact: Arc::new(|_| {}),
+        };
+        let tool_ctx = ExtensionToolContext::new(ext_ctx, "call-1");
+        let outcome =
+            execute_tool_search(json!({ "query": "documentation find" }), &tool_ctx).await?;
+        assert!(!outcome.is_error);
+        assert!(
+            active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&"mcp__docs__find".to_owned())
+        );
+        Ok(())
     }
 }

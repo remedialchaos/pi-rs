@@ -5,17 +5,21 @@
 //! executor with different shell arguments.
 
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use pi_rs_agent::CancellationToken;
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
 use super::truncate::{
     DEFAULT_MAX_BYTES, TruncationOptions, TruncationResult, format_size, truncate_tail,
 };
+
+pub type BashChunkCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub const EXIT_STDIO_GRACE_MS: u64 = 100;
 pub const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
@@ -175,6 +179,104 @@ fn format_output(
     (text, Some(details))
 }
 
+struct ProcessTreeGuard(Option<u32>);
+
+impl ProcessTreeGuard {
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.take().and_then(|pid| i32::try_from(pid).ok()) {
+            use nix::{
+                sys::signal::{Signal, killpg},
+                unistd::Pid,
+            };
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(pid) = self.0.take() {
+            let _ = crate::utils::child_process::kill_process_tree(pid);
+        }
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+struct StreamPipe<R> {
+    reader: Option<R>,
+    buf: [u8; 8192],
+    pending: usize,
+}
+
+impl<R: AsyncRead + Unpin> StreamPipe<R> {
+    fn new(reader: Option<R>) -> Self {
+        Self {
+            reader,
+            buf: [0; 8192],
+            pending: 0,
+        }
+    }
+
+    async fn read_chunk(&mut self) -> std::io::Result<usize> {
+        let Some(reader) = &mut self.reader else {
+            return Ok(0);
+        };
+        reader.read(&mut self.buf[self.pending..]).await
+    }
+
+    fn ingest(
+        &mut self,
+        read: usize,
+        combined: &mut Vec<u8>,
+        on_chunk: Option<&BashChunkCallback>,
+    ) {
+        let end = self.pending + read;
+        if read == 0 {
+            self.reader = None;
+            self.pending = 0;
+            if end > 0 {
+                combined.extend_from_slice(&self.buf[..end]);
+                if let Some(cb) = on_chunk {
+                    let text = String::from_utf8_lossy(&self.buf[..end]);
+                    if !text.is_empty() {
+                        cb(&text);
+                    }
+                }
+            }
+            return;
+        }
+        let mut complete = end;
+        if let Some(start) = self.buf[..end]
+            .iter()
+            .rposition(|&byte| byte & 0xc0 != 0x80)
+            && end - start < 4
+            && std::str::from_utf8(&self.buf[start..end])
+                .is_err_and(|error| error.error_len().is_none())
+        {
+            complete = start;
+        }
+        if complete > 0 {
+            combined.extend_from_slice(&self.buf[..complete]);
+            if let Some(cb) = on_chunk {
+                let text = String::from_utf8_lossy(&self.buf[..complete]);
+                if !text.is_empty() {
+                    cb(&text);
+                }
+            }
+        }
+        self.buf.copy_within(complete..end, 0);
+        self.pending = end - complete;
+    }
+}
+
+enum ShellWaitOutcome {
+    Status(std::io::Result<ExitStatus>),
+    TimedOut,
+    Aborted,
+}
+
 /// Run a command through `shell args... command`, capturing both output streams.
 pub async fn execute_shell(
     input: &BashInput,
@@ -184,12 +286,43 @@ pub async fn execute_shell(
     shell_name: &str,
     temp_file_prefix: &str,
 ) -> Result<BashResult, String> {
+    execute_shell_with(
+        input,
+        cwd,
+        shell,
+        args,
+        shell_name,
+        temp_file_prefix,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Run a command with incremental chunk streaming and mid-flight cancellation / process-group kill.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Internal shared shell executor with optional signal and chunk streaming"
+)]
+pub async fn execute_shell_with(
+    input: &BashInput,
+    cwd: &Path,
+    shell: &str,
+    args: &[&str],
+    shell_name: &str,
+    temp_file_prefix: &str,
+    signal: Option<&CancellationToken>,
+    on_chunk: Option<BashChunkCallback>,
+) -> Result<BashResult, String> {
     let timeout_ms = resolve_timeout_ms(input.timeout)?;
     if !cwd.exists() {
         return Err(format!(
             "Working directory does not exist: {}\nCannot execute {shell_name} commands.",
             cwd.display()
         ));
+    }
+    if signal.is_some_and(CancellationToken::is_cancelled) {
+        return Err("Command aborted".to_owned());
     }
 
     let started_at = Instant::now();
@@ -199,65 +332,96 @@ pub async fn execute_shell(
         .arg(&input.command)
         .current_dir(cwd)
         .envs(NON_INTERACTIVE_ENV.iter().copied());
+    if std::env::var_os("PI_CODING_AGENT").is_none() {
+        command.env("PI_CODING_AGENT", "true");
+    }
+    if std::env::var_os("AI_AGENT").is_none() {
+        command.env("AI_AGENT", crate::config::APP_NAME);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("Failed to spawn {shell_name}: {error}"))?;
+    let mut tree = ProcessTreeGuard(child.id());
 
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let mut stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = stdout_pipe {
-            let _ = pipe.read_to_end(&mut bytes).await;
-        }
-        bytes
-    });
-    let mut stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = stderr_pipe {
-            let _ = pipe.read_to_end(&mut bytes).await;
-        }
-        bytes
-    });
+    let mut stdout_pipe = StreamPipe::new(child.stdout.take());
+    let mut stderr_pipe = StreamPipe::new(child.stderr.take());
+    let mut combined = Vec::new();
 
-    let mut timed_out = false;
-    let wait_result = match timeout_ms {
-        Some(millis) => timeout(Duration::from_millis(millis), child.wait()).await,
-        None => Ok(child.wait().await),
+    let cancel_future = async {
+        match signal {
+            Some(token) => {
+                token.cancelled().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
     };
-    let status = match wait_result {
-        Ok(result) => {
-            Some(result.map_err(|error| format!("Failed to wait for {shell_name}: {error}"))?)
-        }
-        Err(_) => {
-            timed_out = true;
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            None
+    let timeout_future = async {
+        match timeout_ms {
+            Some(millis) => {
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+            }
+            None => std::future::pending::<()>().await,
         }
     };
 
-    let drain = Duration::from_millis(EXIT_STDIO_GRACE_MS);
-    let stdout_bytes = timeout(drain, &mut stdout_task)
-        .await
-        .ok()
-        .and_then(|result| result.ok())
-        .unwrap_or_default();
-    let stderr_bytes = timeout(drain, &mut stderr_task)
-        .await
-        .ok()
-        .and_then(|result| result.ok())
-        .unwrap_or_default();
+    let outcome = {
+        let pump = async {
+            while stdout_pipe.reader.is_some() || stderr_pipe.reader.is_some() {
+                tokio::select! {
+                    read = stdout_pipe.read_chunk(), if stdout_pipe.reader.is_some() => {
+                        let read = read.unwrap_or(0);
+                        stdout_pipe.ingest(read, &mut combined, on_chunk.as_ref());
+                    }
+                    read = stderr_pipe.read_chunk(), if stderr_pipe.reader.is_some() => {
+                        let read = read.unwrap_or(0);
+                        stderr_pipe.ingest(read, &mut combined, on_chunk.as_ref());
+                    }
+                }
+            }
+        };
+        let wait = async {
+            tokio::select! {
+                result = child.wait() => ShellWaitOutcome::Status(result),
+                () = timeout_future => {
+                    tree.kill();
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    ShellWaitOutcome::TimedOut
+                }
+                () = cancel_future => {
+                    tree.kill();
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    ShellWaitOutcome::Aborted
+                }
+            }
+        };
+        tokio::pin!(pump, wait);
+        tokio::select! {
+            outcome = &mut wait => {
+                let _ = timeout(Duration::from_millis(EXIT_STDIO_GRACE_MS), &mut pump).await;
+                outcome
+            }
+            () = &mut pump => wait.await,
+        }
+    };
+
+    if matches!(&outcome, ShellWaitOutcome::Status(_)) {
+        tree.0 = None;
+    }
 
     let elapsed_ms = started_at.elapsed().as_millis() as f64;
     let wall_time_seconds = (elapsed_ms / 100.0).round() / 10.0;
-    let mut combined = stdout_bytes;
-    combined.extend_from_slice(&stderr_bytes);
     let full_output = String::from_utf8_lossy(&combined).into_owned();
 
     let snapshot = truncate_tail(&full_output, &TruncationOptions::default());
@@ -268,64 +432,55 @@ pub async fn execute_shell(
     };
     let (text, details) = format_output(&snapshot, &full_output, full_output_path.as_deref());
 
-    if timed_out {
-        let seconds = input
-            .timeout
-            .map_or_else(|| "undefined".to_string(), |value| value.to_string());
-        return Ok(BashResult {
-            text: append_status(&text, &format!("Command timed out after {seconds} seconds")),
-            details,
-            structured: BashOutput {
-                output: full_output,
-                truncated: snapshot.truncated,
-                full_output_path,
-                exit_code: -1,
+    match outcome {
+        ShellWaitOutcome::Aborted => Err(append_status(&text, "Command aborted")),
+        ShellWaitOutcome::TimedOut => {
+            let seconds = input
+                .timeout
+                .map_or_else(|| "undefined".to_string(), |value| value.to_string());
+            Ok(BashResult {
+                text: append_status(&text, &format!("Command timed out after {seconds} seconds")),
+                details,
+                structured: BashOutput {
+                    output: full_output,
+                    truncated: snapshot.truncated,
+                    full_output_path,
+                    exit_code: -1,
+                    wall_time_seconds,
+                },
+                is_error: true,
+            })
+        }
+        ShellWaitOutcome::Status(wait_result) => {
+            let status =
+                wait_result.map_err(|error| format!("Failed to wait for {shell_name}: {error}"))?;
+            let exit_code = status.code().unwrap_or(1);
+            let (structured_output_text, structured_truncated) = structured_output(&full_output);
+            let structured = BashOutput {
+                output: structured_output_text,
+                truncated: structured_truncated || snapshot.truncated,
+                full_output_path: full_output_path.clone(),
+                exit_code,
                 wall_time_seconds,
-            },
-            is_error: true,
-        });
+            };
+
+            if exit_code != 0 {
+                return Ok(BashResult {
+                    text: append_status(&text, &format!("Command exited with code {exit_code}")),
+                    details,
+                    structured,
+                    is_error: true,
+                });
+            }
+
+            Ok(BashResult {
+                text,
+                details,
+                structured,
+                is_error: false,
+            })
+        }
     }
-
-    let Some(status) = status else {
-        return Ok(BashResult {
-            text: append_status(&text, "Command terminated without an exit code"),
-            details,
-            structured: BashOutput {
-                output: full_output,
-                truncated: snapshot.truncated,
-                full_output_path,
-                exit_code: -1,
-                wall_time_seconds,
-            },
-            is_error: true,
-        });
-    };
-
-    let exit_code = status.code().unwrap_or(1);
-    let (structured_output_text, structured_truncated) = structured_output(&full_output);
-    let structured = BashOutput {
-        output: structured_output_text,
-        truncated: structured_truncated || snapshot.truncated,
-        full_output_path: full_output_path.clone(),
-        exit_code,
-        wall_time_seconds,
-    };
-
-    if exit_code != 0 {
-        return Ok(BashResult {
-            text: append_status(&text, &format!("Command exited with code {exit_code}")),
-            details,
-            structured,
-            is_error: true,
-        });
-    }
-
-    Ok(BashResult {
-        text,
-        details,
-        structured,
-        is_error: false,
-    })
 }
 
 fn append_status(text: &str, status: &str) -> String {
@@ -338,6 +493,15 @@ fn append_status(text: &str, status: &str) -> String {
 
 /// Bash tool: `/bin/bash -c <command>` on Unix, falling back to `bash`/`sh`.
 pub async fn execute_bash(input: &BashInput, cwd: &Path) -> Result<BashResult, String> {
+    execute_bash_with(input, cwd, None, None).await
+}
+
+pub async fn execute_bash_with(
+    input: &BashInput,
+    cwd: &Path,
+    signal: Option<&CancellationToken>,
+    on_chunk: Option<BashChunkCallback>,
+) -> Result<BashResult, String> {
     #[cfg(windows)]
     let (shell, args) = ("bash".to_string(), vec!["-c"]);
     #[cfg(not(windows))]
@@ -346,7 +510,10 @@ pub async fn execute_bash(input: &BashInput, cwd: &Path) -> Result<BashResult, S
     } else {
         ("sh".to_string(), vec!["-c"])
     };
-    execute_shell(input, cwd, &shell, &args, "bash", "pi-bash").await
+    execute_shell_with(
+        input, cwd, &shell, &args, "bash", "pi-bash", signal, on_chunk,
+    )
+    .await
 }
 
 #[cfg(test)]

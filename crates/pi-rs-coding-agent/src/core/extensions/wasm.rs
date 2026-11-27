@@ -41,6 +41,16 @@ pub mod wit_bindings {
 
 /// Callback invoked when a WASM guest calls `pi:extension/host.execute-tool`.
 pub type HostToolHandler = Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>;
+/// Async nested tool dispatcher invoked when a WASM guest calls `pi:extension/host.execute-tool`.
+pub type AsyncHostToolHandler = Arc<
+    dyn Fn(
+            String,
+            String,
+            String,
+        ) -> futures_util::future::BoxFuture<'static, Result<String, String>>
+        + Send
+        + Sync,
+>;
 
 /// A WIT `option<patch>`: `None` means the guest did not touch the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +228,7 @@ struct HostBridge {
     notifications: Arc<Mutex<Vec<(String, String)>>>,
     flags: Arc<Mutex<IndexMap<String, String>>>,
     tool_handler: Arc<Mutex<Option<HostToolHandler>>>,
+    async_tool_handler: Arc<Mutex<Option<AsyncHostToolHandler>>>,
 }
 
 #[derive(Default)]
@@ -237,6 +248,7 @@ struct WasmState {
     registrations: Option<GuestRegistrations>,
     ui: Option<super::types::ExtensionUi>,
     cwd: String,
+    active_tool_call_id: String,
     generation: u64,
     stale: bool,
     bridge: HostBridge,
@@ -707,6 +719,15 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
         if self.stale {
             return Err(STALE_MESSAGE.to_string());
         }
+        let async_handler = self
+            .bridge
+            .async_tool_handler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(handler) = async_handler {
+            return handler(self.active_tool_call_id.clone(), name, args_json).await;
+        }
         let handler = self
             .bridge
             .tool_handler
@@ -717,6 +738,366 @@ impl wit_bindings::pi::extension::host::Host for WasmState {
             Some(handler) => handler(&name, &args_json),
             None => Err(format!("no host tool dispatcher configured for \"{name}\"")),
         }
+    }
+
+    async fn send_user_message(
+        &mut self,
+        content_json: String,
+        deliver_as: Option<String>,
+    ) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let content: Value = serde_json::from_str(&content_json)
+            .map_err(|error| format!("invalid send-user-message content JSON: {error}"))?;
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.send_user_message(content, deliver_as)
+    }
+
+    async fn set_session_name(&mut self, name: String) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.set_session_name(name)
+    }
+
+    async fn get_session_name(&mut self) -> Option<String> {
+        if self.stale {
+            return None;
+        }
+        self.host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|host| host.get_session_name())
+    }
+
+    async fn set_label(&mut self, target_id: String, label: Option<String>) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.set_label(target_id, label)
+    }
+
+    async fn get_all_tools(&mut self) -> String {
+        if self.stale {
+            return "[]".to_string();
+        }
+        let Some(host) = self.host.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return "[]".to_string();
+        };
+        let encoded: Vec<Value> = host
+            .get_all_tools()
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "label": t.label,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                    "exposure": t.exposure.as_str(),
+                })
+            })
+            .collect();
+        serde_json::to_string(&encoded).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    async fn get_settings(&mut self) -> String {
+        if self.stale {
+            return "{}".to_string();
+        }
+        let Some(host) = self.host.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return "{}".to_string();
+        };
+        serde_json::to_string(&host.get_settings()).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    async fn get_commands(&mut self) -> String {
+        if self.stale {
+            return "[]".to_string();
+        }
+        let Some(host) = self.host.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return "[]".to_string();
+        };
+        serde_json::to_string(&host.get_commands()).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    async fn set_model(&mut self, provider: String, model_id: String) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.set_model(provider, model_id)
+    }
+
+    async fn get_thinking_level(&mut self) -> String {
+        if self.stale {
+            return "off".to_string();
+        }
+        self.host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map_or_else(|| "off".to_string(), |host| host.get_thinking_level())
+    }
+
+    async fn set_thinking_level(&mut self, level: String) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.set_thinking_level(level)
+    }
+
+    async fn unregister_provider(&mut self, name: String) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.unregister_provider(&name);
+        Ok(())
+    }
+
+    async fn unregister_mcp_server(&mut self, name: String) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        let servers = host.mcp_servers();
+        let owner = servers
+            .into_iter()
+            .find(|s| s.name == name)
+            .map(|s| s.extension_path)
+            .unwrap_or_default();
+        host.unregister_mcp_server(&name, &owner);
+        Ok(())
+    }
+
+    async fn unregister_virtual_model(
+        &mut self,
+        provider: String,
+        id: String,
+    ) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        host.unregister_virtual_model(&provider, &id);
+        Ok(())
+    }
+
+    async fn get_mcp_servers(&mut self) -> String {
+        if self.stale {
+            return "[]".to_string();
+        }
+        let Some(host) = self.host.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return "[]".to_string();
+        };
+        let encoded: Vec<Value> = host
+            .mcp_servers()
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "config": s.config,
+                    "extensionPath": s.extension_path,
+                })
+            })
+            .collect();
+        serde_json::to_string(&encoded).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    async fn events_emit(&mut self, channel: String, data_json: String) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        let payload: Value = serde_json::from_str(&data_json)
+            .map_err(|error| format!("invalid events-emit JSON: {error}"))?;
+        host.event_bus.emit_channel(&channel, payload).await;
+        Ok(())
+    }
+
+    async fn events_subscribe(&mut self, channel: String) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| STALE_MESSAGE.to_string())?;
+        host.assert_active()?;
+        let bus = Arc::clone(&host.event_bus);
+        let id = host
+            .event_bus
+            .subscribe_channel(channel.clone(), move |data| {
+                let bus = Arc::clone(&bus);
+                let channel = channel.clone();
+                async move {
+                    if let Ok(event) = ExtensionEvent::parse(&channel) {
+                        let _ = bus.emit(event, data).await;
+                    }
+                    Ok(None)
+                }
+            });
+        host.track_unsubscribe(id);
+        Ok(())
+    }
+
+    async fn ui_get_editor_text(&mut self) -> String {
+        String::new()
+    }
+
+    async fn ui_paste_to_editor(&mut self, text: String) {
+        if let Some(ui) = &self.ui {
+            ui.set_editor_text(text);
+        }
+    }
+
+    async fn ui_set_working_message(&mut self, message: Option<String>) {
+        if let Some(ui) = &self.ui {
+            ui.set_status("working".to_owned(), message);
+        }
+    }
+
+    async fn ui_set_widget_placed(
+        &mut self,
+        key: String,
+        lines: Option<Vec<String>>,
+        placement: Option<String>,
+    ) {
+        if let Some(ui) = &self.ui {
+            let parsed = placement.as_deref().and_then(|p| match p {
+                "above" | "aboveEditor" => Some(super::types::UiWidgetPlacement::AboveEditor),
+                "below" | "belowEditor" => Some(super::types::UiWidgetPlacement::BelowEditor),
+                _ => None,
+            });
+            ui.set_widget(key, lines, parsed);
+        }
+    }
+
+    async fn ui_select_timed(
+        &mut self,
+        title: String,
+        items: Vec<String>,
+        timeout_ms: Option<u64>,
+    ) -> Option<String> {
+        self.ui
+            .as_ref()?
+            .select_with_options(
+                title,
+                items,
+                super::types::UiDialogOptions {
+                    timeout_ms,
+                    cancel: None,
+                },
+            )
+            .await
+    }
+
+    async fn ui_confirm_timed(
+        &mut self,
+        title: String,
+        message: String,
+        timeout_ms: Option<u64>,
+    ) -> bool {
+        match &self.ui {
+            Some(ui) => {
+                ui.confirm_with_options(
+                    title,
+                    message,
+                    super::types::UiDialogOptions {
+                        timeout_ms,
+                        cancel: None,
+                    },
+                )
+                .await
+            }
+            None => false,
+        }
+    }
+
+    async fn ui_input_timed(
+        &mut self,
+        title: String,
+        placeholder: Option<String>,
+        timeout_ms: Option<u64>,
+    ) -> Option<String> {
+        self.ui
+            .as_ref()?
+            .input_with_options(
+                title,
+                placeholder,
+                super::types::UiDialogOptions {
+                    timeout_ms,
+                    cancel: None,
+                },
+            )
+            .await
+    }
+
+    async fn ui_set_theme(&mut self, name: String) -> Result<(), String> {
+        if self.stale {
+            return Err(STALE_MESSAGE.to_string());
+        }
+        if let Some(ui) = &self.ui {
+            ui.set_status("theme".to_owned(), Some(name));
+        }
+        Ok(())
+    }
+
+    async fn ui_get_theme(&mut self) -> Option<String> {
+        let host = self.host.as_ref().and_then(std::sync::Weak::upgrade)?;
+        host.get_settings()
+            .get("theme")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
     }
 }
 
@@ -815,6 +1196,7 @@ impl WasmStore {
                 ui: None,
                 registrations: None,
                 cwd: String::new(),
+                active_tool_call_id: String::new(),
                 generation,
                 stale: false,
                 bridge: self.bridge.clone(),
@@ -1060,6 +1442,17 @@ impl WasmExtension {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handler);
     }
 
+    pub fn set_async_tool_handler(&self, handler: AsyncHostToolHandler) {
+        *self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .bridge
+            .async_tool_handler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handler);
+    }
+
     pub fn notifications(&self) -> Vec<(String, String)> {
         self.store
             .lock()
@@ -1098,6 +1491,7 @@ impl WasmExtension {
                 ui: None,
                 registrations: None,
                 cwd: String::new(),
+                active_tool_call_id: String::new(),
                 generation,
                 stale: false,
                 bridge,
@@ -1302,6 +1696,7 @@ impl Extension for WasmExtension {
                     id,
                     definition,
                     extension_path: ctx.registration.path.clone(),
+                    route: None,
                 })?;
             }
             for (name, config) in registrations.mcp_servers {
@@ -1399,10 +1794,15 @@ impl Extension for WasmExtension {
             } = &mut *guard;
             store.data_mut().ui = Some(ctx.base.ui.clone());
             store.data_mut().cwd.clone_from(&ctx.base.cwd);
+            store
+                .data_mut()
+                .active_tool_call_id
+                .clone_from(&ctx.tool_call_id);
             let result = instance
                 .call_execute_tool(&mut *store, name, &args_json)
                 .await;
             store.data_mut().ui = None;
+            store.data_mut().active_tool_call_id.clear();
             result.map_err(|error| format!("guest execute-tool trap: {error}"))??
         };
         self.assert_current()?;
@@ -1444,6 +1844,10 @@ impl Extension for WasmExtension {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         store.invalidate();
         self.generation.store(store.generation(), Ordering::SeqCst);
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 }
 
@@ -1497,6 +1901,7 @@ mod tests {
             cwd: "/work".to_string(),
             generation: 0,
             stale: false,
+            active_tool_call_id: String::new(),
             bridge: HostBridge::default(),
         };
         assert_eq!(
@@ -1678,6 +2083,7 @@ mod tests {
             cwd: dir.path().to_string_lossy().into_owned(),
             generation: 1,
             stale: false,
+            active_tool_call_id: String::new(),
             bridge: HostBridge::default(),
         };
 
@@ -1729,6 +2135,7 @@ mod tests {
             cwd: dir.path().to_string_lossy().into_owned(),
             generation: 1,
             stale: false,
+            active_tool_call_id: String::new(),
             bridge: HostBridge::default(),
         };
 
@@ -1767,6 +2174,7 @@ mod tests {
             cwd: dir.path().to_string_lossy().into_owned(),
             generation: 1,
             stale: false,
+            active_tool_call_id: String::new(),
             bridge: HostBridge::default(),
         };
 
@@ -1819,6 +2227,7 @@ mod tests {
                     .push((kind, data));
                 Ok("entry-42".to_string())
             })),
+            ..ExtensionHostActions::default()
         });
 
         let mut state = WasmState {
@@ -1828,6 +2237,7 @@ mod tests {
             cwd: "/workspace".to_string(),
             generation: 1,
             stale: false,
+            active_tool_call_id: String::new(),
             bridge: HostBridge::default(),
         };
 
@@ -1884,5 +2294,91 @@ mod tests {
         assert_eq!(regs.subscriptions, vec![ExtensionEvent::ToolResult]);
         assert_eq!(regs.shortcuts.len(), 1);
         assert_eq!(regs.mcp_servers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expanded_wit_host_callbacks_round_trip_through_actions_and_bus() {
+        use super::wit_bindings::pi::extension::host::Host;
+        use crate::core::event_bus::EventBus;
+        use crate::core::extensions::types::{ExtensionHost, ExtensionHostActions};
+
+        let bus = Arc::new(EventBus::new());
+        let host = Arc::new(ExtensionHost::new(bus));
+        host.commit();
+
+        let session_name = Arc::new(Mutex::new(Some("initial-name".to_owned())));
+        let labels = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let name_read = Arc::clone(&session_name);
+        let name_write = Arc::clone(&session_name);
+        let labels_write = Arc::clone(&labels);
+
+        host.set_actions(ExtensionHostActions {
+            get_session_name: Some(Arc::new(move || {
+                name_read.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            })),
+            set_session_name: Some(Arc::new(move |next| {
+                *name_write.lock().unwrap_or_else(|e| e.into_inner()) = Some(next);
+                Ok(())
+            })),
+            set_label: Some(Arc::new(move |id, label| {
+                labels_write
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((id, label));
+                Ok(())
+            })),
+            get_settings: Some(Arc::new(|| json!({ "theme": "dark" }))),
+            get_commands: Some(Arc::new(
+                || json!([{ "name": "session", "source": "builtin" }]),
+            )),
+            ..ExtensionHostActions::default()
+        });
+
+        let mut state = WasmState {
+            host: Some(Arc::downgrade(&host)),
+            registrations: Some(GuestRegistrations::default()),
+            ui: None,
+            cwd: "/workspace".to_string(),
+            generation: 1,
+            stale: false,
+            active_tool_call_id: String::new(),
+            bridge: HostBridge::default(),
+        };
+
+        assert_eq!(
+            state.get_session_name().await.as_deref(),
+            Some("initial-name")
+        );
+        state
+            .set_session_name("renamed".into())
+            .await
+            .expect("set_session_name");
+        assert_eq!(state.get_session_name().await.as_deref(), Some("renamed"));
+
+        state
+            .set_label("entry-1".into(), Some("checkpoint".into()))
+            .await
+            .expect("set_label");
+        assert_eq!(
+            *labels.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![("entry-1".to_owned(), Some("checkpoint".to_owned()))]
+        );
+
+        let settings_json = state.get_settings().await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&settings_json).expect("json"),
+            json!({ "theme": "dark" })
+        );
+        let commands_json = state.get_commands().await;
+        assert!(commands_json.contains("session"));
+
+        state
+            .events_subscribe("custom:ping".into())
+            .await
+            .expect("events_subscribe");
+        state
+            .events_emit("custom:ping".into(), r#"{"ok":true}"#.into())
+            .await
+            .expect("events_emit");
     }
 }

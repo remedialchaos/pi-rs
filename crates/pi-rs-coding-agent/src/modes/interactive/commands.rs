@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::{
     cli::{auth_command, session_picker},
+    config,
     core::{
         agent_session::ForkPosition,
         agent_session_services::export_to_html,
@@ -30,9 +31,12 @@ use crate::{
             ProjectTrustStore, format_project_trust_prompt, get_project_trust_options,
         },
         session_manager::SessionManager,
+        settings_manager::SettingsManager,
+        skills::{SourceInfo, SourceScope},
         slash_commands::{BUILTIN_SLASH_COMMANDS, parse_slash_command},
     },
     modes::rpc::session,
+    utils::tools_manager::{Tool as HelperTool, ToolManager},
 };
 use pi_rs_tui::{EditorComponent, EditorHistory};
 
@@ -61,67 +65,228 @@ pub(super) enum Choice {
     Auth(Option<String>, bool),
 }
 
-const EXTRA_COMMANDS: &[(&str, &str)] = &[
-    ("help", "Show commands"),
-    ("theme", "Change the color theme"),
-    ("clear", "Clear the displayed transcript"),
-    ("exit", "Quit pi"),
-    ("debug", "Show interactive diagnostics"),
-    ("arminsayshi", "Show Armin"),
-    ("dementedelves", "Explore Demented Elves"),
-];
+fn clear_should_quit(last_clear: &mut Option<Instant>, now: Instant) -> bool {
+    if last_clear.is_some_and(|last| now.duration_since(last) < Duration::from_millis(500)) {
+        return true;
+    }
+    *last_clear = Some(now);
+    false
+}
 
-pub(super) fn autocomplete(bound: &Bound) -> impl AutocompleteProvider + use<> {
-    let make = |name, description, argument_hint| SlashCommand {
-        name,
-        description,
-        argument_hint,
-        get_argument_completions: None,
+fn source_tag(info: &SourceInfo) -> Option<String> {
+    if info.source == "builtin" {
+        return None;
+    }
+    let scope = match info.scope {
+        SourceScope::User => "u",
+        SourceScope::Project => "p",
+        SourceScope::Temporary => "t",
     };
-    let mut commands: Vec<_> = BUILTIN_SLASH_COMMANDS
+    let source = info.source.trim();
+    if source == "auto" || source == "local" || source == "cli" {
+        return Some(scope.to_owned());
+    }
+    if source.starts_with("npm:") || source.starts_with("git:") {
+        return Some(format!("{scope}:{source}"));
+    }
+    Some(scope.to_owned())
+}
+
+fn prefix_source_description(
+    description: Option<String>,
+    info: Option<&SourceInfo>,
+) -> Option<String> {
+    let tag = info.and_then(source_tag)?;
+    match description.filter(|d| !d.is_empty()) {
+        Some(desc) => Some(format!("[{tag}] {desc}")),
+        None => Some(format!("[{tag}]")),
+    }
+}
+
+pub(super) fn autocomplete(
+    bound: &Bound,
+    settings: &SettingsManager,
+    agent_dir: &Path,
+) -> impl AutocompleteProvider + use<> {
+    let mut commands: Vec<SlashCommand> = BUILTIN_SLASH_COMMANDS
         .iter()
         .map(|cmd| {
-            make(
-                cmd.name.into(),
-                Some(cmd.description.into()),
-                cmd.argument_hint.map(str::to_owned),
-            )
+            let completions: Option<Box<pi_rs_tui::autocomplete::CompleteArguments>> =
+                match cmd.name {
+                    "model" => {
+                        let models = bound.session.available_models();
+                        let scoped = bound.session.scoped_models();
+                        let candidates: Vec<(String, String, String)> = if scoped.is_empty() {
+                            models
+                                .into_iter()
+                                .map(|m| {
+                                    (
+                                        format!("{}/{}", m.provider, m.id),
+                                        m.id.clone(),
+                                        m.provider.clone(),
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            scoped
+                                .into_iter()
+                                .map(|(m, _)| {
+                                    (
+                                        format!("{}/{}", m.provider, m.id),
+                                        m.id.clone(),
+                                        m.provider.clone(),
+                                    )
+                                })
+                                .collect()
+                        };
+                        Some(Box::new(move |prefix: &str| {
+                            let q = prefix.trim().to_ascii_lowercase();
+                            let items: Vec<AutocompleteItem> = candidates
+                                .iter()
+                                .filter(|(val, id, _)| {
+                                    q.is_empty()
+                                        || val.to_ascii_lowercase().contains(&q)
+                                        || id.to_ascii_lowercase().contains(&q)
+                                })
+                                .map(|(val, id, prov)| AutocompleteItem {
+                                    value: val.clone(),
+                                    label: id.clone(),
+                                    description: Some(prov.clone()),
+                                })
+                                .collect();
+                            (!items.is_empty()).then_some(items)
+                        }))
+                    }
+                    "thinking" => {
+                        let levels: Vec<String> = bound
+                            .session
+                            .model()
+                            .supported_thinking_levels()
+                            .map(|l| l.as_str().to_owned())
+                            .collect();
+                        Some(Box::new(move |prefix: &str| {
+                            let q = prefix.trim().to_ascii_lowercase();
+                            let items: Vec<AutocompleteItem> = levels
+                                .iter()
+                                .filter(|l| q.is_empty() || l.starts_with(&q))
+                                .map(|l| AutocompleteItem {
+                                    value: l.clone(),
+                                    label: l.clone(),
+                                    description: None,
+                                })
+                                .collect();
+                            (!items.is_empty()).then_some(items)
+                        }))
+                    }
+                    "login" => {
+                        let providers: Vec<String> = auth_command::auth_providers(agent_dir)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|p| p.id)
+                            .collect();
+                        Some(Box::new(move |prefix: &str| {
+                            let q = prefix.trim().to_ascii_lowercase();
+                            let items: Vec<AutocompleteItem> = providers
+                                .iter()
+                                .filter(|p| q.is_empty() || p.to_ascii_lowercase().contains(&q))
+                                .map(|p| AutocompleteItem {
+                                    value: p.clone(),
+                                    label: p.clone(),
+                                    description: None,
+                                })
+                                .collect();
+                            (!items.is_empty()).then_some(items)
+                        }))
+                    }
+                    _ => None,
+                };
+            SlashCommand {
+                name: cmd.name.into(),
+                description: Some(cmd.description.into()),
+                argument_hint: cmd.argument_hint.map(str::to_owned),
+                get_argument_completions: completions,
+            }
         })
         .collect();
-    commands.extend(
-        EXTRA_COMMANDS
-            .iter()
-            .map(|&(name, description)| make(name.into(), Some(description.into()), None)),
-    );
     if let Some(native) = bound.extensions.native() {
-        commands.extend(
-            native
-                .get_registered_commands()
-                .into_iter()
-                .filter(|cmd| !is_builtin(&cmd.invocation_name))
-                .map(|cmd| make(cmd.invocation_name, cmd.definition.description, None)),
-        );
+        for cmd in native.get_registered_commands() {
+            if is_builtin(&cmd.invocation_name) {
+                continue;
+            }
+            let arg_fn: Option<Box<pi_rs_tui::autocomplete::CompleteArguments>> =
+                match cmd.invocation_name.as_str() {
+                    "mcp" => Some(Box::new(|prefix: &str| {
+                        let q = prefix.trim().to_ascii_lowercase();
+                        let items: Vec<AutocompleteItem> = ["reconnect", "login", "logout"]
+                            .into_iter()
+                            .filter(|sub| q.is_empty() || sub.starts_with(&q))
+                            .map(|sub| AutocompleteItem {
+                                value: sub.to_owned(),
+                                label: sub.to_owned(),
+                                description: None,
+                            })
+                            .collect();
+                        (!items.is_empty()).then_some(items)
+                    })),
+                    "llama" => Some(Box::new(|prefix: &str| {
+                        let q = prefix.trim().to_ascii_lowercase();
+                        let items: Vec<AutocompleteItem> = ["download"]
+                            .into_iter()
+                            .filter(|sub| q.is_empty() || sub.starts_with(&q))
+                            .map(|sub| AutocompleteItem {
+                                value: sub.to_owned(),
+                                label: sub.to_owned(),
+                                description: None,
+                            })
+                            .collect();
+                        (!items.is_empty()).then_some(items)
+                    })),
+                    _ => None,
+                };
+            commands.push(SlashCommand {
+                name: cmd.invocation_name,
+                description: cmd.definition.description,
+                argument_hint: None,
+                get_argument_completions: arg_fn,
+            });
+        }
     }
+    let enable_skill_commands = settings.get()["enableSkillCommands"]
+        .as_bool()
+        .unwrap_or(true);
     if let Some(resources) = bound.extensions.resources() {
         commands.extend(
             resources
                 .prompts
                 .iter()
                 .filter(|prompt| !is_builtin(&prompt.name))
-                .map(|prompt| make(prompt.name.clone(), Some(prompt.description.clone()), None)),
+                .map(|prompt| SlashCommand {
+                    name: prompt.name.clone(),
+                    description: prefix_source_description(
+                        Some(prompt.description.clone()),
+                        Some(&prompt.source_info),
+                    ),
+                    argument_hint: prompt.argument_hint.clone(),
+                    get_argument_completions: None,
+                }),
         );
-        commands.extend(resources.skills.iter().map(|skill| {
-            make(
-                format!("skill:{}", skill.name),
-                Some(skill.description.clone()),
-                None,
-            )
-        }));
+        if enable_skill_commands {
+            commands.extend(resources.skills.iter().map(|skill| SlashCommand {
+                name: format!("skill:{}", skill.name),
+                description: prefix_source_description(
+                    Some(skill.description.clone()),
+                    Some(&skill.source_info),
+                ),
+                argument_hint: None,
+                get_argument_completions: None,
+            }));
+        }
     }
+    let fd_path = ToolManager::new(agent_dir.join("bin")).get_tool_path(HelperTool::Fd);
     EditorAutocomplete(CombinedAutocompleteProvider::new(
         commands,
         bound.session.cwd().into(),
-        None,
+        fd_path,
     ))
 }
 
@@ -170,7 +335,6 @@ impl AutocompleteProvider for EditorAutocomplete {
 
 fn is_builtin(name: &str) -> bool {
     BUILTIN_SLASH_COMMANDS.iter().any(|cmd| cmd.name == name)
-        || EXTRA_COMMANDS.iter().any(|&(cmd, _)| cmd == name)
 }
 
 pub(super) fn submit(
@@ -197,9 +361,7 @@ pub(super) fn submit(
             "help" => {
                 let text = BUILTIN_SLASH_COMMANDS
                     .iter()
-                    .map(|cmd| (cmd.name, cmd.description))
-                    .chain(EXTRA_COMMANDS.iter().copied())
-                    .map(|(name, description)| format!("/{name}  {description}"))
+                    .map(|cmd| format!("/{}  {}", cmd.name, cmd.description))
                     .collect::<Vec<_>>()
                     .join("\n");
                 ui.notice(text, "text");
@@ -309,16 +471,42 @@ pub(super) fn submit(
                 ui.notice(text[start..end].into(), "text");
             }
             "debug" => {
-                let native = ui.bound.extensions.native();
-                ui.notice(
-                    format!(
-                        "Theme: {}\nSession: {}\nExtensions: {}\n",
-                        ui.theme.name(),
-                        ui.bound.session.session_id(),
-                        native.map_or(0, |runner| runner.extension_paths().len())
-                    ),
-                    "muted",
-                );
+                let (width, height, lines) = ui.debug_lines();
+                let debug_log_path = ui
+                    .options
+                    .agent_dir
+                    .join(format!("{}-debug.log", config::APP_NAME));
+                let mut debug_lines = vec![
+                    format!("Debug output at {}", chrono::Utc::now().to_rfc3339()),
+                    format!("Terminal: {width}x{height}"),
+                    format!("Total lines: {}", lines.len()),
+                    String::new(),
+                    "=== All rendered lines with visible widths ===".to_owned(),
+                ];
+                for (idx, line) in lines.iter().enumerate() {
+                    let vw = pi_rs_tui::visible_width(line);
+                    let escaped = serde_json::to_string(line).unwrap_or_else(|_| "\"\"".to_owned());
+                    debug_lines.push(format!("[{idx}] (w={vw}) {escaped}"));
+                }
+                debug_lines.push(String::new());
+                debug_lines.push("=== Agent messages (JSONL) ===".to_owned());
+                for msg in ui.bound.session.messages() {
+                    if let Ok(line) = serde_json::to_string(&msg) {
+                        debug_lines.push(line);
+                    }
+                }
+                debug_lines.push(String::new());
+                if let Some(parent) = debug_log_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(error) = std::fs::write(&debug_log_path, debug_lines.join("\n")) {
+                    ui.notice(format!("Failed to write debug log: {error}"), "error");
+                } else {
+                    ui.notice(
+                        format!("✓ Debug log written\n{}", debug_log_path.display()),
+                        "accent",
+                    );
+                }
             }
             "arminsayshi" => ui.show_armin(),
             "dementedelves" => {
@@ -413,49 +601,71 @@ pub(super) fn key(
             }
         }
         Key::Clear => {
-            let now = Instant::now();
-            if ui.editor.borrow().editor.text().is_empty()
-                && ui
-                    .last_clear
-                    .is_some_and(|last| now.duration_since(last) < Duration::from_millis(500))
-            {
+            if clear_should_quit(&mut ui.last_clear, Instant::now()) {
                 return send(ui, UiEvent::Quit);
             }
-            ui.last_clear = Some(now);
+            let was_empty = ui.editor.borrow().editor.text().is_empty();
             ui.editor.borrow_mut().editor.set_text("");
             ui.images.clear();
+            if was_empty {
+                ui.notice("Press Ctrl+C again to exit".into(), "muted");
+            }
         }
         Key::Exit => send(ui, UiEvent::Quit)?,
         Key::Suspend => send(ui, UiEvent::Suspend)?,
         Key::ToolsExpand => {
-            ui.transcript.borrow_mut().toggle_tools();
+            let expanded = ui.transcript.borrow_mut().toggle_tools();
+            ui.notice(
+                format!(
+                    "Tool output: {}",
+                    if expanded { "expanded" } else { "collapsed" }
+                ),
+                "muted",
+            );
         }
         Key::ThinkingToggle => {
             let visible = ui.transcript.borrow_mut().toggle_thinking();
             ui.settings
                 .set_value(&["hideThinkingBlock".into()], json!(!visible))?;
+            ui.notice(
+                format!(
+                    "Thinking blocks: {}",
+                    if visible { "visible" } else { "hidden" }
+                ),
+                "muted",
+            );
         }
         Key::ThinkingCycle => {
             let model = ui.bound.session.model();
             let levels: Vec<_> = model.supported_thinking_levels().collect();
-            if !levels.is_empty() {
+            if !model.reasoning || levels.is_empty() {
+                ui.notice("Current model does not support thinking".into(), "muted");
+            } else {
                 let current = levels
                     .iter()
                     .position(|&it| it == ui.bound.session.thinking_level());
                 let next = current.map_or(0, |index| (index + 1) % levels.len());
-                ui.bound.session.set_thinking_level(levels[next]);
+                let new_level = levels[next];
+                ui.bound.session.set_thinking_level(new_level);
+                ui.notice(format!("Thinking level: {}", new_level.as_str()), "muted");
             }
         }
-        Key::ThinkingSave => ui.settings.set_value(
-            &["defaultThinkingLevel".into()],
-            json!(ui.bound.session.thinking_level()),
-        )?,
+        Key::ThinkingSave => {
+            let level = ui.bound.session.thinking_level();
+            ui.settings
+                .set_value(&["defaultThinkingLevel".into()], json!(level))?;
+            ui.notice(
+                format!("Default thinking level: {}", level.as_str()),
+                "muted",
+            );
+        }
         Key::ModelCycleForward | Key::ModelCycleBackward => {
             let session = &ui.bound.session;
             let available = ui.available_models();
             let scoped = scope(ui, &available);
+            let scoped_empty = scoped.is_empty();
             let current = session.model();
-            let models: Vec<_> = if scoped.is_empty() {
+            let models: Vec<_> = if scoped_empty {
                 available.into_iter().map(|model| (model, None)).collect()
             } else {
                 scoped
@@ -463,7 +673,17 @@ pub(super) fn key(
                     .map(|entry| (entry.model, entry.thinking_level))
                     .collect()
             };
-            if !models.is_empty() {
+            if models.len() <= 1 {
+                ui.notice(
+                    if scoped_empty {
+                        "Only one model available"
+                    } else {
+                        "Only one model in scope"
+                    }
+                    .into(),
+                    "muted",
+                );
+            } else {
                 let len = models.len();
                 let index = models
                     .iter()
@@ -478,22 +698,18 @@ pub(super) fn key(
                             % len
                     });
                 if let Some((model, level)) = models.into_iter().nth(index) {
-                    set_model(ui, model, level, controller, work);
+                    switch_model_notice(ui, model, level, controller, work, false);
                 }
             }
         }
         Key::ModelSelect => show_model(ui, "", controller, work),
         Key::EditorExternal => {
             let text = ui.editor.borrow().editor.expanded_text().into_owned();
-            let command = ui.settings.get()["editor"].as_str().map(str::to_owned);
+            let command = ui.settings.get_external_editor_command();
             ui.pause()?;
             let send = ui.send.clone();
             work.push(Box::pin(async move {
-                let result = if let Some(command) = command {
-                    utilities::external_editor_with_command(&command, &text).await
-                } else {
-                    utilities::external_editor(&text).await
-                };
+                let result = utilities::external_editor_with_command(&command, &text).await;
                 let _ = send.send(UiEvent::EditorFinished(result));
             }));
         }
@@ -521,13 +737,24 @@ fn restore_queue(ui: &mut Frontend) {
     let session = &ui.bound.session;
     let mut pending = session.peek_steering();
     pending.extend(session.peek_follow_up());
-    if !pending.is_empty() {
+    if pending.is_empty() {
+        ui.notice("No queued messages to restore".into(), "muted");
+    } else {
+        let count = pending.len();
         session.clear_queue();
         let mut editor = ui.editor.borrow_mut();
         if !editor.editor.text().is_empty() {
             pending.push(editor.editor.expanded_text().into_owned());
         }
         editor.editor.set_text(&pending.join("\n\n"));
+        drop(editor);
+        ui.notice(
+            format!(
+                "Restored {count} queued message{} to editor",
+                if count == 1 { "" } else { "s" }
+            ),
+            "muted",
+        );
     }
 }
 
@@ -660,17 +887,45 @@ fn set_model(
     controller: &Rc<Controller>,
     work: &Work,
 ) {
+    switch_model_notice(ui, model, level, controller, work, true);
+}
+
+fn switch_model_notice(
+    ui: &Frontend,
+    model: Model,
+    level: Option<ThinkingLevel>,
+    controller: &Rc<Controller>,
+    work: &Work,
+    direct_command: bool,
+) {
     let session = ui.bound.session.clone();
     let controller = controller.clone();
     work.push(Box::pin(async move {
         let label = format!("{}/{}", model.provider, model.id);
-        let level = level.map(|level| model.clamp_thinking_level(level));
+        let display = if model.name.is_empty() {
+            model.id.clone()
+        } else {
+            model.name.clone()
+        };
+        let supports_reasoning = model.reasoning;
+        let clamped_level = level.map(|level| model.clamp_thinking_level(level));
         match session.set_model(model).await {
             Ok(()) => {
-                if let Some(level) = level {
+                if let Some(level) = clamped_level {
                     session.set_thinking_level(level);
                 }
-                controller.notice(format!("Model: {label}"), "success");
+                if direct_command {
+                    controller.notice(format!("Model: {label}"), "success");
+                } else {
+                    let active_level = session.thinking_level();
+                    let thinking_suffix =
+                        if supports_reasoning && active_level != ThinkingLevel::Off {
+                            format!(" (thinking: {})", active_level.as_str())
+                        } else {
+                            String::new()
+                        };
+                    controller.notice(format!("Switched to {display}{thinking_suffix}"), "muted");
+                }
             }
             Err(error) => controller.notice(error.to_string(), "error"),
         }
@@ -805,21 +1060,235 @@ fn show_fork(ui: &mut Frontend) {
 
 fn show_session(ui: &mut Frontend) {
     let s = ui.bound.session.stats();
-    let name = super::chrome::session_name(&ui.bound.session)
-        .map_or_else(String::new, |name| format!("\nName: {name}"));
-    let path = s.session_file.as_deref().unwrap_or("(not saved)");
-    ui.notice(format!("Session: {}{name}\nFile: {path}\nUser messages: {}\nAssistant messages: {}\nTool calls: {}\nTool results: {}\nTokens: {} input, {} output\nCost: ${:.3}", s.session_id, s.user_messages, s.assistant_messages, s.tool_calls, s.tool_results, s.tokens.input, s.tokens.output, s.cost), "text");
+    let name = super::chrome::session_name(&ui.bound.session);
+    let cache_waste = ui.bound.session.cache_waste();
+    let breakdown = ui.bound.session.usage_cost_breakdown();
+    let cw_mode = ui.bound.session.cache_warming_mode();
+    let cw_status = ui.bound.session.cache_warming_status();
+    let model = ui.bound.session.model();
+    let selected_key = format!("{}/{}", model.provider, model.id);
+
+    let mut info = String::from("Session Info\n\n");
+    if let Some(name) = name {
+        info.push_str(&format!("Name: {name}\n"));
+    }
+    let path = s.session_file.as_deref().unwrap_or("In-memory");
+    info.push_str(&format!("File: {path}\n"));
+    info.push_str(&format!("ID: {}\n\n", s.session_id));
+
+    info.push_str("Messages\n");
+    info.push_str(&format!("Total: {}\n", s.total_messages));
+    info.push_str(&format!("User: {}\n", s.user_messages));
+    info.push_str(&format!("Assistant: {}\n", s.assistant_messages));
+    info.push_str(&format!(
+        "Tools: {} calls, {} results\n\n",
+        s.tool_calls, s.tool_results
+    ));
+
+    info.push_str("Tokens\n");
+    let prompt_tokens = s.tokens.input + s.tokens.cache_read + s.tokens.cache_write;
+    info.push_str(&format!("Input: {:.0}\n", prompt_tokens));
+    if prompt_tokens > 0.0 && (s.tokens.cache_read > 0.0 || s.tokens.cache_write > 0.0) {
+        let hit_rate = (s.tokens.cache_read / prompt_tokens) * 100.0;
+        info.push_str(&format!(
+            "  Cached: {:.0} ({hit_rate:.1}%)\n",
+            s.tokens.cache_read
+        ));
+        let written = if s.tokens.cache_write > 0.0 {
+            format!(" ({:.0} written to cache)", s.tokens.cache_write)
+        } else {
+            String::new()
+        };
+        info.push_str(&format!(
+            "  Uncached: {:.0}{written}\n",
+            s.tokens.input + s.tokens.cache_write
+        ));
+    }
+    info.push_str(&format!("Output: {:.0}\n", s.tokens.output));
+    info.push_str(&format!("Total: {:.0}\n", s.tokens.total));
+
+    info.push_str("\nCache Warming\n");
+    info.push_str(&format!("Mode: {cw_mode:?}\n"));
+    let status_text = match cw_status.state {
+        crate::core::cache_warmer::CacheWarmingState::Inactive => cw_status
+            .reason
+            .as_deref()
+            .map_or_else(|| "Inactive".to_owned(), |r| format!("Inactive ({r})")),
+        crate::core::cache_warmer::CacheWarmingState::Scheduled => {
+            cw_status.next_warm_at.map_or_else(
+                || "Scheduled".to_owned(),
+                |at| format!("Scheduled (at {at})"),
+            )
+        }
+        crate::core::cache_warmer::CacheWarmingState::Refreshing => "Refreshing".to_owned(),
+    };
+    info.push_str(&format!("Status: {status_text}\n"));
+    if let Some(decision) = cw_status.decision.as_ref()
+        && decision.economics_available
+    {
+        info.push_str(&format!("Cache miss penalty: ${:.3}\n", decision.miss_cost));
+        info.push_str(&format!("Refresh cost: ${:.3}\n", decision.warm_cost));
+    }
+
+    if s.cost > 0.0 || cache_waste.missed_tokens > 0.0 {
+        info.push_str("\nCost\n");
+        info.push_str(&format!("Total: ${:.3}", s.cost));
+        if breakdown.len() > 1
+            || breakdown
+                .first()
+                .is_some_and(|entry| entry.key != selected_key)
+        {
+            for entry in breakdown {
+                info.push_str(&format!(
+                    "\n  {}: ${:.3} ({:.0} tokens)",
+                    entry.key, entry.cost, entry.tokens
+                ));
+            }
+        }
+        if cache_waste.missed_tokens > 0.0 {
+            let miss_label = if cache_waste.miss_count == 1 {
+                "1 miss".to_owned()
+            } else {
+                format!("{} misses", cache_waste.miss_count)
+            };
+            let detail = format!("{:.0} tokens, {miss_label}", cache_waste.missed_tokens);
+            if cache_waste.missed_cost >= 0.0001 {
+                info.push_str(&format!(
+                    "\nCache Re-billed: ${:.3} ({detail})",
+                    cache_waste.missed_cost
+                ));
+            } else {
+                info.push_str(&format!("\nCache Re-billed: {detail}"));
+            }
+        }
+    }
+
+    ui.notice(info, "text");
 }
 
 fn show_hotkeys(ui: &mut Frontend) {
-    let keys = ui.editor.borrow().keys.get_effective_config();
-    let lines = keys
-        .iter()
-        .filter(|(_, keys)| !keys.keys().is_empty())
-        .map(|(action, keys)| format!("{}  {action}", keys.keys().join(" / ")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    ui.notice(lines, "text");
+    let app_keys = ui.editor.borrow().keys.get_effective_config();
+    let app_disp = |action: &str, fallback: &str| -> String {
+        app_keys
+            .get(action)
+            .filter(|v| !v.keys().is_empty())
+            .map_or_else(|| fallback.to_owned(), |v| v.keys().join(" / "))
+    };
+    let tui_keys = pi_rs_tui::get_keybindings();
+    let tui_disp = |action: &str, fallback: &str| -> String {
+        let keys = tui_keys.get_keys(action);
+        if keys.is_empty() {
+            fallback.to_owned()
+        } else {
+            keys.join(" / ")
+        }
+    };
+    let newline_note = if cfg!(windows) {
+        "New line (Ctrl+Enter on Windows Terminal)"
+    } else {
+        "New line"
+    };
+    let mut doc = format!(
+        "Keyboard Shortcuts\n\n\
+**Navigation**\n\
+| Key | Action |\n\
+|-----|--------|\n\
+| `{}` / `{}` / `{}` / `{}` | Move cursor / browse history |\n\
+| `{}` / `{}` | Move by word |\n\
+| `{}` | Start of line |\n\
+| `{}` | End of line |\n\
+| `{}` | Jump forward to character |\n\
+| `{}` | Jump backward to character |\n\
+| `{}` / `{}` | Scroll by page |\n\n\
+**Editing**\n\
+| Key | Action |\n\
+|-----|--------|\n\
+| `{}` | Send message |\n\
+| `{}` | {newline_note} |\n\
+| `{}` | Delete word backwards |\n\
+| `{}` | Delete word forwards |\n\
+| `{}` | Delete to start of line |\n\
+| `{}` | Delete to end of line |\n\
+| `{}` | Paste the most-recently-deleted text |\n\
+| `{}` | Cycle through the deleted text after pasting |\n\
+| `{}` | Undo |\n\n\
+**Other**\n\
+| Key | Action |\n\
+|-----|--------|\n\
+| `{}` | Path completion / accept autocomplete |\n\
+| `{}` | Cancel autocomplete / abort streaming |\n\
+| `{}` | Clear editor (first) / exit (second) |\n\
+| `{}` | Exit (when editor is empty) |\n\
+| `{}` | Suspend to background |\n\
+| `{}` | Cycle thinking level |\n\
+| `{}` / `{}` | Cycle models |\n\
+| `{}` | Open model selector |\n\
+| `{}` | Toggle tool output expansion |\n\
+| `{}` | Toggle thinking block visibility |\n\
+| `{}` | Edit message in external editor |\n\
+| `{}` | Copy selection or last assistant message |\n\
+| `{}` | Queue follow-up message |\n\
+| `{}` | Restore queued messages |\n\
+| `{}` | Paste files on macOS, images, or text from clipboard |\n\
+| `/` | Slash commands |\n\
+| `!` | Run bash command |\n\
+| `!!` | Run bash command (excluded from context) |\n",
+        tui_disp("tui.editor.cursorUp", "up"),
+        tui_disp("tui.editor.cursorDown", "down"),
+        tui_disp("tui.editor.cursorLeft", "left"),
+        tui_disp("tui.editor.cursorRight", "right"),
+        tui_disp("tui.editor.cursorWordLeft", "alt+left"),
+        tui_disp("tui.editor.cursorWordRight", "alt+right"),
+        tui_disp("tui.editor.cursorLineStart", "home"),
+        tui_disp("tui.editor.cursorLineEnd", "end"),
+        tui_disp("tui.editor.jumpForward", "ctrl+]"),
+        tui_disp("tui.editor.jumpBackward", "ctrl+alt+]"),
+        tui_disp("tui.editor.pageUp", "pageUp"),
+        tui_disp("tui.editor.pageDown", "pageDown"),
+        tui_disp("tui.input.submit", "enter"),
+        tui_disp("tui.input.newLine", "shift+enter"),
+        tui_disp("tui.editor.deleteWordBackward", "ctrl+w"),
+        tui_disp("tui.editor.deleteWordForward", "alt+d"),
+        tui_disp("tui.editor.deleteToLineStart", "ctrl+u"),
+        tui_disp("tui.editor.deleteToLineEnd", "ctrl+k"),
+        tui_disp("tui.editor.yank", "ctrl+y"),
+        tui_disp("tui.editor.yankPop", "alt+y"),
+        tui_disp("tui.editor.undo", "ctrl+-"),
+        tui_disp("tui.input.tab", "tab"),
+        app_disp("app.interrupt", "escape"),
+        app_disp("app.clear", "ctrl+c"),
+        app_disp("app.exit", "ctrl+d"),
+        app_disp("app.suspend", "ctrl+z"),
+        app_disp("app.thinking.cycle", "shift+tab"),
+        app_disp("app.model.cycleForward", "ctrl+p"),
+        app_disp("app.model.cycleBackward", "shift+ctrl+p"),
+        app_disp("app.model.select", "ctrl+l"),
+        app_disp("app.tools.expand", "ctrl+o"),
+        app_disp("app.thinking.toggle", "ctrl+t"),
+        app_disp("app.editor.external", "ctrl+g"),
+        app_disp("app.message.copy", "ctrl+x"),
+        app_disp("app.message.followUp", "alt+enter"),
+        app_disp("app.message.dequeue", "alt+up"),
+        app_disp("app.clipboard.pasteImage", "ctrl+v"),
+    );
+    if let Some(native) = ui.bound.extensions.native() {
+        let resolved: indexmap::IndexMap<String, Vec<String>> = app_keys
+            .into_iter()
+            .map(|(k, v)| (k, v.keys().to_vec()))
+            .collect();
+        let shortcuts = native.get_shortcuts(&resolved);
+        if !shortcuts.is_empty() {
+            doc.push_str("\n**Extensions**\n| Key | Action |\n|-----|--------|\n");
+            for (key, shortcut) in shortcuts {
+                let desc = shortcut
+                    .description
+                    .as_deref()
+                    .unwrap_or(&shortcut.extension_path);
+                doc.push_str(&format!("| `{key}` | {desc} |\n"));
+            }
+        }
+    }
+    ui.notice(doc.trim_end().to_owned(), "text");
 }
 
 fn show_trust(ui: &mut Frontend) {
@@ -1467,5 +1936,55 @@ mod autocomplete_tests {
         assert_eq!(stale.lines, ["/dialogs"]);
         assert_eq!(stale.cursor_col, 8);
         Ok(())
+    }
+
+    #[test]
+    fn builtin_slash_commands_match_upstream_24_and_source_tags() {
+        assert_eq!(BUILTIN_SLASH_COMMANDS.len(), 24);
+        for extra in ["help", "theme", "clear", "exit", "debug"] {
+            assert!(
+                !BUILTIN_SLASH_COMMANDS.iter().any(|c| c.name == extra),
+                "unexpected non-upstream command {extra} in autocomplete table"
+            );
+        }
+        let user_tag = SourceInfo {
+            path: "/home/u/.pi/agent/skills/s/SKILL.md".into(),
+            source: "auto".into(),
+            scope: SourceScope::User,
+            origin: crate::core::skills::SourceOrigin::TopLevel,
+            base_dir: None,
+            changelog_path: None,
+        };
+        let npm_tag = SourceInfo {
+            path: "/proj/.pi/npm/pkg/SKILL.md".into(),
+            source: "npm:my-pkg".into(),
+            scope: SourceScope::Project,
+            origin: crate::core::skills::SourceOrigin::Package,
+            base_dir: None,
+            changelog_path: None,
+        };
+        assert_eq!(
+            prefix_source_description(Some("Do work".into()), Some(&user_tag)).as_deref(),
+            Some("[u] Do work")
+        );
+        assert_eq!(
+            prefix_source_description(None, Some(&npm_tag)).as_deref(),
+            Some("[p:npm:my-pkg]")
+        );
+    }
+
+    #[test]
+    fn clear_double_press_exits_within_500ms_and_resets_after_timeout() {
+        let t0 = Instant::now();
+        let mut last_clear = None;
+        assert!(!clear_should_quit(&mut last_clear, t0));
+        assert!(!clear_should_quit(
+            &mut last_clear,
+            t0 + Duration::from_millis(600)
+        ));
+        assert!(clear_should_quit(
+            &mut last_clear,
+            t0 + Duration::from_millis(900)
+        ));
     }
 }

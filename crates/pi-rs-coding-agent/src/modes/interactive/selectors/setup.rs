@@ -252,6 +252,7 @@ const THEMES: [(&str, &str); 3] = [
     ("light", "Light"),
 ];
 const ANALYTICS: [&str; 2] = ["Share anonymous usage data", "Don't share"];
+const SETUP_LOGO_LINES: [&str; 4] = ["██████", "██  ██", "████  ██", "██    ██"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirstTimeSetupResult {
@@ -275,7 +276,10 @@ impl FirstTimeSetup {
         let selection = Rc::clone(&result);
         let preview = theme.clone();
         let picker = Picker::new(
-            format!("Welcome to {APP_NAME}, the minimal coding agent."),
+            format!(
+                "{}\nWelcome to {APP_NAME}, the minimal coding agent.",
+                SETUP_LOGO_LINES.join("\n")
+            ),
             THEMES
                 .iter()
                 .map(|(_, label)| (*label).to_owned())
@@ -326,7 +330,7 @@ impl Component for FirstTimeSetup {
                 let selection = Rc::clone(&self.result);
                 let focused = self.picker.is_focused();
                 self.picker = Picker::new("Opt-in to anonymous usage data sharing?".into(), ANALYTICS.iter().map(|label| (*label).to_owned()).collect(), self.theme.clone(), move |index| selection.set(Some(index)))
-                    .description("Opting in stores a tracking identifier in settings.json and enables anonymous usage analytics. You can see what is shared using /privacy.")
+                    .description("Opting in stores a tracking identifier in settings.json and enables anonymous\nusage analytics. This helps us to better debug, reproduce, and resolve issues\nand bugs within Pi. You can observe what is shared using /privacy and make\nchanges anytime in settings.json.")
                     .without_filter().without_wrap()
                     .hint("↑↓ navigate · Enter finish · Esc skip setup");
                 self.picker.set_focused(focused);
@@ -339,5 +343,26 @@ impl Component for FirstTimeSetup {
     }
     fn captures_viewport_input(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_time_setup_renders_logo_and_analytics_prompt() -> Result<(), String> {
+        let theme = Theme::load(std::path::Path::new("/nonexistent-agent-dir"), Some("dark"))
+            .map_err(|e| e.to_string())?;
+        let mut setup = FirstTimeSetup::new(theme, |_| {});
+        let rendered = setup.render(80).join("\n");
+        assert!(rendered.contains(SETUP_LOGO_LINES[0]));
+        assert!(rendered.contains("minimal coding agent"));
+
+        setup.handle_input("\r");
+        let analytics = setup.render(80).join("\n");
+        assert!(analytics.contains("Opt-in to anonymous usage data sharing?"));
+        assert!(analytics.contains("/privacy"));
+        Ok(())
     }
 }

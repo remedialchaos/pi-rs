@@ -271,7 +271,7 @@ fn safe_link(raw: &str) -> bool {
 }
 
 fn offline() -> bool {
-    std::env::var_os("PI_OFFLINE").is_some()
+    crate::config::is_truthy_env_flag("PI_OFFLINE")
 }
 
 fn native_models(agent_dir: &Path) -> Result<Models, String> {

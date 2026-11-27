@@ -610,7 +610,9 @@ pub fn get_default_session_dir(cwd: impl AsRef<Path>) -> PathBuf {
     let resolved = resolve_path(cwd.as_ref());
     let text = resolved.to_string_lossy();
     let safe = text
-        .trim_start_matches(['/', '\\'])
+        .strip_prefix('/')
+        .or_else(|| text.strip_prefix('\\'))
+        .unwrap_or(&text)
         .replace(['/', '\\', ':'], "-");
     get_agent_dir().join("sessions").join(format!("--{safe}--"))
 }

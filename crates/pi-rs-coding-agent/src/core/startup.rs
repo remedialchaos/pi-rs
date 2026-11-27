@@ -26,9 +26,7 @@ pub struct StartupRefreshPolicy {
 
 impl StartupRefreshPolicy {
     pub fn from_args(args: &Args, mode: AppMode, startup_benchmark: bool) -> Self {
-        let env_offline = std::env::var("PI_OFFLINE").ok().is_some_and(|value| {
-            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
-        });
+        let env_offline = crate::config::is_truthy_env_flag("PI_OFFLINE");
         Self {
             mode,
             offline: args.offline || env_offline,

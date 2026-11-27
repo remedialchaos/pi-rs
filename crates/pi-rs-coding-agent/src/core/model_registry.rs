@@ -605,6 +605,10 @@ pub struct ModelRegistry {
     env: IndexMap<String, String>,
     /// Provider snapshots taken before any `models.json` overrides were applied.
     pristine: IndexMap<String, Provider>,
+    /// Per-provider composition errors recorded during `apply_extensions`.
+    composition_errors: IndexMap<String, String>,
+    /// Extension-registered provider configs kept for auth-status resolution.
+    extension_providers: IndexMap<String, ModelsJsonProvider>,
 }
 
 impl std::fmt::Debug for ModelRegistry {
@@ -634,6 +638,8 @@ impl ModelRegistry {
             applied: Vec::new(),
             env: IndexMap::new(),
             pristine,
+            composition_errors: IndexMap::new(),
+            extension_providers: IndexMap::new(),
         };
         registry.reload();
         registry
@@ -707,23 +713,51 @@ impl ModelRegistry {
         self.error = error;
     }
 
+    pub(crate) fn composition_errors(&self) -> &IndexMap<String, String> {
+        &self.composition_errors
+    }
+
+    pub(crate) fn extension_provider_config(&self, provider: &str) -> Option<&ModelsJsonProvider> {
+        self.extension_providers.get(provider)
+    }
+
     pub(crate) fn apply_extensions(
         &mut self,
         runner: &super::extensions::runner::ExtensionRunner,
     ) -> Result<Vec<String>, String> {
+        self.composition_errors.clear();
+        self.extension_providers.clear();
         let mut virtual_only = Vec::new();
         for extension in runner.extensions() {
             let registration = extension.registration();
             for provider in &registration.providers {
-                let config = serde_json::from_value(provider.config.clone())
-                    .map_err(|error| format!("Provider {}: {error}", provider.name))?;
+                let config: ModelsJsonProvider =
+                    match serde_json::from_value(provider.config.clone()) {
+                        Ok(config) => config,
+                        Err(error) => {
+                            let msg = error.to_string();
+                            self.composition_errors
+                                .insert(provider.name.clone(), msg.clone());
+                            return Err(format!("Provider {}: {msg}", provider.name));
+                        }
+                    };
+                self.extension_providers
+                    .insert(provider.name.clone(), config.clone());
                 let overlay = ModelsConfig {
                     schema: None,
                     providers: IndexMap::from([(provider.name.clone(), config)]),
                 };
-                self.applied
-                    .extend(apply_config(&self.models, &overlay, &self.env)?);
-                self.config.providers.extend(overlay.providers);
+                match apply_config(&self.models, &overlay, &self.env) {
+                    Ok(applied) => {
+                        self.applied.extend(applied);
+                        self.config.providers.extend(overlay.providers);
+                    }
+                    Err(error) => {
+                        self.composition_errors
+                            .insert(provider.name.clone(), error.clone());
+                        return Err(error);
+                    }
+                }
             }
             for entry in &registration.virtual_models {
                 if entry.provider.trim().is_empty() || entry.id.trim().is_empty() {
@@ -864,6 +898,7 @@ mod tests {
                 id: "router".into(),
                 extension_path: "test".into(),
                 definition: serde_json::json!({"name":"Router"}),
+                route: None,
             });
             ext.set_registration(reg);
             let runner = ExtensionRunner::new(vec![Arc::new(ext)], host, bus, ".");

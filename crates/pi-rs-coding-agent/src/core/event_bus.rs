@@ -206,6 +206,7 @@ struct Listener {
 /// matching the Node `EventEmitter` behavior the upstream relies on.
 pub struct EventBus {
     listeners: RwLock<Vec<Listener>>,
+    channels: RwLock<IndexMap<String, Vec<(usize, EventHandler)>>>,
     pending: Mutex<Option<Vec<Listener>>>,
     next_id: AtomicUsize,
     error_reporter: Mutex<Option<ErrorReporter>>,
@@ -223,11 +224,41 @@ impl EventBus {
     pub fn new() -> Self {
         Self {
             listeners: RwLock::new(Vec::new()),
+            channels: RwLock::new(IndexMap::new()),
             pending: Mutex::new(None),
             next_id: AtomicUsize::new(1),
             error_reporter: Mutex::new(None),
             ui_prompt_depth: AtomicUsize::new(0),
             active_ui_prompt: Mutex::new(None),
+        }
+    }
+
+    pub fn subscribe_channel<F, Fut>(&self, channel: impl Into<String>, handler: F) -> usize
+    where
+        F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = HandlerResult> + Send + 'static,
+    {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let boxed: EventHandler = Arc::new(move |value| Box::pin(handler(value)));
+        self.channels
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(channel.into())
+            .or_default()
+            .push((id, boxed));
+        id
+    }
+
+    pub async fn emit_channel(&self, channel: &str, payload: Value) {
+        let snapshot = self
+            .channels
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(channel)
+            .cloned()
+            .unwrap_or_default();
+        for (_, handler) in snapshot {
+            let _ = handler(payload.clone()).await;
         }
     }
 

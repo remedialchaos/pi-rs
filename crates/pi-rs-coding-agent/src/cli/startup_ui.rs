@@ -6,10 +6,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use pi_rs_tui::keybindings::BindingKeys;
-use pi_rs_tui::terminal_image::CapabilityOverrides;
 use pi_rs_tui::{
-    ComponentRef, ImageProtocol, KeybindingDefinition, ProcessTerminal, Terminal, Tui,
-    TuiMainScreen, TuiStopOptions, set_capability_overrides, set_keybindings,
+    ComponentRef, KeybindingDefinition, ProcessTerminal, Terminal, Tui, TuiMainScreen,
+    TuiStopOptions, set_capability_overrides, set_keybindings,
 };
 use serde_json::{Value, json};
 
@@ -61,21 +60,9 @@ pub fn install_keybindings(agent_dir: &Path) {
 }
 
 pub(crate) fn setup_terminal(settings: &Value) {
-    let terminal = &settings["terminal"];
-    let images = match &terminal["images"] {
-        Value::Bool(false) => Some(None),
-        value => match value.as_str().map(str::to_ascii_lowercase).as_deref() {
-            Some("none" | "off") => Some(None),
-            Some("kitty") => Some(Some(ImageProtocol::Kitty)),
-            Some("iterm2") => Some(Some(ImageProtocol::Iterm2)),
-            _ => None,
-        },
-    };
-    set_capability_overrides(CapabilityOverrides {
-        images,
-        true_color: terminal["trueColor"].as_bool(),
-        hyperlinks: terminal["hyperlinks"].as_bool(),
-    });
+    set_capability_overrides(
+        crate::core::settings_manager::terminal_capability_overrides_from(settings),
+    );
 }
 
 pub(super) fn load_theme(settings: &SettingsManager, agent_dir: &Path) -> Result<Theme, String> {
@@ -117,7 +104,7 @@ fn run_on_terminal<T: 'static>(
     }
     let mut ui = TuiMainScreen::new(
         terminal,
-        settings["showHardwareCursor"].as_bool().unwrap_or(false),
+        crate::core::settings_manager::show_hardware_cursor_from(settings),
         Some(agent_dir.to_path_buf()),
     );
     let clear_on_shrink = settings["terminal"]["clearOnShrink"]

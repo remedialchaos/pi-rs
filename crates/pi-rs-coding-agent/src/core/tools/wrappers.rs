@@ -6,6 +6,8 @@
 //! `packages/coding-agent/src/core/tools/{read,bash,powershell,edit,write,grep,find,ls}.ts`.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use base64::Engine;
 use futures_util::future::BoxFuture;
@@ -446,6 +448,33 @@ fn powershell_declaration() -> Tool {
     )
 }
 
+fn shell_chunk_callback(on_update: AgentToolUpdateCallback) -> super::bash::BashChunkCallback {
+    let state = Arc::new(Mutex::new((String::new(), Option::<Instant>::None)));
+    Arc::new(move |chunk: &str| {
+        if chunk.is_empty() {
+            return;
+        }
+        let snapshot_text = {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.0.push_str(chunk);
+            let now = Instant::now();
+            let should_emit = guard
+                .1
+                .is_none_or(|last| now.duration_since(last).as_millis() >= 100);
+            if !should_emit {
+                return;
+            }
+            guard.1 = Some(now);
+            let truncated = super::truncate::truncate_tail(
+                &guard.0,
+                &super::truncate::TruncationOptions::default(),
+            );
+            truncated.content
+        };
+        on_update(text_result(snapshot_text));
+    })
+}
+
 /// Bash tool: `/bin/bash -c <command>` on Unix (or `sh` when bash is absent).
 pub struct BashTool {
     cwd: PathBuf,
@@ -475,14 +504,17 @@ impl AgentTool for BashTool {
         _tool_call_id: &'a str,
         params: &'a Value,
         signal: &'a CancellationToken,
-        _on_update: AgentToolUpdateCallback,
+        on_update: AgentToolUpdateCallback,
     ) -> BoxFuture<'a, Result<AgentToolResult>> {
         Box::pin(async move {
             check_cancel(signal)?;
             let input: super::bash::BashInput = parse(params)?;
-            let result = super::bash::execute_bash(&input, &self.cwd)
-                .await
-                .map_err(AgentError::Callback)?;
+            on_update(AgentToolResult::default());
+            let chunk_cb = shell_chunk_callback(on_update);
+            let result =
+                super::bash::execute_bash_with(&input, &self.cwd, Some(signal), Some(chunk_cb))
+                    .await
+                    .map_err(AgentError::Callback)?;
             check_cancel(signal)?;
             Ok(shell_result(result))
         })
@@ -518,14 +550,21 @@ impl AgentTool for PowerShellTool {
         _tool_call_id: &'a str,
         params: &'a Value,
         signal: &'a CancellationToken,
-        _on_update: AgentToolUpdateCallback,
+        on_update: AgentToolUpdateCallback,
     ) -> BoxFuture<'a, Result<AgentToolResult>> {
         Box::pin(async move {
             check_cancel(signal)?;
             let input: super::powershell::PowerShellInput = parse(params)?;
-            let result = super::powershell::execute_powershell(&input, &self.cwd)
-                .await
-                .map_err(AgentError::Callback)?;
+            on_update(AgentToolResult::default());
+            let chunk_cb = shell_chunk_callback(on_update);
+            let result = super::powershell::execute_powershell_with(
+                &input,
+                &self.cwd,
+                Some(signal),
+                Some(chunk_cb),
+            )
+            .await
+            .map_err(AgentError::Callback)?;
             check_cancel(signal)?;
             Ok(shell_result(result))
         })
@@ -536,13 +575,25 @@ impl AgentTool for PowerShellTool {
 pub struct EditTool {
     cwd: PathBuf,
     declaration: Tool,
+    queue: Arc<super::file_mutation_queue::FileMutationQueue>,
 }
 
 impl EditTool {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self::with_queue(
+            cwd,
+            super::file_mutation_queue::shared_file_mutation_queue(),
+        )
+    }
+
+    pub fn with_queue(
+        cwd: impl Into<PathBuf>,
+        queue: Arc<super::file_mutation_queue::FileMutationQueue>,
+    ) -> Self {
         Self {
             cwd: cwd.into(),
             declaration: build_tool("edit", EDIT_DESCRIPTION, edit_parameters(), true),
+            queue,
         }
     }
 }
@@ -567,8 +618,18 @@ impl AgentTool for EditTool {
             check_cancel(signal)?;
             let input =
                 super::edit::prepare_edit_arguments(params).map_err(AgentError::Callback)?;
-            let execution =
-                super::edit::execute_edit(&input, &self.cwd).map_err(AgentError::Callback)?;
+            let path = input.path.clone();
+            let cwd = self.cwd.clone();
+            let execution = self
+                .queue
+                .run_with(&path, &self.cwd, AgentError::Callback, || async move {
+                    check_cancel(signal)?;
+                    tokio::task::spawn_blocking(move || super::edit::execute_edit(&input, &cwd))
+                        .await
+                        .map_err(|error| AgentError::Callback(error.to_string()))?
+                        .map_err(AgentError::Callback)
+                })
+                .await?;
             check_cancel(signal)?;
             Ok(text_result_with_details(
                 execution.output,
@@ -587,13 +648,25 @@ impl AgentTool for EditTool {
 pub struct WriteTool {
     cwd: PathBuf,
     declaration: Tool,
+    queue: Arc<super::file_mutation_queue::FileMutationQueue>,
 }
 
 impl WriteTool {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self::with_queue(
+            cwd,
+            super::file_mutation_queue::shared_file_mutation_queue(),
+        )
+    }
+
+    pub fn with_queue(
+        cwd: impl Into<PathBuf>,
+        queue: Arc<super::file_mutation_queue::FileMutationQueue>,
+    ) -> Self {
         Self {
             cwd: cwd.into(),
             declaration: build_tool("write", WRITE_DESCRIPTION, write_parameters(), true),
+            queue,
         }
     }
 }
@@ -617,9 +690,17 @@ impl AgentTool for WriteTool {
         Box::pin(async move {
             check_cancel(signal)?;
             let input: super::write::WriteInput = parse(params)?;
-            let text = super::write::write_file(&input, &self.cwd)
-                .await
-                .map_err(AgentError::Callback)?;
+            let path = input.path.clone();
+            let cwd = self.cwd.clone();
+            let text = self
+                .queue
+                .run_with(&path, &self.cwd, AgentError::Callback, || async move {
+                    check_cancel(signal)?;
+                    super::write::write_file(&input, &cwd)
+                        .await
+                        .map_err(AgentError::Callback)
+                })
+                .await?;
             check_cancel(signal)?;
             Ok(text_result(text))
         })
@@ -1152,6 +1233,63 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.to_string(), "Operation aborted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bash_tool_streams_incremental_updates_and_cancels_sleeping_process()
+    -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tool = BashTool::new(dir.path());
+        let signal = CancellationToken::new();
+        let chunks = Arc::new(Mutex::new(Vec::<String>::new()));
+        let chunks_ref = Arc::clone(&chunks);
+        let on_update: AgentToolUpdateCallback = Arc::new(move |partial| {
+            let text = partial
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    pi_rs_ai::InputContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            chunks_ref
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(text);
+        });
+        let result = tool
+            .execute(
+                "call-stream",
+                &json!({"command": "printf 'step1\\n'; sleep 0.05; printf 'step2\\n'"}),
+                &signal,
+                on_update,
+            )
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        assert!(text_of(&result).contains("step2"));
+        assert!(!chunks.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+        let cancel = CancellationToken::new();
+        let cancel_trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            cancel_trigger.cancel();
+        });
+        let err = match tool
+            .execute(
+                "call-abort",
+                &json!({"command": "sleep 10"}),
+                &cancel,
+                callback(),
+            )
+            .await
+        {
+            Ok(_) => return Err(std::io::Error::other("expected aborted error")),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("Command aborted"), "{err}");
         Ok(())
     }
 }

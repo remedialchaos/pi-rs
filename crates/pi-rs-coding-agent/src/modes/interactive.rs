@@ -24,6 +24,7 @@ use crate::{
         agent_session::AgentSessionEvent,
         agent_session_runtime::{AgentSessionRuntime, RuntimeDiagnostic},
         bash_executor::BashOutput,
+        crash_log::CrashRecord,
         extensions::types::{UiAnswer, UiDialog, UiUpdate},
         keybindings::AppKeybinding,
     },
@@ -45,6 +46,8 @@ pub struct InteractiveOptions {
     pub offline: bool,
     pub no_refresh: bool,
     pub startup_benchmark: bool,
+    pub migrated_auth_providers: Vec<String>,
+    pub unnotified_crash: Option<CrashRecord>,
 }
 
 type Work = FuturesUnordered<LocalBoxFuture<'static, ()>>;

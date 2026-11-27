@@ -92,6 +92,10 @@ pub fn default_settings() -> Value {
             "reserveTokens": 16384,
             "keepRecentTokens": 20000
         },
+        "branchSummary": {
+            "reserveTokens": 16384,
+            "skipPrompt": false
+        },
         "retry": {
             "enabled": true,
             "maxRetries": 3,
@@ -751,6 +755,252 @@ impl SettingsManager {
             Some(value) => parse_timeout_setting(value, "httpIdleTimeoutMs"),
         }
     }
+
+    pub fn get_branch_summary_settings(&self) -> (usize, bool) {
+        let effective = self.get();
+        let branch = &effective["branchSummary"];
+        let reserve_tokens = branch["reserveTokens"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(16_384);
+        let skip_prompt = branch["skipPrompt"].as_bool().unwrap_or(false);
+        (reserve_tokens, skip_prompt)
+    }
+
+    pub fn get_branch_summary_skip_prompt(&self) -> bool {
+        self.get_branch_summary_settings().1
+    }
+
+    pub fn get_compaction_settings_for_model(
+        &self,
+        provider: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<(bool, usize, usize), String> {
+        let effective = self.get();
+        let compaction = effective.get("compaction");
+        let enabled = compaction
+            .and_then(|c| c.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let reserve = resolve_compaction_token_setting(
+            compaction,
+            "reserveTokens",
+            provider,
+            model_id,
+            16_384,
+        )?;
+        let keep_recent = resolve_compaction_token_setting(
+            compaction,
+            "keepRecentTokens",
+            provider,
+            model_id,
+            20_000,
+        )?;
+        Ok((enabled, reserve, keep_recent))
+    }
+
+    pub fn get_provider_retry_settings(&self) -> (Option<u64>, Option<u32>, u64) {
+        let effective = self.get();
+        let provider = &effective["retry"]["provider"];
+        let timeout_ms = provider.get("timeoutMs").and_then(Value::as_u64);
+        let max_retries = provider
+            .get("maxRetries")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        let max_retry_delay_ms = provider
+            .get("maxRetryDelayMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(60_000);
+        (timeout_ms, max_retries, max_retry_delay_ms)
+    }
+
+    pub fn get_websocket_connect_timeout_ms(&self) -> Result<Option<u64>, String> {
+        let Some(value) = self.raw_get("websocketConnectTimeoutMs") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let parsed = parse_timeout_setting(value, "websocketConnectTimeoutMs")?;
+        Ok(u64::try_from(parsed).ok())
+    }
+
+    pub fn get_external_editor_command(&self) -> String {
+        if let Some(configured) = self
+            .get()
+            .get("externalEditor")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return configured.to_owned();
+        }
+        for variable in ["VISUAL", "EDITOR"] {
+            if let Ok(value) = std::env::var(variable)
+                && !value.trim().is_empty()
+            {
+                return value;
+            }
+        }
+        if cfg!(windows) {
+            "notepad".to_owned()
+        } else {
+            "nano".to_owned()
+        }
+    }
+
+    pub fn get_thinking_budgets(&self) -> indexmap::IndexMap<pi_rs_agent::ThinkingLevel, u64> {
+        let mut budgets = indexmap::IndexMap::new();
+        let binding = self.get();
+        let Some(map) = binding.get("thinkingBudgets").and_then(Value::as_object) else {
+            return budgets;
+        };
+        for (level, value) in map {
+            let Some(tokens) = value.as_u64() else {
+                continue;
+            };
+            let parsed = match level.as_str() {
+                "minimal" => Some(pi_rs_agent::ThinkingLevel::Minimal),
+                "low" => Some(pi_rs_agent::ThinkingLevel::Low),
+                "medium" => Some(pi_rs_agent::ThinkingLevel::Medium),
+                "high" => Some(pi_rs_agent::ThinkingLevel::High),
+                "xhigh" => Some(pi_rs_agent::ThinkingLevel::Xhigh),
+                _ => None,
+            };
+            if let Some(level) = parsed {
+                budgets.insert(level, tokens);
+            }
+        }
+        budgets
+    }
+
+    pub fn get_collapse_changelog(&self) -> bool {
+        self.get()
+            .get("collapseChangelog")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn get_codemode_mode(&self) -> crate::extensions::codemode::CodemodeMode {
+        match self.get()["codemode"]["mode"].as_str() {
+            Some("only") => crate::extensions::codemode::CodemodeMode::Only,
+            _ => crate::extensions::codemode::CodemodeMode::On,
+        }
+    }
+
+    pub fn get_codemode_inline_budget(&self) -> usize {
+        self.get()["codemode"]["inlineBudget"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(3_000)
+    }
+
+    pub fn get_show_hardware_cursor(&self) -> bool {
+        show_hardware_cursor_from(&self.get())
+    }
+
+    pub fn get_show_images(&self) -> bool {
+        show_images_from(&self.get())
+    }
+
+    pub fn get_terminal_capability_overrides(
+        &self,
+    ) -> pi_rs_tui::terminal_image::CapabilityOverrides {
+        terminal_capability_overrides_from(&self.get())
+    }
+}
+
+pub fn show_images_from(settings: &Value) -> bool {
+    let terminal = &settings["terminal"];
+    if terminal["images"].as_bool() == Some(false)
+        || matches!(
+            terminal["images"]
+                .as_str()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("none" | "off")
+        )
+    {
+        return false;
+    }
+    terminal["showImages"].as_bool().unwrap_or(true)
+}
+
+pub fn terminal_capability_overrides_from(
+    settings: &Value,
+) -> pi_rs_tui::terminal_image::CapabilityOverrides {
+    let terminal = &settings["terminal"];
+    let images = match &terminal["images"] {
+        Value::Bool(false) => Some(None),
+        value => match value.as_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("none" | "off") => Some(None),
+            Some("kitty") => Some(Some(pi_rs_tui::ImageProtocol::Kitty)),
+            Some("iterm2") => Some(Some(pi_rs_tui::ImageProtocol::Iterm2)),
+            _ => None,
+        },
+    };
+    pi_rs_tui::terminal_image::CapabilityOverrides {
+        images,
+        true_color: terminal["trueColor"].as_bool(),
+        hyperlinks: terminal["hyperlinks"].as_bool(),
+    }
+}
+
+pub fn show_hardware_cursor_from(settings: &Value) -> bool {
+    settings
+        .get("showHardwareCursor")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| std::env::var("PI_HARDWARE_CURSOR").ok().as_deref() == Some("1"))
+}
+
+fn resolve_compaction_token_setting(
+    compaction: Option<&Value>,
+    field: &str,
+    provider: Option<&str>,
+    model_id: Option<&str>,
+    default: usize,
+) -> Result<usize, String> {
+    let parse_non_neg_int = |value: &Value, label: &str| -> Result<usize, String> {
+        value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                format!("Invalid {label} setting: {value}. Expected a non-negative safe integer.")
+            })
+    };
+    let ordinary = match compaction
+        .and_then(|c| c.get(field))
+        .filter(|v| !v.is_null())
+    {
+        Some(value) => Some(parse_non_neg_int(value, &format!("compaction.{field}"))?),
+        None => None,
+    };
+    let override_val = if let (Some(provider), Some(model_id)) = (provider, model_id)
+        && let Some(overrides) = compaction
+            .and_then(|c| c.get("modelOverrides"))
+            .and_then(Value::as_object)
+    {
+        let model_key = format!("{provider}/{model_id}");
+        if let Some(entry) = overrides.get(&model_key).filter(|v| !v.is_null()) {
+            if !entry.is_object() {
+                return Err(format!(
+                    "Invalid compaction.modelOverrides[\"{model_key}\"] setting: {entry}. Expected an object."
+                ));
+            }
+            match entry.get(field).filter(|v| !v.is_null()) {
+                Some(value) => Some(parse_non_neg_int(
+                    value,
+                    &format!("compaction.modelOverrides[\"{model_key}\"].{field}"),
+                )?),
+                None => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(override_val.or(ordinary).unwrap_or(default))
 }
 
 fn as_object_mut(value: &mut Value) -> Option<&mut Map<String, Value>> {
@@ -1191,5 +1441,56 @@ mod tests {
         assert_eq!(apply_tool_modifiers(&base, &entries), vec!["bash", "grep"]);
         assert!(is_tool_modifier("+x"));
         assert!(!is_tool_modifier("x"));
+    }
+
+    #[test]
+    fn newly_wired_settings_getters_and_terminal_overrides_read_values() -> Result<(), String> {
+        let manager = SettingsManager::in_memory(
+            serde_json::json!({
+                "branchSummary": { "reserveTokens": 4096, "skipPrompt": true },
+                "compaction": {
+                    "reserveTokens": 12000,
+                    "modelOverrides": { "anthropic/claude-opus": { "reserveTokens": 24000 } }
+                },
+                "retry": { "provider": { "timeoutMs": 9000, "maxRetries": 5, "maxRetryDelayMs": 12000 } },
+                "websocketConnectTimeoutMs": 4500,
+                "externalEditor": "hx",
+                "thinkingBudgets": { "low": 1024, "high": 8192 },
+                "terminal": { "images": "kitty", "hyperlinks": true, "trueColor": false },
+                "collapseChangelog": true,
+                "codemode": { "mode": "only", "inlineBudget": 4200 },
+                "showHardwareCursor": true,
+            }),
+            CreateOptions::default(),
+        );
+        assert_eq!(manager.get_branch_summary_settings().0, 4096);
+        assert!(manager.get_branch_summary_skip_prompt());
+        let (_, reserve, _) =
+            manager.get_compaction_settings_for_model(Some("anthropic"), Some("claude-opus"))?;
+        assert_eq!(reserve, 24000);
+        assert_eq!(
+            manager.get_provider_retry_settings(),
+            (Some(9000), Some(5), 12000)
+        );
+        assert_eq!(manager.get_websocket_connect_timeout_ms()?, Some(4500));
+        assert_eq!(manager.get_external_editor_command(), "hx");
+        let budgets = manager.get_thinking_budgets();
+        assert_eq!(budgets.get(&pi_rs_agent::ThinkingLevel::Low), Some(&1024));
+        assert_eq!(budgets.get(&pi_rs_agent::ThinkingLevel::High), Some(&8192));
+        let overrides = manager.get_terminal_capability_overrides();
+        assert_eq!(
+            overrides.images,
+            Some(Some(pi_rs_tui::ImageProtocol::Kitty))
+        );
+        assert_eq!(overrides.hyperlinks, Some(true));
+        assert_eq!(overrides.true_color, Some(false));
+        assert!(manager.get_collapse_changelog());
+        assert_eq!(
+            manager.get_codemode_mode(),
+            crate::extensions::codemode::CodemodeMode::Only
+        );
+        assert_eq!(manager.get_codemode_inline_budget(), 4200);
+        assert!(manager.get_show_hardware_cursor());
+        Ok(())
     }
 }

@@ -135,7 +135,7 @@ impl Screen {
         events: &UnboundedSender<UiEvent>,
     ) -> Self {
         let terminal = OwnedTerminal((terminal.create)());
-        let hardware_cursor = settings["showHardwareCursor"].as_bool().unwrap_or(false);
+        let hardware_cursor = crate::core::settings_manager::show_hardware_cursor_from(settings);
         let mut screen = match mode {
             TuiMode::Regular => Self::Main(Box::new(TuiMainScreen::new(
                 terminal,

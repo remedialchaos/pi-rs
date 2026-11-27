@@ -31,11 +31,17 @@ pub mod agent_session;
 pub mod agent_session_runtime;
 pub mod agent_session_services;
 pub mod auth_guidance;
+pub mod cache_stats;
+pub mod cache_warmer;
+pub mod crash_log;
 pub mod http_dispatcher;
+pub mod schemas;
 pub mod sdk;
 pub mod session_cwd;
 pub mod settings_diagnostics;
+pub mod usage_totals;
 
 pub mod export_html;
+pub mod nested_tool_calls;
 pub mod package_manager;
 pub mod startup;

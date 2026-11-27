@@ -238,9 +238,21 @@ impl SessionStore for DiskSession {
     fn disk(&self) -> Option<&Self> {
         Some(self)
     }
+    fn append_usage(
+        &self,
+        kind: &str,
+        provider: &str,
+        model: &str,
+        usage: &pi_rs_ai::Usage,
+        note: Option<&str>,
+    ) {
+        if let Ok(value) = serde_json::to_value(usage) {
+            let _ = self.lock().append_usage(kind, provider, model, value, note);
+        }
+    }
 }
 
-struct DiskSettings(Mutex<SettingsManager>);
+struct DiskSettings(Arc<Mutex<SettingsManager>>);
 
 fn queue_mode(value: &Value) -> QueueMode {
     if value.as_str() == Some("all") {
@@ -337,11 +349,43 @@ impl SettingsStore for DiskSettings {
                 .is_project_trusted(),
         )
     }
+    fn raw_value(&self) -> Value {
+        self.value()
+    }
+    fn cache_warming_mode(&self) -> super::cache_warmer::CacheWarmingMode {
+        let mode = self
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_cache_warming_mode();
+        super::cache_warmer::CacheWarmingMode::from_setting(mode)
+    }
+    fn compaction_reserve_tokens_for_model(&self, provider: &str, model_id: &str) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_compaction_settings_for_model(Some(provider), Some(model_id))
+            .ok()
+            .map(|(_, reserve, _)| reserve as u64)
+    }
+    fn branch_summary_reserve_tokens(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_branch_summary_settings()
+            .0
+    }
+    fn branch_summary_skip_prompt(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_branch_summary_skip_prompt()
+    }
 }
 
 struct ModelCompactor {
     runtime: Arc<ModelRuntime>,
-    keep_recent_tokens: usize,
+    settings: Arc<Mutex<SettingsManager>>,
 }
 
 impl agent_session::Compactor for ModelCompactor {
@@ -371,10 +415,21 @@ impl agent_session::Compactor for ModelCompactor {
                     }
                 }
             }
+            let (reserve_tokens, keep_recent_tokens) = self
+                .settings
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_compaction_settings_for_model(Some(&model.provider), Some(&model.id))
+                .map(|(_, reserve, keep_recent)| (reserve, keep_recent))
+                .unwrap_or((
+                    compaction::DEFAULT_RESERVE_TOKENS,
+                    compaction::DEFAULT_KEEP_RECENT_TOKENS,
+                ));
             let instructions = (!instructions.is_empty()).then_some(instructions);
             let context = compaction::CompactionContext::new(messages);
             let options = compaction::CompactionOptions {
-                keep_recent_tokens: self.keep_recent_tokens,
+                reserve_tokens,
+                keep_recent_tokens,
                 previous_summary: previous_summary.clone(),
                 ..compaction::CompactionOptions::default()
             };
@@ -425,6 +480,24 @@ impl agent_session::ExtensionRunner for NativeExtensions {
             handle.spawn(async move { runner.emit(kind, data).await });
         }
         Value::Null
+    }
+    fn emit_async<'a>(&'a self, event: Value) -> futures_util::future::BoxFuture<'a, Value> {
+        Box::pin(async move {
+            let Some(name) = event["type"].as_str() else {
+                return Value::Null;
+            };
+            let Ok(kind) = ExtensionEvent::parse(name) else {
+                return Value::Null;
+            };
+            if !self.runner.has_handlers(kind) {
+                return Value::Null;
+            }
+            if kind == ExtensionEvent::BeforeAgentStart {
+                return self.runner.emit_before_agent_start(event).await;
+            }
+            let _ = self.runner.emit(kind, event).await;
+            Value::Null
+        })
     }
     fn has_handlers(&self, event_type: &str) -> bool {
         ExtensionEvent::parse(event_type).is_ok_and(|kind| self.runner.has_handlers(kind))
@@ -810,9 +883,11 @@ async fn create_services(
         )
     });
 
-    let mut model_runtime = ModelRuntime::create(&agent_dir, &runner, &mut diagnostics).await?;
+    let mut model_runtime =
+        ModelRuntime::create_with_settings(&agent_dir, &runner, &settings, &mut diagnostics)
+            .await?;
     if args.list_models.is_some()
-        && let Some(load_error) = model_runtime.registry().get_error()
+        && let Some(load_error) = model_runtime.get_error()
     {
         diagnostics.push(RuntimeDiagnostic::warning(format!(
             "errors loading models.json:\n{load_error}"
@@ -830,8 +905,65 @@ async fn create_services(
         &mut model_runtime,
         &mut diagnostics,
     );
+    let hooks = build_agent_hooks(&runner);
+    let nested_tools_slot: Arc<Mutex<Arc<super::nested_tool_calls::GetToolsFn>>> =
+        Arc::new(Mutex::new(Arc::new(Arc::new(Vec::new))));
+    let nested_seq_slot: Arc<Mutex<Arc<super::nested_tool_calls::IsSequentialFn>>> =
+        Arc::new(Mutex::new(Arc::new(Arc::new(|| true))));
+    let tools_slot_for_nested = Arc::clone(&nested_tools_slot);
+    let seq_slot_for_nested = Arc::clone(&nested_seq_slot);
+    let nested_runner = Arc::new(super::nested_tool_calls::NestedToolCallRunner::new(
+        Arc::new(move || {
+            let getter = tools_slot_for_nested
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            getter()
+        }),
+        Arc::new(move || {
+            let checker = seq_slot_for_nested
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            checker()
+        }),
+        hooks.tool_calls.clone(),
+        Arc::new(|_| {}),
+    ));
+    let nested_for_wasm = Arc::clone(&nested_runner);
+    for extension in runner.extensions() {
+        if let Some(wasm) = extension
+            .as_any()
+            .and_then(|any| any.downcast_ref::<WasmExtension>())
+        {
+            let runner_wasm = Arc::clone(&nested_for_wasm);
+            wasm.set_async_tool_handler(Arc::new(move |caller_id, name, args_json| {
+                let runner = Arc::clone(&runner_wasm);
+                Box::pin(async move {
+                    let parsed: Value = serde_json::from_str(&args_json)
+                        .map_err(|error| format!("invalid nested tool args JSON: {error}"))?;
+                    let outcome = runner
+                        .execute(&caller_id, &name, parsed, None, false, None)
+                        .await;
+                    serde_json::to_string(&json!({
+                        "toolCall": outcome.tool_call,
+                        "result": outcome.result,
+                        "isError": outcome.is_error,
+                    }))
+                    .map_err(|error| error.to_string())
+                })
+            }));
+        }
+    }
     let builtin_tools = selected_tools(&cwd, args, &settings);
-    let tools = collect_session_tools(&builtin_tools, &runner, args);
+    let all_nested_tools =
+        collect_all_extension_tools(&builtin_tools, &runner, Some(&nested_runner), args);
+    {
+        let all_for_nested = all_nested_tools.clone();
+        *nested_tools_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            Arc::new(Arc::new(move || all_for_nested.clone()));
+    }
+    let tools = collect_session_tools(&builtin_tools, &runner, Some(&nested_runner), args);
     let system_prompt = build_system_prompt_sections(&SystemPromptOptions {
         cwd: cwd.clone(),
         custom_prompt: resources.system_prompt.clone(),
@@ -863,9 +995,20 @@ async fn create_services(
             manager.append_thinking_level_change(thinking.as_str())?;
         }
     }
-    let model_runtime = Arc::new(model_runtime);
+    let (provider_timeout_ms, provider_max_retries, provider_max_retry_delay_ms) =
+        settings.get_provider_retry_settings();
+    let http_idle_timeout_ms = settings.get_http_idle_timeout_ms().unwrap_or(300_000);
+    let effective_timeout_ms = provider_timeout_ms.or(Some(if http_idle_timeout_ms == 0 {
+        i32::MAX as u64
+    } else {
+        http_idle_timeout_ms as u64
+    }));
+    let websocket_connect_timeout_ms = settings.get_websocket_connect_timeout_ms().ok().flatten();
+    let thinking_budgets = settings.get_thinking_budgets();
+    let model_runtime = Arc::new(model_runtime.with_extensions(runner.clone()));
     let stream_fn = model_runtime.stream();
-    let settings: Arc<dyn SettingsStore> = Arc::new(DiskSettings(Mutex::new(settings)));
+    let settings_store = Arc::new(Mutex::new(settings));
+    let settings: Arc<dyn SettingsStore> = Arc::new(DiskSettings(settings_store.clone()));
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
             model,
@@ -875,13 +1018,29 @@ async fn create_services(
             messages: target.session_manager.messages(),
         },
         stream_fn: Some(stream_fn),
+        hooks,
         stream_options: StreamOptions {
             session_id: Some(target.session_manager.session_id()),
+            websocket_connect_timeout_ms,
+            thinking_budgets: thinking_budgets.clone(),
+            request: pi_rs_ai::ProviderRequestOptions {
+                timeout_ms: effective_timeout_ms,
+                max_retries: provider_max_retries,
+                max_retry_delay_ms: Some(provider_max_retry_delay_ms),
+                ..pi_rs_ai::ProviderRequestOptions::default()
+            },
             ..StreamOptions::default()
         },
         ..AgentOptions::default()
     })
     .map_err(|error| error.to_string())?;
+    {
+        let agent_for_seq = agent.clone();
+        *nested_seq_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            Arc::new(Arc::new(move || {
+                agent_for_seq.tool_execution() == pi_rs_agent::ToolExecutionMode::Sequential
+            }));
+    }
     // Declare the initial loadout on the first prompt, not as hidden history.
     agent.set_tools(tools);
     {
@@ -889,24 +1048,50 @@ async fn create_services(
         let runner_weak = Arc::downgrade(&runner);
         let args_refresh = args.clone();
         let builtins_refresh = builtin_tools.clone();
+        let nested_refresh = Arc::clone(&nested_runner);
+        let nested_slot_refresh = Arc::clone(&nested_tools_slot);
         runner.host.set_refresh_tools(Arc::new(move || {
             if let Some(runner) = runner_weak.upgrade() {
+                let all = collect_all_extension_tools(
+                    &builtins_refresh,
+                    &runner,
+                    Some(&nested_refresh),
+                    &args_refresh,
+                );
+                *nested_slot_refresh
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Arc::new(Arc::new(move || all.clone()));
                 agent_refresh.set_tools(collect_session_tools(
                     &builtins_refresh,
                     &runner,
+                    Some(&nested_refresh),
                     &args_refresh,
                 ));
             }
         }));
 
         let agent_model = agent.clone();
+        let agent_set_model = agent.clone();
+        let registry_for_model = model_runtime.clone();
+        let agent_thinking = agent.clone();
+        let agent_set_thinking = agent.clone();
         let agent_tools = agent.clone();
         let agent_set_tools = agent.clone();
         let runner_set_tools = Arc::downgrade(&runner);
+        let runner_all_tools = Arc::downgrade(&runner);
+        let runner_for_commands = Arc::downgrade(&runner);
+        let builtins_all_tools = builtin_tools.clone();
         let args_set_tools = args.clone();
+        let nested_set_tools = Arc::clone(&nested_runner);
         let session_for_entry = target.session_manager.clone();
+        let session_for_set_name = target.session_manager.clone();
+        let session_for_get_name = target.session_manager.clone();
+        let session_for_label = target.session_manager.clone();
         let session_for_message = target.session_manager.clone();
         let agent_for_message = agent.clone();
+        let agent_for_user = agent.clone();
+        let session_for_user = target.session_manager.clone();
+        let settings_for_host = settings.clone();
         runner
             .host
             .set_actions(super::extensions::types::ExtensionHostActions {
@@ -921,11 +1106,33 @@ async fn create_services(
                         .map(|tool| tool.declaration().name.clone())
                         .collect()
                 })),
+                get_all_tools: Some(Arc::new(move || {
+                    let mut defs = Vec::new();
+                    for tool in &builtins_all_tools {
+                        let decl = tool.declaration();
+                        let mut def = super::extensions::types::ToolDefinition::new(
+                            &decl.name,
+                            decl.parameters.clone(),
+                        );
+                        def.label = tool.label().to_owned();
+                        def.description = decl.description.clone();
+                        defs.push(def);
+                    }
+                    if let Some(runner) = runner_all_tools.upgrade() {
+                        defs.extend(runner.get_all_registered_tools());
+                    }
+                    defs
+                })),
                 set_active_tools: Some(Arc::new(move |names| {
                     let Some(runner) = runner_set_tools.upgrade() else {
                         return Err(super::extensions::types::STALE_MESSAGE.to_string());
                     };
-                    let available = collect_session_tools(&builtin_tools, &runner, &args_set_tools);
+                    let available = collect_all_extension_tools(
+                        &builtin_tools,
+                        &runner,
+                        Some(&nested_set_tools),
+                        &args_set_tools,
+                    );
                     let selected = resolve_active_tools(&available, &names)?;
                     agent_set_tools.set_tools(selected);
                     Ok(())
@@ -965,14 +1172,84 @@ async fn create_services(
                     };
                     disk.lock().append_custom_entry(&custom_type, data)
                 })),
+                send_user_message: Some(Arc::new(move |content, deliver_as| {
+                    let text = match content {
+                        Value::String(s) => s,
+                        other => serde_json::to_string(&other).unwrap_or_default(),
+                    };
+                    let message = AgentMessage::user(text);
+                    match deliver_as.as_deref() {
+                        Some("steer") => agent_for_user.steer(message),
+                        Some("followUp") => agent_for_user.follow_up(message),
+                        _ => {
+                            let _ = session_for_user.try_append_message(&message);
+                            agent_for_user.append_message(message);
+                        }
+                    }
+                    Ok(())
+                })),
+                set_session_name: Some(Arc::new(move |name| {
+                    let Some(disk) = session_for_set_name.disk() else {
+                        return Err("Session does not support session names".to_string());
+                    };
+                    disk.lock().append_session_info(&name).map(|_| ())
+                })),
+                get_session_name: Some(Arc::new(move || {
+                    session_for_get_name
+                        .disk()
+                        .and_then(|disk| disk.lock().get_session_name().map(str::to_owned))
+                })),
+                set_label: Some(Arc::new(move |target_id, label| {
+                    let Some(disk) = session_for_label.disk() else {
+                        return Err("Session does not support labels".to_string());
+                    };
+                    disk.lock()
+                        .append_label_change(&target_id, label.as_deref())
+                        .map(|_| ())
+                })),
+                get_settings: Some(Arc::new(move || settings_for_host.raw_value())),
+                get_commands: Some(Arc::new(move || {
+                    let mut cmds = Vec::new();
+                    for cmd in super::slash_commands::BUILTIN_SLASH_COMMANDS {
+                        cmds.push(json!({
+                            "name": cmd.name,
+                            "description": cmd.description,
+                            "source": "builtin",
+                        }));
+                    }
+                    if let Some(runner) = runner_for_commands.upgrade() {
+                        for cmd in runner.get_registered_commands() {
+                            cmds.push(json!({
+                                "name": cmd.invocation_name,
+                                "description": cmd.definition.description,
+                                "source": "extension",
+                            }));
+                        }
+                    }
+                    Value::Array(cmds)
+                })),
+                set_model: Some(Arc::new(move |provider, model_id| {
+                    let Some(model) = registry_for_model.registry().get(&provider, &model_id)
+                    else {
+                        return Err(format!("Model not found: {provider}/{model_id}"));
+                    };
+                    agent_set_model.set_model(model);
+                    Ok(())
+                })),
+                get_thinking_level: Some(Arc::new(move || {
+                    agent_thinking.thinking_level().as_str().to_owned()
+                })),
+                set_thinking_level: Some(Arc::new(move |level| {
+                    let parsed = parse_thinking_level(&level)
+                        .ok_or_else(|| format!("Invalid thinking level: {level}"))?;
+                    agent_set_thinking.set_thinking_level(parsed);
+                    Ok(())
+                })),
             });
     }
     let compactor = Arc::new(ModelCompactor {
         runtime: model_runtime.clone(),
-        keep_recent_tokens: settings_value["compaction"]["keepRecentTokens"]
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(super::compaction::DEFAULT_KEEP_RECENT_TOKENS),
+        settings: settings_store,
     });
     let extensions = Arc::new(NativeExtensions { runner, resources });
     let session = AgentSession::new(AgentSessionConfig {
@@ -987,7 +1264,8 @@ async fn create_services(
         retry_prompt: None,
     })
     .map_err(|error| error.to_string())?
-    .with_system_prompt_sections(system_prompt);
+    .with_system_prompt_sections(system_prompt)
+    .with_nested_runner(nested_runner);
     Ok(CreateAgentSessionRuntimeResult {
         session,
         services: RuntimeServices {
@@ -1192,24 +1470,207 @@ fn select_model(
     (model, thinking, fallback)
 }
 
+struct ExtensionAgentTool {
+    declaration: pi_rs_ai::Tool,
+    label: String,
+    extension: Arc<dyn super::extensions::types::Extension>,
+    host: Arc<ExtensionHost>,
+    bus: Arc<EventBus>,
+    cwd: String,
+    mode: super::extensions::types::ExtensionMode,
+    nested_runner: Option<Arc<super::nested_tool_calls::NestedToolCallRunner>>,
+}
+
+impl AgentTool for ExtensionAgentTool {
+    fn declaration(&self) -> &pi_rs_ai::Tool {
+        &self.declaration
+    }
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn execute<'a>(
+        &'a self,
+        tool_call_id: &'a str,
+        params: &'a Value,
+        signal: &'a pi_rs_agent::CancellationToken,
+        on_update: pi_rs_agent::AgentToolUpdateCallback,
+    ) -> futures_util::future::BoxFuture<'a, pi_rs_agent::Result<pi_rs_agent::AgentToolResult>>
+    {
+        let name = self.declaration.name.clone();
+        let params = params.clone();
+        let tool_call_id = tool_call_id.to_owned();
+        let signal = signal.clone();
+        let extension = Arc::clone(&self.extension);
+        let host = Arc::clone(&self.host);
+        let bus = Arc::clone(&self.bus);
+        let cwd = self.cwd.clone();
+        let mode = self.mode;
+        let nested_runner = self.nested_runner.clone();
+        Box::pin(async move {
+            let base = super::extensions::types::ExtensionContext {
+                host,
+                cwd,
+                mode,
+                ui: super::extensions::types::ExtensionUi::no_op(mode),
+                bus: Some(bus),
+                is_idle: Arc::new(|| false),
+                is_project_trusted: Arc::new(|| true),
+                has_pending_messages: Arc::new(|| false),
+                get_context_usage: Arc::new(|| None),
+                get_system_prompt: Arc::new(String::new),
+                abort: Arc::new(|| {}),
+                shutdown: Arc::new(|| {}),
+                compact: Arc::new(|_| {}),
+            };
+            let mut ctx = super::extensions::types::ExtensionToolContext::new(base, &tool_call_id);
+            if let Some(nested) = nested_runner {
+                let signal_for_nested = signal.clone();
+                let on_update_for_nested = on_update.clone();
+                ctx = ctx.with_execute_tool(Arc::new(move |caller_id, target_name, args, opts| {
+                    let nested = Arc::clone(&nested);
+                    let sig = signal_for_nested.clone();
+                    let cb = on_update_for_nested.clone();
+                    Box::pin(async move {
+                        let cb_ref: Option<&(dyn Fn(pi_rs_agent::AgentToolResult) + Send + Sync)> =
+                            if opts.deliver_as_update {
+                                Some(&*cb)
+                            } else {
+                                None
+                            };
+                        nested
+                            .execute(
+                                &caller_id,
+                                &target_name,
+                                args,
+                                Some(&sig),
+                                opts.deliver_as_update,
+                                cb_ref,
+                            )
+                            .await
+                    })
+                }));
+            }
+            let outcome = extension
+                .execute_tool(&name, params, &ctx)
+                .await
+                .map_err(pi_rs_agent::AgentError::Callback)?;
+            let mut result = pi_rs_agent::AgentToolResult::default();
+            if let Some(content) = outcome.result.get("content")
+                && let Ok(parsed) =
+                    serde_json::from_value::<Vec<pi_rs_ai::InputContent>>(content.clone())
+            {
+                result.content = parsed;
+            }
+            if let Some(details) = outcome.result.get("details").filter(|v| !v.is_null()) {
+                result.details = Some(details.clone());
+            }
+            if let Some(structured) = outcome
+                .result
+                .get("structuredContent")
+                .filter(|v| !v.is_null())
+            {
+                result.structured_content = Some(structured.clone());
+            }
+            if let Some(usage) = outcome.result.get("usage").filter(|v| !v.is_null())
+                && let Ok(parsed) = serde_json::from_value::<pi_rs_ai::Usage>(usage.clone())
+            {
+                result.usage = Some(parsed);
+            }
+            if outcome.is_error {
+                result.is_error = Some(true);
+            }
+            Ok(result)
+        })
+    }
+}
+
 fn collect_session_tools(
     builtin_tools: &[Arc<dyn AgentTool>],
     runner: &ExtensionRunner,
+    nested_runner: Option<&Arc<super::nested_tool_calls::NestedToolCallRunner>>,
     args: &Args,
+) -> Vec<Arc<dyn AgentTool>> {
+    collect_tools_with_filter(builtin_tools, runner, nested_runner, args, true)
+}
+
+fn collect_all_extension_tools(
+    builtin_tools: &[Arc<dyn AgentTool>],
+    runner: &ExtensionRunner,
+    nested_runner: Option<&Arc<super::nested_tool_calls::NestedToolCallRunner>>,
+    args: &Args,
+) -> Vec<Arc<dyn AgentTool>> {
+    collect_tools_with_filter(builtin_tools, runner, nested_runner, args, false)
+}
+
+fn collect_tools_with_filter(
+    builtin_tools: &[Arc<dyn AgentTool>],
+    runner: &ExtensionRunner,
+    nested_runner: Option<&Arc<super::nested_tool_calls::NestedToolCallRunner>>,
+    args: &Args,
+    direct_only: bool,
 ) -> Vec<Arc<dyn AgentTool>> {
     let mut tools = builtin_tools.to_vec();
     if !args.no_tools {
         for extension in runner.extensions() {
-            tools.extend(extension.agent_tools().into_iter().filter(|tool| {
-                let name = &tool.declaration().name;
-                args.tools
+            let mut provided = std::collections::HashSet::new();
+            for tool in extension.agent_tools() {
+                let name = tool.declaration().name.clone();
+                provided.insert(name.clone());
+                if args
+                    .tools
+                    .as_ref()
+                    .is_none_or(|patterns| patterns.iter().any(|p| tool_name_matches(p, &name)))
+                    && args.exclude_tools.as_ref().is_none_or(|patterns| {
+                        !patterns.iter().any(|p| tool_name_matches(p, &name))
+                    })
+                {
+                    tools.push(tool);
+                }
+            }
+            for (name, def) in &extension.registration().tools {
+                if provided.contains(name) {
+                    continue;
+                }
+                if direct_only
+                    && !matches!(
+                        def.exposure,
+                        super::extensions::types::ToolExposure::Direct
+                            | super::extensions::types::ToolExposure::ModelOnly
+                    )
+                {
+                    continue;
+                }
+                if args
+                    .tools
                     .as_ref()
                     .is_none_or(|patterns| patterns.iter().any(|p| tool_name_matches(p, name)))
                     && args
                         .exclude_tools
                         .as_ref()
                         .is_none_or(|patterns| !patterns.iter().any(|p| tool_name_matches(p, name)))
-            }));
+                {
+                    let label = if def.label.is_empty() {
+                        def.name.clone()
+                    } else {
+                        def.label.clone()
+                    };
+                    tools.push(Arc::new(ExtensionAgentTool {
+                        declaration: pi_rs_ai::Tool {
+                            name: def.name.clone(),
+                            description: def.description.clone(),
+                            parameters: def.parameters.clone(),
+                            constrained_sampling: None,
+                        },
+                        label,
+                        extension: Arc::clone(&extension),
+                        host: Arc::clone(&runner.host),
+                        bus: Arc::clone(&runner.bus),
+                        cwd: runner.cwd.clone(),
+                        mode: runner.mode(),
+                        nested_runner: nested_runner.cloned(),
+                    }));
+                }
+            }
         }
     }
     tools
@@ -1281,6 +1742,7 @@ fn selected_tools(cwd: &Path, args: &Args, settings: &SettingsManager) -> Vec<Ar
     let auto_resize = settings.get()["images"]["autoResize"]
         .as_bool()
         .unwrap_or(true);
+    let mutation_queue = Arc::new(super::tools::file_mutation_queue::FileMutationQueue::new());
     enabled
         .iter()
         .map(String::as_str)
@@ -1301,8 +1763,8 @@ fn selected_tools(cwd: &Path, args: &Args, settings: &SettingsManager) -> Vec<Ar
                 "read" => Arc::new(ReadTool::new(cwd).with_auto_resize_images(auto_resize)),
                 "bash" => Arc::new(BashTool::new(cwd)),
                 "powershell" => Arc::new(PowerShellTool::new(cwd)),
-                "edit" => Arc::new(EditTool::new(cwd)),
-                "write" => Arc::new(WriteTool::new(cwd)),
+                "edit" => Arc::new(EditTool::with_queue(cwd, mutation_queue.clone())),
+                "write" => Arc::new(WriteTool::with_queue(cwd, mutation_queue.clone())),
                 "grep" => Arc::new(GrepTool::new(cwd)),
                 "find" => Arc::new(FindTool::new(cwd)),
                 "ls" => Arc::new(LsTool::new(cwd)),
@@ -1348,6 +1810,128 @@ pub fn export_to_html(
     let html = export_session_html(&snapshot, &ExportOptions::default())?;
     std::fs::write(&output, html).map_err(|error| format!("{}: {output}", error))?;
     Ok(output)
+}
+
+fn build_agent_hooks(runner: &Arc<ExtensionRunner>) -> pi_rs_agent::AgentHooks {
+    let before_runner = Arc::clone(runner);
+    let after_runner = Arc::clone(runner);
+    let context_runner = Arc::clone(runner);
+    pi_rs_agent::AgentHooks {
+        transform_context: Some(Arc::new(move |messages, _signal| {
+            let runner = Arc::clone(&context_runner);
+            let owned = messages.to_vec();
+            Box::pin(async move {
+                if !runner.has_handlers(ExtensionEvent::Context)
+                    && !runner.has_handlers(ExtensionEvent::ContextWithSystem)
+                {
+                    return owned;
+                }
+                let encoded = owned
+                    .iter()
+                    .filter_map(|message| serde_json::to_value(message).ok())
+                    .collect::<Vec<_>>();
+                let transformed = runner.emit_context(encoded).await;
+                let parsed = transformed
+                    .into_iter()
+                    .map(serde_json::from_value::<AgentMessage>)
+                    .collect::<std::result::Result<Vec<_>, _>>();
+                parsed.unwrap_or(owned)
+            })
+        })),
+        tool_calls: pi_rs_agent::ToolCallHooks {
+            before_tool_call: Some(Arc::new(move |ctx, _signal| {
+                let runner = Arc::clone(&before_runner);
+                let tool_call_id = ctx.tool_call.id.clone();
+                let tool_name = ctx.tool_call.name.clone();
+                let args_val = ctx.args.clone();
+                Box::pin(async move {
+                    if !runner.has_handlers(ExtensionEvent::ToolCall) {
+                        return Ok(None);
+                    }
+                    let event = json!({
+                        "type": "tool_call",
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "input": args_val,
+                    });
+                    let Some(decision) = runner.emit_tool_call(event).await else {
+                        return Ok(None);
+                    };
+                    if let Some(updated_input) = decision.get("input").filter(|v| !v.is_null()) {
+                        *ctx.args = updated_input.clone();
+                    }
+                    if decision.get("block").and_then(Value::as_bool) == Some(true) {
+                        return Ok(Some(pi_rs_agent::BeforeToolCallResult {
+                            block: true,
+                            reason: decision
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            terminate: decision
+                                .get("terminate")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        }));
+                    }
+                    Ok(None)
+                })
+            })),
+            after_tool_call: Some(Arc::new(move |ctx, _signal| {
+                let runner = Arc::clone(&after_runner);
+                let tool_call_id = ctx.tool_call.id.clone();
+                let tool_name = ctx.tool_call.name.clone();
+                let input = ctx.args.clone();
+                let content = ctx.result.content.clone();
+                let details = ctx.result.details.clone();
+                let structured_content = ctx.result.structured_content.clone();
+                let is_error = ctx.is_error;
+                let usage = ctx.result.usage;
+                Box::pin(async move {
+                    if !runner.has_handlers(ExtensionEvent::ToolResult) {
+                        return Ok(None);
+                    }
+                    let event = json!({
+                        "type": "tool_result",
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "input": input,
+                        "content": content,
+                        "details": details,
+                        "structuredContent": structured_content,
+                        "isError": is_error,
+                        "usage": usage,
+                    });
+                    let Some(modified) = runner.emit_tool_result(event).await else {
+                        return Ok(None);
+                    };
+                    let mut result = pi_rs_agent::AfterToolCallResult::default();
+                    if let Some(value) = modified.get("content")
+                        && let Ok(parsed) =
+                            serde_json::from_value::<Vec<pi_rs_ai::InputContent>>(value.clone())
+                    {
+                        result.content = Some(parsed);
+                    }
+                    if let Some(value) = modified.get("details").filter(|v| !v.is_null()) {
+                        result.details = Some(value.clone());
+                    }
+                    if let Some(value) = modified.get("structuredContent").filter(|v| !v.is_null())
+                    {
+                        result.structured_content = Some(value.clone());
+                    }
+                    if let Some(err) = modified.get("isError").and_then(Value::as_bool) {
+                        result.is_error = Some(err);
+                    }
+                    if let Some(value) = modified.get("usage").filter(|v| !v.is_null())
+                        && let Ok(parsed) = serde_json::from_value::<pi_rs_ai::Usage>(value.clone())
+                    {
+                        result.usage = Some(parsed);
+                    }
+                    Ok(Some(result))
+                })
+            })),
+        },
+        ..pi_rs_agent::AgentHooks::default()
+    }
 }
 
 fn resolve_active_tools(
@@ -1445,6 +2029,127 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err, "Unknown tool(s): missing_one, missing_two");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_agent_hooks_routes_before_after_and_context_through_runner() -> Result<(), String>
+    {
+        let bus = Arc::new(EventBus::new());
+        let host = Arc::new(ExtensionHost::new(bus.clone()));
+        let runner = Arc::new(ExtensionRunner::new(Vec::new(), host, bus, "."));
+        runner.bus.on(ExtensionEvent::ToolCall, |event| {
+            Box::pin(async move {
+                let name = event["toolName"].as_str().unwrap_or_default();
+                if name == "blocked" {
+                    return Ok(Some(json!({ "block": true, "reason": "denied" })));
+                }
+                Ok(Some(json!({ "input": { "command": "rewritten" } })))
+            })
+        });
+        runner.bus.on(ExtensionEvent::ToolResult, |_event| {
+            Box::pin(async move {
+                Ok(Some(json!({
+                    "content": [{ "type": "text", "text": "hooked-output" }],
+                    "isError": true
+                })))
+            })
+        });
+        runner.bus.on(ExtensionEvent::Context, |event| {
+            Box::pin(async move {
+                let mut messages = event["messages"].as_array().cloned().unwrap_or_default();
+                messages.push(
+                    serde_json::to_value(AgentMessage::user("from-hook")).unwrap_or(Value::Null),
+                );
+                Ok(Some(json!({ "messages": messages })))
+            })
+        });
+        let hooks = build_agent_hooks(&runner);
+        let signal = pi_rs_agent::CancellationToken::new();
+        let assistant = pi_rs_ai::faux::faux_assistant_message(Vec::new());
+        let ctx = pi_rs_agent::AgentContext::default();
+
+        let before = hooks
+            .tool_calls
+            .before_tool_call
+            .as_ref()
+            .ok_or("missing before_tool_call")?;
+        let mut ok_args = json!({ "command": "orig" });
+        let ok_call = pi_rs_ai::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: serde_json::Map::from_iter([("command".to_owned(), json!("orig"))]),
+            ..Default::default()
+        };
+        let decision = before(
+            pi_rs_agent::BeforeToolCallContext {
+                assistant_message: &assistant,
+                tool_call: &ok_call,
+                args: &mut ok_args,
+                context: &ctx,
+            },
+            &signal,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        assert!(decision.is_none());
+        assert_eq!(ok_args, json!({ "command": "rewritten" }));
+
+        let mut blocked_args = json!({});
+        let blocked_call = pi_rs_ai::ToolCall {
+            id: "c2".into(),
+            name: "blocked".into(),
+            arguments: serde_json::Map::new(),
+            ..Default::default()
+        };
+        let blocked = before(
+            pi_rs_agent::BeforeToolCallContext {
+                assistant_message: &assistant,
+                tool_call: &blocked_call,
+                args: &mut blocked_args,
+                context: &ctx,
+            },
+            &signal,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("expected block result")?;
+        assert!(blocked.block);
+        assert_eq!(blocked.reason.as_deref(), Some("denied"));
+
+        let after = hooks
+            .tool_calls
+            .after_tool_call
+            .as_ref()
+            .ok_or("missing after_tool_call")?;
+        let result = pi_rs_agent::AgentToolResult::text("raw");
+        let after_res = after(
+            pi_rs_agent::AfterToolCallContext {
+                assistant_message: &assistant,
+                tool_call: &ok_call,
+                args: &ok_args,
+                result: &result,
+                is_error: false,
+                context: &ctx,
+            },
+            &signal,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("expected after result")?;
+        assert_eq!(after_res.is_error, Some(true));
+        let txt = match after_res.content.and_then(|c| c.into_iter().next()) {
+            Some(pi_rs_ai::InputContent::Text(t)) => t.text,
+            _ => String::new(),
+        };
+        assert_eq!(txt, "hooked-output");
+
+        let transform = hooks
+            .transform_context
+            .as_ref()
+            .ok_or("missing transform_context")?;
+        let transformed = transform(&[AgentMessage::user("hi")], &signal).await;
+        assert_eq!(transformed.len(), 2);
         Ok(())
     }
 }

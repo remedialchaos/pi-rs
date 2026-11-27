@@ -1124,9 +1124,17 @@ const BASE_KEYS: &[&str] = &[
     "?",
 ];
 
-/// Hand-rolled equivalent of the `KeyIdSchema` regular expression.
+/// Validate a key id against `keybindings.schema.json` rules.
 pub fn is_valid_key_id(value: &str) -> bool {
-    let parts: Vec<&str> = value.split('+').collect();
+    let parts: Vec<&str> = if value == "+" {
+        vec!["+"]
+    } else if let Some(prefix) = value.strip_suffix("++") {
+        let mut split: Vec<&str> = prefix.split('+').collect();
+        split.push("+");
+        split
+    } else {
+        value.split('+').collect()
+    };
     let Some(base) = parts.last() else {
         return false;
     };
@@ -1150,11 +1158,16 @@ pub fn is_valid_key_id(value: &str) -> bool {
     parts.len() - 1 <= 4
 }
 
-/// Filter a raw JSON object to valid binding values, preserving file order.
+/// Filter a raw JSON object to valid binding values against `keybindings.schema.json`,
+/// preserving file order.
 pub fn to_keybindings_config(raw: &IndexMap<String, Value>) -> IndexMap<String, KeyIdValue> {
     let mut config = IndexMap::new();
     for (key, value) in raw {
         if key == "$schema" {
+            continue;
+        }
+        let schema_ok = super::schemas::validate_keybinding_value(value).unwrap_or(true);
+        if !schema_ok {
             continue;
         }
         let binding = match value {
@@ -1179,6 +1192,22 @@ pub fn to_keybindings_config(raw: &IndexMap<String, Value>) -> IndexMap<String, 
         }
     }
     config
+}
+
+/// Validate a raw keybindings object against `keybindings.schema.json` and return any invalid entries.
+pub fn validate_keybindings_entries(raw: &IndexMap<String, Value>) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (key, value) in raw {
+        if key == "$schema" {
+            continue;
+        }
+        match super::schemas::validate_keybinding_value(value) {
+            Ok(true) => {}
+            Ok(false) => errors.push(format!("Invalid keybinding value for \"{key}\": {value}")),
+            Err(err) => errors.push(err),
+        }
+    }
+    errors
 }
 
 fn strip_bom(content: &str) -> &str {

@@ -219,7 +219,10 @@ fn migrate_sessions_from_agent_root(agent_dir: &Path) {
         if cwd.is_empty() {
             continue;
         }
-        let without_root = cwd.trim_start_matches(['/', '\\']);
+        let without_root = cwd
+            .strip_prefix('/')
+            .or_else(|| cwd.strip_prefix('\\'))
+            .unwrap_or(cwd);
         let safe_path: String = without_root
             .chars()
             .map(|character| {
@@ -385,6 +388,42 @@ pub fn run_migrations(cwd: &Path) -> MigrationResult {
     match crate::config::get_agent_dir() {
         Ok(agent_dir) => run_migrations_in(cwd, &agent_dir),
         Err(_) => MigrationResult::default(),
+    }
+}
+
+/// Format deprecation warnings matching upstream `showDeprecationWarnings`.
+pub fn format_deprecation_warnings(warnings: &[String]) -> Vec<String> {
+    if warnings.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = warnings
+        .iter()
+        .map(|warning| format!("Warning: {warning}"))
+        .collect::<Vec<_>>();
+    lines.push("Move your extensions to the extensions/ directory.".to_owned());
+    lines.push("Migration guide: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md".to_owned());
+    lines
+}
+
+/// Print deprecation warnings to stdout/stderr; wait for a keypress when `interactive_tty` is true.
+pub async fn show_deprecation_warnings(warnings: &[String], interactive_tty: bool) {
+    if warnings.is_empty() {
+        return;
+    }
+    for warning in warnings {
+        eprintln!("Warning: {warning}");
+    }
+    eprintln!("\nMove your extensions to the extensions/ directory.");
+    eprintln!(
+        "Migration guide: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md"
+    );
+    if interactive_tty {
+        eprintln!("\nPress Enter to continue...");
+        let _ = tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        })
+        .await;
     }
 }
 

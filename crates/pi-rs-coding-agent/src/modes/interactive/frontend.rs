@@ -6,10 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base64::Engine;
 use indexmap::IndexMap;
 use pi_rs_agent::CancellationToken;
-use pi_rs_ai::{ImageContent, ImageContentKind, ThinkingLevel};
+use pi_rs_ai::{ImageContent, ThinkingLevel};
 use pi_rs_tui::{
     Component, ComponentRef, Editor, EditorAppearance, EditorAutocomplete, EditorComponent,
     EditorInsertion, EditorOptions, EditorTheme, OverlayHandle, OverlayMargin, OverlayOptions,
@@ -190,8 +189,70 @@ impl Frontend {
         if ui.bound.session.model().provider == "unknown" {
             ui.notice(no_models_available(), "warning");
         }
+        if !ui.options.migrated_auth_providers.is_empty() {
+            ui.notice(
+                format!(
+                    "Migrated credentials to auth.json: {}",
+                    ui.options.migrated_auth_providers.join(", ")
+                ),
+                "warning",
+            );
+        }
+        if let Some(crash) = &ui.options.unnotified_crash {
+            ui.notice(
+                crate::core::crash_log::format_crash_notice(crash),
+                "warning",
+            );
+        }
+        if let Some(last_version) = value
+            .get("lastChangelogVersion")
+            .and_then(serde_json::Value::as_str)
+            && !last_version.is_empty()
+            && last_version != config::VERSION
+            && !value["quietStartup"].as_bool().unwrap_or(false)
+        {
+            if ui.settings.get_collapse_changelog() {
+                ui.notice(
+                    format!(
+                        "Updated to v{}. Use /changelog to view full changelog.",
+                        config::VERSION
+                    ),
+                    "text",
+                );
+            } else {
+                ui.notice(
+                    format!("Updated to v{} — What's New", config::VERSION),
+                    "accent",
+                );
+            }
+            let _ = ui.settings.set_value(
+                &["lastChangelogVersion".into()],
+                serde_json::json!(config::VERSION),
+            );
+        }
         if let Some(error) = theme_error {
             ui.notice(error, "warning");
+        }
+        if !ui.options.offline
+            && !crate::config::is_truthy_env_flag("PI_OFFLINE")
+            && !crate::config::is_truthy_env_flag("PI_SKIP_VERSION_CHECK")
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let notify_send = ui.send.clone();
+            handle.spawn(async move {
+                if let Some(release) =
+                    crate::utils::version_check::check_for_new_pi_version(config::VERSION).await
+                {
+                    let _ = notify_send.send(UiEvent::Notice(
+                        format!(
+                            "New version {} is available. Run {} update",
+                            release.version,
+                            config::APP_NAME
+                        ),
+                        "muted",
+                    ));
+                }
+            });
         }
         ui.screen
             .tui_mut()
@@ -248,10 +309,9 @@ impl Frontend {
                 .as_bool()
                 .unwrap_or(false),
         );
-        self.screen
-            .tui_mut()
-            .base_mut()
-            .set_show_hardware_cursor(settings["showHardwareCursor"].as_bool().unwrap_or(false));
+        self.screen.tui_mut().base_mut().set_show_hardware_cursor(
+            crate::core::settings_manager::show_hardware_cursor_from(&settings),
+        );
         let mut editor = self.editor.borrow_mut();
         editor.editor.set_padding_x(
             settings["editorPaddingX"]
@@ -301,7 +361,11 @@ impl Frontend {
             .unwrap_or_default();
         editor
             .editor
-            .set_autocomplete_provider(Box::new(commands::autocomplete(&self.bound)));
+            .set_autocomplete_provider(Box::new(commands::autocomplete(
+                &self.bound,
+                &self.settings,
+                &self.options.agent_dir,
+            )));
         let theme = self.theme.clone();
         let level = self.bound.session.thinking_level();
         editor
@@ -600,6 +664,13 @@ impl Frontend {
         if let Some(cancel) = &self.auth {
             cancel.cancel();
         }
+    }
+
+    pub(super) fn debug_lines(&mut self) -> (usize, usize, Vec<String>) {
+        let width = self.screen.tui_mut().base().terminal.width();
+        let height = self.screen.tui_mut().base().terminal.height();
+        let lines = self.transcript.borrow_mut().render(width);
+        (width, height, lines)
     }
 
     pub(super) fn finish(&mut self) -> io::Result<()> {
@@ -977,20 +1048,78 @@ impl Frontend {
     fn paste(&mut self) -> Result<(), String> {
         let platform = clipboard::Platform::current();
         let env = clipboard::ClipboardEnv::from_env();
-        if let Some(image) = clipboard_image::read_clipboard_image(platform, &env)? {
-            self.images.push(ImageContent {
-                kind: ImageContentKind::Image,
-                data: base64::engine::general_purpose::STANDARD.encode(image.bytes),
-                mime_type: image.mime_type,
-            });
-            self.notice("Image attached to the next message".into(), "muted");
-        } else {
-            let text = clipboard::read_text(platform, &env)?;
-            self.editor.borrow_mut().editor.insert_text_at_cursor(&text);
+        if let Ok(text) = clipboard::read_text(platform, &env)
+            && let Some(paths) = parse_copied_file_paths(&text)
+        {
+            self.editor
+                .borrow_mut()
+                .editor
+                .insert_text_at_cursor(&paths);
+            self.render();
+            return Ok(());
+        }
+        match clipboard_image::read_clipboard_image(platform, &env) {
+            Ok(Some(image)) => {
+                let ext = clipboard_image::extension_for_image_mime_type(&image.mime_type)
+                    .unwrap_or("png");
+                let file_name = format!("pi-clipboard-{}.{ext}", uuid::Uuid::new_v4());
+                let file_path = std::env::temp_dir().join(file_name);
+                match std::fs::write(&file_path, &image.bytes) {
+                    Ok(()) => {
+                        let path_str = file_path.to_string_lossy().into_owned();
+                        self.editor
+                            .borrow_mut()
+                            .editor
+                            .insert_text_at_cursor(&path_str);
+                    }
+                    Err(error) => {
+                        self.notice(format!("Failed to paste from clipboard: {error}"), "error");
+                    }
+                }
+            }
+            Ok(None) => match clipboard::read_text(platform, &env) {
+                Ok(text) if !text.is_empty() => {
+                    self.editor.borrow_mut().editor.insert_text_at_cursor(&text);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.notice(format!("Failed to paste from clipboard: {error}"), "error");
+                }
+            },
+            Err(error) => match clipboard::read_text(platform, &env) {
+                Ok(text) if !text.is_empty() => {
+                    self.editor.borrow_mut().editor.insert_text_at_cursor(&text);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.notice(format!("Failed to paste from clipboard: {error}"), "error");
+                }
+            },
         }
         self.render();
         Ok(())
     }
+}
+
+fn parse_copied_file_paths(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut resolved = Vec::new();
+    for line in trimmed.lines() {
+        let candidate = line
+            .trim()
+            .strip_prefix("file://")
+            .unwrap_or_else(|| line.trim())
+            .trim_matches('"')
+            .trim_matches('\'');
+        if candidate.is_empty() || !std::path::Path::new(candidate).exists() {
+            return None;
+        }
+        resolved.push(candidate.to_owned());
+    }
+    (!resolved.is_empty()).then(|| resolved.join(" "))
 }
 
 fn register_themes(theme: &Theme, bound: &Bound) {

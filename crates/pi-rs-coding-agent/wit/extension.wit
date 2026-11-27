@@ -62,6 +62,31 @@ interface host {
     append-entry: func(custom-type: string, data-json: option<string>) -> result<string, string>;
     exec: func(command: string, args: list<string>, cwd: option<string>, timeout-ms: option<u64>) -> result<exec-result, string>;
     execute-tool: func(name: string, args-json: string) -> result<string, string>;
+    send-user-message: func(content-json: string, deliver-as: option<string>) -> result<_, string>;
+    set-session-name: func(name: string) -> result<_, string>;
+    get-session-name: func() -> option<string>;
+    set-label: func(target-id: string, label: option<string>) -> result<_, string>;
+    get-all-tools: func() -> string;
+    get-settings: func() -> string;
+    get-commands: func() -> string;
+    set-model: func(provider: string, model-id: string) -> result<_, string>;
+    get-thinking-level: func() -> string;
+    set-thinking-level: func(level: string) -> result<_, string>;
+    unregister-provider: func(name: string) -> result<_, string>;
+    unregister-mcp-server: func(name: string) -> result<_, string>;
+    unregister-virtual-model: func(provider: string, id: string) -> result<_, string>;
+    get-mcp-servers: func() -> string;
+    events-emit: func(channel: string, data-json: string) -> result<_, string>;
+    events-subscribe: func(channel: string) -> result<_, string>;
+    ui-get-editor-text: func() -> string;
+    ui-paste-to-editor: func(text: string);
+    ui-set-working-message: func(message: option<string>);
+    ui-set-widget-placed: func(key: string, lines: option<list<string>>, placement: option<string>);
+    ui-select-timed: func(title: string, items: list<string>, timeout-ms: option<u64>) -> option<string>;
+    ui-confirm-timed: func(title: string, message: string, timeout-ms: option<u64>) -> bool;
+    ui-input-timed: func(title: string, placeholder: option<string>, timeout-ms: option<u64>) -> option<string>;
+    ui-set-theme: func(name: string) -> result<_, string>;
+    ui-get-theme: func() -> option<string>;
 }
 
 world extension {

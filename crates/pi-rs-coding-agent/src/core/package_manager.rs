@@ -428,13 +428,7 @@ impl PackageManager {
 
     /// True when `PI_OFFLINE` is `1`, `true` or `yes`, or offline was forced.
     pub fn is_offline(&self) -> bool {
-        if self.offline {
-            return true;
-        }
-        std::env::var("PI_OFFLINE").ok().is_some_and(|value| {
-            let value = value.to_ascii_lowercase();
-            value == "1" || value == "true" || value == "yes"
-        })
+        self.offline || crate::config::is_truthy_env_flag("PI_OFFLINE")
     }
 
     /// The configured `npmCommand` argv, defaulting to `npm`.

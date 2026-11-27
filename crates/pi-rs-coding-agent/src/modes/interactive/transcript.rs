@@ -104,7 +104,7 @@ impl Options {
         Self {
             pad: usize::from(settings["outputPad"].as_i64() != Some(0)),
             show_thinking: !settings["hideThinkingBlock"].as_bool().unwrap_or(false),
-            show_images: settings["terminal"]["showImages"].as_bool().unwrap_or(true),
+            show_images: crate::core::settings_manager::show_images_from(settings),
             image_width: settings["terminal"]["imageWidthCells"]
                 .as_u64()
                 .and_then(|width| usize::try_from(width).ok())

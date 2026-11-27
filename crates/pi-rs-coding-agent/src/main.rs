@@ -27,6 +27,7 @@ use pi_rs_coding_agent::{
         agent_session_runtime::{DiagnosticLevel, RuntimeTarget, create_agent_session_runtime},
         agent_session_services::{DiskSession, create_factory, export_to_html},
         auth_guidance::{docs_path, no_models_available},
+        crash_log,
         project_trust::AppMode,
         session_cwd::missing_session_cwd,
         session_manager::{
@@ -77,6 +78,7 @@ async fn run(argv: &[String]) -> Result<u8, String> {
         _ => error.to_string(),
     })?;
     let agent_dir = config::get_agent_dir()?;
+    install_crash_panic_hook(&agent_dir, &cwd);
     if let Some(code) = auth_command::run(argv, &cwd, &agent_dir).await {
         return Ok(code);
     }
@@ -129,7 +131,14 @@ async fn run(argv: &[String]) -> Result<u8, String> {
         return Err("@file arguments are not supported in RPC mode".to_owned());
     }
     validate_session_flags(&args)?;
-    migrations::run_migrations(&cwd);
+    let migration_result = migrations::run_migrations(&cwd);
+    if mode != AppMode::Interactive && !migration_result.deprecation_warnings.is_empty() {
+        for warning in
+            migrations::format_deprecation_warnings(&migration_result.deprecation_warnings)
+        {
+            eprintln!("{warning}");
+        }
+    }
     let mut startup_settings =
         SettingsManager::create_with_dirs(&cwd, &agent_dir, CreateOptions::default());
     if mode == AppMode::Interactive
@@ -267,10 +276,26 @@ async fn run(argv: &[String]) -> Result<u8, String> {
         eprintln!("{}", no_models_available());
         return Ok(1);
     }
-    let startup_benchmark = std::env::var("PI_STARTUP_BENCHMARK").is_ok_and(|value| truthy(&value));
+    let startup_benchmark =
+        std::env::var("PI_STARTUP_BENCHMARK").is_ok_and(|value| config::is_truthy_value(&value));
     if startup_benchmark && mode != AppMode::Interactive {
         return Err("PI_STARTUP_BENCHMARK only supports interactive mode".to_owned());
     }
+    if mode == AppMode::Interactive
+        && !startup_benchmark
+        && !migration_result.deprecation_warnings.is_empty()
+    {
+        migrations::show_deprecation_warnings(
+            &migration_result.deprecation_warnings,
+            stdin_tty && io::stdout().is_terminal(),
+        )
+        .await;
+    }
+    let unnotified_crash = if mode == AppMode::Interactive {
+        crash_log::take_unnotified_crash(&agent_dir)
+    } else {
+        None
+    };
     timings::print_timings();
     let _catalog_refresh = pi_rs_coding_agent::core::startup::spawn_startup_catalog_refresh(
         pi_rs_coding_agent::core::startup::StartupRefreshPolicy::from_args(
@@ -318,6 +343,8 @@ async fn run(argv: &[String]) -> Result<u8, String> {
                     offline: args.offline,
                     no_refresh: args.no_refresh,
                     startup_benchmark,
+                    migrated_auth_providers: migration_result.migrated_auth_providers,
+                    unnotified_crash,
                 },
             )
             .await
@@ -325,8 +352,36 @@ async fn run(argv: &[String]) -> Result<u8, String> {
     }
 }
 
-fn truthy(value: &str) -> bool {
-    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+fn install_crash_panic_hook(agent_dir: &Path, cwd: &Path) {
+    let agent_dir = agent_dir.to_path_buf();
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = if let Some(msg) = info.payload().downcast_ref::<&str>() {
+            (*msg).to_owned()
+        } else if let Some(msg) = info.payload().downcast_ref::<String>() {
+            msg.clone()
+        } else {
+            "panic".to_owned()
+        };
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
+        let backtrace = std::backtrace::Backtrace::capture().to_string();
+        let stack = match location {
+            Some(loc) => Some(format!("{loc}\n{backtrace}")),
+            None => Some(backtrace),
+        };
+        let _ = crash_log::record_crash(
+            &agent_dir,
+            crash_log::CrashKind::UncaughtException,
+            message,
+            stack,
+            None,
+            &cwd_str,
+        );
+        previous(info);
+    }));
 }
 
 fn validate_session_flags(args: &Args) -> Result<(), String> {

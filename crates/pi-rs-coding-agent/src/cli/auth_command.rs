@@ -238,8 +238,8 @@ pub async fn run(args: &[String], cwd: &Path, agent_dir: &Path) -> Option<u8> {
         println!("{HELP}");
         return Some(0);
     }
-    let offline =
-        args.iter().any(|arg| arg == "--offline") || std::env::var_os("PI_OFFLINE").is_some();
+    let offline = args.iter().any(|arg| arg == "--offline")
+        || crate::config::is_truthy_env_flag("PI_OFFLINE");
     if matches!(name.as_str(), "login" | "logout") {
         let args: Vec<&str> = args
             .iter()

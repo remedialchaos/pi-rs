@@ -37,10 +37,13 @@ pub async fn external_editor_with_command(
             let status = child
                 .status()
                 .await
-                .map_err(|error| format!("Failed to launch external editor: {command}: {error}"))?;
+                .map_err(|_| format!("Failed to launch external editor: {command}"))?;
             if !status.success() {
+                let reason = status
+                    .code()
+                    .map_or_else(|| status.to_string(), |code| format!("code {code}"));
                 return Err(format!(
-                    "External editor exited with {status}; prompt unchanged"
+                    "External editor exited with {reason}; prompt unchanged"
                 ));
             }
             Ok(())
@@ -136,5 +139,20 @@ mod tests {
     async fn editor_failure_does_not_return_modified_prompt() {
         let result = edit_with("original", |_| async { Err("cancelled".into()) }).await;
         assert_eq!(result, Err("cancelled".into()));
+    }
+
+    #[tokio::test]
+    async fn external_editor_reports_exact_launch_and_exit_errors() {
+        let missing = external_editor_with_command("pi-nonexistent-editor-binary-xyz", "hi").await;
+        assert_eq!(
+            missing,
+            Err("Failed to launch external editor: pi-nonexistent-editor-binary-xyz".to_owned())
+        );
+
+        let failed = external_editor_with_command("sh -c exit\\ 7", "hi").await;
+        assert!(
+            matches!(failed, Err(ref msg) if msg.starts_with("External editor exited with code ") && msg.ends_with("; prompt unchanged")),
+            "{failed:?}"
+        );
     }
 }
