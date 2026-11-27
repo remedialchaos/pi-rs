@@ -37,6 +37,8 @@ pub struct ToolExecutionComponent {
     expanded: bool,
     renderers: ToolRenderers,
     ctx: ToolCardContext,
+    started_at_ms: u64,
+    ended_at_ms: Option<u64>,
 }
 
 impl ToolExecutionComponent {
@@ -47,15 +49,28 @@ impl ToolExecutionComponent {
         args_complete: bool,
     ) -> Self {
         let renderers = renderers.unwrap_or_default();
+        let started_at_ms = crate::tools::shell::now_epoch_ms();
+        let ended_at_ms = (!matches!(
+            tool.status,
+            crate::tools::ToolStatus::Pending | crate::tools::ToolStatus::Running
+        ))
+        .then_some(started_at_ms);
+        let mut renderer_state = HashMap::new();
+        renderer_state.insert("startedAt".into(), serde_json::json!(started_at_ms));
+        if let Some(ended) = ended_at_ms {
+            renderer_state.insert("endedAt".into(), serde_json::json!(ended));
+        }
         let mut card = Self {
             call_renderer_component: None,
             result_renderer_component: None,
-            renderer_state: HashMap::new(),
+            renderer_state,
             tool,
             args_complete,
             expanded: false,
             renderers,
             ctx,
+            started_at_ms,
+            ended_at_ms,
         };
         card.update_display();
         card
@@ -65,9 +80,20 @@ impl ToolExecutionComponent {
         &self.tool.id
     }
 
+    pub fn elapsed_ms(&self) -> Option<u64> {
+        self.ended_at_ms
+            .map(|ended| ended.saturating_sub(self.started_at_ms))
+    }
+
     pub fn update(&mut self, tool: ToolView, args_complete: bool) {
         self.tool = tool;
         self.args_complete = args_complete;
+        if !self.is_partial() && self.ended_at_ms.is_none() {
+            let ended = crate::tools::shell::now_epoch_ms();
+            self.ended_at_ms = Some(ended);
+            self.renderer_state
+                .insert("endedAt".into(), serde_json::json!(ended));
+        }
         self.update_display();
     }
 
@@ -123,7 +149,9 @@ impl ToolExecutionComponent {
             expanded: self.expanded,
             show_images: false,
             is_error: self.is_error(),
-            duration_ms: None,
+            duration_ms: self
+                .ended_at_ms
+                .map(|ended| ended.saturating_sub(self.started_at_ms)),
             output_pad: self.ctx.output_pad.unwrap_or(1),
             calls: self.calls(),
             ui: Box::new(self.ctx.clone()),

@@ -115,10 +115,17 @@ pub struct Transcript {
     pub items: Vec<Item>,
 }
 
+pub type KeyTextFn = std::rc::Rc<dyn Fn(&str) -> String + Send + Sync>;
+
 pub struct TranscriptView {
     pub theme: ThemeRef,
     pub expanded: bool,
     pub show_thinking: bool,
+    pub quiet_tools: bool,
+    pub cwd: String,
+    pub output_pad: usize,
+    pub mermaid_settings: Option<crate::preferences::TuiSettings>,
+    pub key_text: Option<KeyTextFn>,
     pub transcript: Transcript,
     pub tool_renderers: indexmap::IndexMap<String, crate::tools::ToolRenderers>,
     pub entry_renderers: indexmap::IndexMap<String, super::TuiEntryRenderer>,
@@ -178,7 +185,27 @@ impl TranscriptView {
         }
     }
     fn tool_lines(&self, row: &mut Row, tool: &ToolView, width: usize) -> Vec<String> {
-        use crate::tools::{ToolResultContent, ToolResultView};
+        use crate::tools::{ToolResultContent, ToolResultView, ToolStatus};
+        let is_error = matches!(tool.status, ToolStatus::Error | ToolStatus::Interrupted);
+        if self.quiet_tools && !self.expanded && !is_error {
+            let is_partial = matches!(tool.status, ToolStatus::Pending | ToolStatus::Running);
+            let duration = row
+                .cards
+                .get(&tool.id)
+                .and_then(|(_, card)| card.elapsed_ms());
+            return crate::tools::render_quiet_tool_line(
+                &tool.name,
+                &tool.args,
+                &crate::tools::QuietToolOptions {
+                    cwd: &self.cwd,
+                    is_partial,
+                    duration_ms: duration,
+                    output_pad: self.output_pad,
+                },
+                &self.theme.current(),
+                width,
+            );
+        }
         if let Some((previous, card)) = row.cards.get_mut(&tool.id)
             && previous == tool
         {
@@ -198,10 +225,10 @@ impl TranscriptView {
             calls: None,
         };
         let ctx = super::ToolCardContext {
-            cwd: String::new(),
-            output_pad: None,
+            cwd: self.cwd.clone(),
+            output_pad: Some(self.output_pad),
             theme: self.theme.clone(),
-            key_text: None,
+            key_text: self.key_text.clone(),
             request_render: None,
         };
         let complete = !matches!(tool.status, crate::tools::ToolStatus::Pending);
@@ -263,34 +290,50 @@ impl TranscriptView {
         let mut lines = Vec::new();
         let theme = self.theme.current();
         match item {
-            Item::User { text, .. } => lines.extend(pi_rs_tui::wrap_text_with_ansi(
-                &theme.fg("userMessageText", &safe_text(text)),
-                width,
-            )),
+            Item::User { text, .. } => {
+                let inner = width.saturating_sub(2).max(1);
+                let pad_line = theme.bg("userMessageBg", &" ".repeat(width.max(1)));
+                lines.push(String::new());
+                lines.push(pad_line.clone());
+                for wrapped in pi_rs_tui::wrap_text_with_ansi(&safe_text(text), inner) {
+                    let vis = pi_rs_tui::visible_width(&wrapped);
+                    let right_pad = width.saturating_sub(1 + vis);
+                    let row_str = format!(" {wrapped}{}", " ".repeat(right_pad));
+                    lines.push(theme.bg("userMessageBg", &theme.fg("userMessageText", &row_str)));
+                }
+                lines.push(pad_line);
+            }
             Item::Assistant {
                 message,
                 tools,
                 streaming,
                 ..
             } => {
+                let mut started = false;
                 for block in &message.content {
                     match block {
                         ContentBlock::Text { text } => {
+                            let cleaned = safe_text(text);
+                            if cleaned.trim().is_empty() {
+                                continue;
+                            }
+                            if !started {
+                                lines.push(String::new());
+                                started = true;
+                            }
                             let context = super::mermaid::MermaidTransformContext {
-                                settings: None,
+                                settings: self.mermaid_settings.clone(),
                                 message_type: "assistant".into(),
                                 is_streaming: *streaming,
                                 available_width: width,
                                 theme: theme.clone(),
                             };
-                            let markdown = super::mermaid::mermaid_markdown_transformer(
-                                &safe_text(text),
-                                context,
-                            );
+                            let markdown =
+                                super::mermaid::mermaid_markdown_transformer(&cleaned, context);
                             lines.extend(
                                 Markdown::new(
                                     markdown,
-                                    0,
+                                    self.output_pad,
                                     0,
                                     self.theme.markdown(),
                                     Default::default(),
@@ -300,31 +343,53 @@ impl TranscriptView {
                             );
                         }
                         ContentBlock::Thinking { thinking } if self.show_thinking => {
-                            lines.extend(pi_rs_tui::wrap_text_with_ansi(
-                                &theme.fg("thinkingText", &safe_text(thinking)),
-                                width,
-                            ))
+                            let cleaned = safe_text(thinking);
+                            if cleaned.trim().is_empty() {
+                                continue;
+                            }
+                            if !started {
+                                lines.push(String::new());
+                                started = true;
+                            }
+                            let pad = " ".repeat(self.output_pad);
+                            let inner = width.saturating_sub(self.output_pad + 1).max(1);
+                            for wrapped in pi_rs_tui::wrap_text_with_ansi(&cleaned, inner) {
+                                lines.push(format!(
+                                    "{pad}{}",
+                                    theme.italic(&theme.fg("thinkingText", &wrapped))
+                                ));
+                            }
                         }
                         ContentBlock::ToolCall {
                             id,
                             name,
                             arguments,
-                        } if *streaming => lines.extend(self.tool_lines(
-                            &mut row,
-                            &ToolView {
-                                id: id.clone(),
-                                name: name.clone(),
-                                args: arguments.clone(),
-                                status: crate::tools::ToolStatus::Pending,
-                                output: String::new(),
-                                details: None,
-                            },
-                            width,
-                        )),
+                        } if *streaming => {
+                            if !started {
+                                lines.push(String::new());
+                                started = true;
+                            }
+                            lines.extend(self.tool_lines(
+                                &mut row,
+                                &ToolView {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    args: arguments.clone(),
+                                    status: crate::tools::ToolStatus::Pending,
+                                    output: String::new(),
+                                    details: None,
+                                },
+                                width,
+                            ));
+                        }
                         _ => {}
                     }
                 }
                 for tool in tools.iter().filter(|_| !streaming) {
+                    if !started {
+                        lines.push(String::new());
+                        started = true;
+                    }
                     lines.extend(self.tool_lines(&mut row, tool, width));
                 }
             }
@@ -334,10 +399,10 @@ impl TranscriptView {
                 }) {
                     let ctx: Box<dyn crate::render_context::RenderContext> =
                         Box::new(super::ToolCardContext {
-                            cwd: String::new(),
-                            output_pad: None,
+                            cwd: self.cwd.clone(),
+                            output_pad: Some(self.output_pad),
                             theme: self.theme.clone(),
-                            key_text: None,
+                            key_text: self.key_text.clone(),
                             request_render: None,
                         });
                     let view = if let Some(renderer) = self.entry_renderers.get(&entry.kind) {

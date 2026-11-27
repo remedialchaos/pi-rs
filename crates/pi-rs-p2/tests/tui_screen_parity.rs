@@ -597,7 +597,7 @@ async fn mouse_scroll_and_live_theme_switch_with_integrated_worker() -> TestResu
     );
 
     // Send SGR mouse wheel up sequences and verify the viewport scrolls up cleanly.
-    for _ in 0..12 {
+    for _ in 0..24 {
         tmux.send_raw(b"\x1b[<64;20;10M")?;
         thread::sleep(Duration::from_millis(25));
     }
@@ -613,7 +613,7 @@ async fn mouse_scroll_and_live_theme_switch_with_integrated_worker() -> TestResu
     );
 
     // Send SGR mouse wheel down sequences and verify the viewport returns cleanly to the bottom.
-    for _ in 0..15 {
+    for _ in 0..25 {
         tmux.send_raw(b"\x1b[<65;20;10M")?;
         thread::sleep(Duration::from_millis(25));
     }

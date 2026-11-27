@@ -63,11 +63,15 @@ pub struct VisualLinePreviewOptions {
     pub padding_x: usize,
 }
 
+pub type PreviewHintFn = Box<dyn Fn(usize) -> String + Send + Sync>;
+
 pub struct VisualLinePreview {
     text: String,
     max_lines: usize,
     width: usize,
     padding_x: usize,
+    keep: Keep,
+    format_hint: Option<PreviewHintFn>,
     cached_lines: Option<Vec<String>>,
     cached_width: Option<usize>,
     focused: bool,
@@ -80,29 +84,50 @@ impl VisualLinePreview {
             max_lines,
             width,
             padding_x,
+            keep: Keep::End,
+            format_hint: None,
             cached_lines: None,
             cached_width: None,
             focused: false,
         }
     }
 
+    pub fn with_keep(mut self, keep: Keep) -> Self {
+        self.keep = keep;
+        self.cached_lines = None;
+        self.cached_width = None;
+        self
+    }
+
+    pub fn with_hint(
+        mut self,
+        format_hint: impl Fn(usize) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.format_hint = Some(Box::new(format_hint));
+        self.cached_lines = None;
+        self.cached_width = None;
+        self
+    }
+
     pub fn render(&self, width: usize) -> Vec<String> {
         let width = if width == 0 { self.width } else { width };
-        if self.cached_width == Some(width) {
-            return self.cached_lines.clone().unwrap_or_default();
+        if self.cached_width == Some(width)
+            && let Some(cached) = &self.cached_lines
+        {
+            return cached.clone();
         }
 
-        let temp_text = Text::new(self.text.clone(), self.padding_x, 0, None);
-        let lines = temp_text.render(width);
-
-        let result = if lines.len() <= self.max_lines {
-            lines
-        } else {
-            lines.into_iter().rev().take(self.max_lines).rev().collect()
-        };
-
-        // Can't cache in &self, so we just return
-        result
+        let mut truncated =
+            truncate_to_visual_lines(&self.text, self.max_lines, width, self.padding_x, self.keep);
+        if truncated.skipped_count > 0
+            && let Some(format_hint) = &self.format_hint
+        {
+            let hint = format_hint(truncated.skipped_count);
+            if !hint.is_empty() {
+                truncated.visual_lines.push(hint);
+            }
+        }
+        truncated.visual_lines
     }
 }
 

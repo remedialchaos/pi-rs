@@ -59,9 +59,18 @@ impl TuiClient<TuiAltScreen> {
             let width = self.screen.base.terminal.width().max(1);
             let reserved = layout.header.borrow().render(width).len()
                 + layout.editor.borrow().render(width).len();
-            frame
-                .borrow_mut()
-                .set_height(self.screen.base.terminal.height().saturating_sub(reserved));
+            let next_height = self.screen.base.terminal.height().saturating_sub(reserved);
+            let changed = {
+                let mut frame_ref = frame.borrow_mut();
+                let changed = frame_ref.height() != Some(next_height);
+                if changed {
+                    frame_ref.set_height(next_height);
+                }
+                changed
+            };
+            if changed {
+                self.screen.base.request_render(false);
+            }
             if self.screen.base.terminal.width() < 100 && frame.borrow().focused {
                 self.screen.base.set_focus(Some(layout.editor.clone()));
             }

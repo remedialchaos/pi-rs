@@ -38,6 +38,9 @@ impl PanelFrame {
     pub fn set_height(&mut self, rows: usize) {
         self.height = Some(rows);
     }
+    pub fn height(&self) -> Option<usize> {
+        self.height
+    }
 }
 impl Component for PanelFrame {
     fn render(&self, width: usize) -> Vec<String> {

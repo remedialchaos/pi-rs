@@ -437,3 +437,218 @@ pub fn open_keybindings(ctx: Box<dyn crate::render_context::RenderContext>) -> C
     }
     container
 }
+
+type KeyRebindFn =
+    std::sync::Arc<dyn Fn(&str, Option<crate::keybindings::KeyIdValue>) + Send + Sync>;
+
+/// Interactive `/keybindings` overlay: navigate bindings, press Enter to rebind via `KeyCapture`,
+/// Backspace to reset to default, rejecting launcher-owned privileged actions.
+pub struct KeybindingsOverlay {
+    ctx: Box<dyn crate::render_context::RenderContext>,
+    entries: Vec<(String, String, Vec<String>, bool)>,
+    user: IndexMap<String, crate::keybindings::KeyIdValue>,
+    selected: usize,
+    capture: Option<KeyCapture>,
+    warning: Option<String>,
+    on_change: KeyRebindFn,
+    on_close: Box<dyn Fn() + Send>,
+    focused: bool,
+}
+
+impl KeybindingsOverlay {
+    pub fn new(
+        ctx: Box<dyn crate::render_context::RenderContext>,
+        user: IndexMap<String, crate::keybindings::KeyIdValue>,
+        on_change: impl Fn(&str, Option<crate::keybindings::KeyIdValue>) + Send + Sync + 'static,
+        on_close: impl Fn() + Send + 'static,
+    ) -> Self {
+        let builtins = builtin_keybindings(KeyPlatform::default());
+        let entries = builtins
+            .into_iter()
+            .map(|(id, def)| {
+                (
+                    id.to_string(),
+                    def.description.to_string(),
+                    def.default_keys.as_slice().to_vec(),
+                    PRIVILEGED_ACTIONS.contains(&id),
+                )
+            })
+            .collect();
+        Self {
+            ctx,
+            entries,
+            user,
+            selected: 0,
+            capture: None,
+            warning: None,
+            on_change: std::sync::Arc::new(on_change),
+            on_close: Box::new(on_close),
+            focused: true,
+        }
+    }
+
+    fn effective_keys(&self, id: &str, defaults: &[String]) -> String {
+        let keys = self.user.get(id).map(|v| v.as_slice()).unwrap_or(defaults);
+        if keys.is_empty() {
+            "unbound".to_string()
+        } else {
+            keys.iter()
+                .map(|k| format_key_text(k, false))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+}
+
+impl Component for KeybindingsOverlay {
+    fn render(&self, width: usize) -> Vec<String> {
+        let theme = self.ctx.theme().current();
+        let border = theme.fg("border", &"─".repeat(width.max(1)));
+        let mut lines = vec![
+            border.clone(),
+            pi_rs_tui::truncate_to_width(&theme.fg("accent", "Rebind keys"), width, true),
+        ];
+        if let Some(capture) = &self.capture {
+            if let Some((id, desc, _, _)) = self.entries.get(self.selected) {
+                lines.push(pi_rs_tui::truncate_to_width(
+                    &format!("{} — {}", theme.bold(id), theme.fg("muted", desc)),
+                    width,
+                    true,
+                ));
+            }
+            lines.extend(capture.render(width));
+            lines.push(border);
+            return lines;
+        }
+        let max_visible = 12usize;
+        let start = self.selected.saturating_sub(max_visible / 2);
+        let end = (start + max_visible).min(self.entries.len());
+        for (idx, (id, _desc, defaults, is_priv)) in self
+            .entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end - start)
+        {
+            let prefix = if idx == self.selected { "→ " } else { "  " };
+            let keys = self.effective_keys(id, defaults);
+            let style = if *is_priv {
+                "warning"
+            } else if idx == self.selected {
+                "accent"
+            } else {
+                "text"
+            };
+            let suffix = if *is_priv { " [launcher]" } else { "" };
+            let row = format!(
+                "{}{}  {}{}",
+                prefix,
+                theme.fg(style, id),
+                theme.fg("muted", &keys),
+                theme.fg("dim", suffix)
+            );
+            lines.push(pi_rs_tui::truncate_to_width(&row, width, true));
+        }
+        if let Some(warning) = &self.warning {
+            lines.push(pi_rs_tui::truncate_to_width(
+                &theme.fg("warning", warning),
+                width,
+                true,
+            ));
+        }
+        lines.push(pi_rs_tui::truncate_to_width(
+            &theme.fg("dim", "Enter rebind · Backspace reset · Esc close"),
+            width,
+            true,
+        ));
+        lines.push(border);
+        lines
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        if let Some(capture) = &mut self.capture {
+            if data == "\x1b" {
+                self.capture = None;
+                return;
+            }
+            if let Some(key) = pi_rs_tui::parse_key(data) {
+                let key_id: KeyId = key.id().into();
+                if let Some((id, _, _, _)) = self.entries.get(self.selected).cloned() {
+                    let val = crate::keybindings::KeyIdValue::One(key_id.clone());
+                    self.user.insert(id.clone(), val.clone());
+                    (self.on_change)(&id, Some(val));
+                }
+                self.capture = None;
+                self.warning = None;
+                return;
+            }
+            let _ = capture;
+            return;
+        }
+        let keys = pi_rs_tui::get_keybindings();
+        let len = self.entries.len();
+        if keys.matches(data, "tui.select.up") {
+            self.selected = if self.selected == 0 {
+                len.saturating_sub(1)
+            } else {
+                self.selected - 1
+            };
+        } else if keys.matches(data, "tui.select.down") && len > 0 {
+            self.selected = (self.selected + 1) % len;
+        } else if keys.matches(data, "tui.select.pageUp") {
+            self.selected = self.selected.saturating_sub(12);
+        } else if keys.matches(data, "tui.select.pageDown") {
+            self.selected = (self.selected + 12).min(len.saturating_sub(1));
+        } else if keys.matches(data, "tui.select.confirm") {
+            if let Some((id, _, _, is_priv)) = self.entries.get(self.selected) {
+                if *is_priv {
+                    self.warning = Some(format!(
+                        "{id} is launcher-owned; edit ~/.pi/p2-tui/prefs.json directly"
+                    ));
+                } else {
+                    self.warning = None;
+                    let dummy_ctx = Box::new(CloneThemeCtx(self.ctx.theme().clone()));
+                    self.capture = Some(KeyCapture::new(dummy_ctx, |_| {}, || {}));
+                }
+            }
+        } else if data == "\x7f" || data == "\x08" {
+            if let Some((id, _, _, is_priv)) = self.entries.get(self.selected).cloned() {
+                if is_priv {
+                    self.warning = Some(format!("{id} is launcher-owned"));
+                } else {
+                    self.user.shift_remove(&id);
+                    (self.on_change)(&id, None);
+                    self.warning = None;
+                }
+            }
+        } else if keys.matches(data, "tui.select.cancel") {
+            (self.on_close)();
+        }
+    }
+
+    fn as_focusable(&mut self) -> Option<&mut dyn Focusable> {
+        Some(self)
+    }
+
+    fn invalidate(&mut self) {}
+}
+
+impl Focusable for KeybindingsOverlay {
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+    fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+}
+
+struct CloneThemeCtx(ThemeRef);
+impl crate::render_context::RenderContext for CloneThemeCtx {
+    fn theme(&self) -> &ThemeRef {
+        &self.0
+    }
+    fn key_text(&self, _id: &str) -> String {
+        String::new()
+    }
+    fn request_render(&self) {}
+}

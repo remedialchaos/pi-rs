@@ -3,7 +3,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use pi_rs_p2_tui::{KeyPlatform, builtin_keybindings, resolve_privileged_keys};
 use pi_rs_tui::{
-    Component, Input,
+    Component, Editor,
     keys::matches_key_data,
     native_platform::{ClipboardRead, get_native_clipboard},
 };
@@ -26,7 +26,7 @@ impl CopyGrant {
     pub(super) fn listener(
         state: Rc<RefCell<Self>>,
         user: &pi_rs_p2_tui::KeybindingsConfig,
-        editor: Rc<RefCell<Input>>,
+        editor: Rc<RefCell<Editor>>,
     ) -> impl FnMut(&str) -> bool + use<> {
         let bindings = builtin_keybindings(KeyPlatform::default());
         let mut resolved = resolve_privileged_keys(&bindings, user);

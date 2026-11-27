@@ -237,7 +237,24 @@ async fn live_native_server_and_p2_tui_pty_e2e() -> TestResult {
         send_line(&mut stdin, "/new Second Session")?;
         wait_for_screen_text(&captured, offset, "Second Session", Duration::from_secs(10))?;
 
-        // 4. `Ctrl+C` exits `p2 tui` cleanly with status 0.
+        // 4. First `Ctrl+C` clears typed text without exiting; second `Ctrl+C` within 500ms exits cleanly.
+        stdin.write_all(b"draft to clear")?;
+        stdin.flush()?;
+        offset =
+            wait_for_screen_text(&captured, offset, "draft to clear", Duration::from_secs(10))?;
+        stdin.write_all(b"\x03")?;
+        stdin.flush()?;
+        offset = wait_for_screen_text(
+            &captured,
+            offset,
+            "Press Ctrl+C again to exit",
+            Duration::from_secs(10),
+        )?;
+        let _ = offset;
+        assert!(
+            child.try_wait()?.is_none(),
+            "first Ctrl+C should clear editor rather than exiting immediately"
+        );
         stdin.write_all(b"\x03")?;
         stdin.flush()?;
         drop(stdin);
