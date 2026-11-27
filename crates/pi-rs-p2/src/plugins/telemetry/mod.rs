@@ -1,26 +1,27 @@
 //! `telemetry` built-in plugin: owner & unshared/unlocked worker read access to the server's
 //! telemetry store (`p2.traces`) and worker-side `telemetry_*` code-mode tools.
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use indexmap::IndexMap;
 use pi_rs_ai::{InputContent, Tool};
 use pi_rs_chord::{
     Error, Result,
     context::Context,
-    contracts::Contract,
+    contracts::{Contract, HostKind, Member, read_params},
     data::ChordError,
-    host::{Members, ServeOptions, define_facet},
+    host::{Facet, Members, ServeOptions, define_facet},
     json::JsonValue,
     sync::SyncFuture,
+    telemetry::{IngestFacet, IngestOptions, IngestRegistry, SqliteTelemetry, worker_batch_schema},
 };
 use pi_rs_durable::{
     harness::{Extension, ToolRegistration, define_extension},
     tools::ToolResult,
 };
 use pi_rs_telemetry::{
-    AttributeValue, MetricQuery, SpanAttributes, SpanStatus, StoredSpan, StoredTrace,
-    TelemetryStore, TraceQuery, memory::InMemoryTelemetryContext, render_trace,
+    AttributeValue, FallibleTelemetryStore, MetricQuery, SpanAttributes, SpanStatus, StoredSpan,
+    StoredTrace, TelemetryStore, TraceQuery, memory::InMemoryTelemetryContext, render_trace,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -90,6 +91,232 @@ pub fn summarize_trace(trace: &StoredTrace) -> TraceSummary {
         spans: trace.spans.len(),
         errors,
         hosts,
+    }
+}
+
+/// Resolves whether server telemetry is enabled from explicit option, `P2_TELEMETRY`,
+/// or `<data_dir>/settings.json` (`telemetry: bool`, defaulting to `true`).
+pub fn telemetry_enabled(data_dir: &Path, explicit: Option<bool>) -> bool {
+    if let Some(flag) = explicit {
+        return flag;
+    }
+    if let Ok(env_val) = std::env::var("P2_TELEMETRY") {
+        let trimmed = env_val.trim();
+        if trimmed == "0" || trimmed.eq_ignore_ascii_case("false") {
+            return false;
+        }
+        if trimmed == "1" || trimmed.eq_ignore_ascii_case("true") {
+            return true;
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(data_dir.join("settings.json"))
+        && let Ok(val) = serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}'))
+        && let Some(flag) = val.get("telemetry").and_then(Value::as_bool)
+    {
+        return flag;
+    }
+    true
+}
+
+/// Adapter exposing `SqliteTelemetry` (`<data>/telemetry.sqlite`) as a `TelemetryBackend`.
+pub struct SqliteTelemetryBackend(pub SqliteTelemetry);
+
+impl TelemetryBackend for SqliteTelemetryBackend {
+    fn find_traces(&self, query: TraceQuery) -> SyncFuture<Value> {
+        let store = self.0.clone();
+        Box::pin(async move {
+            let page = store.find_traces_fallible(query).await?;
+            let summaries: Vec<TraceSummary> = page.traces.iter().map(summarize_trace).collect();
+            let mut obj = Map::new();
+            obj.insert("traces".into(), serde_json::to_value(summaries)?);
+            if let Some(cursor) = page.cursor {
+                obj.insert("cursor".into(), Value::String(cursor));
+            }
+            Ok(Value::Object(obj))
+        })
+    }
+
+    fn get_trace(&self, trace_id: String) -> SyncFuture<Value> {
+        let store = self.0.clone();
+        Box::pin(async move {
+            let Some(trace) = store.get_trace_fallible(&trace_id).await? else {
+                return Ok(Value::Null);
+            };
+            let mut spans = trace.spans;
+            spans.sort_by(|a, b| a.started_ms.total_cmp(&b.started_ms));
+            let truncated = spans.len() > MAX_SPANS;
+            spans.truncate(MAX_SPANS);
+            Ok(json!({
+                "traceId": trace_id,
+                "spans": serde_json::to_value(&spans)?,
+                "truncated": truncated,
+            }))
+        })
+    }
+
+    fn find_metrics(&self, query: MetricQuery) -> SyncFuture<Value> {
+        let store = self.0.clone();
+        Box::pin(async move {
+            let mut metrics = store.find_metrics_fallible(query).await?;
+            let truncated = metrics.len() > MAX_METRICS;
+            metrics.truncate(MAX_METRICS);
+            Ok(json!({
+                "metrics": serde_json::to_value(&metrics)?,
+                "truncated": truncated,
+            }))
+        })
+    }
+}
+
+fn ingest_contract(name: &str, variant: &str, batch_schema: Value) -> Result<Contract> {
+    let host = HostKind::new("server", read_params(&[], "server")?)?;
+    let members = IndexMap::from([(
+        "ingest".into(),
+        Member::Method {
+            args: JsonValue::from_serde(batch_schema),
+            result: JsonValue::from_serde(json!({
+                "type": "object",
+                "properties": {
+                    "written": { "type": "number" },
+                    "dropped": { "type": "number" },
+                },
+                "required": ["written", "dropped"],
+            })),
+        },
+    )]);
+    Contract::remote(
+        name,
+        1,
+        Vec::new(),
+        IndexMap::from([(variant.into(), members)]),
+        Arc::new(move |_| host.address(JsonValue::Object(IndexMap::new()))),
+    )
+}
+
+/// Server-hosted remote contract used by workers to upload telemetry batches.
+pub fn worker_ingest_contract() -> Result<Contract> {
+    ingest_contract("chord.telemetry.worker", "worker", worker_batch_schema())
+}
+
+/// Builds the Chord facet serving `chord.telemetry.page` and `chord.telemetry.worker`
+/// and persisting ingested spans/metrics into `sqlite`.
+pub fn ingest_facet(sqlite: SqliteTelemetry) -> Result<Facet> {
+    struct Entry {
+        contract: Arc<Contract>,
+        variant: &'static str,
+        ingest: IngestFacet,
+    }
+    struct Collector(Vec<Entry>);
+    impl IngestRegistry for Collector {
+        fn register(
+            &mut self,
+            name: &str,
+            variant: &str,
+            batch_schema: Value,
+            facet: IngestFacet,
+        ) -> Result<()> {
+            let variant_static = if variant == "worker" {
+                "worker"
+            } else {
+                "main"
+            };
+            let contract = Arc::new(ingest_contract(name, variant_static, batch_schema)?);
+            self.0.push(Entry {
+                contract,
+                variant: variant_static,
+                ingest: facet,
+            });
+            Ok(())
+        }
+    }
+
+    let target_store = sqlite;
+    let ingest = IngestFacet::new(IngestOptions {
+        target: Arc::new(move |batch| target_store.ingest(batch)),
+        admit: Arc::new(|principal| {
+            matches!(
+                serde_json::from_value::<Principal>(principal.clone()),
+                Ok(Principal::Owner { .. } | Principal::Guest { .. })
+            )
+        }),
+        worker_host: Arc::new(|principal| {
+            if let Ok(Principal::Worker { session, .. }) =
+                serde_json::from_value::<Principal>(principal.clone())
+            {
+                Some(format!("worker:{session}"))
+            } else {
+                None
+            }
+        }),
+        principal_attributes: Arc::new(|principal| {
+            let mut attrs = SpanAttributes::new();
+            if let Ok(parsed) = serde_json::from_value::<Principal>(principal.clone()) {
+                let tag = match parsed {
+                    Principal::Owner { .. } => "owner".to_owned(),
+                    Principal::Guest { id, .. } => format!("guest:{id}"),
+                    Principal::Worker { session, .. } => format!("worker:{session}"),
+                    _ => "unknown".to_owned(),
+                };
+                attrs.insert("chord.principal".into(), AttributeValue::String(tag));
+            }
+            attrs
+        }),
+    })?;
+
+    let mut collector = Collector(Vec::new());
+    ingest.register(&mut collector)?;
+    let entries = Arc::new(collector.0);
+
+    Ok(define_facet(move |host| {
+        for entry in entries.iter() {
+            let contract = entry.contract.clone();
+            let variant = entry.variant;
+            let facet = entry.ingest.clone();
+            host.serve(
+                contract,
+                move |_, principal, object| {
+                    let principal_val = principal.cloned().unwrap_or(Value::Null);
+                    let mut members = Members::variant(variant);
+                    if variant == "main" {
+                        let page = Arc::new(facet.page(principal_val)?);
+                        let incarnation = object.host().incarnation().to_owned();
+                        let recorder = target_recorder_clock();
+                        members.method("ingest", move |args, _| {
+                            let page = page.clone();
+                            let incarnation = incarnation.clone();
+                            let recorder = recorder;
+                            Box::pin(async move {
+                                let receipt =
+                                    page.ingest(&incarnation, recorder(), args.to_serde()?)?;
+                                Ok(JsonValue::from_serde(serde_json::to_value(receipt)?))
+                            })
+                        })?;
+                    } else {
+                        let worker = Arc::new(facet.worker(&principal_val).ok_or_else(|| {
+                            ChordError::new("forbidden", "chord.telemetry.worker: workers only")
+                        })?);
+                        members.method("ingest", move |args, _| {
+                            let worker = worker.clone();
+                            Box::pin(async move {
+                                let receipt = worker.ingest(args.to_serde()?)?;
+                                Ok(JsonValue::from_serde(serde_json::to_value(receipt)?))
+                            })
+                        })?;
+                    }
+                    Ok(members)
+                },
+                ServeOptions::default(),
+            )?;
+        }
+        Ok(())
+    }))
+}
+
+fn target_recorder_clock() -> fn() -> f64 {
+    || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
     }
 }
 

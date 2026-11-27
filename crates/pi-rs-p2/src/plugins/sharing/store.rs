@@ -10,14 +10,14 @@ use crate::{api::v1::GrantMode, runtime::address::session_address};
 
 const OWNER: &str = "p2.shares";
 
-pub(super) struct Tables {
-    pub(super) links: TableDefinition,
-    pub(super) guests: TableDefinition,
-    pub(super) grants: TableDefinition,
+pub(crate) struct Tables {
+    pub(crate) links: TableDefinition,
+    pub(crate) guests: TableDefinition,
+    pub(crate) grants: TableDefinition,
 }
 
 impl Tables {
-    pub(super) fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let host = HostKind::new(
             "session",
             read_params(&[("id".into(), schema::str())], "session")?,

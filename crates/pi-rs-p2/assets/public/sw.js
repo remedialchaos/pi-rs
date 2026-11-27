@@ -80,12 +80,14 @@ async function page(event) {
 }
 
 async function bundleFile(request) {
-	const hit = await caches.match(request);
+	const hit = await caches.match(request).catch(() => undefined);
 	if (hit) return hit;
 	const response = await fetch(request);
 	if (response.ok) {
-		const version = await keptVersion();
-		if (version) await (await caches.open(bundleCache(version))).put(request, response.clone());
+		try {
+			const version = await keptVersion();
+			if (version) await (await caches.open(bundleCache(version))).put(request, response.clone());
+		} catch {}
 	}
 	return response;
 }

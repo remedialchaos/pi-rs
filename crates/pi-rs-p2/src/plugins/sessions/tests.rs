@@ -212,3 +212,42 @@ async fn session_lock_is_worker_scoped_and_sidebar_preferences_reopen() -> TestR
     server.close().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn lock_mirror_persists_and_clears_durable_session_lock_doc() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let storage = crate::runtime::session_store::open_session_storage(dir.path(), "s-lock")
+        .await
+        .map_err(|e| e.to_string())?;
+    let context = Context::background();
+    let harness = pi_rs_durable::Harness::open(
+        storage.storage.clone(),
+        pi_rs_durable::session::SessionOptions::default(),
+        &context,
+    )
+    .await?;
+    let lock = crate::runtime::session_lock::SessionLock {
+        mcp: vec!["github".into()],
+        project_mcp: true,
+        instructions: true,
+        capabilities: vec![crate::runtime::session_lock::LockCapability::Ports],
+    };
+    transfer::mirror_lock(&harness, Some(&lock), &context).await?;
+    assert_eq!(
+        crate::runtime::session_lock::session_lock(&harness.session, &context)
+            .await
+            .map_err(|e| e.to_string())?,
+        Some(lock.clone())
+    );
+    transfer::mirror_lock(&harness, Some(&lock), &context).await?;
+    transfer::mirror_lock(&harness, None, &context).await?;
+    assert_eq!(
+        crate::runtime::session_lock::session_lock(&harness.session, &context)
+            .await
+            .map_err(|e| e.to_string())?,
+        None
+    );
+    harness.close(&context).await?;
+    storage.close().await.map_err(|e| e.to_string())?;
+    Ok(())
+}

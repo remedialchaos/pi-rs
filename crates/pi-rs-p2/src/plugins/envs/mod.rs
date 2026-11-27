@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod manager;
+pub mod sandbox_host;
 pub mod secrets;
 pub mod server;
 pub mod store;

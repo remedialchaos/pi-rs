@@ -148,6 +148,10 @@ fn browser_asset(request: &HttpRequest) -> HttpResult<HttpResponse> {
 }
 
 fn sign_in(request: &HttpRequest) -> HttpResult<HttpResponse> {
+    sign_in_page(request, StatusCode::UNAUTHORIZED)
+}
+
+pub(crate) fn sign_in_page(request: &HttpRequest, status: StatusCode) -> HttpResult<HttpResponse> {
     let nonce = new_token(18);
     let page = request.path.as_str();
     let reload = if foreign_browser_request(&request.headers)
@@ -160,12 +164,21 @@ fn sign_in(request: &HttpRequest) -> HttpResult<HttpResponse> {
     } else {
         ""
     };
-    let mut response = html_response(
-        SIGN_IN
-            .replace("{{nonce}}", &nonce)
-            .replace("{{reload}}", reload),
-    )?;
-    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    let mut response = if request.method == http::Method::HEAD {
+        let mut response = HttpResponse::new(Body::empty());
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        response
+    } else {
+        html_response(
+            SIGN_IN
+                .replace("{{nonce}}", &nonce)
+                .replace("{{reload}}", reload),
+        )?
+    };
+    *response.status_mut() = status;
     response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(
         &format!("default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
     )?);
@@ -230,7 +243,6 @@ pub(crate) fn add_routes(routes: &mut HttpContribution, nonce: String) -> HttpRe
     for pattern in [
         "GET /",
         "GET /new",
-        "GET /owner",
         "GET /s/*",
         "GET /list/*",
         "GET /join/*",

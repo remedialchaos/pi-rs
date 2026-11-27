@@ -122,6 +122,26 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
             }));
 
             http.route(
+                "GET /owner",
+                RouteOptions::public(|request| {
+                    Box::pin(async move {
+                        crate::hosts::web::sign_in_page(&request, StatusCode::OK)
+                    })
+                }),
+            )
+            .map_err(|err| Error::Invalid(err.to_string()))?;
+
+            http.route(
+                "HEAD /owner",
+                RouteOptions::public(|request| {
+                    Box::pin(async move {
+                        crate::hosts::web::sign_in_page(&request, StatusCode::OK)
+                    })
+                }),
+            )
+            .map_err(|err| Error::Invalid(err.to_string()))?;
+
+            http.route(
                 "GET /owner/check",
                 RouteOptions::public(|request| {
                     Box::pin(async move {
@@ -131,7 +151,10 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                             .and_then(|v| Principal::deserialize(v).ok())
                             .is_some_and(|p| p.is_owner());
                         if !is_owner {
-                            return Ok(text_status(StatusCode::UNAUTHORIZED, "Sign in required"));
+                            return crate::hosts::web::sign_in_page(
+                                &request,
+                                StatusCode::UNAUTHORIZED,
+                            );
                         }
                         Ok(json_status(StatusCode::OK, &json!({ "owner": true }), None))
                     })

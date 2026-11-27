@@ -6,11 +6,18 @@ use std::{
     sync::Arc,
 };
 
+use axum::body::Body;
+use http::{HeaderValue, Method, Response, StatusCode, header};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use pi_rs_chord::{
     Error, Result,
+    context::Context,
     data::ChordError,
-    host::{Members, ServeOptions, define_facet},
+    host::{Host, Members, ServeOptions, WeakHost, define_facet},
     json::JsonValue,
+    node::http::{
+        HttpContribution, HttpRequest, HttpResponse, RouteOptions, json_response, text_response,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,7 +29,8 @@ use crate::{
     },
     plugins::send_file::WORKER_FILES_SERVICE,
     runtime::{
-        files::safe_file_name,
+        files::{file_preview, safe_file_name},
+        http::{cross_site_read, same_origin},
         session_files::{
             DOWNLOADS, FILE_CHUNK, FileInfo, FileWrite, Files, MAX_DOWNLOAD_BYTES, UPLOADS,
             display_name, find_download, read_whole,
@@ -194,13 +202,362 @@ struct ReadArgs {
     length: usize,
 }
 
+const RFC5987_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'!')
+    .remove(b'~')
+    .remove(b'*')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')');
+
+fn query_param(query: &str, key: &str) -> String {
+    form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default()
+}
+
+fn upload_error_response(status: u16, message: &str) -> HttpResponse {
+    let mut response = json_response(&json!({
+        "error": message,
+        "limit": MAX_UPLOAD_BYTES,
+    }))
+    .unwrap_or_else(|_| HttpResponse::new(Body::from("{}")));
+    *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+    response
+}
+
+fn status_text(status: StatusCode, body: &'static str) -> HttpResponse {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    response
+}
+
+async fn handle_upload(
+    request: HttpRequest,
+    host: &Host,
+    session_files: &pi_rs_chord::contracts::Contract,
+    catalog: &pi_rs_chord::contracts::Contract,
+) -> HttpResponse {
+    if !same_origin(&request.headers, &request.origin) {
+        return upload_error_response(403, "Invalid origin");
+    }
+    let session = query_param(&request.query, "session");
+    let principal = request
+        .principal
+        .as_ref()
+        .and_then(|v| Principal::deserialize(v).ok());
+    if !principal.as_ref().is_some_and(|p| p.can_send(&session)) {
+        return upload_error_response(403, "Forbidden");
+    }
+    let name = query_param(&request.query, "name");
+    if name.is_empty() || name.encode_utf16().count() > 255 {
+        return upload_error_response(400, "Invalid file name");
+    }
+    if let Some(len) = request
+        .header("content-length")
+        .and_then(|v| v.parse::<u64>().ok())
+        && len > MAX_UPLOAD_BYTES
+    {
+        return upload_error_response(413, "File too large");
+    }
+    let bytes = match request.body(MAX_UPLOAD_BYTES as usize).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.status == 413 => return upload_error_response(413, "File too large"),
+        Err(err) => return upload_error_response(err.status, &err.message),
+    };
+    if bytes.len() as u64 > MAX_UPLOAD_BYTES {
+        return upload_error_response(413, "File too large");
+    }
+    let source = match principal {
+        Some(Principal::Guest { id, .. }) => format!("guest:{id}"),
+        _ => "owner".to_owned(),
+    };
+    let root = host.root();
+    let ctx = Context::background();
+    let cat = match root.hold(Arc::new(catalog.clone()), JsonValue::from_serde(json!({}))) {
+        Ok(held) => held,
+        Err(err) => return upload_error_response(400, &err.to_string()),
+    };
+    if let Err(err) = cat.wait(&ctx).await {
+        return upload_error_response(400, &err.to_string());
+    }
+    let row = match cat
+        .call("get", JsonValue::from_serde(json!({ "id": session })), &ctx)
+        .await
+    {
+        Ok(val) => match val.to_serde() {
+            Ok(v) => v,
+            Err(err) => return upload_error_response(400, &err.to_string()),
+        },
+        Err(_) => return upload_error_response(400, "Unknown session"),
+    };
+    if !row["archivedAt"].is_null() {
+        return upload_error_response(409, "Session is archived");
+    }
+    let server = match crate::runtime::server::server_of(host) {
+        Ok(server) => server,
+        Err(_) => return upload_error_response(503, "Server unavailable"),
+    };
+    let files = match server
+        .workers
+        .hold(
+            Arc::new(session_files.clone()),
+            JsonValue::from_serde(json!({ "session": session })),
+            pi_rs_chord::host::Caller {
+                principal: Some(json!({ "kind": "server" })),
+                incarnation: host.incarnation().into(),
+            },
+            &ctx,
+        )
+        .await
+    {
+        Ok(held) => held,
+        Err(err) => return upload_error_response(400, &err.to_string()),
+    };
+    let outcome = async {
+        let begun = match files
+            .call(
+                "begin",
+                JsonValue::from_serde(json!({
+                    "space": UPLOADS,
+                    "name": name,
+                    "source": source,
+                })),
+                &ctx,
+            )
+            .await
+            .and_then(|v| v.to_serde())
+        {
+            Ok(v) => v,
+            Err(err) => return upload_error_response(400, &err.to_string()),
+        };
+        let Some(upload) = begun["upload"].as_str().map(str::to_owned) else {
+            return upload_error_response(400, "Missing upload token");
+        };
+        let mut offset = 0usize;
+        for chunk in bytes.chunks(FILE_CHUNK) {
+            if let Err(err) = files
+                .call(
+                    "append",
+                    JsonValue::from_serde(json!({
+                        "upload": upload,
+                        "offset": offset,
+                        "bytes": chunk,
+                    })),
+                    &ctx,
+                )
+                .await
+            {
+                let _ = files
+                    .call("cancel", JsonValue::from_serde(Value::String(upload)), &ctx)
+                    .await;
+                return upload_error_response(400, &err.to_string());
+            }
+            offset += chunk.len();
+        }
+        match files
+            .call("finish", JsonValue::from_serde(Value::String(upload)), &ctx)
+            .await
+            .and_then(|v| v.to_serde())
+        {
+            Ok(saved) => {
+                json_response(&saved).unwrap_or_else(|_| status_text(StatusCode::OK, "{}"))
+            }
+            Err(err) => upload_error_response(400, &err.to_string()),
+        }
+    }
+    .await;
+    files.release();
+    outcome
+}
+
+async fn handle_download(
+    request: HttpRequest,
+    host: &Host,
+    session_files: &pi_rs_chord::contracts::Contract,
+    catalog: &pi_rs_chord::contracts::Contract,
+) -> HttpResponse {
+    let session = query_param(&request.query, "session");
+    let principal = request
+        .principal
+        .as_ref()
+        .and_then(|v| Principal::deserialize(v).ok());
+    if cross_site_read(&request.method, &request.headers)
+        || !principal.as_ref().is_some_and(|p| p.can_view(&session))
+    {
+        return status_text(StatusCode::FORBIDDEN, "Forbidden");
+    }
+    let id = query_param(&request.query, "id");
+    let root = host.root();
+    let ctx = Context::background();
+    let Ok(cat) = root.hold(Arc::new(catalog.clone()), JsonValue::from_serde(json!({}))) else {
+        return status_text(StatusCode::NOT_FOUND, "File not found");
+    };
+    if cat.wait(&ctx).await.is_err() {
+        return status_text(StatusCode::NOT_FOUND, "File not found");
+    }
+    let Ok(row) = cat
+        .call("get", JsonValue::from_serde(json!({ "id": session })), &ctx)
+        .await
+        .and_then(|v| v.to_serde())
+    else {
+        return status_text(StatusCode::NOT_FOUND, "File not found");
+    };
+    if !row["archivedAt"].is_null() {
+        return status_text(StatusCode::NOT_FOUND, "File not found");
+    }
+    let Ok(server) = crate::runtime::server::server_of(host) else {
+        return status_text(StatusCode::NOT_FOUND, "File not found");
+    };
+    let Ok(files) = server
+        .workers
+        .hold(
+            Arc::new(session_files.clone()),
+            JsonValue::from_serde(json!({ "session": session })),
+            pi_rs_chord::host::Caller {
+                principal: Some(json!({ "kind": "server" })),
+                incarnation: host.incarnation().into(),
+            },
+            &ctx,
+        )
+        .await
+    else {
+        return status_text(StatusCode::NOT_FOUND, "File not found");
+    };
+    let outcome = async {
+        let Ok(found) = files
+            .call("download", JsonValue::from_serde(Value::String(id)), &ctx)
+            .await
+            .and_then(|v| v.to_serde())
+        else {
+            return status_text(StatusCode::NOT_FOUND, "File not found");
+        };
+        if found.is_null() {
+            return status_text(StatusCode::NOT_FOUND, "File not found");
+        }
+        let Some(file_id) = found["file"].as_str().map(str::to_owned) else {
+            return status_text(StatusCode::NOT_FOUND, "File not found");
+        };
+        let name = found["name"].as_str().unwrap_or("file").to_owned();
+        let size = found["size"].as_u64().unwrap_or(0);
+        let preview = file_preview(&name);
+        let seekable = preview
+            .as_ref()
+            .is_some_and(|p| matches!(p.kind, "audio" | "video"));
+        let range = if seekable {
+            parse_byte_range(request.header("range"), size)
+        } else {
+            None
+        };
+        if matches!(range, Some(ByteRange::Invalid)) {
+            let mut resp = Response::new(Body::empty());
+            *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            if let Ok(val) = HeaderValue::from_str(&format!("bytes */{size}")) {
+                resp.headers_mut().insert(header::CONTENT_RANGE, val);
+            }
+            return resp;
+        }
+        let (start, end, is_partial) = match range {
+            Some(ByteRange::Valid { start, end }) => (start, end, true),
+            _ => (0, size.saturating_sub(1), false),
+        };
+        let content_length = if size == 0 { 0 } else { end - start + 1 };
+        let ascii: String = name
+            .chars()
+            .map(|c| {
+                if (' '..='~').contains(&c) && c != '"' && c != '\\' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let encoded_name = utf8_percent_encode(&name, RFC5987_SET).to_string();
+        let disposition =
+            format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded_name}");
+
+        let body = if request.method == Method::HEAD || content_length == 0 {
+            Body::empty()
+        } else {
+            let mut out = Vec::with_capacity(content_length as usize);
+            let mut cursor = start;
+            while cursor <= end {
+                let remaining = (end - cursor + 1).min(FILE_CHUNK as u64) as usize;
+                let Ok(chunk_val) = files
+                    .call(
+                        "read",
+                        JsonValue::from_serde(json!({
+                            "file": file_id,
+                            "offset": cursor,
+                            "length": remaining,
+                        })),
+                        &ctx,
+                    )
+                    .await
+                    .and_then(|v| v.to_serde())
+                else {
+                    return status_text(StatusCode::INTERNAL_SERVER_ERROR, "Could not read file");
+                };
+                let Ok(chunk) = serde_json::from_value::<Vec<u8>>(chunk_val) else {
+                    return status_text(StatusCode::INTERNAL_SERVER_ERROR, "Could not read file");
+                };
+                if chunk.is_empty() {
+                    break;
+                }
+                cursor += chunk.len() as u64;
+                out.extend_from_slice(&chunk);
+            }
+            Body::from(out)
+        };
+
+        let mut response = Response::new(body);
+        *response.status_mut() = if is_partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        };
+        let headers = response.headers_mut();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(preview.map_or("application/octet-stream", |p| p.mime_type)),
+        );
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(content_length));
+        if let Ok(val) = HeaderValue::from_str(&disposition) {
+            headers.insert(header::CONTENT_DISPOSITION, val);
+        }
+        headers.insert(
+            header::ACCEPT_RANGES,
+            HeaderValue::from_static(if seekable { "bytes" } else { "none" }),
+        );
+        headers.insert(
+            header::HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        );
+        if is_partial && let Ok(val) = HeaderValue::from_str(&format!("bytes {start}-{end}/{size}"))
+        {
+            headers.insert(header::CONTENT_RANGE, val);
+        }
+        response
+    }
+    .await;
+    files.release();
+    outcome
+}
+
 pub fn register(registry: &mut PluginRegistry) -> Result<()> {
     let download_store_contract = Arc::new(lookup("p2.downloads")?);
     let session_files_contract = Arc::new(lookup("p2.session-files")?);
     let attachments_contract = Arc::new(lookup("p2.attachments")?);
     let catalog_contract = Arc::new(lookup("p2.catalog")?);
 
-    // Server facet: `p2.download-store`
+    // Server facet: `p2.download-store` + HTTP `/upload` & `/download`
     {
         let sf_ref = session_files_contract.clone();
         let cat_ref = catalog_contract.clone();
@@ -208,6 +565,49 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
             "files",
             FacetKind::Server,
             define_facet(move |host| {
+                let mut http = HttpContribution::new("files");
+                {
+                    let weak: WeakHost = host.host().downgrade();
+                    let sf_http = sf_ref.clone();
+                    let cat_http = cat_ref.clone();
+                    http.route(
+                        "POST /upload",
+                        RouteOptions::public(move |request| {
+                            let weak = weak.clone();
+                            let sf_http = sf_http.clone();
+                            let cat_http = cat_http.clone();
+                            Box::pin(async move {
+                                let Some(host) = weak.upgrade() else {
+                                    return text_response(503, "Server closed");
+                                };
+                                Ok(handle_upload(request, &host, &sf_http, &cat_http).await)
+                            })
+                        }),
+                    )
+                    .map_err(|err| Error::Invalid(err.to_string()))?;
+                }
+                for method in ["GET", "HEAD"] {
+                    let weak: WeakHost = host.host().downgrade();
+                    let sf_http = sf_ref.clone();
+                    let cat_http = cat_ref.clone();
+                    http.route(
+                        &format!("{method} /download"),
+                        RouteOptions::public(move |request| {
+                            let weak = weak.clone();
+                            let sf_http = sf_http.clone();
+                            let cat_http = cat_http.clone();
+                            Box::pin(async move {
+                                let Some(host) = weak.upgrade() else {
+                                    return text_response(503, "Server closed");
+                                };
+                                Ok(handle_download(request, &host, &sf_http, &cat_http).await)
+                            })
+                        }),
+                    )
+                    .map_err(|err| Error::Invalid(err.to_string()))?;
+                }
+                host.contribute_http(http)?;
+
                 let sf_ref = sf_ref.clone();
                 let cat_ref = cat_ref.clone();
                 host.serve(

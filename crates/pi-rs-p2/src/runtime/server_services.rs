@@ -34,6 +34,7 @@ const COOKIES: &str = "p2.page-cookies";
 /// Services owned by the running server.
 pub struct ServerNatives {
     pub info: ServerInfo,
+    pub default_model: Option<(String, String)>,
     pub workers: SessionWorkers,
     pub plugin_root: std::path::PathBuf,
     host: Host,
@@ -52,10 +53,16 @@ impl ServerNatives {
                 &info.data_dir,
             )),
             info,
+            default_model: None,
             workers,
             host,
             store,
         }
+    }
+
+    pub(crate) fn with_default_model(mut self, default_model: Option<(String, String)>) -> Self {
+        self.default_model = default_model;
+        self
     }
 
     /// The server's Chord host, for HTTP callbacks that hold objects or open transactions.

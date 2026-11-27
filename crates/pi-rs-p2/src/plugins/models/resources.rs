@@ -86,6 +86,7 @@ pub struct ModelSummary {
 pub struct ModelResources {
     pub directory: PathBuf,
     pub fake: bool,
+    pub default_model_override: Option<(String, String)>,
     pub credentials: FileCredentialStore,
     pub models: Models,
     settings: RwLock<Value>,
@@ -97,6 +98,14 @@ pub struct ModelResources {
 
 impl ModelResources {
     pub async fn open(directory: PathBuf, fake: bool) -> Result<Arc<Self>> {
+        Self::open_with_default(directory, fake, None).await
+    }
+
+    pub async fn open_with_default(
+        directory: PathBuf,
+        fake: bool,
+        default_model_override: Option<(String, String)>,
+    ) -> Result<Arc<Self>> {
         let credentials = FileCredentialStore::new(directory.join("auth.json"));
         let models = if fake {
             crate::hosts::worker::fake_models()
@@ -112,6 +121,7 @@ impl ModelResources {
         let resources = Arc::new(Self {
             directory,
             fake,
+            default_model_override,
             credentials,
             models,
             settings: RwLock::new(json!({})),
@@ -301,6 +311,7 @@ impl ModelResources {
                 let model_id = v.get("modelId")?.as_str()?.to_owned();
                 Some((provider, model_id))
             })
+            .or_else(|| self.default_model_override.clone())
             .or_else(env_default_model);
 
         let wanted = snapshot
@@ -354,14 +365,20 @@ impl ModelResources {
     }
 }
 
-fn env_default_model() -> Option<(String, String)> {
-    let provider = std::env::var("PI_DEFAULT_PROVIDER")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let model = std::env::var("PI_DEFAULT_MODEL")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    Some((provider, model))
+pub fn env_default_model() -> Option<(String, String)> {
+    for (p_key, m_key) in [
+        ("P2_PROVIDER", "P2_MODEL"),
+        ("PI_MOBILE_PROVIDER", "PI_MOBILE_MODEL"),
+        ("PI_DEFAULT_PROVIDER", "PI_DEFAULT_MODEL"),
+    ] {
+        if let (Some(provider), Some(model)) = (
+            std::env::var(p_key).ok().filter(|s| !s.is_empty()),
+            std::env::var(m_key).ok().filter(|s| !s.is_empty()),
+        ) {
+            return Some((provider, model));
+        }
+    }
+    None
 }
 
 async fn read_json_object(path: &Path) -> std::result::Result<Value, String> {

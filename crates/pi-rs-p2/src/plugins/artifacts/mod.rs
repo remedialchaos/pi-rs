@@ -8,6 +8,7 @@ pub mod pages;
 pub mod server;
 pub mod store;
 pub mod tool;
+pub mod viewer;
 pub mod worker;
 
 #[cfg(test)]

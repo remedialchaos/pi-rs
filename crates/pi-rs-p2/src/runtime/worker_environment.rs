@@ -225,6 +225,25 @@ impl Execution {
             _ => Ok(None),
         }
     }
+    /// Probes whether `location`'s machine runs Windows (`None` if remote machine is unreachable).
+    pub fn platform_is_windows(&mut self, location: &Location) -> Option<bool> {
+        let Some(name) = location.env.as_deref() else {
+            return Some(cfg!(windows));
+        };
+        let machine = match self.machines.entry(Some(name.to_owned())) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let opened = self.provider.open(name).ok()?;
+                entry.insert(opened)
+            }
+        };
+        match machine {
+            Machine::Local(_) => Some(cfg!(windows)),
+            Machine::Remote { connection, .. } => {
+                connection.info().ok().map(|info| info.os == "windows")
+            }
+        }
+    }
     pub fn at(
         &mut self,
         location: &Location,

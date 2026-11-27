@@ -566,6 +566,8 @@ impl Lifecycle {
             summary["defaultModel"].clone()
         } else if server.info.fake {
             json!({"provider":"faux","modelId":"faux-1","thinkingLevel":"high"})
+        } else if let Some((provider, model_id)) = &server.default_model {
+            json!({"provider": provider, "modelId": model_id, "thinkingLevel": "high"})
         } else {
             Value::Null
         };

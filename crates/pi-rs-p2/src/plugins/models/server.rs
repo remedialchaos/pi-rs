@@ -51,9 +51,13 @@ pub fn server_facet() -> Result<Facet> {
 
     Ok(define_facet(move |facet_host| {
         let host = facet_host.host();
-        let (data_dir, fake) = match server_of(&host) {
-            Ok(natives) => (PathBuf::from(&natives.info.data_dir), natives.info.fake),
-            Err(_) => (PathBuf::from("."), false),
+        let (data_dir, fake, default_model) = match server_of(&host) {
+            Ok(natives) => (
+                PathBuf::from(&natives.info.data_dir),
+                natives.info.fake,
+                natives.default_model.clone(),
+            ),
+            Err(_) => (PathBuf::from("."), false, None),
         };
         let shared = Arc::new(OnceCell::<Arc<ModelResources>>::new());
 
@@ -90,6 +94,7 @@ pub fn server_facet() -> Result<Facet> {
                 let server_ref =
                     object.get(server_contract, JsonValue::Object(Default::default()))?;
 
+                let open_default_model = default_model.clone();
                 object.open(
                     move |ctx| {
                         let open_shared = open_shared.clone();
@@ -98,6 +103,7 @@ pub fn server_facet() -> Result<Facet> {
                         let snap_w = snap_w.clone();
                         let server_ref = server_ref.clone();
                         let dir_open = dir_open.clone();
+                        let default_model = open_default_model.clone();
                         Box::pin(async move {
                             let (dir, is_fake) = match server_ref
                                 .member("info")
@@ -115,7 +121,9 @@ pub fn server_facet() -> Result<Facet> {
                             };
 
                             let res = open_shared
-                                .get_or_try_init(|| ModelResources::open(dir, is_fake))
+                                .get_or_try_init(|| {
+                                    ModelResources::open_with_default(dir, is_fake, default_model)
+                                })
                                 .await?
                                 .clone();
                             install_service(&open_host, MODEL_RESOURCES_SERVICE, &res)?;

@@ -1,5 +1,7 @@
 //! Session-scoped terminal windows shared by the owner's panel and the terminal tool.
 
+#[cfg(unix)]
+pub mod detached;
 mod server;
 mod service;
 mod worker;

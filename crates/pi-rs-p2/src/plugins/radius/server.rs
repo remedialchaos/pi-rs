@@ -107,10 +107,52 @@ pub(super) fn facet() -> Result<Facet> {
         }),
     );
     Ok(services.with_facet(move |host| {
+        let facet_host = host.host();
+        let targets = crate::plugins::backup::get_or_install_backup_targets(&facet_host)?;
+        let open_host = facet_host.downgrade();
+        let open_contract = contract.clone();
+        let kept_held: Arc<tokio::sync::Mutex<Option<pi_rs_chord::host::Held>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        targets.offer(
+            "radius",
+            Arc::new(move || {
+                let open_host = open_host.clone();
+                let open_contract = open_contract.clone();
+                let kept_held = kept_held.clone();
+                Box::pin(async move {
+                    let host = open_host.upgrade().ok_or(Error::Closed)?;
+                    if service_of::<RadiusBackupTarget>(&host, BACKUP_TARGET).is_err() {
+                        let held = host
+                            .get(
+                                open_contract,
+                                json!({}).into(),
+                                &pi_rs_chord::context::Context::background(),
+                            )
+                            .await?;
+                        *kept_held.lock().await = Some(held);
+                    }
+                    let target = service_of::<RadiusBackupTarget>(&host, BACKUP_TARGET)?;
+                    let opened = target.open().await?;
+                    let terminal = opened.terminal;
+                    Ok(crate::plugins::backup::OpenBackupTarget {
+                        remote: Arc::new(opened.remote),
+                        device: opened.device,
+                        server: opened.server,
+                        terminal: Some(Arc::new(move |error| {
+                            let _ = terminal;
+                            matches!(error, Error::Chord(chord) if chord.code == "backup_terminal")
+                        })),
+                    })
+                })
+            }),
+        )?;
         let relay = relay.clone();
         host.serve(
             contract.clone(),
-            move |_, _, object| members(object, relay.clone()),
+            move |_, _, object| {
+                let _keep_targets = &targets;
+                members(object, relay.clone())
+            },
             ServeOptions::default(),
         )
     }))

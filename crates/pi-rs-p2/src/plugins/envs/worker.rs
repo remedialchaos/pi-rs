@@ -6,11 +6,19 @@ use pi_rs_chord::{
     Result,
     host::{Facet, define_facet},
 };
-use pi_rs_env::ssh::{SshConnectOptions, local_daemon, ssh_connection};
+use pi_rs_env::{
+    CommandSource, Connection, ConnectionOptions, RemoteError,
+    ssh::{SshConnectOptions, SshTarget, local_daemon, ssh_connection},
+};
+use serde_json::json;
 
 use crate::{
     api::v1::worker::worker_of,
-    plugins::envs::config::{EnvConfig, is_sandbox, parse_envs},
+    plugins::envs::{
+        config::{EnvConfig, is_sandbox, parse_envs},
+        sandbox_host::sandbox_daemon_argv,
+        secrets::sandbox_secrets,
+    },
     runtime::worker_environment::{EnvironmentProvider, Machine, WorkerEnvironmentError},
 };
 
@@ -78,9 +86,78 @@ impl EnvironmentProvider for WorkerEnvProvider {
                     shell_path: cfg.shell_path.clone(),
                 })
             }
-            EnvConfig::Gondolin(_) => Err(WorkerEnvironmentError::Provider(
-                format!("Sandbox \"{name}\" requires host launcher").into(),
-            )),
+            EnvConfig::Gondolin(cfg) => {
+                let EnvConfig::Ssh(host_cfg) = configs.get(&cfg.host).ok_or_else(|| {
+                    WorkerEnvironmentError::Provider(
+                        format!(
+                            "Sandbox {name} runs on \"{}\", which is not an SSH environment",
+                            cfg.host
+                        )
+                        .into(),
+                    )
+                })?
+                else {
+                    return Err(WorkerEnvironmentError::Provider(
+                        format!(
+                            "Sandbox {name} runs on \"{}\", which is not an SSH environment",
+                            cfg.host
+                        )
+                        .into(),
+                    ));
+                };
+                let default_key = self.data_dir.join("keys").join(&cfg.host);
+                let identity_file = host_cfg.identity_file.clone().or_else(|| {
+                    default_key
+                        .exists()
+                        .then(|| default_key.to_string_lossy().into_owned())
+                });
+                let target = SshTarget {
+                    host: host_cfg.host.clone(),
+                    user: host_cfg.user.clone(),
+                    port: host_cfg.port,
+                    identity_file,
+                    known_hosts_file: self
+                        .data_dir
+                        .join("known_hosts")
+                        .to_string_lossy()
+                        .into_owned(),
+                    host_key_alias: format!("p2-{}", cfg.host),
+                    ssh: None,
+                    config_file: None,
+                };
+                let directory = self.data_dir.clone();
+                let sb_name = name.to_owned();
+                let sb_cfg = cfg.clone();
+                let conn = Arc::new(Connection::new(ConnectionOptions {
+                    command: CommandSource::Dynamic(Arc::new(move || {
+                        let (meta, values) = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current()
+                                .block_on(sandbox_secrets(&directory, &sb_name))
+                        })
+                        .map_err(|e| {
+                            RemoteError::new(&json!({
+                                "code": "spawn_error",
+                                "message": e.to_string(),
+                                "lost": true,
+                            }))
+                        })?;
+                        sandbox_daemon_argv(&directory, &sb_name, &sb_cfg, &target, &meta, &values)
+                            .map_err(|e| {
+                                RemoteError::new(&json!({
+                                    "code": "spawn_error",
+                                    "message": e.to_string(),
+                                    "lost": true,
+                                }))
+                            })
+                    })),
+                    on_log: None,
+                }));
+                Ok(Machine::Remote {
+                    id: name.to_owned(),
+                    connection: conn,
+                    shell_path: None,
+                })
+            }
         }
     }
 

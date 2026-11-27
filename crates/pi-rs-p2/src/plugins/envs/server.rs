@@ -606,9 +606,25 @@ pub fn server_facet() -> Result<Facet> {
                         "sandboxStop",
                         "sandboxResetDisk",
                     ] {
-                        members.method(method_name, |_, _| {
-                            Box::pin(async {
-                                Ok(JsonValue::from_serde(json!({ "state": "stopped" })))
+                        let mgr_cell = mgr_cell.clone();
+                        members.method(method_name, move |args, _| {
+                            let mgr_cell = mgr_cell.clone();
+                            Box::pin(async move {
+                                let mgr = mgr_cell
+                                    .get()
+                                    .ok_or_else(|| Error::Invalid("EnvManager not open".into()))?;
+                                let args = args.to_serde()?;
+                                let name = args
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| Error::Invalid("missing name".into()))?;
+                                let status = match method_name {
+                                    "sandboxStatus" => mgr.sandbox_status(name).await?,
+                                    "sandboxStart" => mgr.sandbox_start(name).await?,
+                                    "sandboxStop" => mgr.sandbox_stop(name).await?,
+                                    _ => mgr.sandbox_reset_disk(name).await?,
+                                };
+                                Ok(JsonValue::from_serde(serde_json::to_value(status)?))
                             })
                         })?;
                     }
@@ -680,7 +696,10 @@ pub fn server_facet() -> Result<Facet> {
                                     .map(str::to_owned);
                                 let value =
                                     args.get("value").and_then(Value::as_str).map(str::to_owned);
-                                mgr.set_secret(sandbox, name, hosts, preset, value).await?;
+                                let add_hosts =
+                                    args.get("addHosts").and_then(Value::as_bool) == Some(true);
+                                mgr.set_secret(sandbox, name, hosts, preset, value, add_hosts)
+                                    .await?;
                                 Ok(JsonValue::Null)
                             })
                         })?;

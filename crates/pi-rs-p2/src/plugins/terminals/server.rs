@@ -189,6 +189,12 @@ pub(super) fn facet() -> Result<Facet> {
         host.serve(
             service_contract.clone(),
             move |_, _, object| {
+                if let Some(service) = srv.upgrade() {
+                    let rehydrate_service = service;
+                    tokio::spawn(async move {
+                        let _ = rehydrate_service.rehydrate().await;
+                    });
+                }
                 let catalog = object.get(cat.clone(), json!({}).into())?;
                 let service = srv.clone();
                 object.follow(move |target, ctx| {

@@ -15,6 +15,10 @@ pub fn server_directory(data_dir: &Path) -> PathBuf {
     data_dir.join("server")
 }
 
+pub fn telemetry_store(data_dir: &Path) -> PathBuf {
+    data_dir.join("telemetry.sqlite")
+}
+
 pub fn user_plugins_directory(data_dir: &Path) -> PathBuf {
     data_dir.join("plugins")
 }

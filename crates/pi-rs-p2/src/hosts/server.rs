@@ -68,6 +68,8 @@ pub struct ServerOptions {
     pub app_dir: Option<PathBuf>,
     pub port: u16,
     pub fake: bool,
+    pub telemetry: Option<bool>,
+    pub default_model: Option<(String, String)>,
     pub dev: bool,
     pub dev_supervised: bool,
     pub dev_rebuild: Option<DevRebuildHook>,
@@ -87,6 +89,8 @@ impl ServerOptions {
             app_dir: None,
             port: 8788,
             fake: false,
+            telemetry: None,
+            default_model: crate::plugins::models::resources::env_default_model(),
             dev: std::env::var("P2_DEV").as_deref() == Ok("1"),
             dev_supervised: std::env::var(DEV_SUPERVISOR_ENV).as_deref() == Ok("1"),
             dev_rebuild: std::env::var(DEV_REBUILD_CMD_ENV)
@@ -118,7 +122,8 @@ pub struct P2Server {
     tui_bundles: super::tui_bundles::SharedTuiBundles,
     http: HttpServer,
     natives: Arc<ServerNatives>,
-    _telemetry: Arc<Arc<dyn crate::plugins::telemetry::TelemetryBackend>>,
+    _telemetry: Option<Arc<Arc<dyn crate::plugins::telemetry::TelemetryBackend>>>,
+    telemetry_store: Option<pi_rs_chord::telemetry::SqliteTelemetry>,
     #[cfg(unix)]
     _reload: Option<Arc<Arc<crate::plugins::dev_tools::ReloadHandler>>>,
     _lock: ProcessLock,
@@ -372,6 +377,13 @@ impl P2Server {
             .close(&Context::background())
             .await
             .map_err(Error::from);
+        let telemetry = if let Some(telemetry) = self.telemetry_store {
+            let flush = telemetry.close().await.map_err(Error::from);
+            let db = telemetry.database().close().await.map_err(Error::from);
+            flush.and(db)
+        } else {
+            Ok(())
+        };
         let store = self
             .natives
             .store()
@@ -379,7 +391,7 @@ impl P2Server {
             .close()
             .await
             .map_err(Error::from);
-        http.and(host).and(store)
+        http.and(host).and(telemetry).and(store)
     }
 }
 
@@ -508,6 +520,39 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     let data_dir = std::fs::canonicalize(&options.data_dir)?;
     let app = options.app_dir.clone().unwrap_or_default();
     let fake = options.fake;
+    let telemetry_on =
+        crate::plugins::telemetry::telemetry_enabled(&options.data_dir, options.telemetry);
+    let sqlite_telemetry = if telemetry_on {
+        let tel_path = host_dirs::telemetry_store(&options.data_dir);
+        pi_rs_chord::node::app::private_store(&tel_path)?;
+        let tel_db = pi_rs_chord::sqlite::SqliteDatabase::open(
+            &tel_path,
+            pi_rs_chord::sqlite::Options::default(),
+        )
+        .await?;
+        let retention_days = std::env::var("P2_TELEMETRY_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(7.0);
+        let retention_ms = retention_days * 86_400_000.0;
+        let opened = match pi_rs_chord::telemetry::SqliteTelemetry::open(
+            tel_db.clone(),
+            retention_ms,
+            10_000,
+        )
+        .await
+        {
+            Ok(opened) => opened,
+            Err(err) => {
+                let _ = tel_db.close().await;
+                return Err(err.into());
+            }
+        };
+        Some(opened)
+    } else {
+        None
+    };
     let workers = SessionWorkers::new(&host, process, move |session, generation, context| {
         let (host, catalog, data_dir, app) = (
             catalog_host.clone(),
@@ -530,7 +575,7 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
                 app,
                 data_dir,
                 fake,
-                telemetry: false,
+                telemetry: telemetry_on,
                 generation,
                 values,
             })
@@ -556,26 +601,31 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     let http = http
         .listen(SocketAddr::from(([127, 0, 0, 1], options.port)))
         .await?;
-    let natives = Arc::new(ServerNatives::new(
-        ServerInfo {
-            app: options
-                .app_dir
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            data_dir: options.data_dir.to_string_lossy().into_owned(),
-            fake: options.fake,
-            allowed_hosts: options.allowed_hosts,
-            port: http.address.port(),
-        },
-        workers.clone(),
-        host.clone(),
-        store,
-    ));
-    let telemetry_backend: Arc<Arc<dyn crate::plugins::telemetry::TelemetryBackend>> = Arc::new(
-        Arc::new(crate::plugins::telemetry::InMemoryTelemetryBackend(
-            pi_rs_telemetry::InMemoryTelemetryContext::new(),
-        )),
+    let natives = Arc::new(
+        ServerNatives::new(
+            ServerInfo {
+                app: options
+                    .app_dir
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                data_dir: options.data_dir.to_string_lossy().into_owned(),
+                fake: options.fake,
+                allowed_hosts: options.allowed_hosts,
+                port: http.address.port(),
+            },
+            workers.clone(),
+            host.clone(),
+            store,
+        )
+        .with_default_model(options.default_model),
     );
+    let telemetry_backend: Option<Arc<Arc<dyn crate::plugins::telemetry::TelemetryBackend>>> =
+        sqlite_telemetry.as_ref().map(|sqlite| {
+            Arc::new(Arc::new(crate::plugins::telemetry::SqliteTelemetryBackend(
+                sqlite.clone(),
+            ))
+                as Arc<dyn crate::plugins::telemetry::TelemetryBackend>)
+        });
     let mut server = P2Server {
         host,
         address: http.address,
@@ -587,6 +637,7 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
         http,
         natives,
         _telemetry: telemetry_backend.clone(),
+        telemetry_store: sqlite_telemetry.clone(),
         #[cfg(unix)]
         _reload: None,
         _lock: lock,
@@ -597,13 +648,15 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
     };
     let load = async {
         install_natives(&server.host, &server.natives)?;
-        crate::runtime::server::install_service(
-            &server.host,
-            crate::plugins::telemetry::TELEMETRY_STORE_SERVICE,
-            &telemetry_backend,
-        )?;
+        if let Some(ref telemetry_backend) = telemetry_backend {
+            crate::runtime::server::install_service(
+                &server.host,
+                crate::plugins::telemetry::TELEMETRY_STORE_SERVICE,
+                telemetry_backend,
+            )?;
+        }
         add_request_services(&mut routes, &server.natives);
-        let core = vec![
+        let mut core = vec![
             PluginFacet::new(
                 "@p2/core",
                 info_facet(&server.natives, server.host.downgrade())?,
@@ -611,6 +664,12 @@ pub async fn start_server(options: ServerOptions) -> Result<P2Server> {
             PluginFacet::new("p2.core-http", routes.facet()),
             PluginFacet::new("chord.app.files", files.facet()?),
         ];
+        if let Some(ref sqlite) = sqlite_telemetry {
+            core.push(PluginFacet::new(
+                "chord.telemetry",
+                crate::plugins::telemetry::ingest_facet(sqlite.clone())?,
+            ));
+        }
         let mut sources = super::plugins::PluginSources::new(
             &options.registry,
             options.plugins.as_deref(),

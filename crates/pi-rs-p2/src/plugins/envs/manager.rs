@@ -21,8 +21,12 @@ use serde_json::{Value, json};
 
 use crate::plugins::{
     envs::{
-        config::{EnvConfig, SshEnvConfig, delete_env, env_revision, load_envs, save_env},
-        secrets::{SecretInfo, delete_secret, list_secrets, save_secret},
+        config::{
+            EnvConfig, GondolinEnvConfig, SshEnvConfig, delete_env, env_revision, load_envs,
+            save_env,
+        },
+        sandbox_host::{SandboxStatusReport, check_sandbox_support, run_sandbox_command},
+        secrets::{SecretInfo, delete_secret, list_secrets, sandbox_secrets, save_secret},
     },
     locations::{BoxedFuture, DirectoryListing, EnvDirectoryManager},
 };
@@ -155,8 +159,56 @@ impl EnvManager {
                 "Environment \"{name}\" is used by {sessions} session(s); pass force to delete"
             )));
         }
+        let existing = self.config(name).await.ok();
         delete_env(&self.directory, name).await?;
+        if let Some(EnvConfig::Gondolin(cfg)) = existing {
+            if let Ok(target) = self.sandbox_host_target(&cfg.host).await
+                && let Ok((meta, values)) = sandbox_secrets(&self.directory, name).await
+            {
+                let _ = run_sandbox_command(
+                    &self.directory,
+                    name,
+                    &cfg,
+                    target,
+                    "forget",
+                    meta,
+                    values,
+                )
+                .await;
+            }
+            let _ = delete_secret(&self.directory, name, None).await;
+        }
         Ok(())
+    }
+
+    async fn sandbox_host_target(&self, host_name: &str) -> Result<SshTarget> {
+        let host_cfg = self.ssh_config(host_name).await?;
+        Ok(self.ssh_target(host_name, &host_cfg))
+    }
+
+    async fn sandbox_command(&self, name: &str, command: &str) -> Result<SandboxStatusReport> {
+        let EnvConfig::Gondolin(cfg) = self.config(name).await? else {
+            return Err(Error::Invalid(format!("\"{name}\" is not a sandbox")));
+        };
+        let target = self.sandbox_host_target(&cfg.host).await?;
+        let (meta, values) = sandbox_secrets(&self.directory, name).await?;
+        run_sandbox_command(&self.directory, name, &cfg, target, command, meta, values).await
+    }
+
+    pub async fn sandbox_status(&self, name: &str) -> Result<SandboxStatusReport> {
+        self.sandbox_command(name, "status").await
+    }
+
+    pub async fn sandbox_start(&self, name: &str) -> Result<SandboxStatusReport> {
+        self.sandbox_command(name, "start").await
+    }
+
+    pub async fn sandbox_stop(&self, name: &str) -> Result<SandboxStatusReport> {
+        self.sandbox_command(name, "stop").await
+    }
+
+    pub async fn sandbox_reset_disk(&self, name: &str) -> Result<SandboxStatusReport> {
+        self.sandbox_command(name, "reset").await
     }
 
     pub async fn accept_host_key(&self, name: &str, lines: &[String]) -> Result<()> {
@@ -281,12 +333,24 @@ impl EnvManager {
                         let info = conn.info();
                         let platform = format!("{:?}", remote.platform).to_lowercase();
                         let arch = format!("{:?}", remote.arch).to_lowercase();
-                        let home = remote.home;
+                        let home = remote.home.clone();
                         let version = info
                             .as_ref()
                             .map(|i| i.version.clone())
                             .unwrap_or_else(|_| "1".into());
                         conn.close();
+                        let target_for_sb = target.clone();
+                        let remote_for_sb = remote.clone();
+                        let sandboxes = tokio::task::spawn_blocking(move || {
+                            check_sandbox_support(&target_for_sb, &remote_for_sb)
+                        })
+                        .await
+                        .unwrap_or(
+                            crate::plugins::envs::sandbox_host::SandboxSupport {
+                                runtime: "none".into(),
+                                detail: "could not check sandbox runtime".into(),
+                            },
+                        );
                         json!({
                             "ok": true,
                             "testedAt": tested_at,
@@ -297,7 +361,7 @@ impl EnvManager {
                             "latencyMs": started.elapsed().as_millis() as u64,
                             "watchMode": "native",
                             "warnings": remote.warnings,
-                            "sandboxes": { "runtime": "none", "detail": "managed via host" }
+                            "sandboxes": sandboxes,
                         })
                     }
                     Err(err) => {
@@ -321,11 +385,37 @@ impl EnvManager {
                 }
             }
             EnvConfig::Gondolin(cfg) => {
-                json!({
-                    "ok": false,
-                    "testedAt": tested_at,
-                    "error": format!("Sandbox {} requires host {} launcher", name, cfg.host),
-                })
+                let conn_res = self.open_sandbox_connection(name, cfg).await;
+                match conn_res {
+                    Ok(conn) => {
+                        let info = conn.info();
+                        let version = info
+                            .as_ref()
+                            .map(|i| i.version.clone())
+                            .unwrap_or_else(|_| "1".into());
+                        let home = info
+                            .as_ref()
+                            .map(|i| i.home.clone())
+                            .unwrap_or_else(|_| "/root".into());
+                        conn.close();
+                        json!({
+                            "ok": true,
+                            "testedAt": tested_at,
+                            "platform": "linux",
+                            "arch": "x86_64",
+                            "home": home,
+                            "version": version,
+                            "latencyMs": started.elapsed().as_millis() as u64,
+                            "watchMode": "native",
+                            "warnings": [],
+                        })
+                    }
+                    Err(err) => json!({
+                        "ok": false,
+                        "testedAt": tested_at,
+                        "error": err.to_string(),
+                    }),
+                }
             }
         };
 
@@ -334,6 +424,44 @@ impl EnvManager {
             .unwrap_or_else(|e| e.into_inner())
             .insert(format!("{name}@{rev}"), result.clone());
         Ok(result)
+    }
+
+    async fn open_sandbox_connection(
+        &self,
+        name: &str,
+        cfg: &GondolinEnvConfig,
+    ) -> Result<Arc<Connection>> {
+        let target = self.sandbox_host_target(&cfg.host).await?;
+        let (meta, values) = sandbox_secrets(&self.directory, name).await?;
+        let directory = self.directory.clone();
+        let name_owned = name.to_owned();
+        let cfg_owned = cfg.clone();
+        let conn = Arc::new(Connection::new(pi_rs_env::ConnectionOptions {
+            command: pi_rs_env::CommandSource::Dynamic(Arc::new(move || {
+                crate::plugins::envs::sandbox_host::sandbox_daemon_argv(
+                    &directory,
+                    &name_owned,
+                    &cfg_owned,
+                    &target,
+                    &meta,
+                    &values,
+                )
+                .map_err(|e| {
+                    pi_rs_env::RemoteError::new(&json!({
+                        "code": "spawn_error",
+                        "message": e.to_string(),
+                        "lost": true,
+                    }))
+                })
+            })),
+            on_log: None,
+        }));
+        let conn_check = conn.clone();
+        tokio::task::spawn_blocking(move || conn_check.info())
+            .await
+            .map_err(|e| Error::Invalid(e.to_string()))?
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        Ok(conn)
     }
 
     pub async fn list_remote_directory(&self, name: &str, path: &str) -> Result<DirectoryListing> {
@@ -393,14 +521,41 @@ impl EnvManager {
         hosts: Vec<String>,
         preset: Option<String>,
         value: Option<String>,
+        add_hosts: bool,
     ) -> Result<()> {
-        let _ = self.config(sandbox).await?;
-        save_secret(&self.directory, sandbox, name, hosts, preset, value).await
+        let mut cfg = match self.config(sandbox).await? {
+            EnvConfig::Gondolin(g) => g,
+            EnvConfig::Ssh(_) => {
+                return Err(Error::Invalid(format!("\"{sandbox}\" is not a sandbox")));
+            }
+        };
+        if add_hosts && let Some(ref mut allowed) = cfg.allow_hosts {
+            let missing: Vec<String> = hosts
+                .iter()
+                .filter(|h| !allowed.contains(h))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                allowed.extend(missing);
+                let updated = cfg.clone();
+                self.save(sandbox, EnvConfig::Gondolin(updated)).await?;
+            }
+        }
+        save_secret(
+            &self.directory,
+            sandbox,
+            name,
+            hosts,
+            preset,
+            value,
+            cfg.allow_hosts.as_deref(),
+        )
+        .await
     }
 
     pub async fn delete_secret(&self, sandbox: &str, name: &str) -> Result<()> {
         let _ = self.config(sandbox).await?;
-        delete_secret(&self.directory, sandbox, name).await
+        delete_secret(&self.directory, sandbox, Some(name)).await
     }
 }
 

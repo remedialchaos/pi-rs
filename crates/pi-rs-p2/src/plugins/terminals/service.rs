@@ -98,6 +98,8 @@ fn color_scheme(theme: Theme) -> &'static str {
 enum Process {
     #[cfg(unix)]
     Local(pi_rs_env::daemon::LocalTerminal),
+    #[cfg(unix)]
+    Detached(super::detached::DetachedProcess),
     Remote(RemoteTerminal),
 }
 
@@ -106,6 +108,8 @@ impl Process {
         match self {
             #[cfg(unix)]
             Self::Local(process) => process.write(bytes),
+            #[cfg(unix)]
+            Self::Detached(_) => {}
             Self::Remote(process) => process.write(bytes),
         }
     }
@@ -114,6 +118,8 @@ impl Process {
         match self {
             #[cfg(unix)]
             Self::Local(process) => process.resize(cols, rows).map_err(invalid)?,
+            #[cfg(unix)]
+            Self::Detached(_) => {}
             Self::Remote(process) => process.resize(cols, rows),
         }
         Ok(())
@@ -123,6 +129,8 @@ impl Process {
         match self {
             #[cfg(unix)]
             Self::Local(process) => process.foreground().ok().flatten(),
+            #[cfg(unix)]
+            Self::Detached(_) => None,
             Self::Remote(process) => process.foreground().ok().flatten(),
         }
     }
@@ -131,6 +139,13 @@ impl Process {
         match self {
             #[cfg(unix)]
             Self::Local(process) => process.close(),
+            #[cfg(unix)]
+            Self::Detached(process) => {
+                let process = process.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move { process.close().await });
+                }
+            }
             Self::Remote(process) => process.close(),
         }
     }
@@ -139,6 +154,8 @@ impl Process {
         match self {
             #[cfg(unix)]
             Self::Local(process) => process.wait().map_err(invalid),
+            #[cfg(unix)]
+            Self::Detached(_) => Err(invalid("detached terminal exit is event-driven")),
             Self::Remote(process) => process.wait().map_err(invalid),
         }
     }
@@ -242,6 +259,11 @@ impl Terminal {
     pub async fn send(&self, bytes: Vec<u8>) -> Result<()> {
         let process = lock(&self.process).clone();
         if let Some(process) = process {
+            #[cfg(unix)]
+            if let Process::Detached(detached) = &*process {
+                detached.write(bytes).await;
+                return Ok(());
+            }
             tokio::task::spawn_blocking(move || process.write(&bytes))
                 .await
                 .map_err(invalid)?;
@@ -252,6 +274,15 @@ impl Terminal {
     pub async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         let process = lock(&self.process).clone();
         if let Some(process) = process {
+            #[cfg(unix)]
+            if let Process::Detached(detached) = &*process {
+                detached.resize(cols, rows).await?;
+            } else {
+                tokio::task::spawn_blocking(move || process.resize(cols, rows))
+                    .await
+                    .map_err(invalid)??;
+            }
+            #[cfg(not(unix))]
             tokio::task::spawn_blocking(move || process.resize(cols, rows))
                 .await
                 .map_err(invalid)??;
@@ -267,11 +298,21 @@ impl Terminal {
 
     pub async fn foreground(&self) -> Option<String> {
         let process = lock(&self.process).clone()?;
-        tokio::task::spawn_blocking(move || process.foreground())
+        #[cfg(unix)]
+        let job = if let Process::Detached(detached) = &*process {
+            detached.foreground().await
+        } else {
+            tokio::task::spawn_blocking(move || process.foreground())
+                .await
+                .ok()
+                .flatten()
+        };
+        #[cfg(not(unix))]
+        let job = tokio::task::spawn_blocking(move || process.foreground())
             .await
             .ok()
-            .flatten()
-            .map(|job| job.name.unwrap_or_else(|| format!("process {}", job.pid)))
+            .flatten();
+        job.map(|job| job.name.unwrap_or_else(|| format!("process {}", job.pid)))
     }
 
     pub async fn theme(&self, theme: Theme) -> Result<()> {
@@ -409,9 +450,25 @@ pub(super) struct Service {
     host: pi_rs_chord::host::WeakHost,
     catalog_watch: OnceLock<pi_rs_chord::host::Held>,
     calls: AsyncMutex<VecDeque<MemoizedCall>>,
+    #[cfg(unix)]
+    detached: AsyncMutex<Option<Arc<super::detached::DetachedClient>>>,
+    #[cfg(unix)]
+    detached_rehydrated: AtomicBool,
 }
 
 type MemoizedCall = ((String, String, String), Value);
+
+fn can_auto_spawn_detached_host() -> bool {
+    if std::env::var("P2_TERMINALS_DETACHED").as_deref() == Ok("0") {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    exe.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "p2" || n == "p2.exe")
+}
 
 impl Service {
     pub(super) fn new(host: pi_rs_chord::host::WeakHost) -> Self {
@@ -421,7 +478,183 @@ impl Service {
             terminals: Mutex::default(),
             changes: watch::channel(0).0,
             calls: AsyncMutex::default(),
+            #[cfg(unix)]
+            detached: AsyncMutex::new(None),
+            #[cfg(unix)]
+            detached_rehydrated: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(unix)]
+    fn data_dir(&self) -> Option<std::path::PathBuf> {
+        let host = self.host.upgrade()?;
+        let natives = crate::runtime::server::server_of(&host).ok()?;
+        Some(std::path::PathBuf::from(&natives.info.data_dir))
+    }
+
+    #[cfg(all(unix, test))]
+    pub(super) async fn attach_detached_client(
+        self: &Arc<Self>,
+        client: Arc<super::detached::DetachedClient>,
+    ) -> Result<()> {
+        *self.detached.lock().await = Some(client.clone());
+        self.sync_detached(&client).await
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn rehydrate(self: &Arc<Self>) -> Result<()> {
+        if self.detached_rehydrated.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let Some(data_dir) = self.data_dir() else {
+            return Ok(());
+        };
+        if std::env::var("P2_TERMINALS_DETACHED").as_deref() == Ok("0") {
+            return Ok(());
+        }
+        let sock = super::detached::terminal_host_socket_path(&data_dir);
+        let Ok(client) = super::detached::DetachedClient::connect_existing(&sock).await else {
+            return Ok(());
+        };
+        *self.detached.lock().await = Some(client.clone());
+        self.sync_detached(&client).await
+    }
+
+    #[cfg(unix)]
+    async fn ensure_detached_client(&self) -> Option<Arc<super::detached::DetachedClient>> {
+        if std::env::var("P2_TERMINALS_DETACHED").as_deref() == Ok("0") {
+            return None;
+        }
+        if let Some(existing) = self.detached.lock().await.clone() {
+            return Some(existing);
+        }
+        let data_dir = self.data_dir()?;
+        let sock = super::detached::terminal_host_socket_path(&data_dir);
+        let client = if let Ok(c) = super::detached::DetachedClient::connect_existing(&sock).await {
+            Some(c)
+        } else if can_auto_spawn_detached_host() {
+            super::detached::DetachedClient::connect_or_spawn(&data_dir)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        if let Some(ref c) = client {
+            *self.detached.lock().await = Some(c.clone());
+        }
+        client
+    }
+
+    #[cfg(unix)]
+    async fn sync_detached(
+        self: &Arc<Self>,
+        client: &Arc<super::detached::DetachedClient>,
+    ) -> Result<()> {
+        let entries = client.list().await?;
+        let runtime = tokio::runtime::Handle::current();
+        for entry in entries {
+            let tid = entry.info.id.clone();
+            if lock(&self.terminals)
+                .iter()
+                .any(|t| lock(&t.info).id == tid)
+            {
+                continue;
+            }
+            let terminal = Arc::new(Terminal {
+                info: Mutex::new(Info {
+                    id: entry.info.id.clone(),
+                    session_id: entry.info.session_id.clone(),
+                    index: entry.info.index,
+                    name: entry.info.name.clone(),
+                    agent: entry.info.agent,
+                    location: Location {
+                        env: None,
+                        cwd: entry.info.cwd.clone(),
+                    },
+                    title: entry.info.title.clone(),
+                    created_at: entry.info.created_at,
+                    cols: entry.info.cols,
+                    rows: entry.info.rows,
+                    exited: entry.info.exited.clone(),
+                }),
+                output: Mutex::new({
+                    let mut out = Output {
+                        bytes: VecDeque::new(),
+                        end: 0,
+                        cursor: 0,
+                        latest: Instant::now(),
+                        vt: vt100::Parser::new_with_callbacks(
+                            entry.info.rows,
+                            entry.info.cols,
+                            SCROLLBACK,
+                            VtEvents {
+                                theme: Theme::default(),
+                                title: None,
+                                replies: Vec::new(),
+                                report_theme: false,
+                            },
+                        ),
+                    };
+                    if !entry.buffered.is_empty() {
+                        out.append(&entry.buffered);
+                    }
+                    out
+                }),
+                process: Mutex::new(if entry.info.exited.is_none() {
+                    Some(Arc::new(Process::Detached(
+                        super::detached::DetachedProcess {
+                            id: entry.info.id.clone(),
+                            client: client.clone(),
+                        },
+                    )))
+                } else {
+                    None
+                }),
+                closed: AtomicBool::new(false),
+                changed: watch::channel(0).0,
+            });
+            let weak_term = Arc::downgrade(&terminal);
+            let changed = self.changes.clone();
+            let rt = runtime.clone();
+            let weak_exit = Arc::downgrade(&terminal);
+            let changed_exit = self.changes.clone();
+            client.register_subscriber(
+                &tid,
+                Arc::new(move |bytes| {
+                    if let Some(terminal) = weak_term.upgrade() {
+                        let (title, reply) = {
+                            let mut output = lock(&terminal.output);
+                            output.append(bytes);
+                            let events = output.vt.callbacks_mut();
+                            (events.title.take(), std::mem::take(&mut events.replies))
+                        };
+                        if let Some(title) = title {
+                            lock(&terminal.info).title = title;
+                            changed.send_modify(|version| *version = version.wrapping_add(1));
+                        }
+                        if !reply.is_empty() {
+                            let terminal = terminal.clone();
+                            rt.spawn(async move {
+                                let _ = terminal.send(reply).await;
+                            });
+                        }
+                        terminal.publish();
+                    }
+                }),
+                Arc::new(move |exited| {
+                    if let Some(terminal) = weak_exit.upgrade() {
+                        lock(&terminal.process).take();
+                        lock(&terminal.info).exited = Some(exited);
+                        terminal.publish();
+                        changed_exit.send_modify(|version| *version = version.wrapping_add(1));
+                    }
+                }),
+            );
+            lock(&self.terminals).push(terminal);
+        }
+        self.changes
+            .send_modify(|version| *version = version.wrapping_add(1));
+        Ok(())
     }
 
     pub fn list(&self, session: &str) -> Vec<Arc<Terminal>> {
@@ -518,6 +751,129 @@ impl Service {
                 .await?;
             let _ = self.catalog_watch.set(held);
         }
+        #[cfg(unix)]
+        if location.env.is_none()
+            && let Some(client) = self.ensure_detached_client().await
+        {
+            let service = self.clone();
+            let (cols, rows) = size;
+            let id = uuid::Uuid::new_v4().to_string();
+            let created_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let index = {
+                let terminals = lock(&service.terminals);
+                let mut index = 1;
+                while terminals.iter().any(|terminal| {
+                    let info = lock(&terminal.info);
+                    info.session_id == session && info.index == index
+                }) {
+                    index += 1;
+                }
+                index
+            };
+            let info = super::detached::DetachedTerminalInfo {
+                id: id.clone(),
+                session_id: session.clone(),
+                index,
+                title: String::new(),
+                name: name.clone(),
+                agent: agent.then_some(true),
+                cwd: location.cwd.clone(),
+                created_at,
+                cols,
+                rows,
+                exited: None,
+            };
+            let terminal = Arc::new(Terminal {
+                info: Mutex::new(Info {
+                    id: id.clone(),
+                    session_id: session.clone(),
+                    index,
+                    title: String::new(),
+                    name,
+                    agent: agent.then_some(true),
+                    location: location.clone(),
+                    cols,
+                    rows,
+                    exited: None,
+                    created_at,
+                }),
+                output: Mutex::new(Output {
+                    bytes: VecDeque::new(),
+                    end: 0,
+                    cursor: 0,
+                    latest: Instant::now(),
+                    vt: vt100::Parser::new_with_callbacks(
+                        rows,
+                        cols,
+                        SCROLLBACK,
+                        VtEvents {
+                            theme: Theme::default(),
+                            title: None,
+                            replies: Vec::new(),
+                            report_theme: false,
+                        },
+                    ),
+                }),
+                process: Mutex::new(None),
+                closed: AtomicBool::new(false),
+                changed: watch::channel(0).0,
+            });
+            let weak_out = Arc::downgrade(&terminal);
+            let changed_out = service.changes.clone();
+            let rt = tokio::runtime::Handle::current();
+            let weak_exit = Arc::downgrade(&terminal);
+            let changed_exit = service.changes.clone();
+            let process = client
+                .open(
+                    info,
+                    Some(serde_json::Map::from_iter([
+                        ("TERM".into(), json!("xterm-256color")),
+                        ("COLORTERM".into(), json!("truecolor")),
+                        ("COLORFGBG".into(), json!("15;0")),
+                    ])),
+                    Arc::new(move |bytes| {
+                        if let Some(terminal) = weak_out.upgrade() {
+                            let (title, reply) = {
+                                let mut output = lock(&terminal.output);
+                                output.append(bytes);
+                                let events = output.vt.callbacks_mut();
+                                (events.title.take(), std::mem::take(&mut events.replies))
+                            };
+                            if let Some(title) = title {
+                                lock(&terminal.info).title = title;
+                                changed_out
+                                    .send_modify(|version| *version = version.wrapping_add(1));
+                            }
+                            if !reply.is_empty() {
+                                let terminal = terminal.clone();
+                                rt.spawn(async move {
+                                    let _ = terminal.send(reply).await;
+                                });
+                            }
+                            terminal.publish();
+                        }
+                    }),
+                    Arc::new(move |exited| {
+                        if let Some(terminal) = weak_exit.upgrade() {
+                            lock(&terminal.process).take();
+                            lock(&terminal.info).exited = Some(exited);
+                            terminal.publish();
+                            changed_exit.send_modify(|version| *version = version.wrapping_add(1));
+                        }
+                    }),
+                )
+                .await?;
+            *lock(&terminal.process) = Some(Arc::new(Process::Detached(process)));
+            lock(&service.terminals).push(terminal.clone());
+            service
+                .changes
+                .send_modify(|version| *version = version.wrapping_add(1));
+            return Ok(terminal);
+        }
+
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
             let (cols, rows) = size;
@@ -649,6 +1005,15 @@ impl Service {
     }
 
     pub fn close_all(&self) {
+        #[cfg(unix)]
+        if let Ok(guard) = self.detached.try_lock()
+            && let Some(client) = guard.as_ref().cloned()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                let _ = client.close_all().await;
+            });
+        }
         for terminal in std::mem::take(&mut *lock(&self.terminals)) {
             terminal.close();
         }
@@ -771,7 +1136,18 @@ impl Service {
 
 impl Drop for Service {
     fn drop(&mut self) {
-        self.close_all();
+        // Detach without closing remote detached-host PTYs so local terminals survive server restart.
+        for terminal in std::mem::take(&mut *lock(&self.terminals)) {
+            #[cfg(unix)]
+            let is_detached = lock(&terminal.process)
+                .as_ref()
+                .is_some_and(|p| matches!(&**p, Process::Detached(_)));
+            #[cfg(not(unix))]
+            let is_detached = false;
+            if !is_detached {
+                terminal.close();
+            }
+        }
     }
 }
 
@@ -995,4 +1371,101 @@ fn plain(input: &str) -> String {
     }
     text.extend(row);
     text
+}
+
+#[cfg(all(unix, test))]
+mod tests {
+    use super::*;
+    use pi_rs_chord::host::{
+        HostOptions, Members, PluginFacet, ServeOptions, create_host, define_facet,
+    };
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn detached_terminal_rehydrates_live_pty_across_reconnect() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sock_path = dir.path().join("detached-terminals.sock");
+        let listener = UnixListener::bind(&sock_path)?;
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let server_task = tokio::spawn(super::super::detached::serve_listener(
+            listener,
+            Some(sock_path.clone()),
+            stop_rx,
+            None,
+        ));
+
+        let host = create_host(HostOptions::default())?;
+        let contract = Arc::new(crate::api::v1::p2_contracts::lookup("p2.terminal-service")?);
+        let facet = define_facet(move |facet_host| {
+            facet_host.serve(
+                contract.clone(),
+                |_, _, _| Ok(Members::new()),
+                ServeOptions::default(),
+            )
+        });
+        let _ = host
+            .load(
+                vec![PluginFacet::new("test.terminal-service", facet)],
+                &Context::background(),
+            )
+            .await?;
+
+        let client1 = super::super::detached::DetachedClient::connect_existing(&sock_path).await?;
+        let service1 = Arc::new(Service::new(host.downgrade()));
+        service1.attach_detached_client(client1).await?;
+
+        let term1 = service1
+            .open(
+                "sess-detached".into(),
+                Location {
+                    env: None,
+                    cwd: dir.path().to_string_lossy().into_owned(),
+                },
+                (80, 24),
+                Some("work".into()),
+                false,
+            )
+            .await?;
+        let term1_id = lock(&term1.info).id.clone();
+        term1
+            .send(b"printf 'DETACHED_SURVIVAL_OK\\n'\n".to_vec())
+            .await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if term1.capture(100, false).contains("DETACHED_SURVIVAL_OK") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for detached PTY output"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        drop(term1);
+        drop(service1);
+
+        let client2 = super::super::detached::DetachedClient::connect_existing(&sock_path).await?;
+        let service2 = Arc::new(Service::new(host.downgrade()));
+        service2.attach_detached_client(client2).await?;
+
+        let listed = service2.list("sess-detached");
+        assert_eq!(listed.len(), 1);
+        let rehydrated = &listed[0];
+        assert_eq!(lock(&rehydrated.info).id, term1_id);
+        assert_eq!(lock(&rehydrated.info).name.as_deref(), Some("work"));
+        assert!(lock(&rehydrated.info).exited.is_none());
+        assert!(
+            rehydrated
+                .capture(100, false)
+                .contains("DETACHED_SURVIVAL_OK")
+        );
+
+        rehydrated.close();
+        let _ = stop_tx.send(true);
+        let _ = server_task.await;
+        let _ = host.close(&Context::background()).await;
+        Ok(())
+    }
 }

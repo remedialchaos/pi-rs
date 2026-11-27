@@ -1,5 +1,10 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
+use indexmap::IndexMap;
 use pi_rs_ai::{
     Message, StringOrBlocks,
     faux::{
@@ -12,11 +17,17 @@ use pi_rs_ai::{
 use pi_rs_chord::{
     Error, Result,
     context::Context,
+    contracts::Contract,
     host::{Host, HostOptions, PluginFacet, define_facet},
+    json::JsonValue,
     node::{
         app::{FilesCaps, WorkerApp, WorkerAppOptions, start_worker_with_setup},
         workers::WorkerSession,
     },
+    remote::RemotePeer,
+    sync::SyncFuture,
+    telemetry::{Recorder, SendKind, TelemetrySender, TelemetrySink},
+    telemetry_ingest::TelemetryBatch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -116,6 +127,38 @@ pub fn worker_of(host: &Host) -> Result<Arc<WorkerProcess>> {
 struct HeldWorkerServices {
     _parent: Arc<pi_rs_chord::remote::RemotePeer>,
     _files: Arc<pi_rs_chord::node::app::Files>,
+    sender: Option<TelemetrySender>,
+}
+
+struct WorkerTelemetrySink {
+    parent: Weak<RemotePeer>,
+    contract: Arc<Contract>,
+}
+
+impl TelemetrySink for WorkerTelemetrySink {
+    fn send(&self, batch: &TelemetryBatch) -> Option<SyncFuture<()>> {
+        let parent = self.parent.upgrade()?;
+        let contract = self.contract.clone();
+        let Ok(payload) = serde_json::to_value(batch) else {
+            return None;
+        };
+        Some(Box::pin(async move {
+            let ctx = Context::background();
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                let held = parent.hold(contract, JsonValue::Object(IndexMap::new()), &ctx)?;
+                held.wait(&ctx).await?;
+                let _ = held
+                    .call("ingest", JsonValue::from_serde(payload), &ctx)
+                    .await;
+                held.release();
+                Ok::<_, Error>(())
+            })
+            .await;
+            Ok(())
+        }))
+    }
+
+    fn release(&self) {}
 }
 
 type HeldWorkerServicesSlot = Arc<std::sync::Mutex<Option<HeldWorkerServices>>>;
@@ -181,6 +224,8 @@ async fn start(
         .iter()
         .map(|s| (s.name.clone(), s.digest.clone()))
         .collect();
+    let telemetry_enabled = process.init.telemetry;
+    let session_id = id.clone();
     let opening = process.clone();
     let held_services: HeldWorkerServicesSlot = Arc::default();
     let setup_services = held_services.clone();
@@ -206,11 +251,26 @@ async fn start(
                 crate::plugins::send_file::WORKER_FILES_SERVICE,
                 &files_arc,
             )?;
+            let sender = if telemetry_enabled {
+                let scope_session = session_id.clone();
+                let recorder = Recorder::new(move || format!("worker:{scope_session}"), 10_000);
+                let contract = Arc::new(crate::plugins::telemetry::worker_ingest_contract()?);
+                let sink = Arc::new(WorkerTelemetrySink {
+                    parent: Arc::downgrade(&parent_arc),
+                    contract,
+                });
+                let sender = TelemetrySender::new(recorder, sink, SendKind::Worker);
+                let _ = sender.start_timer(Duration::from_secs(5));
+                Some(sender)
+            } else {
+                None
+            };
             *setup_services
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HeldWorkerServices {
                 _parent: parent_arc,
                 _files: files_arc,
+                sender,
             });
             Ok(())
         },
@@ -266,6 +326,16 @@ impl SessionWorker {
 
     pub async fn close(self) -> Result<()> {
         self.process.stop();
+        let sender = self
+            ._services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|s| s.sender.take());
+        if let Some(sender) = sender {
+            let _ = sender.send(true).await;
+            sender.stop();
+        }
         let host = self.app.host.close(&Context::background()).await;
         let durable = self.process.close().await;
         let store = self.app.store.database().close().await;

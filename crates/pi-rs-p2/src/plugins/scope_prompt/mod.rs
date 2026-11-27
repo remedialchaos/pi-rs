@@ -99,9 +99,36 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                     created
                 }
             };
+            let contexts =
+                crate::plugins::views::contract::get_or_install_message_contexts(&host.host())?;
+            let ctx_store = store.clone();
+            contexts.contribute(
+                "scope-prompt",
+                Arc::new(move |input, _ctx| {
+                    let ctx_store = ctx_store.clone();
+                    Box::pin(async move {
+                        let Some((block, note)) = ctx_store.get(&input.request_id) else {
+                            return Ok(None);
+                        };
+                        let drop_store = ctx_store.clone();
+                        let request_id = input.request_id.clone();
+                        Ok(Some(crate::plugins::views::contract::MessageContext {
+                            text: block,
+                            note,
+                            carried: Box::new(move |_| {
+                                Box::pin(async move {
+                                    drop_store.drop_staged(&request_id);
+                                    Ok(())
+                                })
+                            }),
+                        }))
+                    })
+                }),
+            );
             host.serve(
                 contract.clone(),
                 move |params, principal, _| {
+                    let _keep_contexts = &contexts;
                     let session = params.to_serde()?["session"]
                         .as_str()
                         .ok_or_else(|| Error::Invalid("missing session param".into()))?

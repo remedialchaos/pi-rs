@@ -2,7 +2,7 @@
 
 mod http;
 mod server;
-mod store;
+pub(crate) mod store;
 mod store_data;
 
 pub use server::PeopleUrl;

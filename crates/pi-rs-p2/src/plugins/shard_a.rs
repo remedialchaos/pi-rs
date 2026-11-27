@@ -5,9 +5,9 @@ mod conversations;
 #[path = "login/mod.rs"]
 mod login;
 #[path = "sessions/mod.rs"]
-mod sessions;
+pub(crate) mod sessions;
 #[path = "sharing/mod.rs"]
-mod sharing;
+pub(crate) mod sharing;
 
 pub use chat::{SendRouter, SendRouters};
 pub use login::{LoginResources, MODEL_RESOURCES};

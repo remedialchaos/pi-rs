@@ -22,13 +22,13 @@ const OWNER: &str = "p2.catalog";
 const WINDOW: usize = 100_000;
 
 #[derive(Clone)]
-pub(super) struct CatalogTable {
+pub(crate) struct CatalogTable {
     history: TableHistory,
     branches: JsonColumn,
 }
 
 impl CatalogTable {
-    pub(super) fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let host = HostKind::new(
             "session",
             read_params(&[("id".into(), schema::str())], "session")?,
@@ -94,6 +94,10 @@ impl CatalogTable {
             Ok(())
         })?;
         Ok(Self { history, branches })
+    }
+
+    pub(crate) fn history(&self) -> &TableHistory {
+        &self.history
     }
 
     fn session(row: &Value) -> Value {

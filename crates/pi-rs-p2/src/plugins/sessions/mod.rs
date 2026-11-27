@@ -1,4 +1,4 @@
-mod catalog;
+pub(crate) mod catalog;
 mod copy;
 mod lifecycle;
 mod preferences;
