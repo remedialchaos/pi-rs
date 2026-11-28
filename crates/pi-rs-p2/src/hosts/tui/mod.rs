@@ -1,6 +1,7 @@
 mod actions;
 mod admission;
 mod builtin_panels;
+pub mod clipboard;
 mod facets;
 mod grants;
 pub mod plugins;
@@ -13,7 +14,6 @@ mod view;
 mod when;
 
 use crate::runtime::local_owner::*;
-use base64::{Engine, engine::general_purpose::STANDARD};
 use facets::{
     ActionQueue, PanelAction, PanelRenderCtx, make_diff_overlay, make_fork_overlay,
     make_tree_overlay, push_action,
@@ -1577,10 +1577,9 @@ async fn mount(
                     }
                 }
                 PanelAction::CopyText(txt) => {
-                    if !txt.is_empty() && txt.len() <= 75_000 {
-                        let seq = format!("\x1b]52;c;{}\x1b\\", STANDARD.encode(txt.as_bytes()));
-                        client.screen.base.terminal.write(&seq);
-                    }
+                    clipboard::copy_to_clipboard(&txt, |seq| {
+                        client.screen.base.terminal.write(seq);
+                    });
                 }
                 PanelAction::CallContract {
                     contract,

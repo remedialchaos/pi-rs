@@ -791,10 +791,5 @@ fn validate_members(contract: &Contract, members: &Members) -> Result<()> {
         )
         .into());
     }
-    for (name, schema) in &variant.state {
-        let value = members.state[name].value()?.to_json();
-        crate::data::Validator::compile(&schema.schema.to_serde()?)?
-            .check(&value.to_serde()?, name)?;
-    }
     Ok(())
 }

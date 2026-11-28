@@ -89,32 +89,6 @@ pub fn is_terminal_sync_error(error: &RadiusSyncError) -> bool {
     matches!(error.status, 400 | 403 | 413) || error.code.as_deref() == Some(PROTOCOL_TOO_OLD)
 }
 
-#[derive(Deserialize)]
-struct ErrorEnvelope {
-    error: Option<ErrorDetail>,
-}
-
-#[derive(Deserialize)]
-struct ErrorDetail {
-    message: Option<String>,
-    code: Option<String>,
-    details: Option<Map<String, Value>>,
-}
-
-#[derive(Deserialize)]
-struct SessionsPage {
-    sessions: Vec<SessionPageRow>,
-    cursor: u64,
-    more: bool,
-}
-
-#[derive(Deserialize)]
-struct SessionPageRow {
-    id: String,
-    head: u64,
-    meta: Option<Map<String, Value>>,
-}
-
 pub type AccessProvider = Arc<dyn Fn() -> SyncFuture<RadiusSyncAccess> + Send + Sync>;
 
 /// HTTP adapter for Chord's session-sync remote contract over Radius's server-scoped API.
@@ -211,16 +185,13 @@ impl RadiusSyncRemote {
             return Ok(PutBatchResult::Created);
         }
         if status == 409 {
-            let envelope: ErrorEnvelope =
-                resp.json().await.unwrap_or(ErrorEnvelope { error: None });
-            let err = envelope.error;
-            let code = err.as_ref().and_then(|e| e.code.as_deref());
-            let details = err.as_ref().and_then(|e| e.details.as_ref());
+            let body = resp.json::<Value>().await.ok();
+            let err = error_of(body.as_ref());
+            let code = err.code.as_deref();
+            let details = &err.details;
             if code == Some("slot_taken")
-                && let Some(slot_to) = details.and_then(|d| d.get("to")).and_then(Value::as_u64)
-                && let Some(device) = details
-                    .and_then(|d| d.get("device"))
-                    .and_then(Value::as_str)
+                && let Some(slot_to) = details.get("to").and_then(is_seq)
+                && let Some(device) = details.get("device").and_then(Value::as_str)
             {
                 return Ok(PutBatchResult::Exists {
                     to: slot_to,
@@ -228,33 +199,30 @@ impl RadiusSyncRemote {
                 });
             }
             if code == Some("not_head")
-                && let Some(head) = details.and_then(|d| d.get("head")).and_then(Value::as_u64)
+                && let Some(head) = details.get("head").and_then(is_seq)
             {
                 return Ok(PutBatchResult::NotHead { head });
             }
             if code == Some("slot_content_mismatch")
-                && let Some(slot_to) = details.and_then(|d| d.get("to")).and_then(Value::as_u64)
+                && let Some(slot_to) = details.get("to").and_then(is_seq)
             {
                 return Ok(PutBatchResult::NotHead { head: slot_to });
             }
             if matches!(code, Some("next_id_regression" | "legacy_session_history"))
-                && let Some(head) = details.and_then(|d| d.get("head")).and_then(Value::as_u64)
+                && let Some(head) = details.get("head").and_then(is_seq)
             {
                 return Ok(PutBatchResult::NotHead { head });
             }
-            let msg = err
-                .as_ref()
-                .and_then(|e| e.message.as_deref())
-                .unwrap_or("");
-            let suffix = if msg.is_empty() {
+            let message = err.message.as_deref().unwrap_or("");
+            let suffix = if message.is_empty() {
                 String::new()
             } else {
-                format!(" {msg}")
+                format!(" {message}")
             };
             return Err(RadiusSyncError::new(
                 format!("Radius sync could not upload a batch: 409{suffix}"),
                 409,
-                err.and_then(|e| e.code),
+                err.code,
             ));
         }
         Err(response_failure(resp, "upload a batch").await)
@@ -311,9 +279,10 @@ impl RadiusSyncRemote {
         if !resp.status().is_success() {
             return Err(response_failure(resp, "list a session").await);
         }
-        resp.json::<RemoteListing>().await.map_err(|e| {
+        let body: Value = resp.json().await.map_err(|e| {
             RadiusSyncError::new(format!("Radius sync invalid listing: {e}"), 500, None)
-        })
+        })?;
+        listing_of(&body)
     }
 
     pub async fn sessions(
@@ -329,22 +298,10 @@ impl RadiusSyncRemote {
         if !resp.status().is_success() {
             return Err(response_failure(resp, "list sessions").await);
         }
-        let page: SessionsPage = resp.json().await.map_err(|e| {
+        let body: Value = resp.json().await.map_err(|e| {
             RadiusSyncError::new(format!("Radius sync invalid sessions page: {e}"), 500, None)
         })?;
-        Ok(SessionChanges {
-            sessions: page
-                .sessions
-                .into_iter()
-                .map(|row| SessionChange {
-                    id: row.id,
-                    head: row.head,
-                    meta: row.meta,
-                })
-                .collect(),
-            cursor: page.cursor.to_string(),
-            more: page.more,
-        })
+        changes_of(&body)
     }
 
     pub async fn put_meta(
@@ -392,10 +349,13 @@ impl RadiusSyncRemote {
         if !resp.status().is_success() {
             return Err(response_failure(resp, "read a session description").await);
         }
-        resp.json::<Map<String, Value>>()
-            .await
-            .map(Some)
-            .map_err(|e| RadiusSyncError::new(format!("Radius sync invalid meta: {e}"), 500, None))
+        let meta: Value = resp.json().await.map_err(|e| {
+            RadiusSyncError::new(format!("Radius sync invalid meta: {e}"), 500, None)
+        })?;
+        let Value::Object(map) = meta else {
+            return Err(malformed("read a session description"));
+        };
+        Ok(Some(map))
     }
 
     async fn fetch_body(
@@ -500,15 +460,9 @@ impl pi_rs_chord::sync::AsyncRemote for RadiusSyncRemote {
 
 async fn response_failure(resp: reqwest::Response, operation: &str) -> RadiusSyncError {
     let status = resp.status().as_u16();
-    let detail = resp
-        .json::<ErrorEnvelope>()
-        .await
-        .ok()
-        .and_then(|e| e.error);
-    let message = detail
-        .as_ref()
-        .and_then(|d| d.message.as_deref())
-        .unwrap_or("");
+    let body = resp.json::<Value>().await.ok();
+    let detail = error_of(body.as_ref());
+    let message = detail.message.as_deref().unwrap_or("");
     let suffix = if message.is_empty() {
         String::new()
     } else {
@@ -517,6 +471,130 @@ async fn response_failure(resp: reqwest::Response, operation: &str) -> RadiusSyn
     RadiusSyncError::new(
         format!("Radius sync could not {operation}: {status}{suffix}"),
         status,
-        detail.and_then(|d| d.code),
+        detail.code,
     )
+}
+
+struct ParsedError {
+    message: Option<String>,
+    code: Option<String>,
+    details: Map<String, Value>,
+}
+
+fn is_seq(value: &Value) -> Option<u64> {
+    value.as_u64()
+}
+
+fn malformed(operation: &str) -> RadiusSyncError {
+    RadiusSyncError::new(
+        format!("Radius sync could not {operation}: a malformed answer"),
+        500,
+        None,
+    )
+}
+
+fn error_of(body: Option<&Value>) -> ParsedError {
+    let Some(err) = body.and_then(|b| b.get("error")).and_then(Value::as_object) else {
+        return ParsedError {
+            message: None,
+            code: None,
+            details: Map::new(),
+        };
+    };
+    ParsedError {
+        message: err
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        code: err.get("code").and_then(Value::as_str).map(str::to_owned),
+        details: err
+            .get("details")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
+pub fn listing_of(body: &Value) -> std::result::Result<RemoteListing, RadiusSyncError> {
+    let Some(obj) = body.as_object() else {
+        return Err(malformed("list a session"));
+    };
+    let (Some(raw_batches), Some(raw_snapshots)) = (
+        obj.get("batches").and_then(Value::as_array),
+        obj.get("snapshots").and_then(Value::as_array),
+    ) else {
+        return Err(malformed("list a session"));
+    };
+    let mut batches = Vec::with_capacity(raw_batches.len());
+    for raw in raw_batches {
+        let Some(slot) = raw.as_object() else {
+            return Err(malformed("list a session"));
+        };
+        let (Some(after), Some(to), Some(device)) = (
+            slot.get("after").and_then(is_seq),
+            slot.get("to").and_then(is_seq),
+            slot.get("device").and_then(Value::as_str),
+        ) else {
+            return Err(malformed("list a session"));
+        };
+        let mut normalized = Map::new();
+        normalized.insert("after".into(), Value::from(after));
+        normalized.insert("to".into(), Value::from(to));
+        normalized.insert("device".into(), Value::from(device));
+        if slot.get("folded") == Some(&Value::Bool(true)) {
+            normalized.insert("folded".into(), Value::Bool(true));
+        }
+        if slot.get("archive") == Some(&Value::Bool(true)) {
+            normalized.insert("archive".into(), Value::Bool(true));
+        }
+        batches.push(Value::Object(normalized));
+    }
+    let mut snapshots = Vec::with_capacity(raw_snapshots.len());
+    for raw in raw_snapshots {
+        let Some(at) = is_seq(raw) else {
+            return Err(malformed("list a session"));
+        };
+        snapshots.push(Value::from(at));
+    }
+    Ok(RemoteListing { batches, snapshots })
+}
+
+pub fn changes_of(body: &Value) -> std::result::Result<SessionChanges, RadiusSyncError> {
+    let Some(obj) = body.as_object() else {
+        return Err(malformed("list sessions"));
+    };
+    let (Some(raw_sessions), Some(cursor), Some(more)) = (
+        obj.get("sessions").and_then(Value::as_array),
+        obj.get("cursor").and_then(is_seq),
+        obj.get("more").and_then(Value::as_bool),
+    ) else {
+        return Err(malformed("list sessions"));
+    };
+    let mut sessions = Vec::with_capacity(raw_sessions.len());
+    for raw in raw_sessions {
+        let Some(session) = raw.as_object() else {
+            return Err(malformed("list sessions"));
+        };
+        let (Some(id), Some(head)) = (
+            session.get("id").and_then(Value::as_str),
+            session.get("head").and_then(is_seq),
+        ) else {
+            return Err(malformed("list sessions"));
+        };
+        let meta = match session.get("meta") {
+            Some(Value::Object(map)) => Some(map.clone()),
+            Some(Value::Null) | None => None,
+            Some(_) => return Err(malformed("list sessions")),
+        };
+        sessions.push(SessionChange {
+            id: id.to_owned(),
+            head,
+            meta,
+        });
+    }
+    Ok(SessionChanges {
+        sessions,
+        cursor: cursor.to_string(),
+        more,
+    })
 }

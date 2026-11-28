@@ -1513,6 +1513,30 @@ async fn scope_prompt_send_file_files_sync_and_telemetry_behaviors() -> TestResu
         }
     );
     assert_eq!(remote.get_batch("sess-1", 99, &ctx).await?, None);
+
+    // Wire validation rejects malformed Radius listings and sessions pages.
+    assert!(
+        pi_rs_p2::plugins::sync::listing_of(
+            &json!({"batches": [{"after": "bad", "to": 1, "device": "d"}], "snapshots": []})
+        )
+        .is_err()
+    );
+    assert!(
+        pi_rs_p2::plugins::sync::listing_of(&json!({"batches": [], "snapshots": ["bad"]})).is_err()
+    );
+    assert!(
+        pi_rs_p2::plugins::sync::listing_of(&json!({"batches": [{"after": 0, "to": 1, "device": "d", "archive": true}], "snapshots": [1]})).is_ok()
+    );
+    assert!(
+        pi_rs_p2::plugins::sync::changes_of(&json!({"sessions": [{"id": "s", "head": 1, "meta": [1, 2]}], "cursor": 1, "more": false})).is_err()
+    );
+    assert!(
+        pi_rs_p2::plugins::sync::changes_of(
+            &json!({"sessions": [{"id": "s", "head": 1, "meta": null}], "cursor": 1, "more": false})
+        )
+        .is_ok()
+    );
+
     srv.abort();
 
     Ok(())

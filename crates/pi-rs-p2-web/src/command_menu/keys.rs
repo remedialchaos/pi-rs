@@ -85,6 +85,73 @@ pub fn resolve_shortcut(
     None
 }
 
+/// Modifier-only binding specification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModifierTapSpec {
+    pub id: &'static str,
+    pub primary: bool,
+    pub shift: bool,
+}
+
+/// Modifier-only bindings by id: pressed together and released with no other key or click in between.
+pub const MODIFIER_TAPS: &[ModifierTapSpec] = &[ModifierTapSpec {
+    id: "p2.sessions.next",
+    primary: true,
+    shift: true,
+}];
+
+/// Tracks modifier-only taps (e.g. `Cmd+Shift` on macOS, `Ctrl+Shift` elsewhere) while cancelling
+/// if any non-modifier key, key repeat, pointer press, or window blur occurs before release.
+#[derive(Clone, Debug)]
+pub struct ModifierTapTracker {
+    spec: ModifierTapSpec,
+    apple: bool,
+    armed: bool,
+}
+
+impl ModifierTapTracker {
+    pub fn new(tap_id: &str, apple: bool) -> Option<Self> {
+        let spec = MODIFIER_TAPS.iter().find(|s| s.id == tap_id).copied()?;
+        Some(Self {
+            spec,
+            apple,
+            armed: false,
+        })
+    }
+
+    fn is_tap_modifier(&self, key: &str) -> bool {
+        let primary_key = if self.apple { "Meta" } else { "Control" };
+        key == primary_key || key == "Shift"
+    }
+
+    pub fn on_keydown(&mut self, key: &str, mods: Modifiers, repeat: bool) {
+        let primary = if self.apple { mods.meta } else { mods.ctrl };
+        let other = if self.apple { mods.ctrl } else { mods.meta };
+        self.armed = self.is_tap_modifier(key)
+            && !repeat
+            && primary == self.spec.primary
+            && mods.shift == self.spec.shift
+            && !other
+            && !mods.alt;
+    }
+
+    pub fn on_keyup(&mut self, key: &str) -> bool {
+        if !self.armed || !self.is_tap_modifier(key) {
+            return false;
+        }
+        self.armed = false;
+        true
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +217,45 @@ mod tests {
             resolve_shortcut("Escape", Modifiers::default(), true, true, true),
             Some(ShortcutAction::CloseModal)
         );
+    }
+
+    #[test]
+    fn modifier_tap_cycles_sessions_on_clean_release_and_disarms_on_interrupts() {
+        let mut apple_tracker =
+            ModifierTapTracker::new("p2.sessions.next", true).expect("registered tap");
+        let cmd_shift = Modifiers {
+            meta: true,
+            shift: true,
+            ..Default::default()
+        };
+        apple_tracker.on_keydown("Shift", cmd_shift, false);
+        assert!(apple_tracker.is_armed());
+        assert!(apple_tracker.on_keyup("Shift"));
+        assert!(!apple_tracker.on_keyup("Meta"));
+
+        // Non-Apple uses Ctrl+Shift.
+        let mut linux_tracker =
+            ModifierTapTracker::new("p2.sessions.next", false).expect("registered tap");
+        let ctrl_shift = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        linux_tracker.on_keydown("Control", ctrl_shift, false);
+        assert!(linux_tracker.on_keyup("Control"));
+
+        // Cmd+Shift+K disarms.
+        apple_tracker.on_keydown("Shift", cmd_shift, false);
+        apple_tracker.on_keydown("k", cmd_shift, false);
+        assert!(!apple_tracker.on_keyup("Shift"));
+
+        // Key repeat disarms.
+        apple_tracker.on_keydown("Shift", cmd_shift, true);
+        assert!(!apple_tracker.on_keyup("Shift"));
+
+        // Pointer click / blur disarms.
+        apple_tracker.on_keydown("Meta", cmd_shift, false);
+        apple_tracker.disarm();
+        assert!(!apple_tracker.on_keyup("Meta"));
     }
 }

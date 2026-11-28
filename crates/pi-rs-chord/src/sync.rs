@@ -17,6 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 pub const LOG_VERSION: u32 = 2;
+pub const LOG_START: u64 = 0;
 pub const SYNC_PROTOCOL: u32 = 1;
 pub const UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub const PULL_BYTES: usize = 4 * 1024 * 1024;
@@ -161,7 +162,6 @@ pub enum PutBatchResult {
     Created,
     Exists { to: u64, device: String },
     NotHead { head: u64 },
-    StaleEpoch { epoch: u64 },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteHistory {

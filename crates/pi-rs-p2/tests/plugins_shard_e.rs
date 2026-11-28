@@ -491,3 +491,193 @@ async fn backup_worker_streams_its_store_over_the_authenticated_server_link() ->
     server.close().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn backup_store_handles_account_pause_remote_empty_and_stopped_states() -> TestResult {
+    use pi_rs_chord::{
+        Error,
+        data::ChordError,
+        sqlite::SqliteDatabase,
+        store::{ColumnRecord, ColumnType, Query, StoreEngine, TableDefinition},
+        sync::FileSystemSyncRemote,
+    };
+    use pi_rs_p2::plugins::backup::{BackupStore, paused_while_off};
+
+    let fixture = tempfile::tempdir()?;
+    let store_dir = fixture.path().join("store");
+    let first_remote_dir = fixture.path().join("remote-a");
+    let second_remote_dir = fixture.path().join("remote-b");
+    let table = TableDefinition::new(
+        "items",
+        1,
+        indexmap::IndexMap::from([("id".into(), ColumnRecord::new(ColumnType::Str))]),
+        vec!["id".into()],
+        indexmap::IndexMap::new(),
+    )?;
+    let origin =
+        StoreEngine::open(SqliteDatabase::open(":memory:", Default::default()).await?).await?;
+    origin.commit(table.declaration("app")?).await?;
+    origin
+        .commit(vec![table.put("app", json!({"id": "one"}))?])
+        .await?;
+
+    // Before any backup, paused_while_off is None.
+    assert!(paused_while_off(&store_dir).await?.is_none());
+
+    let account_name = Arc::new(std::sync::Mutex::new(Some("org-1/user-a".to_owned())));
+    let account_provider = {
+        let account_name = account_name.clone();
+        Arc::new(move || {
+            let current = account_name
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            Box::pin(async move { Ok(current) }) as pi_rs_chord::sync::SyncFuture<Option<String>>
+        })
+    };
+
+    let remote_a = Arc::new(FileSystemSyncRemote::new(&first_remote_dir));
+    let backup = BackupStore::open(
+        origin.clone(),
+        "server".into(),
+        &store_dir,
+        "radius",
+        remote_a,
+        "dev-1".into(),
+    )
+    .await?
+    .with_account(Some(account_provider.clone()));
+
+    let statuses = std::sync::Mutex::new(Vec::new());
+    let record = |s| {
+        statuses.lock().unwrap_or_else(|e| e.into_inner()).push(s);
+    };
+    let take_statuses = || -> Vec<serde_json::Value> {
+        std::mem::take(&mut *statuses.lock().unwrap_or_else(|e| e.into_inner()))
+    };
+
+    backup.run(&record).await?;
+    let recorded = take_statuses();
+    assert_eq!(
+        recorded.last().and_then(|s| s["state"].as_str()),
+        Some("synced")
+    );
+    assert_eq!(
+        recorded.last().and_then(|s| s["syncedHead"].as_u64()),
+        Some(2)
+    );
+
+    // While off, paused_while_off reports state=paused reason=off with syncedHead=2.
+    let paused = paused_while_off(&store_dir)
+        .await?
+        .ok_or("expected paused status")?;
+    assert_eq!(paused["state"], "paused");
+    assert_eq!(paused["reason"], "off");
+    assert_eq!(paused["syncedHead"], 2);
+
+    // Switching to another signed-in account pauses without uploading.
+    *account_name.lock().unwrap_or_else(|e| e.into_inner()) = Some("org-2/user-b".into());
+    origin
+        .commit(vec![table.put("app", json!({"id": "two"}))?])
+        .await?;
+    backup.run(&record).await?;
+    let recorded = take_statuses();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0]["state"], "paused");
+    assert_eq!(recorded[0]["reason"], "other_account");
+    assert_eq!(recorded[0]["syncedHead"], 2);
+
+    // Returning to the binding account recovers from an emptied remote by uploading an archive.
+    *account_name.lock().unwrap_or_else(|e| e.into_inner()) = Some("org-1/user-a".into());
+    let remote_b = Arc::new(FileSystemSyncRemote::new(&second_remote_dir));
+    let recovered = BackupStore::open(
+        origin.clone(),
+        "server".into(),
+        &store_dir,
+        "radius",
+        remote_b.clone(),
+        "dev-1".into(),
+    )
+    .await?
+    .with_account(Some(account_provider));
+    recovered.run(&record).await?;
+    let recorded = take_statuses();
+    assert_eq!(
+        recorded.last().and_then(|s| s["state"].as_str()),
+        Some("synced")
+    );
+    assert_eq!(
+        recorded.last().and_then(|s| s["syncedHead"].as_u64()),
+        Some(3)
+    );
+    let restored = BackupStore::restore(
+        remote_b,
+        "dev-1".into(),
+        "server",
+        &fixture.path().join("restored"),
+        "radius",
+        SqliteDatabase::open(":memory:", Default::default()).await?,
+    )
+    .await?;
+    assert_eq!(restored.count(Query::new("app", table)?).await?, 2);
+
+    // Terminal error puts backup into stopped/refused and prevents further retries.
+    #[derive(Clone)]
+    struct FailingRemote;
+    impl pi_rs_chord::sync::AsyncRemote for FailingRemote {
+        fn list(
+            &self,
+            _: String,
+        ) -> pi_rs_chord::sync::SyncFuture<pi_rs_chord::sync::RemoteListing> {
+            Box::pin(async { Err(ChordError::new("backup_terminal", "protocol too old").into()) })
+        }
+        fn get_batch(
+            &self,
+            _: String,
+            _: u64,
+        ) -> pi_rs_chord::sync::SyncFuture<Option<pi_rs_chord::sync::Body>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn get_snapshot(
+            &self,
+            _: String,
+            _: u64,
+        ) -> pi_rs_chord::sync::SyncFuture<Option<pi_rs_chord::sync::Body>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn put_batch(
+            &self,
+            _: String,
+            _: pi_rs_chord::sync::BatchInfo,
+            _: pi_rs_chord::sync::Body,
+        ) -> pi_rs_chord::sync::SyncFuture<pi_rs_chord::sync::PutBatchResult> {
+            Box::pin(async { Err(ChordError::new("backup_terminal", "protocol too old").into()) })
+        }
+    }
+    let refused_store = BackupStore::open(
+        origin,
+        "server".into(),
+        &store_dir,
+        "other-target",
+        Arc::new(FailingRemote),
+        "dev-1".into(),
+    )
+    .await?
+    .with_terminal(Some(Arc::new(
+        |err: &Error| matches!(err, Error::Chord(c) if c.code == "backup_terminal"),
+    )));
+    refused_store.run(&record).await?;
+    let recorded = take_statuses();
+    assert_eq!(
+        recorded.last().and_then(|s| s["state"].as_str()),
+        Some("stopped")
+    );
+    assert_eq!(
+        recorded.last().and_then(|s| s["reason"].as_str()),
+        Some("refused")
+    );
+    // Second run is a no-op once stopped.
+    refused_store.run(&record).await?;
+    assert!(take_statuses().is_empty());
+    Ok(())
+}

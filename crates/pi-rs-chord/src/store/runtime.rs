@@ -30,6 +30,30 @@ impl StoreEngine {
     pub async fn open(db: SqliteDatabase) -> Result<Self> {
         Self::open_with_batch(db, crate::state::Batch::new(|_| {})).await
     }
+    pub async fn open_with_outbox(db: SqliteDatabase, outbox: bool) -> Result<Self> {
+        let store = Self::open(db).await?;
+        store
+            .database()
+            .transaction(move |c| {
+                let meta = read_meta(c)?;
+                if outbox {
+                    if !meta.outbox {
+                        c.execute("UPDATE chord_meta SET outbox=1 WHERE singleton=1", [])?;
+                    }
+                } else {
+                    if meta.outbox {
+                        c.execute(
+                            "UPDATE chord_meta SET outbox=0, outbox_floor=? WHERE singleton=1",
+                            [meta.last_seq],
+                        )?;
+                    }
+                    c.execute("DELETE FROM chord_outbox", [])?;
+                }
+                Ok(())
+            })
+            .await?;
+        Ok(store)
+    }
     pub async fn open_with_batch(db: SqliteDatabase, batch: crate::state::Batch) -> Result<Self> {
         let meta = super::apply_store_schema(&db).await?;
         let (changed, _) = watch::channel(meta.last_seq);

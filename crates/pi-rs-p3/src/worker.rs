@@ -19,6 +19,8 @@ use pi_rs_chord::{
     host::{Host, HostOptions, PluginFacet, create_host},
     link::Link,
     remote::{LinkRole, RemoteOptions},
+    sqlite::{Options as SqliteOptions, SqliteDatabase},
+    store::StoreEngine,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -31,8 +33,9 @@ use crate::{
         worker_message, write_ipc_frame,
     },
     api::v1::session_address,
+    api::v1::worker::worker_outbox_enabled,
     app::worker_principal,
-    files::private_directory,
+    files::{private_directory, private_store},
     plugins::{runner_worker, sessions},
     principals::Principal,
     registry::WorkerRegistries,
@@ -49,6 +52,8 @@ pub enum WorkerError {
     NoStart(String),
     #[error("p3 worker: no plugin runtime: {0}")]
     Host(String),
+    #[error("p3 worker: no store: {0}")]
+    Store(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -156,6 +161,17 @@ where
     };
     let dir = PathBuf::from(dir);
     private_directory(&dir)?;
+    let store_path = dir.join("store.sqlite");
+    private_store(&store_path)?;
+    // Backup is on for this session (the backup plugin's marker): the store records an outbox,
+    // which the plugin uploads. Without the marker the outbox is off, its pending commits dropped.
+    let outbox = worker_outbox_enabled(&dir);
+    let db = SqliteDatabase::open(&store_path, SqliteOptions::default())
+        .await
+        .map_err(|error| WorkerError::Store(error.to_string()))?;
+    let store = StoreEngine::open_with_outbox(db, outbox)
+        .await
+        .map_err(|error| WorkerError::Store(error.to_string()))?;
     let (out_tx, mut out_rx) = mpsc::channel::<IpcFrame>(64);
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ToWorker>(32);
     let parent_link = IpcPipeLink::new(out_tx.clone());
@@ -195,6 +211,7 @@ where
         address: Some(pi_rs_chord::json::JsonValue::from_serde(session_address(
             &session,
         ))),
+        store: Some(store.clone()),
         ..HostOptions::default()
     })
     .map_err(|error| WorkerError::Host(error.to_string()))?;
@@ -282,6 +299,7 @@ where
     host.close(&context)
         .await
         .map_err(|error| WorkerError::Host(error.to_string()))?;
+    let _ = store.database().close().await;
     drop(out_tx);
     let _ =
         tokio::time::timeout(std::time::Duration::from_millis(FORCED_EXIT_MS), write_task).await;

@@ -123,7 +123,22 @@ pub struct RadiusBrain {
     status: watch::Sender<Status>,
     shell_page: watch::Sender<Option<String>>,
     config_lock: Mutex<()>,
+    account: Mutex<Option<(String, String)>>,
     login: LoginOptions,
+}
+
+#[derive(Deserialize)]
+struct ContextResponse {
+    actor: ContextActor,
+    organization: ContextOrganization,
+}
+#[derive(Deserialize)]
+struct ContextActor {
+    principal_id: String,
+}
+#[derive(Deserialize)]
+struct ContextOrganization {
+    id: String,
 }
 
 impl RadiusBrain {
@@ -148,6 +163,7 @@ impl RadiusBrain {
             status: watch::channel(Status::SignedOut).0,
             shell_page: watch::channel(None).0,
             config_lock: Mutex::new(()),
+            account: Mutex::new(None),
             login: LoginOptions::default(),
         })
     }
@@ -191,6 +207,50 @@ impl RadiusBrain {
             gateway: config.gateway,
             server_id: config.server_id,
         })
+    }
+
+    /// The Radius account this brain is signed in as, `<organization ID>/<principal ID>`.
+    /// Cached per access token; failed lookups are not remembered.
+    pub async fn account(&self) -> Result<String> {
+        let access = self.sync_access().await?;
+        let mut cached = self.account.lock().await;
+        if let Some((token, account)) = cached.as_ref()
+            && token == &access.token
+        {
+            return Ok(account.clone());
+        }
+        let gateway = Url::parse(&access.gateway).map_err(invalid)?;
+        let signal = self.login.signal.child_token();
+        let http = self.http.clone();
+        let token = access.token.clone();
+        let result = tokio::select! {
+            _ = signal.cancelled() => Err(Error::Closed),
+            res = async {
+                let context = http
+                    .get(gateway.join("/v1/context").map_err(invalid)?)
+                    .bearer_auth(&token)
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .send()
+                    .await
+                    .map_err(invalid)?
+                    .error_for_status()
+                    .map_err(invalid)?
+                    .json::<ContextResponse>()
+                    .await
+                    .map_err(invalid)?;
+                Ok::<String, Error>(format!("{}/{}", context.organization.id, context.actor.principal_id))
+            } => res,
+        };
+        match result {
+            Ok(account) => {
+                *cached = Some((access.token, account.clone()));
+                Ok(account)
+            }
+            Err(error) => {
+                *cached = None;
+                Err(error)
+            }
+        }
     }
 
     pub(super) fn start(self: &Arc<Self>) -> JoinHandle<()> {

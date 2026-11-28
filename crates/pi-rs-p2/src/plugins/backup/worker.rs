@@ -31,7 +31,7 @@ use crate::{
     },
 };
 
-use super::{BackupStore, Target, is_terminal};
+use super::{BackupStore, Target, is_terminal, paused_while_off};
 
 #[derive(Default)]
 struct WorkerBackup {
@@ -113,8 +113,8 @@ impl AsyncRemote for ChunkedRemote {
                 slot["archive"] = json!(true);
             }
             let begun = remote.call("begin", slot).await?;
-            if let Some(result) = begun.get("result") {
-                return parse_result(result);
+            if begun["kind"].as_str() == Some("result") {
+                return parse_result(&begun["result"]);
             }
             let upload = begun["upload"]
                 .as_str()
@@ -149,9 +149,6 @@ fn parse_result(result: &Value) -> Result<PutBatchResult> {
         }),
         Some("not_head") => Ok(PutBatchResult::NotHead {
             head: result["head"].as_u64().ok_or_else(invalid)?,
-        }),
-        Some("stale_epoch") => Ok(PutBatchResult::StaleEpoch {
-            epoch: result["epoch"].as_u64().ok_or_else(invalid)?,
         }),
         _ => Err(invalid()),
     }
@@ -202,11 +199,38 @@ pub(super) fn facet(remote: Arc<Contract>) -> Result<Facet> {
                     let remote = remote.clone();
                     let running = backup.clone();
                     Box::pin(async move {
-                        let Some(target) = Target::configured()? else {
-                            return Ok(());
-                        };
                         let process = worker_of(&host)?;
                         let session = process.init.session()?.id;
+                        let store_dir = session_directory(&process.init.data_dir, &session)?;
+                        let context = Context::background();
+                        let hold_remote = || match service_of::<RemotePeer>(&host, "p2.server-peer")
+                        {
+                            Ok(peer) => Ok(BackupReference::Remote(peer.hold(
+                                remote.clone(),
+                                json!({}).into(),
+                                &context,
+                            )?)),
+                            Err(_) => Ok::<_, Error>(BackupReference::Local(host.hold(
+                                remote.clone(),
+                                json!({}).into(),
+                                &context,
+                            )?)),
+                        };
+                        let Some(target) = Target::configured()? else {
+                            if let Some(paused) = paused_while_off(&store_dir).await?
+                                && let Ok(held) = hold_remote()
+                                && held.wait(&ctx.context).await.is_ok()
+                            {
+                                let worker_remote = ChunkedRemote {
+                                    store: format!("session-{session}"),
+                                    reference: held,
+                                };
+                                let _ = worker_remote
+                                    .call("report", json!({"status": paused}))
+                                    .await;
+                            }
+                            return Ok(());
+                        };
                         let store_name = format!("session-{session}");
                         let Some(abort) = ctx.context.abort_signal() else {
                             return Ok(());
@@ -220,19 +244,7 @@ pub(super) fn facet(remote: Arc<Contract>) -> Result<Facet> {
                                 _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                             }
                         };
-                        let context = Context::background();
-                        let held = match service_of::<RemotePeer>(&host, "p2.server-peer") {
-                            Ok(peer) => BackupReference::Remote(peer.hold(
-                                remote,
-                                json!({}).into(),
-                                &context,
-                            )?),
-                            Err(_) => BackupReference::Local(host.hold(
-                                remote,
-                                json!({}).into(),
-                                &context,
-                            )?),
-                        };
+                        let held = hold_remote()?;
                         held.wait(&ctx.context).await?;
                         let device = held.member("device")?.value()?.to_json().to_serde()?;
                         let Some(device) = device.as_str() else {
@@ -242,17 +254,30 @@ pub(super) fn facet(remote: Arc<Contract>) -> Result<Facet> {
                             store: store_name.clone(),
                             reference: held,
                         });
+                        let account_remote = remote.clone();
                         let backup = Arc::new(
                             BackupStore::open(
                                 parts.store.clone(),
                                 store_name,
-                                &session_directory(&process.init.data_dir, &session)?,
+                                &store_dir,
                                 &target.key(),
                                 remote.clone(),
                                 device.into(),
                             )
                             .await?
-                            .with_terminal(Some(Arc::new(is_terminal))),
+                            .with_terminal(Some(Arc::new(is_terminal)))
+                            .with_account(Some(Arc::new(move || {
+                                let remote = account_remote.clone();
+                                Box::pin(async move {
+                                    match remote.call("account", json!({})).await? {
+                                        Value::String(account) => Ok(Some(account)),
+                                        Value::Null => Ok(None),
+                                        _ => Err(Error::Invalid(
+                                            "Invalid backup account response".into(),
+                                        )),
+                                    }
+                                })
+                            }))),
                         );
                         let schedule = FlushScheduler::new(
                             Default::default(),

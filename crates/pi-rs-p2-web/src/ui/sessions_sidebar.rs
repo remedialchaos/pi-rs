@@ -15,6 +15,20 @@ pub struct SessionSummary {
     pub badge: Option<String>,
 }
 
+/// Returns the next visible session in sidebar order, wrapping around from the last to the first.
+pub fn next_cycle_session<'a>(
+    shown: &'a [SessionSummary],
+    active_id: Option<&str>,
+) -> Option<&'a SessionSummary> {
+    if shown.is_empty() {
+        return None;
+    }
+    let idx = active_id
+        .and_then(|id| shown.iter().position(|row| row.id == id))
+        .map_or(0, |at| (at + 1) % shown.len());
+    shown.get(idx)
+}
+
 /// `/new` screen allowing custom cwd, env, model, and title before creating a session.
 #[component]
 pub fn NewSessionView(
@@ -225,5 +239,39 @@ pub fn RichSessionsControls(
                 })
             }}
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sess(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            title: id.into(),
+            main: 1,
+            pinned: false,
+            archived: false,
+            badge: None,
+        }
+    }
+
+    #[test]
+    fn next_cycle_session_wraps_and_handles_missing_active() {
+        assert!(next_cycle_session(&[], Some("a")).is_none());
+        let list = vec![sess("a"), sess("b"), sess("c")];
+        assert_eq!(
+            next_cycle_session(&list, Some("a")).map(|s| s.id.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            next_cycle_session(&list, Some("c")).map(|s| s.id.as_str()),
+            Some("a")
+        );
+        assert_eq!(
+            next_cycle_session(&list, Some("missing")).map(|s| s.id.as_str()),
+            Some("a")
+        );
     }
 }

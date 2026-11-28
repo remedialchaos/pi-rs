@@ -4,6 +4,11 @@ use crate::browser_plugins::{
     ArtifactsView, McpServersView, ModelsView, SettingsView, SharingView, TreeView,
 };
 use crate::markdown::{render_diff_html, render_html};
+use crate::state::artifact_kinds::ArtifactTextCache;
+#[cfg(target_arch = "wasm32")]
+use crate::state::artifact_kinds::{
+    BlockSnapshot, ReadingPlace, capture_reading_place, compute_scroll_delta, is_heading_tag,
+};
 use leptos::prelude::*;
 
 /// Interactive Settings panel (`p2.settings` `update` mutations).
@@ -414,6 +419,11 @@ pub fn ArtifactsPanel(
     on_remove: Callback<String>,
 ) -> impl IntoView {
     let show_diff = RwSignal::new(false);
+    let cached_text = StoredValue::new(ArtifactTextCache::default());
+    #[cfg(target_arch = "wasm32")]
+    let reading_place = StoredValue::new(ReadingPlace::default());
+    #[cfg(target_arch = "wasm32")]
+    let md_scroller = NodeRef::<leptos::html::Div>::new();
     let selected_kind = view_state
         .selected_id
         .as_deref()
@@ -425,6 +435,12 @@ pub fn ArtifactsPanel(
         .and_then(|id| view_state.items.iter().find(|i| i.id == id))
         .map(|i| i.version)
         .unwrap_or(1);
+    if let (Some(aid), Some(fresh)) = (
+        view_state.selected_id.as_deref(),
+        view_state.selected_content.clone(),
+    ) {
+        cached_text.update_value(|cache| cache.update(aid, selected_version, fresh));
+    }
 
     view! {
         <div class="sheet" role="dialog" aria-label="Artifacts" data-testid="panel-artifacts">
@@ -450,7 +466,13 @@ pub fn ArtifactsPanel(
                 let frame_src = session_id.as_deref().map(|sid| {
                     format!("/artifact-frame?session={sid}&id={aid}&version={selected_version}")
                 });
-                let content = view_state.selected_content.clone().unwrap_or_default();
+                let content = view_state
+                    .selected_content
+                    .clone()
+                    .or_else(|| {
+                        cached_text.with_value(|c| c.visible_for(&aid).map(str::to_owned))
+                    })
+                    .unwrap_or_default();
                 view! {
                     <div class="artifact-viewer" data-testid="artifact-viewer">
                         <div class="artifact-viewer-toolbar">
@@ -473,7 +495,52 @@ pub fn ArtifactsPanel(
                                 }.into_any()
                             } else if kind == "md" {
                                 let html = render_html(&content);
-                                view! { <div class="elanor-markdown" inner_html=html></div> }.into_any()
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    let aid_effect = aid.clone();
+                                    let content_effect = content.clone();
+                                    Effect::new(move |_| {
+                                        let _ = (&aid_effect, &content_effect);
+                                        if let Some(el) = md_scroller.get() {
+                                            let elem: &web_sys::Element = &el;
+                                            let (pane_top, _) = rect_top_bottom(elem);
+                                            let cur_scroll = f64::from(elem.scroll_top());
+                                            let blocks = snapshot_markdown_blocks(elem);
+                                            let place = reading_place.get_value();
+                                            if let Some(delta) = compute_scroll_delta(&place, cur_scroll, pane_top, &blocks) {
+                                                elem.set_scroll_top((cur_scroll + delta) as i32);
+                                            }
+                                            reading_place.set_value(capture_reading_place(
+                                                f64::from(elem.scroll_top()),
+                                                pane_top,
+                                                &blocks,
+                                            ));
+                                        }
+                                    });
+                                    view! {
+                                        <div
+                                            node_ref=md_scroller
+                                            class="elanor-markdown artifact-md"
+                                            on:scroll=move |_| {
+                                                if let Some(el) = md_scroller.get() {
+                                                    let elem: &web_sys::Element = &el;
+                                                    let (pane_top, _) = rect_top_bottom(elem);
+                                                    let blocks = snapshot_markdown_blocks(elem);
+                                                    reading_place.set_value(capture_reading_place(
+                                                        f64::from(elem.scroll_top()),
+                                                        pane_top,
+                                                        &blocks,
+                                                    ));
+                                                }
+                                            }
+                                            inner_html=html
+                                        ></div>
+                                    }.into_any()
+                                }
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    view! { <div class="elanor-markdown artifact-md" inner_html=html></div> }.into_any()
+                                }
                             } else {
                                 view! { <pre class="artifact-preview">{content.clone()}</pre> }.into_any()
                             }
@@ -483,4 +550,57 @@ pub fn ArtifactsPanel(
             })}
         </div>
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rect_top_bottom(elem: &web_sys::Element) -> (f64, f64) {
+    let Ok(f) = js_sys::Reflect::get(elem, &"getBoundingClientRect".into()) else {
+        return (0.0, 0.0);
+    };
+    let Ok(func) = wasm_bindgen::JsCast::dyn_into::<js_sys::Function>(f) else {
+        return (0.0, 0.0);
+    };
+    let Ok(rect) = func.call0(elem) else {
+        return (0.0, 0.0);
+    };
+    let top = js_sys::Reflect::get(&rect, &"top".into())
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let bottom = js_sys::Reflect::get(&rect, &"bottom".into())
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    (top, bottom)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn snapshot_markdown_blocks(elem: &web_sys::Element) -> Vec<BlockSnapshot> {
+    let selector = "h1,h2,h3,h4,h5,h6,p,li,pre,blockquote,table,hr";
+    let Ok(qsa_val) = js_sys::Reflect::get(elem, &"querySelectorAll".into()) else {
+        return Vec::new();
+    };
+    let Ok(qsa_fn) = wasm_bindgen::JsCast::dyn_into::<js_sys::Function>(qsa_val) else {
+        return Vec::new();
+    };
+    let Ok(list_val) = qsa_fn.call1(elem, &selector.into()) else {
+        return Vec::new();
+    };
+    let array = js_sys::Array::from(&list_val);
+    let mut out = Vec::with_capacity(array.length() as usize);
+    for node in array.iter() {
+        if let Some(el) = wasm_bindgen::JsCast::dyn_ref::<web_sys::Element>(&node) {
+            let (top, bottom) = rect_top_bottom(el);
+            let tag = el.tag_name();
+            let _ = is_heading_tag(&tag);
+            let text = el.text_content().unwrap_or_default();
+            out.push(BlockSnapshot {
+                tag,
+                text,
+                top,
+                bottom,
+            });
+        }
+    }
+    out
 }

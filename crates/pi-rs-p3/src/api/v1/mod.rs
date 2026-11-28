@@ -9,6 +9,8 @@
 pub mod contribute;
 pub mod control;
 pub mod forward;
+pub mod server;
+pub mod worker;
 
 use indexmap::IndexMap;
 use pi_rs_chord::{

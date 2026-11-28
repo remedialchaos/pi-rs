@@ -88,13 +88,15 @@ async fn provider_credentials_are_owner_scoped_persisted_and_deleted() -> TestRe
         .call("logout", json!({"providerId":PROVIDER}).into(), &context)
         .await?;
     assert_eq!(state(&owner, "providers")?[0]["signedIn"], Value::Null);
-    owner
+    let started: Value = owner
         .call(
             "start",
             json!({"providerId":PROVIDER,"authType":"api_key"}).into(),
             &context,
         )
-        .await?;
+        .await?
+        .to_serde()?;
+    let cancel_id = started["attemptId"].clone();
     until(&owner, |state| state["prompt"]["type"] == "secret").await?;
     let service = server
         .host
@@ -106,8 +108,11 @@ async fn provider_credentials_are_owner_scoped_persisted_and_deleted() -> TestRe
         .await?;
     other.release();
     assert_eq!(state(&service, "login")?["status"], "working");
-    owner.release();
+    owner
+        .call("cancel", json!({"attemptId": cancel_id}).into(), &context)
+        .await?;
     until(&service, |state| state["status"] == "cancelled").await?;
+    owner.release();
     assert_eq!(
         tokio::fs::read(directory.path().join("device.json")).await?,
         identity
@@ -121,6 +126,145 @@ async fn provider_credentials_are_owner_scoped_persisted_and_deleted() -> TestRe
             .await?
             .is_empty()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn login_survives_short_disconnect_and_ends_after_away_timeout() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let server = start_with_away(directory.path(), Duration::from_millis(120)).await?;
+    let context = Context::background();
+    let owner = hold(&server, json!({"kind":"owner","access":"local"}), &context)?;
+    owner.wait(&context).await?;
+    let service = server
+        .host
+        .get(
+            Arc::new(lookup("p2.login-service")?),
+            json!({}).into(),
+            &context,
+        )
+        .await?;
+
+    let started: Value = owner
+        .call(
+            "start",
+            json!({"providerId":PROVIDER,"authType":"api_key"}).into(),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    let prompt = until(&owner, |state| state["prompt"]["type"] == "secret").await?;
+
+    // Dropped connection for less than away_timeout keeps the login alive on reconnect.
+    owner.release();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(state(&service, "login")?["status"], "working");
+    let reconnected = hold(&server, json!({"kind":"owner","access":"local"}), &context)?;
+    reconnected.wait(&context).await?;
+    tokio::time::sleep(Duration::from_millis(130)).await;
+    assert_eq!(state(&service, "login")?["status"], "working");
+    reconnected
+        .call(
+            "answer",
+            json!({
+                "attemptId": started["attemptId"],
+                "promptId": prompt["prompt"]["id"],
+                "value": "fixture-reconnected-key"
+            })
+            .into(),
+            &context,
+        )
+        .await?;
+    until(&reconnected, |state| state["status"] == "success").await?;
+    reconnected.release();
+
+    // Staying disconnected past away_timeout ends the login with an error.
+    let away_owner = hold(&server, json!({"kind":"owner","access":"local"}), &context)?;
+    away_owner.wait(&context).await?;
+    away_owner
+        .call(
+            "start",
+            json!({"providerId":PROVIDER,"authType":"api_key"}).into(),
+            &context,
+        )
+        .await?;
+    until(&away_owner, |state| state["prompt"]["type"] == "secret").await?;
+    away_owner.release();
+    let ended = until(&service, |state| state["status"] == "error").await?;
+    assert!(
+        ended["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no page of yours was connected")),
+        "unexpected message: {ended}"
+    );
+    service.release();
+    server.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn login_same_owner_replaces_unfinished_attempt_while_other_owner_blocked() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let server = start(directory.path()).await?;
+    let context = Context::background();
+    let owner = hold(&server, json!({"kind":"owner","access":"local"}), &context)?;
+    let other = hold(
+        &server,
+        json!({"kind":"owner","access":"device","device":"second"}),
+        &context,
+    )?;
+    owner.wait(&context).await?;
+    other.wait(&context).await?;
+
+    let first: Value = owner
+        .call(
+            "start",
+            json!({"providerId":PROVIDER,"authType":"api_key"}).into(),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    until(&owner, |state| state["prompt"]["type"] == "secret").await?;
+
+    // Different owner still cannot start while an attempt is in progress.
+    assert!(
+        other
+            .call(
+                "start",
+                json!({"providerId":PROVIDER,"authType":"api_key"}).into(),
+                &context,
+            )
+            .await
+            .is_err()
+    );
+
+    // Same owner starting again replaces their unfinished attempt cleanly.
+    let second: Value = owner
+        .call(
+            "start",
+            json!({"providerId":PROVIDER,"authType":"api_key"}).into(),
+            &context,
+        )
+        .await?
+        .to_serde()?;
+    assert_ne!(first["attemptId"], second["attemptId"]);
+    let working = until(&owner, |state| {
+        state["status"] == "working" && state["attemptId"] == second["attemptId"]
+    })
+    .await?;
+    assert_eq!(working["attemptId"], second["attemptId"]);
+
+    owner
+        .call(
+            "cancel",
+            json!({"attemptId": second["attemptId"]}).into(),
+            &context,
+        )
+        .await?;
+    until(&owner, |state| state["status"] == "cancelled").await?;
+    owner.release();
+    other.release();
+    server.close().await?;
     Ok(())
 }
 
@@ -154,10 +298,16 @@ fn hold(server: &P2Server, principal: Value, context: &Context) -> TestResult<He
 }
 
 async fn start(directory: &Path) -> TestResult<P2Server> {
+    start_with_away(directory, flow::AWAY_TIMEOUT).await
+}
+
+async fn start_with_away(directory: &Path, away_timeout: Duration) -> TestResult<P2Server> {
     let mut options = ServerOptions::new(directory.into());
     options.port = 0;
     options.fake = true;
-    super::register(&mut options.registry)?;
+    options
+        .registry
+        .register("login", FacetKind::Server, server_with_away(away_timeout)?)?;
     let directory = directory.to_owned();
     let config = Arc::new(lookup("p2.model-config")?);
     options.registry.register("test-login-models", FacetKind::Server, define_facet(move |host| {

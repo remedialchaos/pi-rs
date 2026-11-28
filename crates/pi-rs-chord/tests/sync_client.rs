@@ -249,3 +249,67 @@ async fn truncated_gzip_pull_keeps_four_mib_prefix_and_retries_remaining_commits
     target.database().close().await?;
     store.database().close().await
 }
+
+#[tokio::test]
+async fn remote_empty_reports_at_synced_and_resumes_with_archive_after_delete() -> Result<()> {
+    let first_dir = tempfile::tempdir()?;
+    let first_remote = Arc::new(FileSystemSyncRemote::new(first_dir.path()));
+    let writer_state = Arc::new(MemorySyncState::default());
+    let writer = SyncClient::new(first_remote, writer_state.clone(), "laptop");
+    let store = source().await?;
+    let table = table()?;
+    for n in 0..4 {
+        store
+            .commit(vec![
+                table.put("app", json!({"id": format!("{n:03}"), "body": "seed"}))?,
+            ])
+            .await?;
+    }
+    assert_eq!(
+        writer.upload("s", &store).await?,
+        UploadResult::Uploaded { to: 5 }
+    );
+    store
+        .commit(vec![
+            table.put("app", json!({"id": "004", "body": "next"}))?,
+        ])
+        .await?;
+
+    // Remote lost its copy while local bookmark still says syncedHead = 5.
+    let emptied_dir = tempfile::tempdir()?;
+    let emptied_remote = Arc::new(FileSystemSyncRemote::new(emptied_dir.path()));
+    let rewriter = SyncClient::new(emptied_remote.clone(), writer_state.clone(), "laptop");
+    assert_eq!(
+        rewriter.upload("s", &store).await?,
+        UploadResult::RemoteEmpty { at: 5 }
+    );
+
+    // Clearing bookmark makes the next upload send the full store as an archive.
+    writer_state.delete("s".into()).await?;
+    assert_eq!(
+        rewriter.upload("s", &store).await?,
+        UploadResult::Uploaded { to: 6 }
+    );
+    let listing = emptied_remote.list("s")?;
+    assert_eq!(listing.batches.len(), 1);
+    assert_eq!(listing.batches[0].after, sync::LOG_START);
+    assert_eq!(listing.batches[0].to, 6);
+    assert_eq!(listing.batches[0].archive, Some(true));
+
+    let reader = SyncClient::new(
+        emptied_remote,
+        Arc::new(MemorySyncState::default()),
+        "replica",
+    );
+    let restored = reader
+        .pull(
+            "s",
+            None,
+            Some(SqliteDatabase::open(":memory:", Options::default()).await?),
+        )
+        .await?;
+    assert_eq!(restored.meta().await?.last_seq, 6);
+    assert_eq!(restored.count(Query::new("app", table)?).await?, 5);
+    store.database().close().await?;
+    restored.database().close().await
+}

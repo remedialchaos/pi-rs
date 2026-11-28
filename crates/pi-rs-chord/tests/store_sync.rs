@@ -165,3 +165,117 @@ fn filesystem_remote_slots_are_single_writer_atomic_and_folded_bodies_disappear(
     assert!(remote.get_snapshot("session", 1)?.is_none());
     Ok(())
 }
+
+struct SmallChunkReader {
+    data: Vec<u8>,
+    pos: usize,
+    chunk: usize,
+}
+impl Read for SmallChunkReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.data.len() {
+            return Ok(0);
+        }
+        let n = out.len().min(self.chunk).min(self.data.len() - self.pos);
+        out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[tokio::test]
+async fn chunked_long_lines_stream_through_batch_reader_and_archive_import() -> Result<()> {
+    use indexmap::IndexMap;
+    use pi_rs_chord::store::{ColumnRecord, ColumnType, Query, StoreEngine, TableDefinition};
+
+    let big = "x".repeat(512 * 1024);
+    let commits = vec![
+        OutboxCommit {
+            seq: 1,
+            next_id: 3,
+            writes: vec![json!({"kind":"document.retire","id":2,"revision":2,"note":big})],
+        },
+        OutboxCommit {
+            seq: 2,
+            next_id: 4,
+            writes: vec![json!({"kind":"document.retire","id":3,"revision":3,"note":big})],
+        },
+    ];
+    let batch = sync::encode_batch(Vec::new(), commits.clone())?;
+    let decoded = BatchReader::new(SmallChunkReader {
+        data: batch,
+        pos: 0,
+        chunk: 64,
+    })
+    .collect::<Result<Vec<_>>>()?;
+    assert_eq!(decoded, commits);
+
+    let table = TableDefinition::new(
+        "items",
+        1,
+        IndexMap::from([
+            ("id".into(), ColumnRecord::new(ColumnType::Str)),
+            ("body".into(), ColumnRecord::new(ColumnType::Str)),
+        ]),
+        vec!["id".into()],
+        IndexMap::new(),
+    )?;
+    let source_db = SqliteDatabase::open(":memory:", Options::default()).await?;
+    let source = StoreEngine::open(source_db).await?;
+    source.commit(table.declaration("app")?).await?;
+    source
+        .commit(vec![table.put("app", json!({"id": "big", "body": big}))?])
+        .await?;
+    let (_, body) = source.export_stream().await?;
+    let archive_bytes = body.collect().await?;
+    let target_db = SqliteDatabase::open(":memory:", Options::default()).await?;
+    let restored = StoreEngine::import_reader(
+        target_db,
+        SmallChunkReader {
+            data: archive_bytes,
+            pos: 0,
+            chunk: 64,
+        },
+        true,
+    )
+    .await?;
+    assert_eq!(restored.meta().await?.last_seq, 2);
+    assert_eq!(restored.count(Query::new("app", table)?).await?, 1);
+    source.database().close().await?;
+    restored.database().close().await
+}
+
+#[tokio::test]
+async fn open_with_outbox_toggles_recording_and_drops_pending_commits_when_disabled() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("store.db");
+
+    let db = SqliteDatabase::open(&path, Options::default()).await?;
+    let store = pi_rs_chord::store::StoreEngine::open_with_outbox(db, true).await?;
+    assert!(store.meta().await?.outbox);
+    store.commit(Vec::new()).await?;
+    assert_eq!(store::read_outbox(store.database(), 0, 10).await?.len(), 1);
+    store.database().close().await?;
+
+    let db = SqliteDatabase::open(&path, Options::default()).await?;
+    let store = pi_rs_chord::store::StoreEngine::open_with_outbox(db, false).await?;
+    let meta = store.meta().await?;
+    assert!(!meta.outbox);
+    assert_eq!(meta.outbox_floor, 1);
+    assert!(
+        store::read_outbox(store.database(), 1, 10)
+            .await?
+            .is_empty()
+    );
+    store.commit(Vec::new()).await?;
+    let after = store.meta().await?;
+    assert_eq!(after.last_seq, 2);
+    assert_eq!(after.outbox_floor, 2);
+    assert!(
+        store::read_outbox(store.database(), 2, 10)
+            .await?
+            .is_empty()
+    );
+    store.database().close().await
+}

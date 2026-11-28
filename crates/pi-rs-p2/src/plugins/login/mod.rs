@@ -62,6 +62,10 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
 }
 
 fn server() -> Result<Facet> {
+    server_with_away(flow::AWAY_TIMEOUT)
+}
+
+fn server_with_away(away_timeout: std::time::Duration) -> Result<Facet> {
     let service = Arc::new(lookup("p2.login-service")?);
     let remote = Arc::new(lookup("p2.provider-login")?);
     let config = Arc::new(lookup("p2.model-config")?);
@@ -74,7 +78,9 @@ fn server() -> Result<Facet> {
                 let host = object.host().downgrade();
                 let publish = state.clone();
                 let logins = object.open(
-                    move |_| Box::pin(async move { Ok(Logins::new(host, publish)) }),
+                    move |_| {
+                        Box::pin(async move { Ok(Logins::with_away(host, publish, away_timeout)) })
+                    },
                     |logins, _| {
                         Box::pin(async move {
                             logins.close().await;
@@ -93,13 +99,13 @@ fn server() -> Result<Facet> {
                             &ctx.context,
                             move |event, _| {
                                 if let NativeWatchCall::Value { value } = event {
-                                    changed.disconnect_absent(&value);
+                                    changed.sync_presence(&value);
                                 }
                                 Ok(())
                             },
                             |_| {},
                         )?;
-                        logins.disconnect_absent(&observation.value);
+                        logins.sync_presence(&observation.value);
                         std::future::pending::<()>().await;
                         Ok(())
                     })

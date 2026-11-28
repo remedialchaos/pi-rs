@@ -15,30 +15,30 @@ use crate::browser_plugins::{
     P2_DEVICES, P2_DISCORD, P2_ENVS, P2_FAMILIAR, P2_FILE_INDEX, P2_LOG_NOTICES, P2_LOGS, P2_MCP,
     P2_MODELS, P2_PORTS, P2_PROJECTS, P2_PROMPT_RESOURCES, P2_PROVIDER_LOGIN, P2_SCOPE_STAGE,
     P2_SEARCH, P2_SENT_FILES, P2_SESSION_FILES, P2_SESSION_METRICS, P2_SESSION_STATUS, P2_SESSIONS,
-    P2_SETTINGS, P2_SHARING, P2_SIDEBAR_ROLLUPS, P2_SUBAGENTS, P2_TERMINALS, P2_TRACES, P2_TREE,
-    P2_VIEWS, P2_VOICE_MODE, P2_VOICE_SERVICE, P2_WORKSPACE, PLUGIN_RELOAD_EVENT,
-    PluginRegistryState, PortsView, ProjectedMessage, ProjectedRole, ProjectsView,
-    PromptResourcesView, RELOAD_STATE_STORAGE_KEY, ReloadSnapshot, ReloadTrigger, RollupView,
-    SearchHitView, SessionMetricsView, SessionStatusView, SettingsView, SharingView, SidePanel,
-    SubagentsView, TerminalsView, TracesView, TreeView, ViewsLayoutView, VoiceView, WorkspaceView,
-    decode_artifact_content, decode_artifacts_view, decode_chat_mode_view, decode_costs_view,
-    decode_devices_view, decode_discord_view, decode_envs_view, decode_familiar_view,
-    decode_log_notices_view, decode_login_view, decode_logs_view, decode_mcp_view,
-    decode_models_view, decode_plugin_manifest, decode_ports_view, decode_projects_view,
-    decode_prompt_resources_view, decode_reload_snapshot, decode_rollups_view,
-    decode_search_results, decode_session_metrics_view, decode_session_status_view,
-    decode_settings_view, decode_sharing_view, decode_subagents_view, decode_terminals_list,
-    decode_traces_result, decode_tree_view, decode_views_state, decode_voice_view,
-    decode_workspace_changes, detect_asset_revision_change, detect_close_reload, draft_key_for,
-    encode_release_frame, encode_reload_snapshot, format_draft_storage, hold_for_contract, indexes,
-    project_chat_transcript, restore_draft_for_conversation,
+    P2_SETTINGS, P2_SHARING, P2_SIDEBAR_ROLLUPS, P2_SUBAGENT_CONTROL, P2_SUBAGENTS, P2_TERMINALS,
+    P2_TRACES, P2_TREE, P2_VIEWS, P2_VOICE_MODE, P2_VOICE_SERVICE, P2_WORKSPACE,
+    PLUGIN_RELOAD_EVENT, PluginRegistryState, PortsView, ProjectedMessage, ProjectedRole,
+    ProjectsView, PromptResourcesView, RELOAD_STATE_STORAGE_KEY, ReloadSnapshot, ReloadTrigger,
+    RollupView, SearchHitView, SessionMetricsView, SessionStatusView, SettingsView, SharingView,
+    SidePanel, SubagentsView, TerminalsView, TracesView, TreeView, ViewsLayoutView, VoiceView,
+    WorkspaceView, decode_artifact_content, decode_artifacts_view, decode_chat_mode_view,
+    decode_costs_view, decode_devices_view, decode_discord_view, decode_envs_view,
+    decode_familiar_view, decode_log_notices_view, decode_login_view, decode_logs_view,
+    decode_mcp_view, decode_models_view, decode_plugin_manifest, decode_ports_view,
+    decode_projects_view, decode_prompt_resources_view, decode_reload_snapshot,
+    decode_rollups_view, decode_search_results, decode_session_metrics_view,
+    decode_session_status_view, decode_settings_view, decode_sharing_view, decode_subagents_view,
+    decode_terminals_list, decode_traces_result, decode_tree_view, decode_views_state,
+    decode_voice_view, decode_workspace_changes, detect_asset_revision_change, detect_close_reload,
+    draft_key_for, encode_release_frame, encode_reload_snapshot, format_draft_storage,
+    hold_for_contract, indexes, project_chat_transcript, restore_draft_for_conversation,
 };
 use crate::chord_bridge::{
     HOST_MENU_EVENT, HOST_THEME_EVENT, HostAnswer, HostMenuEvent, HtmlThemeAttributes,
     PI_HOST_HANDLER, ShellBridgeMessage, THEME_STORAGE_KEY, ThemeBridgeState, ThemePreference,
     format_document_title, is_native_host,
 };
-use crate::command_menu::keys::{Modifiers, ShortcutAction, resolve_shortcut};
+use crate::command_menu::keys::{ModifierTapTracker, Modifiers, ShortcutAction, resolve_shortcut};
 use crate::command_menu::recents::{KEY as RECENTS_STORAGE_KEY, Recents};
 use crate::cost::AssistantCost;
 use crate::gestures::drag_size::read_size;
@@ -63,7 +63,10 @@ use crate::state::navigation::{
 };
 use crate::ui::{
     app::{AppLayout, MainPane},
-    chat::{Chat, ChatMessage, MessageRole},
+    chat::{
+        Chat, ChatMessage, MessageRole, OneShotSubagentBar, SubagentChromeState,
+        SubagentOptionsButton, SubagentOptionsSheet,
+    },
     command_menu::CommandMenu,
     composer::{Composer, SelectedUploadFile},
     cost_ui::CostPanel,
@@ -76,7 +79,9 @@ use crate::ui::{
         TelemetryPanel,
     },
     session_stats::SessionStats,
-    sessions_sidebar::{ListPageView, NewSessionView, RichSessionsControls, SessionSummary},
+    sessions_sidebar::{
+        ListPageView, NewSessionView, RichSessionsControls, SessionSummary, next_cycle_session,
+    },
     terminal::{Terminal, Voice},
     views::ViewsPanel,
     workspace::WorkspacePane,
@@ -200,6 +205,7 @@ enum Command {
     SessionPin(String, bool),
     SessionRename(String, String),
     SessionArchive(String, bool),
+    SubagentArchive(u64, bool),
     SessionClone(String),
     UploadFile {
         key: String,
@@ -288,6 +294,7 @@ struct Ui {
     workspace: RwSignal<WorkspaceView>,
     views_state: RwSignal<ViewsLayoutView>,
     subagents: RwSignal<SubagentsView>,
+    subagent_sheet_open: RwSignal<bool>,
     chat_mode: RwSignal<ChatModeView>,
     familiar: RwSignal<FamiliarView>,
     prompt_res: RwSignal<PromptResourcesView>,
@@ -2668,6 +2675,20 @@ impl Link {
                 );
                 return Ok(out);
             }
+            Command::SubagentArchive(conv, archived) => {
+                if let Some((sid, _)) = self.ui.selected.get_untracked() {
+                    let h =
+                        self.hold_contract(&P2_SUBAGENT_CONTROL, false, Some(&sid), None, &mut out);
+                    self.send_plugin_call(
+                        h,
+                        extra_indexes::subagent_control::METHOD_ARCHIVE,
+                        json!({ "conversation": conv, "archived": archived }),
+                        Command::SubagentArchive(conv, archived),
+                        &mut out,
+                    );
+                }
+                return Ok(out);
+            }
             Command::SessionClone(id) => {
                 self.send_plugin_call(
                     2,
@@ -3398,6 +3419,7 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
             workspace: RwSignal::new(WorkspaceView::default()),
             views_state: RwSignal::new(ViewsLayoutView::default()),
             subagents: RwSignal::new(SubagentsView::default()),
+            subagent_sheet_open: RwSignal::new(false),
             chat_mode: RwSignal::new(ChatModeView::default()),
             familiar: RwSignal::new(FamiliarView::default()),
             prompt_res: RwSignal::new(PromptResourcesView::default()),
@@ -3596,6 +3618,12 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
             .platform()
             .map(|p| p.to_ascii_lowercase().contains("mac"))
             .unwrap_or(false);
+        let show_archived = RwSignal::new(false);
+        let tap_tracker = std::rc::Rc::new(std::cell::RefCell::new(ModifierTapTracker::new(
+            "p2.sessions.next",
+            apple,
+        )));
+        let tap_for_down = tap_tracker.clone();
         let on_keydown = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
             let mods = Modifiers {
                 meta: ev.meta_key(),
@@ -3603,6 +3631,9 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
                 alt: ev.alt_key(),
                 shift: ev.shift_key(),
             };
+            if let Some(tracker) = tap_for_down.borrow_mut().as_mut() {
+                tracker.on_keydown(&ev.key(), mods, ev.repeat());
+            }
             let modal_open = ui.command_menu_open.get_untracked()
                 || ui.panel.get_untracked().is_open()
                 || ui.custom_panel.get_untracked().is_some();
@@ -3656,9 +3687,69 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
                 }
             }
         });
-        let _ = window()
-            .add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref());
+        let _ = window().add_event_listener_with_callback_and_bool(
+            "keydown",
+            on_keydown.as_ref().unchecked_ref(),
+            true,
+        );
         on_keydown.forget();
+
+        let tap_for_up = tap_tracker.clone();
+        let on_keyup = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
+            let fired = tap_for_up
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|tracker| tracker.on_keyup(&ev.key()));
+            if !fired || ui.guest.get_untracked() {
+                return;
+            }
+            let include_archived = show_archived.get_untracked();
+            let shown: Vec<SessionSummary> = ui
+                .sessions
+                .get_untracked()
+                .into_iter()
+                .filter(|s| include_archived || !s.archived)
+                .map(|s| SessionSummary {
+                    id: s.id,
+                    title: s.title,
+                    main: s.main,
+                    pinned: s.pinned,
+                    archived: s.archived,
+                    badge: None,
+                })
+                .collect();
+            let active_id = ui.selected.get_untracked().map(|(id, _)| id);
+            if let Some(next) = next_cycle_session(&shown, active_id.as_deref()) {
+                ui.command(Command::Open(next.id.clone(), next.main));
+            }
+        });
+        let _ = window().add_event_listener_with_callback_and_bool(
+            "keyup",
+            on_keyup.as_ref().unchecked_ref(),
+            true,
+        );
+        on_keyup.forget();
+
+        let tap_for_pointer = tap_tracker.clone();
+        let on_pointerdown = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            if let Some(tracker) = tap_for_pointer.borrow_mut().as_mut() {
+                tracker.disarm();
+            }
+        });
+        let _ = window().add_event_listener_with_callback_and_bool(
+            "pointerdown",
+            on_pointerdown.as_ref().unchecked_ref(),
+            true,
+        );
+        on_pointerdown.forget();
+
+        let on_blur = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            if let Some(tracker) = tap_tracker.borrow_mut().as_mut() {
+                tracker.disarm();
+            }
+        });
+        let _ = window().add_event_listener_with_callback("blur", on_blur.as_ref().unchecked_ref());
+        on_blur.forget();
 
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(e) = run(root, ui).await {
@@ -3666,7 +3757,6 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
             }
         });
 
-        let show_archived = RwSignal::new(false);
         let sidebar = view! {
             <div class="sidebar-content">
                 <div class="sidebar-header-row">
@@ -3936,55 +4026,113 @@ pub fn mount_app() -> std::result::Result<(), JsValue> {
                                 on_refresh_changes=Callback::new(move |_| ui.command(Command::QueryWorkspace))
                             />
                         }.into_any(),
-                        MainPane::Chat => view! {
-                            <Chat messages=ui.messages />
-                            <SessionStats
-                                metrics=Signal::derive(move || ui.session_metrics.get())
-                                on_cost=Callback::new(move |_| ui.command(Command::OpenPanel(SidePanel::Cost)))
-                                on_clients=Callback::new(move |_| ui.command(Command::OpenPanel(SidePanel::Sharing)))
-                            />
-                            {move || {
-                                let att = ui.attachments.get();
-                                (!att.files.is_empty() || att.last_error.is_some()).then(|| view! {
-                                    <div class="composer-attachments" data-testid="composer-attachments">
-                                        {att.last_error.map(|err| view! {
-                                            <span class="notice error small" data-testid="attachment-error">{err}</span>
-                                        })}
-                                        {att.files.into_iter().map(|f| {
-                                            let key = f.key.clone();
-                                            let status_text = att.uploads.get(&key).map(|u| match &u.phase {
-                                                crate::state::attachments::UploadPhase::Queued => "queued".to_owned(),
-                                                crate::state::attachments::UploadPhase::Beginning => "starting...".to_owned(),
-                                                crate::state::attachments::UploadPhase::Uploading { .. } => format!("{}%", u.phase.progress_percent()),
-                                                crate::state::attachments::UploadPhase::Finishing => "finishing...".to_owned(),
-                                                crate::state::attachments::UploadPhase::Uploaded { .. } => "ready".to_owned(),
-                                                crate::state::attachments::UploadPhase::Failed(e) => format!("failed: {e}"),
-                                            });
-                                            view! {
-                                                <span class="attachment-chip" data-testid="attachment-chip">
-                                                    {f.name}
-                                                    {status_text.map(|st| view! { <span class="muted small">{format!(" ({st})")}</span> })}
-                                                    <button type="button" on:click=move |_| ui.command(Command::CancelUpload(key.clone()))>"×"</button>
-                                                </span>
-                                            }
-                                        }).collect_view()}
-                                    </div>
+                        MainPane::Chat => {
+                            let active_child = move || {
+                                let (sid, conv) = ui.selected.get()?;
+                                ui.subagents.get().children.into_iter().find(|c| {
+                                    c.session_id == sid && (c.conversation_id == conv || c.conversation_id == 1)
                                 })
-                            }}
-                            <fieldset disabled=move || !ui.write.get() || ui.busy.get()>
-                                <Composer
-                                    draft=ui.draft
-                                    clear_on_send=false
-                                    on_send=Callback::new(move |text| ui.command(Command::Send(text)))
-                                    on_attach_files=on_attach_files
-                                    can_send_empty=can_send_empty
-                                    streaming=Signal::derive(move || ui.streaming.get())
-                                    on_stop=Callback::new(move |_| ui.command(Command::Stop))
-                                    completion=ui.completion
-                                    on_choose_completion=on_choose_completion
+                            };
+                            let chrome = Signal::derive(move || {
+                                let child = active_child();
+                                let archived = child.as_ref().is_some_and(|c| c.archived);
+                                let one_shot = child.as_ref().is_some_and(|c| c.one_shot);
+                                SubagentChromeState {
+                                    is_subagent: child.is_some(),
+                                    one_shot,
+                                    can_write: ui.write.get(),
+                                    busy: ui.streaming.get() || ui.busy.get(),
+                                    archived,
+                                }
+                            });
+                            view! {
+                                {move || {
+                                    chrome.get().show_top_bar_dots().then(|| view! {
+                                        <header class="topbar">
+                                            <SubagentOptionsButton on_open=Callback::new(move |_| ui.subagent_sheet_open.set(true)) />
+                                        </header>
+                                    })
+                                }}
+                                {move || {
+                                    let c = chrome.get();
+                                    (ui.subagent_sheet_open.get() && c.show_top_bar_dots()).then(|| {
+                                        let archived = c.archived;
+                                        let conv = ui.selected.get().map(|(_, conv)| conv).unwrap_or(1);
+                                        view! {
+                                            <SubagentOptionsSheet
+                                                archived=archived
+                                                on_toggle_archive=Callback::new(move |_| {
+                                                    ui.subagent_sheet_open.set(false);
+                                                    ui.command(Command::SubagentArchive(conv, !archived));
+                                                })
+                                                on_close=Callback::new(move |_| ui.subagent_sheet_open.set(false))
+                                            />
+                                        }
+                                    })
+                                }}
+                                <Chat messages=ui.messages />
+                                <SessionStats
+                                    metrics=Signal::derive(move || ui.session_metrics.get())
+                                    on_cost=Callback::new(move |_| ui.command(Command::OpenPanel(SidePanel::Cost)))
+                                    on_clients=Callback::new(move |_| ui.command(Command::OpenPanel(SidePanel::Sharing)))
                                 />
-                            </fieldset>
-                        }.into_any(),
+                                {move || {
+                                    let c = chrome.get();
+                                    if c.show_read_only_bar() {
+                                        return view! {
+                                            <OneShotSubagentBar
+                                                can_write=c.can_write
+                                                busy=c.busy
+                                                on_stop=Callback::new(move |_| ui.command(Command::Stop))
+                                            />
+                                        }.into_any();
+                                    }
+                                    view! {
+                                        {move || {
+                                            let att = ui.attachments.get();
+                                            (!att.files.is_empty() || att.last_error.is_some()).then(|| view! {
+                                                <div class="composer-attachments" data-testid="composer-attachments">
+                                                    {att.last_error.map(|err| view! {
+                                                        <span class="notice error small" data-testid="attachment-error">{err}</span>
+                                                    })}
+                                                    {att.files.into_iter().map(|f| {
+                                                        let key = f.key.clone();
+                                                        let status_text = att.uploads.get(&key).map(|u| match &u.phase {
+                                                            crate::state::attachments::UploadPhase::Queued => "queued".to_owned(),
+                                                            crate::state::attachments::UploadPhase::Beginning => "starting...".to_owned(),
+                                                            crate::state::attachments::UploadPhase::Uploading { .. } => format!("{}%", u.phase.progress_percent()),
+                                                            crate::state::attachments::UploadPhase::Finishing => "finishing...".to_owned(),
+                                                            crate::state::attachments::UploadPhase::Uploaded { .. } => "ready".to_owned(),
+                                                            crate::state::attachments::UploadPhase::Failed(e) => format!("failed: {e}"),
+                                                        });
+                                                        view! {
+                                                            <span class="attachment-chip" data-testid="attachment-chip">
+                                                                {f.name}
+                                                                {status_text.map(|st| view! { <span class="muted small">{format!(" ({st})")}</span> })}
+                                                                <button type="button" on:click=move |_| ui.command(Command::CancelUpload(key.clone()))>"×"</button>
+                                                            </span>
+                                                        }
+                                                    }).collect_view()}
+                                                </div>
+                                            })
+                                        }}
+                                        <fieldset disabled=move || !ui.write.get() || ui.busy.get()>
+                                            <Composer
+                                                draft=ui.draft
+                                                clear_on_send=false
+                                                on_send=Callback::new(move |text| ui.command(Command::Send(text)))
+                                                on_attach_files=on_attach_files
+                                                can_send_empty=can_send_empty
+                                                streaming=Signal::derive(move || ui.streaming.get())
+                                                on_stop=Callback::new(move |_| ui.command(Command::Stop))
+                                                completion=ui.completion
+                                                on_choose_completion=on_choose_completion
+                                            />
+                                        </fieldset>
+                                    }.into_any()
+                                }}
+                            }.into_any()
+                        }
                     }
                 }}
                 {move || ui.command_menu_open.get().then(|| {
