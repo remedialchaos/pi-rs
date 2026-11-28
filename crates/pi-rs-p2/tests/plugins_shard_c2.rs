@@ -556,13 +556,44 @@ fn voice_protocol_frames_and_validation() {
 fn voice_choice_and_policy() {
     use pi_rs_p2::plugins::voice::{
         choice::{VoiceSettings, engine_label, languages_of, resolve_voice, resolved},
-        policy::{BargeInPhase, barge_in_phase},
+        policy::{AudioOutput, BargeInPhase, barge_in_phase, echo_cancellation_for},
         protocol::{DefaultVoice, LanguageInfo, TtsEngine, VoiceInfo, Voices},
     };
 
     assert_eq!(barge_in_phase(true, false), BargeInPhase::Hearing);
     assert_eq!(barge_in_phase(false, true), BargeInPhase::Speaking);
     assert_eq!(barge_in_phase(false, false), BargeInPhase::Listening);
+
+    let out = |kind: &str, id: &str, label: &str| AudioOutput {
+        kind: kind.into(),
+        device_id: id.into(),
+        label: label.into(),
+    };
+    assert!(echo_cancellation_for(&[]));
+    assert!(echo_cancellation_for(&[out(
+        "audiooutput",
+        "default",
+        "MacBook Pro Speakers"
+    )]));
+    assert!(!echo_cancellation_for(&[out(
+        "audiooutput",
+        "default",
+        "External Headphones"
+    )]));
+    assert!(!echo_cancellation_for(&[
+        out("audiooutput", "spk", "Built-in Speaker"),
+        out("audiooutput", "default", "AirPods Pro"),
+    ]));
+    assert!(!echo_cancellation_for(&[out(
+        "audiooutput",
+        "first",
+        "Kopfhörer (Bluetooth)"
+    )]));
+    assert!(echo_cancellation_for(&[out(
+        "audioinput",
+        "default",
+        "Headset Microphone"
+    )]));
 
     let config = Voices {
         engines: vec![

@@ -202,7 +202,7 @@ async fn download_attachment(
     let upload_id = begun.get("upload").and_then(Value::as_str)?.to_owned();
 
     let res: Result<()> = async {
-        let resp = ctx
+        let mut resp = ctx
             .await_with(
                 client
                     .get(&file.url)
@@ -218,28 +218,40 @@ async fn download_attachment(
                 resp.status().as_u16()
             )));
         }
-        let bytes = ctx
-            .await_with(resp.bytes())
+        let mut accumulator = ChunkedUploadBuffer::new();
+        let mut offset = 0usize;
+        while let Some(chunk) = ctx
+            .await_with(resp.chunk())
             .await
             .map_err(|e| Error::Invalid(e.to_string()))?
-            .map_err(|e| Error::Invalid(e.to_string()))?;
-        if bytes.len() as u64 > MAX_UPLOAD_BYTES {
-            return Err(Error::Invalid("Attachment too large".into()));
+            .map_err(|e| Error::Invalid(e.to_string()))?
+        {
+            for part in accumulator.push(&chunk, &mut offset)? {
+                files
+                    .call(
+                        "append",
+                        JsonValue::from_serde(json!({
+                            "upload": upload_id,
+                            "offset": part.offset,
+                            "bytes": part.bytes,
+                        })),
+                        ctx,
+                    )
+                    .await?;
+            }
         }
-        let mut offset = 0usize;
-        for chunk in bytes.chunks(FILE_CHUNK) {
+        if let Some(part) = accumulator.finish(offset)? {
             files
                 .call(
                     "append",
                     JsonValue::from_serde(json!({
                         "upload": upload_id,
-                        "offset": offset,
-                        "bytes": chunk,
+                        "offset": part.offset,
+                        "bytes": part.bytes,
                     })),
                     ctx,
                 )
                 .await?;
-            offset += chunk.len();
         }
         files
             .call(
@@ -1182,4 +1194,107 @@ pub fn worker_facet() -> Result<Facet> {
 
         Ok(())
     }))
+}
+
+struct UploadPart {
+    offset: usize,
+    bytes: Vec<u8>,
+}
+
+struct ChunkedUploadBuffer {
+    parts: Vec<Vec<u8>>,
+    size: usize,
+}
+
+impl ChunkedUploadBuffer {
+    fn new() -> Self {
+        Self {
+            parts: Vec::new(),
+            size: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8], offset: &mut usize) -> Result<Vec<UploadPart>> {
+        let mut ready = Vec::new();
+        let mut at = 0usize;
+        while at < chunk.len() {
+            let take = (chunk.len() - at).min(FILE_CHUNK - self.size);
+            self.parts.push(chunk[at..at + take].to_vec());
+            self.size += take;
+            at += take;
+            if self.size < FILE_CHUNK {
+                continue;
+            }
+            let bytes = self.drain_joined();
+            ready.push(UploadPart {
+                offset: *offset,
+                bytes,
+            });
+            *offset += FILE_CHUNK;
+            if (*offset as u64) > MAX_UPLOAD_BYTES {
+                return Err(Error::Invalid("Attachment too large".into()));
+            }
+        }
+        Ok(ready)
+    }
+
+    fn finish(mut self, offset: usize) -> Result<Option<UploadPart>> {
+        if self.size == 0 {
+            return Ok(None);
+        }
+        if (offset as u64 + self.size as u64) > MAX_UPLOAD_BYTES {
+            return Err(Error::Invalid("Attachment too large".into()));
+        }
+        let bytes = self.drain_joined();
+        Ok(Some(UploadPart { offset, bytes }))
+    }
+
+    fn drain_joined(&mut self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.size);
+        for part in self.parts.drain(..) {
+            out.extend_from_slice(&part);
+        }
+        self.size = 0;
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunked_upload_buffer_joins_once_per_file_chunk_and_rejects_oversize() -> Result<()> {
+        let mut buf = ChunkedUploadBuffer::new();
+        let mut offset = 0usize;
+        let small = vec![7u8; 1024];
+        assert!(buf.push(&small, &mut offset)?.is_empty());
+
+        let remainder = vec![9u8; FILE_CHUNK];
+        let ready = buf.push(&remainder, &mut offset)?;
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].offset, 0);
+        assert_eq!(ready[0].bytes.len(), FILE_CHUNK);
+        assert_eq!(ready[0].bytes[0], 7);
+        assert_eq!(ready[0].bytes[1024], 9);
+
+        let tail = buf
+            .finish(offset)?
+            .ok_or_else(|| Error::Invalid("expected tail".into()))?;
+        assert_eq!(tail.offset, FILE_CHUNK);
+        assert_eq!(tail.bytes.len(), 1024);
+
+        let mut oversize = ChunkedUploadBuffer::new();
+        let mut over_offset = 0usize;
+        let big = vec![1u8; FILE_CHUNK];
+        let mut rejected = false;
+        for _ in 0..=((MAX_UPLOAD_BYTES as usize / FILE_CHUNK) + 1) {
+            if oversize.push(&big, &mut over_offset).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected);
+        Ok(())
+    }
 }

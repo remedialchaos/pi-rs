@@ -143,6 +143,12 @@ impl PluginRegistry {
 
 pub mod node {
     pub use crate::runtime::host_dirs::*;
+    pub use pi_rs_chord::store::StoreEngine;
+    pub use pi_rs_chord::sync::{
+        AsyncRemote, BatchInfo, Body, FlushOptions, FlushScheduler, MemorySyncState,
+        PutBatchResult, RemoteListing, SYNC_PROTOCOL, SyncClient, SyncFuture, SyncState,
+        SyncStateStore, UploadResult,
+    };
 }
 
 pub mod server {

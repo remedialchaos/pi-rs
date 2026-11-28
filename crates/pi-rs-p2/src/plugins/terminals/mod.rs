@@ -2,6 +2,7 @@
 
 #[cfg(unix)]
 pub mod detached;
+pub mod protocol;
 mod server;
 mod service;
 mod worker;

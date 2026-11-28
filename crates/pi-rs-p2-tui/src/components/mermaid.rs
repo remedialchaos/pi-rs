@@ -36,6 +36,21 @@ enum Role {
 #[derive(Default)]
 struct Art(Vec<Vec<(Role, String)>>);
 
+enum RenderOutcome {
+    Empty,
+    Rendered(Art),
+    TooWide { needed: usize },
+}
+
+impl From<Option<Art>> for RenderOutcome {
+    fn from(value: Option<Art>) -> Self {
+        match value {
+            Some(art) => Self::Rendered(art),
+            None => Self::Empty,
+        }
+    }
+}
+
 impl Art {
     fn push(&mut self, role: Role, text: impl Into<String>) {
         self.0.push(vec![(role, text.into())]);
@@ -75,6 +90,13 @@ fn code_span(line: &str, out: &mut String) {
     let line = if line.is_empty() { "\u{a0}" } else { line };
     let delimiter = "`".repeat(line.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1);
     let _ = writeln!(out, "{delimiter} {line} {delimiter}  ");
+}
+
+fn unrendered_note(theme: &Theme, raw: &str, note: &str) -> String {
+    let mut original = raw.trim_end().to_owned();
+    original.push_str("\n\n");
+    code_span(&theme.fg("warning", note), &mut original);
+    original
 }
 
 #[derive(Clone, Copy)]
@@ -128,19 +150,17 @@ pub(super) fn transform<'a>(
     let mut list_indent = None;
     let mut replace = |span: std::ops::Range<usize>, body: &str| {
         let replacement = match render(body, width) {
-            Ok(Some(art)) if art.width() <= width => art.into_markdown(theme),
-            Err(warning) if !streaming => {
-                let mut original = text[span.clone()].trim_end().to_owned();
-                original.push_str("\n\n");
-                code_span(
-                    &theme.fg(
-                        "warning",
-                        &format!("Mermaid diagram not rendered: {warning}"),
-                    ),
-                    &mut original,
-                );
-                original
-            }
+            Ok(RenderOutcome::Rendered(art)) => art.into_markdown(theme),
+            Ok(RenderOutcome::TooWide { needed }) if !streaming => unrendered_note(
+                theme,
+                &text[span.clone()],
+                &format!("Mermaid diagram not rendered: needs {needed} columns, {width} available"),
+            ),
+            Err(warning) if !streaming => unrendered_note(
+                theme,
+                &text[span.clone()],
+                &format!("Mermaid diagram not rendered: {warning}"),
+            ),
             _ => return,
         };
         transformed.push_str(&text[copied..span.start]);
@@ -216,10 +236,10 @@ fn list_content_indent(line: &str) -> Option<usize> {
         .then_some(prefix + length + 1)
 }
 
-fn render(source: &str, width: usize) -> Result<Option<Art>, &'static str> {
+fn render(source: &str, width: usize) -> Result<RenderOutcome, &'static str> {
     // Model-generated diagrams should not induce unbounded grid allocation or parsing.
     if source.len() > 32_768 || width == 0 {
-        return Ok(None);
+        return Ok(RenderOutcome::Empty);
     }
     let mut source = source.trim_start();
     let mut title = None;
@@ -237,7 +257,7 @@ fn render(source: &str, width: usize) -> Result<Option<Art>, &'static str> {
         !line.is_empty() && !line.starts_with("%%")
     });
     let Some(header) = lines.next() else {
-        return Ok(None);
+        return Ok(RenderOutcome::Empty);
     };
     let (header, first_statement) = header.split_once(';').unwrap_or((header, ""));
     let lines = Some(first_statement)
@@ -246,7 +266,7 @@ fn render(source: &str, width: usize) -> Result<Option<Art>, &'static str> {
         .chain(lines);
     let mut parts = header.split_whitespace();
     let kind = parts.next().unwrap_or_default();
-    let mut art = match kind {
+    let mut outcome = match kind {
         "flowchart" | "graph" => {
             graph::render(parts.next(), lines, width, graph::Grammar::Flowchart)?
         }
@@ -257,15 +277,21 @@ fn render(source: &str, width: usize) -> Result<Option<Art>, &'static str> {
         "erDiagram" => graph::render(None, lines, width, graph::Grammar::Er)?,
         "sequenceDiagram" => other::sequence(lines, width)?,
         "pie" => other::pie(header, lines, width)?,
-        "mindmap" => other::mindmap(lines)?,
-        "timeline" => other::timeline(lines)?,
-        "gitGraph" => other::git_graph(lines)?,
+        "mindmap" => other::mindmap(lines)?.into(),
+        "timeline" => other::timeline(lines)?.into(),
+        "gitGraph" => other::git_graph(lines)?.into(),
         _ => return Err("unsupported diagram type"),
     };
-    if let (Some(art), Some(title)) = (&mut art, title.filter(|title| !title.is_empty())) {
-        art.0.insert(0, vec![(Role::Title, title.to_owned())]);
+    if let RenderOutcome::Rendered(art) = &mut outcome {
+        if let Some(title) = title.filter(|title| !title.is_empty()) {
+            art.0.insert(0, vec![(Role::Title, title.to_owned())]);
+        }
+        let needed = art.width();
+        if needed > width {
+            return Ok(RenderOutcome::TooWide { needed });
+        }
     }
-    Ok(art)
+    Ok(outcome)
 }
 
 pub fn mermaid_markdown_transformer(markdown: &str, context: MermaidTransformContext) -> String {
@@ -302,25 +328,68 @@ mod tests {
             .join("\n")
     }
 
+    fn rendered_art(outcome: RenderOutcome) -> Option<Art> {
+        match outcome {
+            RenderOutcome::Rendered(art) => Some(art),
+            RenderOutcome::Empty | RenderOutcome::TooWide { .. } => None,
+        }
+    }
+
     #[test]
     fn native_diagrams_preserve_meaning_and_width() -> Result<(), &'static str> {
         let flow = "flowchart LR; A[Start] --> B[Done]";
         assert_eq!(
-            render(flow, 80)?.map(plain).as_deref(),
+            rendered_art(render(flow, 80)?).map(plain).as_deref(),
             Some("┌───────┐    ┌──────┐\n│ Start ├───▶│ Done │\n└───────┘    └──────┘")
         );
-        assert!(render(flow, 8)?.is_none());
-        let tree = render("graph TD\n A --> B\n A --> C\n C --> A", 80)?
+        assert!(matches!(
+            render(flow, 8)?,
+            RenderOutcome::TooWide { needed: 21 }
+        ));
+        let tree = rendered_art(render("graph TD\n A --> B\n A --> C\n C --> A", 80)?)
             .map(plain)
             .unwrap_or_default();
         assert!(tree.contains("│ A │") && tree.contains('▼') && tree.contains('│'));
-        let sequence = render("sequenceDiagram\n Alice->>Bob: Hi\n Bob-->>Alice: Done", 80)?
-            .map(plain)
-            .unwrap_or_default();
+        let sequence = rendered_art(render(
+            "sequenceDiagram\n Alice->>Bob: Hi\n Bob-->>Alice: Done",
+            80,
+        )?)
+        .map(plain)
+        .unwrap_or_default();
         assert!(sequence.contains("│ Alice │  │ Bob │"));
         assert!(sequence.contains("├────────▶│") && sequence.contains("│◄╌╌╌╌╌╌╌╌┤"));
         assert!(render("flowchart Q\nA --> B", 80).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn oversized_mermaid_explains_needed_columns_only_after_streaming() {
+        let theme = Theme::default();
+        let md = "```mermaid\nflowchart LR\n  A[Start] --> B[Finish]\n```\n";
+        let streaming = transform(&theme, md, 8, MermaidMode::Streaming, true);
+        assert_eq!(streaming, md);
+
+        let done = transform(&theme, md, 8, MermaidMode::Streaming, false);
+        assert!(done.contains("```mermaid\nflowchart LR\n  A[Start] --> B[Finish]\n```"));
+        assert!(done.contains("Mermaid diagram not rendered: needs 23 columns, 8 available"));
+
+        // Invalid syntax keeps the warning note rather than reporting width, even when narrow.
+        let invalid =
+            "```mermaid\nflowchart Q\n  A[VeryLongNodeName] --> B[AnotherLongNodeName]\n```\n";
+        let invalid_done = transform(&theme, invalid, 8, MermaidMode::Streaming, false);
+        assert!(
+            invalid_done.contains("Mermaid diagram not rendered: unsupported flowchart direction")
+        );
+        assert!(!invalid_done.contains("columns"));
+
+        let seq = "```mermaid\nsequenceDiagram\n  Alice->>Bob: Hello\n```\n";
+        let seq_done = transform(&theme, seq, 8, MermaidMode::Final, false);
+        assert!(seq_done.contains("Mermaid diagram not rendered: needs "));
+        assert!(seq_done.contains("8 available"));
+
+        let pie = "```mermaid\npie\n  \"Alpha\" : 60\n  \"Beta\" : 40\n```\n";
+        let pie_done = transform(&theme, pie, 10, MermaidMode::Final, false);
+        assert!(pie_done.contains("Mermaid diagram not rendered: needs 24 columns, 10 available"));
     }
 
     #[test]

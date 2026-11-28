@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use pi_rs_tui::visible_width;
 
-use super::{Art, Role};
+use super::{Art, RenderOutcome, Role};
 
 #[derive(Clone, Copy)]
 pub(super) enum Grammar {
@@ -226,7 +226,7 @@ pub(super) fn render<'a>(
     lines: impl Iterator<Item = &'a str>,
     width: usize,
     grammar: Grammar,
-) -> Result<Option<Art>, &'static str> {
+) -> Result<RenderOutcome, &'static str> {
     let (horizontal, reverse) = match direction {
         None | Some("TD" | "TB") => (false, false),
         Some("BT") => (false, true),
@@ -253,16 +253,18 @@ pub(super) fn render<'a>(
         }
         graph.statement(line[start..].trim(), grammar)?;
         if graph.nodes.len() > 128 || graph.edges.len() > 256 {
-            return Ok(None);
+            return Ok(RenderOutcome::Empty);
         }
     }
     if graph.nodes.is_empty() {
-        return Ok(None);
+        return Ok(RenderOutcome::Empty);
     }
-    let Some(layout) = Layout::build(&graph, horizontal, reverse, width) else {
-        return Ok(None);
+    let layout = match Layout::build(&graph, horizontal, reverse, width) {
+        LayoutOutcome::Built(layout) => layout,
+        LayoutOutcome::TooWide(needed) => return Ok(RenderOutcome::TooWide { needed }),
+        LayoutOutcome::Empty => return Ok(RenderOutcome::Empty),
     };
-    Ok(Some(layout.draw(&graph)))
+    Ok(RenderOutcome::Rendered(layout.draw(&graph)))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -283,10 +285,19 @@ struct Layout {
     extra_lane: usize,
 }
 
+enum LayoutOutcome {
+    Built(Layout),
+    TooWide(usize),
+    Empty,
+}
+
 impl Layout {
-    fn build(graph: &Graph<'_>, horizontal: bool, reverse: bool, width: usize) -> Option<Self> {
+    fn build(graph: &Graph<'_>, horizontal: bool, reverse: bool, width: usize) -> LayoutOutcome {
         let rank = ranks(graph);
-        let mut groups = vec![Vec::new(); rank.iter().max().copied()? + 1];
+        let Some(max_rank) = rank.iter().max().copied() else {
+            return LayoutOutcome::Empty;
+        };
+        let mut groups = vec![Vec::new(); max_rank + 1];
         let mut positions = Vec::with_capacity(graph.nodes.len());
         for (index, node) in graph.nodes.values().enumerate() {
             let node_width = visible_width(node.label) + 4;
@@ -312,7 +323,9 @@ impl Layout {
                     + 3 * items.len().saturating_sub(1)
             })
             .collect();
-        let base_minor = widths.iter().max().copied()?;
+        let Some(base_minor) = widths.iter().max().copied() else {
+            return LayoutOutcome::Empty;
+        };
         let extra = graph
             .edges
             .iter()
@@ -342,10 +355,13 @@ impl Layout {
         }
         let major = axis - gap + usize::from(extra) * 2;
         let visible = if horizontal { major } else { minor };
-        if visible > width || major.saturating_mul(minor) > 200_000 {
-            return None;
+        if major.saturating_mul(minor) > 200_000 {
+            return LayoutOutcome::Empty;
         }
-        Some(Self {
+        if visible > width {
+            return LayoutOutcome::TooWide(visible);
+        }
+        LayoutOutcome::Built(Self {
             horizontal,
             reverse,
             major,

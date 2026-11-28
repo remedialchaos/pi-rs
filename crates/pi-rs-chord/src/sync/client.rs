@@ -172,6 +172,7 @@ pub struct SyncState {
 pub trait SyncStateStore: Send + Sync {
     fn get(&self, id: String) -> SyncFuture<SyncState>;
     fn set(&self, id: String, state: SyncState) -> SyncFuture<()>;
+    fn delete(&self, id: String) -> SyncFuture<()>;
 }
 #[derive(Default)]
 pub struct MemorySyncState(Mutex<std::collections::HashMap<String, SyncState>>);
@@ -193,6 +194,10 @@ impl SyncStateStore for MemorySyncState {
             .insert(id, state);
         Box::pin(async { Ok(()) })
     }
+    fn delete(&self, id: String) -> SyncFuture<()> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        Box::pin(async { Ok(()) })
+    }
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum UploadResult {
@@ -200,7 +205,7 @@ pub enum UploadResult {
     Uploaded { to: u64 },
     Behind { at: u64 },
     Diverged { at: u64 },
-    StaleEpoch { at: u64, epoch: u64 },
+    RemoteEmpty { at: u64 },
 }
 #[derive(Clone)]
 pub struct SyncClient {
@@ -209,15 +214,7 @@ pub struct SyncClient {
     pub device: String,
 }
 async fn open_target(db: SqliteDatabase) -> Result<StoreEngine> {
-    let store = StoreEngine::open(db).await?;
-    store
-        .database()
-        .call(|c| {
-            c.execute("UPDATE chord_meta SET outbox=1", [])?;
-            Ok(())
-        })
-        .await?;
-    Ok(store)
+    StoreEngine::open_with_outbox(db, true).await
 }
 impl SyncClient {
     pub fn new(
@@ -293,8 +290,8 @@ impl SyncClient {
                     to
                 }
                 PutBatchResult::Exists { to, device } if device == self.device => to,
-                PutBatchResult::StaleEpoch { epoch } => {
-                    return Ok(UploadResult::StaleEpoch { at: shared, epoch });
+                PutBatchResult::NotHead { head } if head == super::LOG_START => {
+                    return Ok(UploadResult::RemoteEmpty { at: shared });
                 }
                 _ => return Ok(UploadResult::Diverged { at: shared }),
             };

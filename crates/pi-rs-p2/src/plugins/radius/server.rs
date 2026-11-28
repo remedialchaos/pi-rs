@@ -45,6 +45,7 @@ pub struct RadiusBackupTarget(Weak<RadiusBrain>);
 
 pub struct RadiusBackup {
     pub remote: RadiusSyncRemote,
+    pub account: Arc<dyn Fn() -> pi_rs_chord::sync::SyncFuture<String> + Send + Sync>,
     pub device: String,
     pub server: String,
     pub terminal: fn(&RadiusSyncError) -> bool,
@@ -54,10 +55,11 @@ impl RadiusBackupTarget {
     pub async fn open(&self) -> Result<RadiusBackup> {
         let brain = self.0.upgrade().ok_or(Error::Closed)?;
         let access = brain.sync_access().await?;
-        let weak = self.0.clone();
+        let weak_remote = self.0.clone();
+        let weak_account = self.0.clone();
         Ok(RadiusBackup {
             remote: RadiusSyncRemote::new(Arc::new(move || {
-                let weak = weak.clone();
+                let weak = weak_remote.clone();
                 Box::pin(async move {
                     let brain = weak.upgrade().ok_or(Error::Closed)?;
                     let access = brain.sync_access().await?;
@@ -68,6 +70,13 @@ impl RadiusBackupTarget {
                     })
                 })
             })),
+            account: Arc::new(move || {
+                let weak = weak_account.clone();
+                Box::pin(async move {
+                    let brain = weak.upgrade().ok_or(Error::Closed)?;
+                    brain.account().await
+                })
+            }),
             server: format!("server-{}", access.server_id),
             device: access.server_id,
             terminal: is_terminal_sync_error,
@@ -136,6 +145,7 @@ pub(super) fn facet() -> Result<Facet> {
                     let terminal = opened.terminal;
                     Ok(crate::plugins::backup::OpenBackupTarget {
                         remote: Arc::new(opened.remote),
+                        account: Some(opened.account),
                         device: opened.device,
                         server: opened.server,
                         terminal: Some(Arc::new(move |error| {
@@ -225,6 +235,7 @@ fn members(object: &mut ObjectSelf, relay: RelayAccess) -> Result<Members> {
                                 let opened = radius_target.open().await?;
                                 Ok(crate::plugins::backup::OpenBackupTarget {
                                     remote: Arc::new(opened.remote),
+                                    account: Some(opened.account),
                                     device: opened.device,
                                     server: opened.server,
                                     terminal: None,

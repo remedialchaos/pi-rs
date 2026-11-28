@@ -6,7 +6,7 @@ use std::{
 };
 
 use pi_rs_chord::{
-    Result,
+    Error, Result,
     sqlite::SqliteDatabase,
     store::StoreEngine,
     sync::{
@@ -64,7 +64,22 @@ impl SyncStateStore for Bookmarks {
             .map_err(|error| pi_rs_chord::Error::Invalid(error.to_string()))?
         })
     }
+
+    fn delete(&self, id: String) -> SyncFuture<()> {
+        let directory = self.0.clone();
+        Box::pin(async move {
+            check_session_id(&id)?;
+            let path = directory.join(format!("{id}.json"));
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
 }
+
+pub type AccountProvider = Arc<dyn Fn() -> SyncFuture<Option<String>> + Send + Sync>;
 
 pub(super) fn atomic_write(directory: &Path, name: &str, data: &[u8]) -> Result<()> {
     std::fs::create_dir_all(directory)?;
@@ -85,6 +100,7 @@ pub struct BackupStore {
     store: StoreEngine,
     stopped: Mutex<bool>,
     terminal: Option<TerminalError>,
+    account: Option<AccountProvider>,
 }
 
 impl BackupStore {
@@ -113,12 +129,36 @@ impl BackupStore {
             store,
             stopped: Mutex::new(false),
             terminal: None,
+            account: None,
         })
     }
 
-    pub(super) fn with_terminal(mut self, terminal: Option<TerminalError>) -> Self {
+    pub fn with_terminal(mut self, terminal: Option<TerminalError>) -> Self {
         self.terminal = terminal;
         self
+    }
+
+    pub fn with_account(mut self, account: Option<AccountProvider>) -> Self {
+        self.account = account;
+        self
+    }
+
+    async fn owner(&self) -> Result<Option<String>> {
+        let path = self.bookmarks.0.join(format!("{}.account", self.name));
+        match tokio::fs::read_to_string(path).await {
+            Ok(owner) => Ok(Some(owner)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn bind_owner(&self, account: &str) -> Result<()> {
+        let directory = self.bookmarks.0.clone();
+        let file_name = format!("{}.account", self.name);
+        let bytes = account.as_bytes().to_vec();
+        tokio::task::spawn_blocking(move || atomic_write(&directory, &file_name, &bytes))
+            .await
+            .map_err(|error| Error::Invalid(error.to_string()))?
     }
 
     pub async fn run(&self, report: impl Fn(Value)) -> Result<()> {
@@ -127,14 +167,57 @@ impl BackupStore {
             return Ok(());
         }
         let head = || self.bookmarks.get(self.name.clone());
-        let result = async {
-            report(status("uploading", head().await?.synced_head, None));
-            let state = match self.sync.upload(&self.name, &self.store).await? {
-                UploadResult::Idle | UploadResult::Uploaded { .. } => "synced",
-                UploadResult::Behind { .. } => "behind",
-                UploadResult::Diverged { .. } | UploadResult::StaleEpoch { .. } => "diverged",
+        if let Some(get_account) = &self.account {
+            let current = match get_account().await {
+                Ok(account) => account,
+                Err(error) => {
+                    report(retrying_status(
+                        error.to_string(),
+                        head().await?.synced_head,
+                    ));
+                    return Err(error);
+                }
             };
-            report(status(state, head().await?.synced_head, None));
+            if let Some(current) = current {
+                match self.owner().await? {
+                    Some(owner) if owner != current => {
+                        report(paused_status("other_account", head().await?.synced_head));
+                        return Ok(());
+                    }
+                    None => self.bind_owner(&current).await?,
+                    Some(_) => {}
+                }
+            }
+        }
+        let result = async {
+            report(status("uploading", head().await?.synced_head));
+            let mut upload = self.sync.upload(&self.name, &self.store).await?;
+            if matches!(upload, UploadResult::RemoteEmpty { .. }) {
+                self.bookmarks.delete(self.name.clone()).await?;
+                upload = self.sync.upload(&self.name, &self.store).await?;
+            }
+            let synced_head = head().await?.synced_head;
+            match upload {
+                UploadResult::Idle | UploadResult::Uploaded { .. } => {
+                    report(status("synced", synced_head));
+                }
+                UploadResult::Diverged { .. } | UploadResult::RemoteEmpty { .. } => {
+                    *stopped = true;
+                    report(stopped_status(
+                        "diverged",
+                        "the backup's history is not this store's",
+                        synced_head,
+                    ));
+                }
+                UploadResult::Behind { .. } => {
+                    *stopped = true;
+                    report(stopped_status(
+                        "behind",
+                        "the store lost commits the backup holds",
+                        synced_head,
+                    ));
+                }
+            }
             Ok(())
         }
         .await;
@@ -146,15 +229,18 @@ impl BackupStore {
                     .is_some_and(|terminal| terminal(&error)) =>
             {
                 *stopped = true;
-                report(status(
-                    "error",
-                    None,
-                    Some(format!("{error} (stopped until a restart)")),
+                report(stopped_status(
+                    "refused",
+                    &error.to_string(),
+                    head().await.ok().and_then(|s| s.synced_head),
                 ));
                 Ok(())
             }
             Err(error) => {
-                report(status("error", None, Some(error.to_string())));
+                report(retrying_status(
+                    error.to_string(),
+                    head().await.ok().and_then(|s| s.synced_head),
+                ));
                 Err(error)
             }
             Ok(()) => Ok(()),
@@ -178,17 +264,76 @@ impl BackupStore {
     }
 }
 
-pub(super) fn status(state: &str, head: Option<u64>, error: Option<String>) -> Value {
-    let at = SystemTime::now()
+fn now_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64;
-    let mut status = json!({"state": state, "at": at});
+        .as_millis() as u64
+}
+
+pub(super) fn status(state: &str, head: Option<u64>) -> Value {
+    let mut status = json!({"state": state, "at": now_ms()});
     if let Some(head) = head {
         status["syncedHead"] = json!(head);
     }
-    if let Some(error) = error {
-        status["error"] = json!(error);
+    status
+}
+
+pub(super) fn retrying_status(error: String, head: Option<u64>) -> Value {
+    let mut status = json!({"state": "retrying", "error": error, "at": now_ms()});
+    if let Some(head) = head {
+        status["syncedHead"] = json!(head);
     }
     status
+}
+
+pub(super) fn paused_status(reason: &str, head: Option<u64>) -> Value {
+    let mut status = json!({"state": "paused", "reason": reason, "at": now_ms()});
+    if let Some(head) = head {
+        status["syncedHead"] = json!(head);
+    }
+    status
+}
+
+pub(super) fn stopped_status(reason: &str, error: &str, head: Option<u64>) -> Value {
+    let mut status = json!({"state": "stopped", "reason": reason, "error": error, "at": now_ms()});
+    if let Some(head) = head {
+        status["syncedHead"] = json!(head);
+    }
+    status
+}
+
+/// Returns a `paused` (`reason = "off"`) status if `directory/backup/<target>/*.json` shows a
+/// previous backup bookmark, or `None` for a store never backed up.
+pub async fn paused_while_off(directory: &Path) -> Result<Option<Value>> {
+    let root = directory.join("backup");
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut found = false;
+    let mut synced_head: Option<u64> = None;
+    while let Some(target) = entries.next_entry().await? {
+        if !target.file_type().await?.is_dir() {
+            continue;
+        }
+        let mut bookmarks = tokio::fs::read_dir(target.path()).await?;
+        while let Some(bookmark) = bookmarks.next_entry().await? {
+            if !bookmark.file_type().await?.is_file() {
+                continue;
+            }
+            if !bookmark.file_name().to_string_lossy().ends_with(".json") {
+                continue;
+            }
+            found = true;
+            let text = tokio::fs::read_to_string(bookmark.path()).await?;
+            if let Ok(parsed) = serde_json::from_str::<Bookmark>(&text)
+                && let Some(head) = parsed.synced_head
+            {
+                synced_head = Some(synced_head.map_or(head, |best| best.max(head)));
+            }
+        }
+    }
+    Ok(found.then(|| paused_status("off", synced_head)))
 }

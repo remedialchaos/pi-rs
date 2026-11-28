@@ -1,8 +1,9 @@
 //! Live WebAudio + `/voice/room` WebSocket streaming client (mic capture, VAD, TTS playback).
 
 use crate::state::voice_audio::{
-    AGENT_AUDIO, DEFAULT_PAUSE_SECS, HUMAN_RATE, RoomEvent, VadDetector, VadTransition,
-    downsample_f32_to_pcm16le, parse_room_frame, pcm16le_to_f32, voice_room_ws_url,
+    AGENT_AUDIO, AudioOutput, BargeInDetector, BargeInPhase, DEFAULT_PAUSE_SECS, HUMAN_RATE,
+    Pcm16kResampler, RoomEvent, VadDetector, VadTransition, downsample_f32_to_pcm16le,
+    echo_cancellation_for, parse_room_frame, pcm16le_to_f32, voice_room_ws_url,
 };
 use crate::ui::terminal::VoiceState;
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -81,10 +82,11 @@ pub fn start_voice_session(runtime: VoiceRuntime, session_id: String, conversati
         let audio_ctx = web_sys::AudioContext::new().ok();
         let next_play_time = Rc::new(RefCell::new(0.0f64));
         let tts_sample_rate = Rc::new(RefCell::new(24_000u32));
+        let barge_in = Rc::new(RefCell::new(BargeInDetector::default()));
 
-        // Start microphone capture via navigator.mediaDevices.getUserMedia({ audio: true }).
+        // Start microphone capture with headphone-aware echo cancellation and adaptive barge-in.
         if let Some(ref ctx) = audio_ctx {
-            start_mic_capture(ctx, runtime, tx.clone());
+            start_mic_capture(ctx, runtime, tx.clone(), barge_in.clone());
         }
 
         loop {
@@ -116,7 +118,10 @@ pub fn start_voice_session(runtime: VoiceRuntime, session_id: String, conversati
                             && frame.kind == AGENT_AUDIO
                             && let Some(ref ctx) = audio_ctx
                         {
-                            play_pcm_chunk(ctx, &frame.pcm, *tts_sample_rate.borrow(), &next_play_time);
+                            let rate = *tts_sample_rate.borrow();
+                            let samples = pcm16le_to_f32(&frame.pcm);
+                            barge_in.borrow_mut().handle_playback_audio(&samples, rate);
+                            play_pcm_chunk(ctx, &frame.pcm, rate, &next_play_time);
                         }
                     }
                     Some(Err(_)) | None => {
@@ -158,10 +163,97 @@ pub fn start_voice_session(runtime: VoiceRuntime, session_id: String, conversati
     });
 }
 
+fn mic_audio_constraints(echo_cancellation: bool) -> js_sys::Object {
+    let audio = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &audio,
+        &"echoCancellation".into(),
+        &JsValue::from_bool(echo_cancellation),
+    );
+    let _ = js_sys::Reflect::set(&audio, &"noiseSuppression".into(), &JsValue::TRUE);
+    let _ = js_sys::Reflect::set(&audio, &"autoGainControl".into(), &JsValue::FALSE);
+    let _ = js_sys::Reflect::set(&audio, &"channelCount".into(), &JsValue::from_f64(1.0));
+    audio
+}
+
+async fn echo_cancellation_wanted(media_devices: &JsValue) -> bool {
+    let Ok(enum_fn) = js_sys::Reflect::get(media_devices, &"enumerateDevices".into())
+        .and_then(|v| v.dyn_into::<js_sys::Function>())
+    else {
+        return true;
+    };
+    let Ok(promise_val) = enum_fn.call0(media_devices) else {
+        return true;
+    };
+    let Ok(promise) = promise_val.dyn_into::<js_sys::Promise>() else {
+        return true;
+    };
+    let Ok(list_val) = wasm_bindgen_futures::JsFuture::from(promise).await else {
+        return true;
+    };
+    let array = js_sys::Array::from(&list_val);
+    let mut outputs = Vec::with_capacity(array.length() as usize);
+    for item in array.iter() {
+        let kind = js_sys::Reflect::get(&item, &"kind".into())
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        let device_id = js_sys::Reflect::get(&item, &"deviceId".into())
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        let label = js_sys::Reflect::get(&item, &"label".into())
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        outputs.push(AudioOutput {
+            kind,
+            device_id,
+            label,
+        });
+    }
+    echo_cancellation_for(&outputs)
+}
+
+async fn open_mic_stream(media_devices: &JsValue, echo_cancellation: bool) -> Option<JsValue> {
+    let get_user_media = js_sys::Reflect::get(media_devices, &"getUserMedia".into())
+        .and_then(|v| v.dyn_into::<js_sys::Function>())
+        .ok()?;
+    let constraints = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &constraints,
+        &"audio".into(),
+        &mic_audio_constraints(echo_cancellation),
+    );
+    let _ = js_sys::Reflect::set(&constraints, &"video".into(), &JsValue::FALSE);
+    let promise = get_user_media
+        .call1(media_devices, &constraints)
+        .ok()?
+        .dyn_into::<js_sys::Promise>()
+        .ok()?;
+    wasm_bindgen_futures::JsFuture::from(promise).await.ok()
+}
+
+fn stop_stream_tracks(stream: &JsValue) {
+    if let Ok(get_tracks) = js_sys::Reflect::get(stream, &"getTracks".into())
+        .and_then(|v| v.dyn_into::<js_sys::Function>())
+        && let Ok(tracks) = get_tracks.call0(stream)
+    {
+        for track in js_sys::Array::from(&tracks).iter() {
+            if let Ok(stop) = js_sys::Reflect::get(&track, &"stop".into())
+                .and_then(|v| v.dyn_into::<js_sys::Function>())
+            {
+                let _ = stop.call0(&track);
+            }
+        }
+    }
+}
+
 fn start_mic_capture(
     ctx: &web_sys::AudioContext,
     runtime: VoiceRuntime,
     tx: UnboundedSender<VoiceWsAction>,
+    barge_in: Rc<RefCell<BargeInDetector>>,
 ) {
     let ctx_clone = ctx.clone();
     wasm_bindgen_futures::spawn_local(async move {
@@ -169,34 +261,25 @@ fn start_mic_capture(
         else {
             return;
         };
-        let Ok(get_user_media) = js_sys::Reflect::get(&media_devices, &"getUserMedia".into())
-            .and_then(|v| v.dyn_into::<js_sys::Function>())
-        else {
-            return;
-        };
-        let constraints = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&constraints, &"audio".into(), &JsValue::TRUE);
-        let Ok(promise_val) = get_user_media.call1(&media_devices, &constraints) else {
-            return;
-        };
-        let Ok(promise) = promise_val.dyn_into::<js_sys::Promise>() else {
-            return;
-        };
-        let Ok(stream) = wasm_bindgen_futures::JsFuture::from(promise).await else {
+        let initial_ec = echo_cancellation_wanted(&media_devices).await;
+        let Some(stream) = open_mic_stream(&media_devices, initial_ec).await else {
             return;
         };
 
         let Ok(src_fn) = js_sys::Reflect::get(&ctx_clone, &"createMediaStreamSource".into())
             .and_then(|v| v.dyn_into::<js_sys::Function>())
         else {
+            stop_stream_tracks(&stream);
             return;
         };
         let Ok(source_node) = src_fn.call1(&ctx_clone, &stream) else {
+            stop_stream_tracks(&stream);
             return;
         };
         let Ok(proc_fn) = js_sys::Reflect::get(&ctx_clone, &"createScriptProcessor".into())
             .and_then(|v| v.dyn_into::<js_sys::Function>())
         else {
+            stop_stream_tracks(&stream);
             return;
         };
         let Ok(proc_node) = proc_fn.call3(
@@ -205,14 +288,77 @@ fn start_mic_capture(
             &JsValue::from_f64(1.0),
             &JsValue::from_f64(1.0),
         ) else {
+            stop_stream_tracks(&stream);
             return;
         };
+
+        let active_ec = Rc::new(RefCell::new(initial_ec));
+        let active_stream = Rc::new(RefCell::new(stream));
+        let active_source = Rc::new(RefCell::new(source_node.clone()));
+
+        if let Ok(add_listener) = js_sys::Reflect::get(&media_devices, &"addEventListener".into())
+            .and_then(|v| v.dyn_into::<js_sys::Function>())
+        {
+            let md_clone = media_devices.clone();
+            let ctx_reopen = ctx_clone.clone();
+            let proc_reopen = proc_node.clone();
+            let active_ec_reopen = active_ec.clone();
+            let active_stream_reopen = active_stream.clone();
+            let active_source_reopen = active_source.clone();
+            let on_dev_change = Closure::<dyn FnMut()>::new(move || {
+                let md = md_clone.clone();
+                let ctx_inner = ctx_reopen.clone();
+                let proc_inner = proc_reopen.clone();
+                let ec_cell = active_ec_reopen.clone();
+                let stream_cell = active_stream_reopen.clone();
+                let source_cell = active_source_reopen.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let wanted = echo_cancellation_wanted(&md).await;
+                    if wanted == *ec_cell.borrow() {
+                        return;
+                    }
+                    let Some(new_stream) = open_mic_stream(&md, wanted).await else {
+                        return;
+                    };
+                    if let Ok(mk_src) =
+                        js_sys::Reflect::get(&ctx_inner, &"createMediaStreamSource".into())
+                            .and_then(|v| v.dyn_into::<js_sys::Function>())
+                        && let Ok(new_src) = mk_src.call1(&ctx_inner, &new_stream)
+                    {
+                        if let Ok(conn) = js_sys::Reflect::get(&new_src, &"connect".into())
+                            .and_then(|v| v.dyn_into::<js_sys::Function>())
+                        {
+                            let _ = conn.call1(&new_src, &proc_inner);
+                        }
+                        if let Ok(disc) =
+                            js_sys::Reflect::get(&source_cell.borrow(), &"disconnect".into())
+                                .and_then(|v| v.dyn_into::<js_sys::Function>())
+                        {
+                            let _ = disc.call0(&source_cell.borrow());
+                        }
+                        stop_stream_tracks(&stream_cell.borrow());
+                        *source_cell.borrow_mut() = new_src;
+                        *stream_cell.borrow_mut() = new_stream;
+                        *ec_cell.borrow_mut() = wanted;
+                    } else {
+                        stop_stream_tracks(&new_stream);
+                    }
+                });
+            });
+            let _ = add_listener.call2(
+                &media_devices,
+                &"devicechange".into(),
+                on_dev_change.as_ref().unchecked_ref(),
+            );
+            on_dev_change.forget();
+        }
 
         let sample_rate = js_sys::Reflect::get(&ctx_clone, &"sampleRate".into())
             .ok()
             .and_then(|v| v.as_f64())
             .unwrap_or(48_000.0) as u32;
         let vad = Rc::new(RefCell::new(VadDetector::default()));
+        let resampler = Rc::new(RefCell::new(Pcm16kResampler::default()));
         let vad_ref = vad.clone();
         let on_audio = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
             if runtime.muted.get_untracked() {
@@ -231,6 +377,28 @@ fn start_mic_capture(
             };
             let samples = js_sys::Float32Array::new(&ch0).to_vec();
             let frame_ms = ((samples.len() as f64 / f64::from(sample_rate.max(1))) * 1000.0) as u64;
+            let pcm_16k = resampler.borrow_mut().push(&samples, sample_rate);
+            let voice_state = runtime.state.get_untracked();
+            let phase = match voice_state {
+                VoiceState::Listening => BargeInPhase::Listening,
+                VoiceState::Processing => BargeInPhase::Thinking,
+                VoiceState::Speaking => BargeInPhase::Speaking,
+                VoiceState::Idle => BargeInPhase::Inactive,
+            };
+            let barge = barge_in.borrow_mut().observe_mic(
+                &samples,
+                sample_rate,
+                &pcm_16k,
+                phase,
+                voice_state == VoiceState::Speaking,
+            );
+            if barge.triggered {
+                let _ = tx.unbounded_send(VoiceWsAction::CancelTts);
+                if let Some(preroll) = barge.preroll {
+                    let bytes: Vec<u8> = preroll.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let _ = tx.unbounded_send(VoiceWsAction::MicPcm(bytes));
+                }
+            }
             let mut detector = vad_ref.borrow_mut();
             detector.set_silence_secs(runtime.pause_secs.get_untracked());
             match detector.process_frame(&samples, frame_ms) {

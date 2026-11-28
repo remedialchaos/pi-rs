@@ -2,7 +2,7 @@ mod backup_store;
 mod upload;
 mod worker;
 
-pub use backup_store::BackupStore;
+pub use backup_store::{BackupStore, paused_while_off};
 pub use upload::{Begun, CHUNK_BYTES, Uploads};
 
 use std::{
@@ -41,8 +41,10 @@ use crate::{
 pub const BACKUP_TARGETS: &str = "p2.backup-targets";
 pub const BACKUP_UPLOADS: &str = "p2.backup-uploads";
 const BACKUP_TERMINAL: &str = "backup_terminal";
+pub const BACKUP_OFF: &str = "backup_off";
 
 pub type TerminalError = Arc<dyn Fn(&Error) -> bool + Send + Sync>;
+pub type AccountFn = Arc<dyn Fn() -> SyncFuture<String> + Send + Sync>;
 
 fn is_terminal(error: &Error) -> bool {
     matches!(error, Error::Chord(error) if error.code == BACKUP_TERMINAL)
@@ -51,6 +53,7 @@ fn is_terminal(error: &Error) -> bool {
 #[derive(Clone)]
 pub struct OpenBackupTarget {
     pub remote: Arc<dyn AsyncRemote>,
+    pub account: Option<AccountFn>,
     pub device: String,
     pub server: String,
     pub terminal: Option<TerminalError>,
@@ -175,6 +178,7 @@ impl Target {
                 .map_err(|error| Error::Invalid(error.to_string()))??;
                 Ok(OpenBackupTarget {
                     remote: Arc::new(FileSystemSyncRemote::new(data_dir.join(path))),
+                    account: None,
                     device,
                     server: "server".into(),
                     terminal: None,
@@ -193,11 +197,26 @@ struct Reports {
 
 impl Reports {
     fn report(&self, store: &str, status: Value) -> Result<()> {
-        if let Some(state @ ("error" | "behind" | "diverged")) = status["state"].as_str() {
-            let message = status["error"]
-                .as_str()
-                .map_or_else(|| state.to_owned(), |error| format!("{state}: {error}"));
-            process_logs().append(&format!("backup:{store}"), LogLevel::Event, &message);
+        match status["state"].as_str() {
+            Some("retrying") => {
+                if let Some(error) = status["error"].as_str() {
+                    process_logs().append(
+                        &format!("backup:{store}"),
+                        LogLevel::Event,
+                        &format!("retrying: {error}"),
+                    );
+                }
+            }
+            Some("stopped") => {
+                let reason = status["reason"].as_str().unwrap_or("unknown");
+                let error = status["error"].as_str().unwrap_or("");
+                process_logs().append(
+                    &format!("backup:{store}"),
+                    LogLevel::Event,
+                    &format!("stopped ({reason}): {error}"),
+                );
+            }
+            _ => {}
         }
         let mut values = self
             .values
@@ -217,6 +236,7 @@ pub struct BackupService {
 
 struct LiveBackup {
     uploads: Uploads,
+    account: Option<AccountFn>,
     server: Arc<BackupStore>,
     scheduler: FlushScheduler,
     observer: JoinHandle<()>,
@@ -229,7 +249,7 @@ impl BackupService {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
-            .ok_or_else(|| Error::Invalid("Backup is off".into()))
+            .ok_or_else(|| ChordError::new(BACKUP_OFF, "Backup is off").into())
     }
 
     /// Flush the server store immediately.
@@ -269,7 +289,6 @@ fn put_result(result: PutBatchResult) -> Value {
             json!({"type": "exists", "to": to, "device": device})
         }
         PutBatchResult::NotHead { head } => json!({"type": "not_head", "head": head}),
-        PutBatchResult::StaleEpoch { epoch } => json!({"type": "stale_epoch", "epoch": epoch}),
     }
 }
 
@@ -305,16 +324,23 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                     let reports = statuses.clone();
                     let open_device = device.clone();
                     let close_device = device.clone();
+                    let pause_statuses = statuses.clone();
                     object.open(
                         move |ctx| {
                             Box::pin(async move {
-                                let Some(target) = Target::configured()? else {
-                                    return Ok(());
-                                };
                                 let natives = server_of(&host)?;
                                 let data = Path::new(&natives.info.data_dir);
+                                let Some(target) = Target::configured()? else {
+                                    if let Some(paused) =
+                                        paused_while_off(&server_directory(data)).await?
+                                    {
+                                        let _ = pause_statuses.report("server", paused);
+                                    }
+                                    return Ok(());
+                                };
                                 let OpenBackupTarget {
                                     remote,
+                                    account,
                                     device,
                                     server,
                                     terminal,
@@ -324,6 +350,16 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                                 let uploads = Uploads::new(remote.clone(), device.clone())
                                     .with_terminal(terminal.clone());
                                 let mut changes = natives.store().changes();
+                                let account_for_store: Option<backup_store::AccountProvider> =
+                                    account.as_ref().map(|provider| {
+                                        let provider = provider.clone();
+                                        let wrapped: backup_store::AccountProvider =
+                                            Arc::new(move || {
+                                                let provider = provider.clone();
+                                                Box::pin(async move { Ok(Some(provider().await?)) })
+                                            });
+                                        wrapped
+                                    });
                                 let server = Arc::new(
                                     BackupStore::open(
                                         natives.store().clone(),
@@ -334,7 +370,8 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                                         device.clone(),
                                     )
                                     .await?
-                                    .with_terminal(terminal),
+                                    .with_terminal(terminal)
+                                    .with_account(account_for_store),
                                 );
                                 let scheduled = server.clone();
                                 let scheduled_reports = reports.clone();
@@ -362,6 +399,7 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                                 });
                                 let live = Arc::new(LiveBackup {
                                     uploads,
+                                    account,
                                     server,
                                     scheduler,
                                     observer,
@@ -447,7 +485,7 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                         })
                     })?;
                     let store = format!("session-{session}");
-                    for name in ["begin", "append", "finish", "abort"] {
+                    for name in ["begin", "append", "finish", "abort", "account"] {
                         let service = service.clone();
                         let store = store.clone();
                         members.method(name, move |args, _| {
@@ -464,9 +502,11 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                                             .begin(&store, slot.after, slot.to, slot.archive)
                                             .await?
                                         {
-                                            Begun::Upload(upload) => json!({"upload": upload}),
+                                            Begun::Upload(upload) => {
+                                                json!({"kind": "upload", "upload": upload})
+                                            }
                                             Begun::Result(result) => {
-                                                json!({"result": put_result(result)})
+                                                json!({"kind": "result", "result": put_result(result)})
                                             }
                                         }
                                     }
@@ -481,6 +521,10 @@ pub fn register(registry: &mut PluginRegistry) -> Result<()> {
                                         let id: UploadId = serde_json::from_value(args)?;
                                         put_result(live.uploads.finish(&store, &id.upload).await?)
                                     }
+                                    "account" => match &live.account {
+                                        Some(account) => Value::String(account().await?),
+                                        None => Value::Null,
+                                    },
                                     _ => {
                                         let id: UploadId = serde_json::from_value(args)?;
                                         live.uploads.abort(&store, &id.upload).await;

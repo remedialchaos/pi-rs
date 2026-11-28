@@ -5,7 +5,10 @@ use std::{
     io::{self, ErrorKind},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -33,11 +36,22 @@ use crate::{
 
 use super::{LoginResources, MODEL_RESOURCES};
 
+/// How long an unfinished login survives its owner having no page that holds it.
+pub(super) const AWAY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy)]
+enum Ending {
+    Cancelled,
+    Away,
+    Replaced,
+}
+
 pub(super) struct Logins {
     state: Source,
     inner: Mutex<Inner>,
     host: WeakHost,
     lifetime: LoginOptions,
+    away_timeout: Duration,
     credentials_operation: tokio::sync::Mutex<()>,
 }
 
@@ -54,6 +68,8 @@ struct Attempt {
     options: LoginOptions,
     done: watch::Receiver<bool>,
     prompts: HashMap<String, PendingPrompt>,
+    ending: Option<Ending>,
+    away_timer: Option<tokio::task::JoinHandle<()>>,
 }
 
 struct PendingPrompt {
@@ -67,6 +83,7 @@ struct Interaction {
     resources: Arc<LoginResources>,
     id: String,
     options: LoginOptions,
+    deadline_expired: Arc<AtomicBool>,
 }
 
 impl Logins {
@@ -74,7 +91,7 @@ impl Logins {
         self.inner.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    pub(super) fn new(host: WeakHost, state: Source) -> Self {
+    pub(super) fn with_away(host: WeakHost, state: Source, away_timeout: Duration) -> Self {
         Self {
             host,
             state,
@@ -84,6 +101,7 @@ impl Logins {
                 login: Value::Null,
             }),
             lifetime: LoginOptions::default(),
+            away_timeout,
             credentials_operation: tokio::sync::Mutex::new(()),
         }
     }
@@ -95,7 +113,9 @@ impl Logins {
                 let owner = text(&args, "owner")?;
                 let provider = text(&args, "providerId")?;
                 let kind = serde_json::from_value(args["authType"].clone())?;
-                let id = self.start(owner, provider, kind, args["remote"] == true)?;
+                let id = self
+                    .start(owner, provider, kind, args["remote"] == true)
+                    .await?;
                 Ok(json!({"attemptId":id}))
             }
             "answer" => {
@@ -132,6 +152,7 @@ impl Logins {
                 let done = {
                     let mut inner = self.lock_inner();
                     let attempt = owned(&mut inner, &args)?;
+                    attempt.ending.get_or_insert(Ending::Cancelled);
                     attempt.options.signal.cancel();
                     attempt.done.clone()
                 };
@@ -186,23 +207,15 @@ impl Logins {
         service_of(&self.host.upgrade().ok_or(Error::Closed)?, MODEL_RESOURCES)
     }
 
-    fn start(
+    async fn start(
         self: &Arc<Self>,
         owner: &str,
         provider: &str,
         kind: AuthType,
         remote: bool,
     ) -> Result<String> {
-        let mut inner = self.lock_inner();
         if self.lifetime.signal.is_cancelled() {
             return Err(invalid("Server is shutting down"));
-        }
-        if let Some(active) = &inner.active {
-            return Err(invalid(if active.owner == owner {
-                "A provider login is already in progress; cancel it first"
-            } else {
-                "Another owner device is signing in to a provider; try again when it has finished"
-            }));
         }
         let resources = self.resources()?;
         let supported =
@@ -220,6 +233,36 @@ impl Logins {
         if !supported {
             return Err(invalid("Provider does not support this login method"));
         }
+        let replaced_done = {
+            let mut inner = self.lock_inner();
+            match &mut inner.active {
+                Some(active) if active.owner == owner => {
+                    active.ending.get_or_insert(Ending::Replaced);
+                    active.options.signal.cancel();
+                    Some(active.done.clone())
+                }
+                Some(_) => {
+                    return Err(invalid(
+                        "Another owner device is signing in to a provider; try again when it has finished",
+                    ));
+                }
+                None => None,
+            }
+        };
+        if let Some(done) = replaced_done {
+            wait(done).await;
+        }
+        let mut inner = self.lock_inner();
+        if self.lifetime.signal.is_cancelled() {
+            return Err(invalid("Server is shutting down"));
+        }
+        if let Some(active) = &inner.active {
+            return Err(invalid(if active.owner == owner {
+                "A provider login is already in progress; cancel it first"
+            } else {
+                "Another owner device is signing in to a provider; try again when it has finished"
+            }));
+        }
         let id = Uuid::new_v4().to_string();
         let (finished, done) = watch::channel(false);
         let options = LoginOptions {
@@ -233,6 +276,8 @@ impl Logins {
             options: options.clone(),
             done,
             prompts: HashMap::new(),
+            ending: None,
+            away_timer: None,
         });
         inner.owner = Some(owner.to_owned());
         inner.login = json!({
@@ -242,17 +287,21 @@ impl Logins {
             inner.active.take();
             return Err(error);
         }
+        let deadline_expired = Arc::new(AtomicBool::new(false));
         let interaction = Interaction {
             logins: self.clone(),
             resources,
             id: id.clone(),
             options: options.clone(),
+            deadline_expired: deadline_expired.clone(),
         };
         let provider = provider.to_owned();
         tokio::spawn(async move {
             let timeout = options.signal.clone();
+            let expired = deadline_expired.clone();
             let deadline = tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(600)).await;
+                expired.store(true, Ordering::Release);
                 timeout.cancel();
             });
             let outcome = interaction.run(&provider, kind).await;
@@ -264,17 +313,36 @@ impl Logins {
         Ok(id)
     }
 
-    pub(super) fn disconnect_absent(&self, references: &[Presence]) {
-        if let Some(active) = &self.lock_inner().active
-            && !references.iter().any(|entry| {
-                entry
-                    .principal
-                    .as_ref()
-                    .and_then(|principal| Principal::deserialize(principal).ok())
-                    .is_some_and(|principal| principal.key() == active.owner)
-            })
-        {
-            active.options.signal.cancel();
+    pub(super) fn sync_presence(self: &Arc<Self>, references: &[Presence]) {
+        let mut inner = self.lock_inner();
+        let Some(active) = inner.active.as_mut() else {
+            return;
+        };
+        let owner_present = references.iter().any(|entry| {
+            entry
+                .principal
+                .as_ref()
+                .and_then(|principal| Principal::deserialize(principal).ok())
+                .is_some_and(|principal| principal.key() == active.owner)
+        });
+        if owner_present {
+            if let Some(timer) = active.away_timer.take() {
+                timer.abort();
+            }
+        } else if active.away_timer.is_none() {
+            let logins = self.clone();
+            let attempt_id = active.id.clone();
+            let delay = self.away_timeout;
+            active.away_timer = Some(tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let mut inner = logins.lock_inner();
+                if let Some(active) = inner.active.as_mut()
+                    && active.id == attempt_id
+                {
+                    active.ending.get_or_insert(Ending::Away);
+                    active.options.signal.cancel();
+                }
+            }));
         }
     }
 
@@ -312,13 +380,32 @@ impl Interaction {
                 .await
         };
         if login.await.is_err() {
-            return if self.options.signal.is_cancelled() {
-                ("cancelled", Some("Login cancelled."))
-            } else {
-                (
+            let ending = self
+                .logins
+                .lock_inner()
+                .active
+                .as_ref()
+                .filter(|active| active.id == self.id)
+                .and_then(|active| active.ending);
+            return match ending {
+                Some(Ending::Cancelled) => ("cancelled", Some("Login cancelled.")),
+                Some(Ending::Replaced) => ("cancelled", Some("Replaced by a new login.")),
+                Some(Ending::Away) => (
+                    "error",
+                    Some(
+                        "Login ended: no page of yours was connected for too long. Start it again.",
+                    ),
+                ),
+                None if self.logins.lifetime.signal.is_cancelled() => {
+                    ("cancelled", Some("Login cancelled: the server stopped."))
+                }
+                None if self.deadline_expired.load(Ordering::Acquire) => {
+                    ("error", Some("Login expired. Start it again."))
+                }
+                None => (
                     "error",
                     Some("Provider login failed. Check the provider configuration and try again."),
-                )
+                ),
             };
         }
         if (self.resources.publish)().await.is_err() {
@@ -338,12 +425,16 @@ impl Interaction {
 
     fn finish(&self, (status, message): (&str, Option<&str>)) {
         let mut inner = self.logins.lock_inner();
-        if inner
+        if let Some(mut active) = inner
             .active
             .as_ref()
             .is_some_and(|active| active.id == self.id)
+            .then(|| inner.active.take())
+            .flatten()
         {
-            inner.active.take();
+            if let Some(timer) = active.away_timer.take() {
+                timer.abort();
+            }
             inner.login["status"] = json!(status);
             inner.login["prompt"] = Value::Null;
             if let Some(message) = message {

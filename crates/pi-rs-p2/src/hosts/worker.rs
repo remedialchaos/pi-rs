@@ -9,7 +9,7 @@ use pi_rs_ai::{
     Message, StringOrBlocks,
     faux::{
         FauxModelDefinition, FauxOptions, FauxStep, faux_assistant_message, faux_provider,
-        faux_text,
+        faux_text, faux_tool_call,
     },
     registry::Models,
     transcript::input_text,
@@ -372,17 +372,69 @@ pub(crate) fn fake_models() -> Models {
                         _ => None,
                     })
                     .unwrap_or_default();
-                let response = text
-                    .strip_prefix("json ")
-                    .map_or_else(|| format!("Echo: {text}"), str::to_owned);
+                let step = if let Some(raw_args) = text.strip_prefix("send_file ")
+                    && let Ok(args) = serde_json::from_str::<pi_rs_ai::types::JsonObject>(raw_args)
+                {
+                    FauxStep::from(faux_assistant_message(vec![faux_tool_call(
+                        "send_file",
+                        args,
+                        None,
+                    )]))
+                } else {
+                    let response = text
+                        .strip_prefix("json ")
+                        .map_or_else(|| format!("Echo: {text}"), str::to_owned);
+                    FauxStep::from(faux_assistant_message(vec![faux_text(response)]))
+                };
                 let _guard = queue.lock().unwrap_or_else(|err| err.into_inner());
-                faux.append_responses([FauxStep::from(faux_assistant_message(vec![faux_text(
-                    response,
-                )]))]);
+                faux.append_responses([step]);
                 chat(model, context, options, simple)
             }));
         }
         models.set_provider(provider);
     }
     models
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake_models;
+    use pi_rs_ai::{
+        AssistantContent, Context, Message, StreamOptions, StringOrBlocks,
+        transcript::normalize_context,
+        types::{UserMessage, UserRole},
+    };
+
+    #[tokio::test]
+    async fn fake_models_emit_send_file_tool_call_when_prompt_requests_it()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let models = fake_models();
+        let model = models
+            .get_model("faux", "faux-1")
+            .ok_or("missing faux-1 model")?;
+        let provider = models.get_provider("faux").ok_or("missing faux provider")?;
+        let chat = provider.chat.ok_or("missing chat handler")?;
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                role: UserRole::User,
+                content: StringOrBlocks::String(r#"send_file {"path":"shot.png"}"#.into()),
+                timestamp: 0,
+            })],
+            tools: None,
+        };
+        let stream = chat(
+            model,
+            normalize_context(ctx),
+            StreamOptions::default(),
+            false,
+        );
+        let msg = stream.result().await?;
+        assert!(matches!(
+            msg.content.as_slice(),
+            [AssistantContent::ToolCall(call)] if call.name == "send_file"
+                && call.arguments.get("path").and_then(|v| v.as_str()) == Some("shot.png")
+        ));
+        Ok(())
+    }
 }

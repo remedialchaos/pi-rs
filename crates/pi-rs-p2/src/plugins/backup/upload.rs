@@ -278,5 +278,5 @@ impl Uploads {
 }
 
 fn no_upload() -> Error {
-    Error::Invalid("No such upload".into())
+    ChordError::invalid("args", "backup: no such upload", None).into()
 }

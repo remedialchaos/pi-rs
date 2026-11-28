@@ -117,6 +117,79 @@ pub fn Results(results: Vec<ToolResult>) -> impl IntoView {
     }
 }
 
+/// Preview kind for downloadable/sent files rendered in [`FileCard`].
+pub fn file_preview_kind(filename: &str) -> Option<&'static str> {
+    let ext = filename.rsplit('.').next()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "svg" => Some("image"),
+        "mp4" | "webm" | "mov" | "m4v" => Some("video"),
+        _ => None,
+    }
+}
+
+/// Sent or artifact file card: shows a fixed-height media thumbnail when previewable,
+/// with the file row opening the viewer and the bordered button downloading the file.
+#[component]
+pub fn FileCard(
+    title: String,
+    meta: String,
+    href: String,
+    download: String,
+    #[prop(optional)] thumbnail: Option<String>,
+    on_open: Callback<()>,
+) -> impl IntoView {
+    let media = thumbnail
+        .as_deref()
+        .and_then(|_| file_preview_kind(&download));
+    let thumb_url = thumbnail.unwrap_or_default();
+    let open_thumb = on_open;
+    let open_main = on_open;
+    let title_label = format!("Open {title}");
+    let download_label = format!("Download {title}");
+    view! {
+        <div class="file-card" data-testid="file-card">
+            {media.map(|kind| {
+                let src = if kind == "video" {
+                    format!("{thumb_url}#t=0.1")
+                } else {
+                    thumb_url.clone()
+                };
+                view! {
+                    <button
+                        type="button"
+                        class="file-card-thumbnail"
+                        tabindex="-1"
+                        aria-hidden="true"
+                        on:click=move |_| open_thumb.run(())
+                    >
+                        {if kind == "image" {
+                            view! { <img src=src.clone() alt="" decoding="async" loading="lazy" /> }.into_any()
+                        } else {
+                            view! { <video src=src.clone() muted=true playsinline=true preload="metadata" /> }.into_any()
+                        }}
+                    </button>
+                }
+            })}
+            <div class="file-card-row">
+                <button
+                    type="button"
+                    class="file-card-main"
+                    aria-label=title_label
+                    on:click=move |_| open_main.run(())
+                >
+                    <span class="file-card-text">
+                        <strong>{title}</strong>
+                        <small>{meta}</small>
+                    </span>
+                </button>
+                <a class="file-card-download" href=href download=download aria-label=download_label>
+                    "Download"
+                </a>
+            </div>
+        </div>
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +199,16 @@ mod tests {
         assert_eq!(state_label(StepStatus::Running), "running");
         assert_eq!(state_label(StepStatus::Done), "done");
         assert_eq!(state_label(StepStatus::Error), "error");
+    }
+
+    #[test]
+    fn file_preview_and_webkit_media_css_contracts() {
+        assert_eq!(file_preview_kind("photo.PNG"), Some("image"));
+        assert_eq!(file_preview_kind("clip.mp4"), Some("video"));
+        assert_eq!(file_preview_kind("notes.txt"), None);
+        let css = crate::assets::STYLE_CSS;
+        assert!(css.contains(".file-card-thumbnail"));
+        assert!(css.contains("grid-template: minmax(0, 1fr) / minmax(0, 1fr);"));
+        assert!(css.contains(".artifact-md:not(.inline)"));
     }
 }

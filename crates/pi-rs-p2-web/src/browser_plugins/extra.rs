@@ -91,6 +91,13 @@ pub const P2_SUBAGENTS: ContractSpec = ContractSpec {
     address_kind: ContractAddressKind::Server,
 };
 
+pub const P2_SUBAGENT_CONTROL: ContractSpec = ContractSpec {
+    name: "p2.subagent-control",
+    version: 1,
+    fingerprint: 0x3cfeee6e948fb4a1,
+    address_kind: ContractAddressKind::Session,
+};
+
 pub const P2_CHAT_MODE: ContractSpec = ContractSpec {
     name: "p2.chat-mode",
     version: 2,
@@ -261,6 +268,10 @@ pub mod extra_indexes {
 
     pub mod subagents {
         pub const STATE_CHILDREN: u64 = 0;
+    }
+
+    pub mod subagent_control {
+        pub const METHOD_ARCHIVE: u64 = 0;
     }
 
     pub mod chat_mode {
@@ -766,9 +777,12 @@ pub fn decode_views_state(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubagentChildView {
     pub session_id: String,
+    pub conversation_id: u64,
     pub title: String,
     pub parent_session: String,
     pub status: String,
+    pub one_shot: bool,
+    pub archived: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -784,9 +798,14 @@ pub fn decode_subagents_view(children_val: Option<&Value>) -> SubagentsView {
                 if let Some(sid) = item["sessionId"].as_str().or_else(|| item["id"].as_str()) {
                     children.push(SubagentChildView {
                         session_id: sid.to_owned(),
+                        conversation_id: item["conversationId"].as_u64().unwrap_or(1),
                         title: item["title"].as_str().unwrap_or(sid).to_owned(),
                         parent_session: parent.clone(),
                         status: item["status"].as_str().unwrap_or("active").to_owned(),
+                        one_shot: item["oneShot"].as_bool().unwrap_or(false),
+                        archived: item["archived"]
+                            .as_bool()
+                            .unwrap_or(!item["archivedAt"].is_null()),
                     });
                 }
             }

@@ -3,12 +3,12 @@ use std::borrow::Cow;
 use indexmap::IndexMap;
 use pi_rs_tui::visible_width;
 
-use super::{Art, Role};
+use super::{Art, RenderOutcome, Role};
 
 pub(super) fn sequence<'a>(
     lines: impl Iterator<Item = &'a str>,
     width: usize,
-) -> Result<Option<Art>, &'static str> {
+) -> Result<RenderOutcome, &'static str> {
     let mut participants = IndexMap::new();
     let mut steps = Vec::new();
     let mut numbered = false;
@@ -78,7 +78,7 @@ pub(super) fn sequence<'a>(
         }
     }
     if participants.is_empty() || participants.len() > 64 || steps.len() > 200 {
-        return Ok(None);
+        return Ok(RenderOutcome::Empty);
     }
     let mut widths: Vec<_> = participants
         .values()
@@ -115,7 +115,7 @@ pub(super) fn sequence<'a>(
     let centers = positions(&widths);
     let total = widths.iter().sum::<usize>() + 2 * (widths.len() - 1);
     if total > width {
-        return Ok(None);
+        return Ok(RenderOutcome::TooWide { needed: total });
     }
     let mut art = Art::default();
     sequence_boxes(&mut art, &participants, &widths, false);
@@ -199,7 +199,7 @@ pub(super) fn sequence<'a>(
     }
     art.push(Role::Border, empty.into_iter().collect::<String>());
     sequence_boxes(&mut art, &participants, &widths, true);
-    Ok(Some(art))
+    Ok(RenderOutcome::Rendered(art))
 }
 
 enum SequenceStep<'a> {
@@ -280,7 +280,7 @@ pub(super) fn pie<'a>(
     header: &str,
     lines: impl Iterator<Item = &'a str>,
     width: usize,
-) -> Result<Option<Art>, &'static str> {
+) -> Result<RenderOutcome, &'static str> {
     let title = header.split_once("title").map(|(_, title)| title.trim());
     let show_data = header.split_whitespace().any(|word| word == "showData");
     let mut slices = Vec::new();
@@ -309,11 +309,13 @@ pub(super) fn pie<'a>(
         .max()
         .unwrap_or(0);
     if total <= 0.0 || !total.is_finite() {
-        return Ok(None);
+        return Ok(RenderOutcome::Empty);
     }
     let bar_width = width.saturating_sub(label_width + 18).min(32);
     if bar_width == 0 {
-        return Ok(None);
+        return Ok(RenderOutcome::TooWide {
+            needed: label_width + 19,
+        });
     }
     let mut art = Art::default();
     if let Some(title) = titles {
@@ -335,7 +337,7 @@ pub(super) fn pie<'a>(
             (Role::Text, number),
         ]);
     }
-    Ok(Some(art))
+    Ok(RenderOutcome::Rendered(art))
 }
 
 pub(super) fn mindmap<'a>(
