@@ -20,7 +20,7 @@ pub const APP_TITLE: &str = "π";
 /// Upstream `piConfig.configDir`.
 pub const CONFIG_DIR_NAME: &str = ".pi";
 /// Upstream `package.json` `version` for this fork.
-pub const VERSION: &str = "1.6.0";
+pub const VERSION: &str = "1.6.1";
 /// `PI_CODING_AGENT_DIR`: overrides the user config directory when non-empty.
 pub const ENV_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 /// `PI_CODING_AGENT_SESSION_DIR`: session directory override used by downstream units.

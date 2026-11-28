@@ -39,7 +39,7 @@ const PROTOCOL: u64 = 1;
 const FEATURES: &[&str] = &["listFiles", "process"];
 /// The npm package version this daemon ships with. Upstream injects this from `package.json` with a `build.rs`;
 /// the port pins the fork's version so `hello` reports the same string without a build script.
-const VERSION: &str = "1.6.0";
+const VERSION: &str = "1.6.1";
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const SILENCE_LIMIT_MS: u64 = 30_000;
 const SCAN_CHUNK: usize = 64 * 1024;

@@ -46,7 +46,7 @@ fn hello_reports_the_remote_machine_and_platform_mapping() {
     let connection = connection();
     let info = connection.info().unwrap();
     assert_eq!(info.protocol, 1);
-    assert_eq!(info.version, "1.6.0");
+    assert_eq!(info.version, "1.6.1");
     assert!(!info.os.is_empty() && !info.arch.is_empty() && !info.cwd.is_empty());
     assert!(info.has_feature("listFiles") && info.has_feature("process"));
     assert_eq!(

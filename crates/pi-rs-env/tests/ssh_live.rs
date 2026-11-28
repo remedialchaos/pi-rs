@@ -329,7 +329,7 @@ async fn live_sshd_bootstrap_deploy_and_remote_execution_env() -> TestResult {
     let conn = Arc::new(conn);
     let info = conn.info()?;
     assert_eq!(info.protocol, 1);
-    assert_eq!(info.version, "1.6.0");
+    assert_eq!(info.version, "1.6.1");
     assert!(info.has_feature("listFiles"));
 
     let env = RemoteExecutionEnv::new(RemoteExecutionEnvOptions {

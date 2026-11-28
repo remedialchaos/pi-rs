@@ -26,7 +26,7 @@ pub fn format_user_agent(identity: &ClientIdentity) -> String {
         Some(UserAgent::Custom(custom)) => custom.clone(),
         _ => format!(
             "pi/{} ({}; rust; {})",
-            identity.version.as_deref().unwrap_or("1.6.0"),
+            identity.version.as_deref().unwrap_or("1.6.1"),
             std::env::consts::OS,
             std::env::consts::ARCH
         ),

@@ -30,7 +30,7 @@ fn metadata_and_argument_errors_use_their_own_streams_and_status() -> TestResult
     for flag in ["--version", "-v"] {
         let output = pi(root.path()).arg(flag).output()?;
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"1.6.0\n");
+        assert_eq!(output.stdout, b"1.6.1\n");
         assert!(output.stderr.is_empty());
     }
     for flag in ["--help", "-h"] {

@@ -797,6 +797,7 @@ fn faux_models(
                     StopReason::Stop
                 },
                 error_message: fail.then(|| "quota exceeded".into()),
+                response_id: None,
                 timestamp: 1,
             }
         })
